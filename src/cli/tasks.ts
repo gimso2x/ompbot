@@ -8,7 +8,7 @@ import { resolveTaskHost } from "../tasks/host";
 import { openTaskLedger, type TaskRow, TaskTransitionError } from "../tasks/ledger";
 
 export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
-  tasks show <id>                registry row and the current Outcome judgement
+  tasks show <id>                registry row, transition history and the current Outcome judgement
   tasks check <id>               judge now; the running daemon posts/reacts like its sweep does
   tasks close <id> --as done|cancelled   human-only completion (the bot can never do this); worktree and branch stay
 `;
@@ -72,7 +72,7 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 				process.stderr.write("tasks close: --as done|cancelled required\n");
 				return 2;
 			}
-			const closed = ledger.transition(row.taskId, values.as, "human");
+			const closed = ledger.transition(row.taskId, values.as, "human", `close --as ${values.as}`);
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
 			if (synced?.ok !== true) process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
@@ -89,10 +89,15 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 		const evaluation = await evaluateTask(row, resolveTaskHost(row.host, dispatchHostsOf(homeDir)));
 		if (!evaluation.ok) {
 			process.stderr.write(`tasks ${sub}: read failed: ${evaluation.error}\n`);
-			out({ task: row });
+			out(sub === "show" ? { task: row, history: ledger.history(row.taskId) } : { task: row });
 			return 1;
 		}
-		out({ task: row, judgement: evaluation.judgement, summary: summarizeJudgement(evaluation.judgement, row.status) });
+		out({
+			task: row,
+			judgement: evaluation.judgement,
+			summary: summarizeJudgement(evaluation.judgement, row.status),
+			...(sub === "show" ? { history: ledger.history(row.taskId) } : {}),
+		});
 		return 0;
 	} catch (error) {
 		if (!(error instanceof TaskTransitionError)) throw error;

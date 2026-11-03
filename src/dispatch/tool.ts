@@ -1,6 +1,8 @@
 import { join } from "node:path";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
+import type { ApprovalDetail, ApprovalResult } from "../safety/approval";
+import { scanHandoffBrief } from "../safety/handoff-risk";
 import type { HostToolDef } from "../safety/host-tools";
 import { buildFloorsPrompt } from "../safety/prompt";
 import { resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
@@ -26,6 +28,8 @@ export interface DispatchToolDeps {
 	frozen?: () => FreezeState | undefined;
 	/** Config `herdr`: present → herdr/host/taskSpec dispatch; absent → the tool is simple-only (`omp -p`). */
 	herdr?: { bin?: string };
+	/** Owner approval card for a high_risk herdr brief; absent → such a brief is refused (`no_approver`). */
+	approve?: (summary: string, detail: ApprovalDetail, signal?: AbortSignal) => Promise<ApprovalResult>;
 	log: {
 		info(event: string, fields?: Record<string, unknown>): void;
 		warn(event: string, fields?: Record<string, unknown>): void;
@@ -42,6 +46,8 @@ const SIMPLE_ONLY_PARAMETERS = {
 	additionalProperties: false,
 };
 const HERDR_OFF_MESSAGE = "herdr가 꺼져 있어 simple만 쓸 수 있습니다";
+/** A brief the handoff risk scan found nothing in (or a call with no brief): the result goes out unchanged. */
+const CLEAR_GATE = { suffix: "", approved: false };
 
 /** The `ompbot_dispatch` host tool for chat origins; `undefined` when the omp binary is not provided. */
 export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
@@ -106,18 +112,60 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			},
 			additionalProperties: false,
 		},
-		async execute(params) {
+		async execute(params, context) {
 			const frozen = deps.frozen?.();
 			if (frozen !== undefined) {
 				deps.log.warn("dispatch_refused_frozen", { origin: deps.originKey });
 				throw new Error(frozenMessage(frozen));
 			}
-			return auditContext.run({ origin: deps.originKey }, () => executeDispatch(params));
+			return auditContext.run({ origin: deps.originKey }, () => executeDispatch(params, context.signal));
 		},
 	};
 	return herdrOn ? tool : { ...tool, description: SIMPLE_ONLY_DESCRIPTION, parameters: SIMPLE_ONLY_PARAMETERS };
 
-	async function executeDispatch(params: Record<string, unknown>): Promise<string> {
+	/**
+	 * Handoff risk scan of a brief about to go to a herdr worker. clear/advisory pass (advisory adds a result line);
+	 * high_risk passes only on an `approved` owner card, anything else throws before a worker is touched.
+	 */
+	async function gateHandoff(text: string, signal: AbortSignal): Promise<{ suffix: string; approved: boolean }> {
+		const scan = scanHandoffBrief(text);
+		const origin = deps.originKey;
+		if (scan.verdict === "clear") return CLEAR_GATE;
+		if (scan.verdict === "advisory") {
+			const rules = [
+				...new Set(scan.findings.map((finding) => finding.rule)),
+				...(scan.truncated ? ["truncated"] : []),
+			];
+			deps.log.info("dispatch_risk_advisory", { origin, rules });
+			return { suffix: `\n위험 검사: advisory (${rules.join(", ")})`, approved: false };
+		}
+		const high = scan.findings.filter((finding) => finding.severity === "high_risk");
+		const rest = scan.findings.filter((finding) => finding.severity !== "high_risk");
+		const rules = [...new Set(high.map((finding) => finding.rule))];
+		deps.log.warn("dispatch_risk_high", { origin, rules });
+		const detail: ApprovalDetail = {
+			action: [...high, ...rest]
+				.slice(0, 5)
+				.map((finding) => `L${finding.line} ${finding.rule}: ${redact(finding.excerpt)}`)
+				.join("\n"),
+			impact: "승인하면 이 지시문이 사람 없이 워커에서 실행됩니다",
+		};
+		const answer =
+			deps.approve === undefined
+				? "no_approver"
+				: await deps.approve("herdr 위임 지시문에 고위험 명령이 있습니다", detail, signal);
+		if (answer === "approved") {
+			deps.log.info("dispatch_risk_approved", { origin, rules });
+			return { suffix: `\n위험 검사: high_risk 승인됨 (${rules.join(", ")})`, approved: true };
+		}
+		const outcome = typeof answer === "object" ? "replied" : answer;
+		deps.log.warn("dispatch_risk_refused", { origin, outcome });
+		throw new Error(
+			`위험 검사에서 막혔습니다(${outcome}): ${rules.join(", ")}. 지시문에서 해당 명령을 빼거나 금지 문장으로 바꾸고 다시 시도하세요`,
+		);
+	}
+
+	async function executeDispatch(params: Record<string, unknown>, signal: AbortSignal): Promise<string> {
 		const herdrArgs =
 			params.mode === "herdr" || ["name", "host", "cwd", "taskSpec"].some((key) => params[key] !== undefined);
 		if (!herdrOn && herdrArgs) throw new Error(HERDR_OFF_MESSAGE);
@@ -143,8 +191,23 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			if (name !== undefined)
 				throw new Error("taskSpec에는 name을 줄 수 없습니다(에이전트 이름은 TASKID에서 만듭니다)");
 			const input = parseTaskSpecInput(params.taskSpec);
-			if (input.kind === "resume") return redact(await resumeTask(taskDeps, { id: input.id, task, host }));
-			return redact(await startTask(taskDeps, { spec: input.spec, task, host: host ?? null }));
+			const briefed = task !== undefined && task !== "";
+			if (input.kind === "resume") {
+				const gate = briefed ? await gateHandoff(task, signal) : CLEAR_GATE;
+				return redact(await resumeTask(taskDeps, { id: input.id, task, host })) + gate.suffix;
+			}
+			// Exclusions and acceptance are forbidding/checking sentences by design; they are not scanned.
+			const { spec } = input;
+			const brief = [
+				task,
+				spec.title,
+				spec.goal,
+				...spec.scope,
+				...(spec.background === undefined ? [] : [spec.background]),
+			];
+			const gate = briefed ? await gateHandoff(brief.join("\n"), signal) : CLEAR_GATE;
+			const raised = gate.approved && ["L0", "L1", "L2"].includes(spec.risk) ? { ...spec, risk: "L3" as const } : spec;
+			return redact(await startTask(taskDeps, { spec: raised, task, host: host ?? null })) + gate.suffix;
 		}
 		const herdrOptions = {
 			cwd: deps.workspaceDir,
@@ -169,16 +232,19 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				const summary = taskDeps === undefined ? undefined : await taskSummaryLine(taskDeps, name, host);
 				return `▸ ${host}/${name} 최근 출력:\n${redact(read.output ?? "")}${summary === undefined ? "" : `\n${summary}`}`;
 			}
+			const gate = await gateHandoff(task, signal);
 			const start = await herdrRemoteStart({ sshTarget: hostEntry.ssh, name, task, cwd, options: sshOptions });
 			if (!start.ok) return `시작 실패: ${start.error}`;
 			deps.log.info("dispatch_remote_started", { host, agent: name, cwd });
 			const link = boardLink === undefined ? undefined : await boardLink(host, start.paneId);
-			return [
-				`${host}에서 ${name} 에이전트를 시작했습니다 (cwd ${cwd}, pane ${start.paneId}).`,
-				...(link === undefined ? [] : [`진행 보기: ${link}`]),
-				`오너에게는 이 모양으로 접수를 알린다: 첫 줄 '\`${host}\`에서 \`${name}\`(<제목>)가 맡았습니다. 결정이 필요하거나 끝나면 이 스레드로 알려 드립니다.'${link === undefined ? "" : ", 다음 줄 '진행 보기: <위 링크>'"}, 빈 줄 뒤 '[목표] <한 문장>'과 '[가정] <오너 대신 정한 해석, 없으면 없음>'. 그 밖의 과정은 쓰지 않는다.`,
-				`후속 지시·진행 확인은 ompbot_dispatch {host:"${host}", name:"${name}"} 로.`,
-			].join("\n");
+			return (
+				[
+					`${host}에서 ${name} 에이전트를 시작했습니다 (cwd ${cwd}, pane ${start.paneId}).`,
+					...(link === undefined ? [] : [`진행 보기: ${link}`]),
+					`오너에게는 이 모양으로 접수를 알린다: 첫 줄 '\`${host}\`에서 \`${name}\`(<제목>)가 맡았습니다. 결정이 필요하거나 끝나면 이 스레드로 알려 드립니다.'${link === undefined ? "" : ", 다음 줄 '진행 보기: <위 링크>'"}, 빈 줄 뒤 '[목표] <한 문장>'과 '[가정] <오너 대신 정한 해석, 없으면 없음>'. 그 밖의 과정은 쓰지 않는다.`,
+					`후속 지시·진행 확인은 ompbot_dispatch {host:"${host}", name:"${name}"} 로.`,
+				].join("\n") + gate.suffix
+			);
 		}
 
 		if (mode === "herdr") {
@@ -189,10 +255,11 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				const summary = taskDeps === undefined ? undefined : await taskSummaryLine(taskDeps, name, null);
 				return `▸ ${name} 최근 출력:\n${redact(read.output ?? "")}${summary === undefined ? "" : `\n${summary}`}`;
 			}
+			const gate = await gateHandoff(task, signal);
 			const follow = await herdrPromptExisting(name, task, herdrOptions);
 			if (!follow.ok) return `전달 실패: ${follow.error ?? "unknown"}`;
 			deps.log.info("dispatch_prompted", { agent: name });
-			return `후속 지시를 ${name}에 전달했습니다. 진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}`;
+			return `후속 지시를 ${name}에 전달했습니다. 진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}${gate.suffix}`;
 		}
 
 		if (task === undefined || task === "") throw new Error("task is required");

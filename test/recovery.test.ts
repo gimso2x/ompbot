@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { openBotStore } from "../src/core/origin";
 import { INTERRUPTED_NOTICE, recoverDispatched } from "../src/daemon/recovery";
 import { createLogger } from "../src/log";
-import { OmpDriverError, type OmpFinal } from "../src/omp/driver";
+import { OmpDriverError, type OmpFinal, type OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore, type FakeTurnMessage } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import type { Store } from "../src/store/db";
@@ -80,6 +80,39 @@ async function dispatchedTurn(
 }
 
 describe("recovery rule (2): dispatched rows of a dead process", () => {
+	test("a child that opened another session than the pinned one: a warn line, no extra notice in the thread", async () => {
+		const pinned = "sess/e1/old-session.jsonl";
+		store.newEpoch(ORIGIN, "sess/e1", undefined, pinned);
+		const previous = new FakeOmpDriver({ sessionDir: "sess/e1", store: sessions });
+		await previous.start();
+		await previous.switchSession(pinned);
+		const leaf = await previous.leafId();
+		const final = nextFinal(previous);
+		const opRef = await previous.prompt("이어서");
+		store.recordInbound({ originKey: ORIGIN, platformMessageId: "m1", textRef: "이어서", threadRef: "D1:m1" });
+		store.markDispatched("m1", { opRef, entryCursor: leaf });
+		await final;
+		await previous.stop();
+
+		/** Binds the pinned session like omp, but reports another file as open. */
+		class ReportingDriver extends FakeOmpDriver {
+			override async state(): Promise<OmpState> {
+				return { ...(await super.state()), sessionFile: "sess/e1/other-session.jsonl" };
+			}
+		}
+		const result = await recoverDispatched({
+			store,
+			driverFactory: (_origin, sessionDir) => new ReportingDriver({ sessionDir, store: sessions }),
+			log: log(),
+		});
+		expect(result).toEqual({ answered: 1, interrupted: 0 });
+		const mismatch = logLines.filter((line) => line.includes("event=session_resume_mismatch"));
+		expect(mismatch).toHaveLength(1);
+		expect(mismatch[0]).toContain("level=warn");
+		// Only the recovered answer reaches the thread: recovery has no notice hook for the mismatch.
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["ECHO 이어서"]);
+	});
+
 	test("final assistant body after the cursor -> answered + exactly one delivery", async () => {
 		const { opRef } = await dispatchedTurn("m1", "ECHO abc", { finish: true });
 		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });

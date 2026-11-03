@@ -11,13 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OriginMailbox, TurnFailureEscalation } from "../src/core/mailbox";
+import { OriginMailbox, type SessionMismatchInfo, type TurnFailureEscalation } from "../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor, slackDmOrigin } from "../src/core/origin";
 import { IDLE_STOP_MS, type InboundRecord, MONITOR_IDLE_STOP_MS } from "../src/core/types";
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
-import { OmpDriverError, type OmpEntries, type OmpOpenResult } from "../src/omp/driver";
+import { OmpDriverError, type OmpEntries, type OmpOpenResult, type OmpState } from "../src/omp/driver";
 import {
 	FakeOmpDriver,
 	type FakeOmpDriverOptions,
@@ -1135,5 +1135,117 @@ describe("mailbox: idle stop per origin kind", () => {
 		expect(await stoppedAfter(lane, IDLE_STOP_MS - 1)).toBe(false);
 		clock.advance(1);
 		expect(await router.mailbox(lane).sweepIdle()).toBe(true);
+	});
+});
+
+/** Reports `reported` as the session file it opened, like an omp child that bound some other session. */
+class ReportingDriver extends FakeOmpDriver {
+	readonly #reported: string | undefined;
+
+	constructor(options: FakeOmpDriverOptions, reported: string | undefined) {
+		super(options);
+		this.#reported = reported;
+	}
+
+	override async state(): Promise<OmpState> {
+		const state = await super.state();
+		return this.#reported === undefined ? state : { ...state, sessionFile: this.#reported };
+	}
+}
+
+describe("mailbox: session resume check", () => {
+	const RESUME_ORIGIN = "slack/dm/DRESUME";
+	let mismatches: SessionMismatchInfo[];
+	let opened: ReportingDriver[];
+
+	/** A mailbox built directly (no router) whose children report `reported(sessionDir)` as their session file. */
+	function resumeMailbox(reported: (sessionDir: string) => string | undefined): OriginMailbox {
+		return new OriginMailbox({
+			originKey: RESUME_ORIGIN,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new ReportingDriver({ sessionDir, store: sessionStore }, reported(sessionDir));
+				opened.push(driver);
+				return driver;
+			},
+			onSessionMismatch: (info) => mismatches.push(info),
+		});
+	}
+
+	/** A saved session of the origin's epoch 1: what the next open is expected to resume. */
+	function savedSession(): string {
+		const sessionDir = sessionDirFor(join(dir, "sessions"), RESUME_ORIGIN, 1);
+		mkdirSync(sessionDir, { recursive: true });
+		const file = join(sessionDir, "2026-11-03T00-00-00-000Z_aaaa0000.jsonl");
+		writeFileSync(file, `${JSON.stringify({ type: "session", version: 1, id: "aaaa0000", cwd: dir })}\n`);
+		return file;
+	}
+
+	const mismatchLogs = () => logLines.filter((line) => line.includes("event=session_resume_mismatch"));
+
+	beforeEach(() => {
+		mismatches = [];
+		opened = [];
+	});
+
+	test("a child that opened another file than the one to resume: one warn line and one notice per epoch", async () => {
+		const expected = savedSession();
+		const other = join(dir, "elsewhere", "2026-11-03T01-00-00-000Z_bbbb0000.jsonl");
+		const mailbox = resumeMailbox(() => other);
+		try {
+			const first = msg("이어서", { originKey: RESUME_ORIGIN });
+			await mailbox.enqueue(first);
+			await mailbox.sweepIdle();
+			expect(mismatchLogs()).toHaveLength(1);
+			expect(mismatchLogs()[0]).toContain("level=warn");
+			expect(mismatches).toEqual([{ originKey: RESUME_ORIGIN, threadRef: first.threadRef, expected, actual: other }]);
+			// The turn still ran in the opened session.
+			expect(store.getInbound(first.platformMessageId)?.state).toBe("answered");
+
+			// Same (origin, epoch) opened again after an idle stop: logged again, never noticed twice.
+			clock.advance(IDLE_STOP_MS);
+			expect(await mailbox.sweepIdle()).toBe(true);
+			await mailbox.enqueue(msg("또", { originKey: RESUME_ORIGIN }));
+			expect(opened).toHaveLength(2);
+			expect(mismatchLogs()).toHaveLength(2);
+			expect(mismatches).toHaveLength(1);
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	/** Runs one turn on a fresh mailbox and returns its child's calls; nothing about the resume may be signalled. */
+	async function quietTurn(reported: (sessionDir: string) => string | undefined): Promise<string[]> {
+		const mailbox = resumeMailbox(reported);
+		try {
+			const row = msg("안녕", { originKey: RESUME_ORIGIN });
+			await mailbox.enqueue(row);
+			await mailbox.sweepIdle();
+			expect(store.getInbound(row.platformMessageId)?.state).toBe("answered");
+			expect(mismatchLogs()).toEqual([]);
+			expect(mismatches).toEqual([]);
+			return opened[0]?.calls ?? [];
+		} finally {
+			await mailbox.close();
+		}
+	}
+
+	test("the child opened the file to resume: no line, no notice, the turn runs as before", async () => {
+		const expected = savedSession();
+		expect(await quietTurn(() => expected)).toEqual(["openSession", "prompt:안녕"]);
+	});
+
+	test("an empty epoch dir (nothing to resume): no line, no notice, the turn runs as before", async () => {
+		const elsewhere = join(dir, "x.jsonl");
+		expect(await quietTurn(() => elsewhere)).toEqual(["openSession", "prompt:안녕"]);
+	});
+
+	test("a child that does not report its session file: no line, no notice, the turn runs as before", async () => {
+		savedSession();
+		expect(await quietTurn(() => undefined)).toEqual(["openSession", "prompt:안녕"]);
 	});
 });

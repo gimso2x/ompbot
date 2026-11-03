@@ -93,9 +93,30 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_thread ON tasks(thread_ref);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
+CREATE TABLE IF NOT EXISTS task_transitions (
+	transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id TEXT NOT NULL REFERENCES tasks(task_id),
+	from_status TEXT,
+	to_status TEXT NOT NULL,
+	actor TEXT NOT NULL CHECK (actor IN ('bot','human')),
+	reason TEXT,
+	at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_transitions_task ON task_transitions(task_id, transition_id);
 `;
 
-/** Creates the table in a database that may predate it (idempotent, never touches rows). */
+/** One append-only line of a task's status history; the registration line has `fromStatus: null`. */
+export interface TaskTransitionRow {
+	transitionId: number;
+	taskId: string;
+	fromStatus: TaskStatus | null;
+	toStatus: TaskStatus;
+	actor: TaskActor;
+	reason: string | null;
+	at: number;
+}
+
+/** Creates the tables in a database that may predate them (idempotent, never touches rows). */
 export function migrateTaskSchema(db: Database): void {
 	db.run(TASK_SCHEMA);
 }
@@ -119,6 +140,16 @@ interface TaskSql {
 	reminded_at: number | null;
 	notices_json: string;
 	closed_at: number | null;
+}
+
+interface TransitionSql {
+	transition_id: number;
+	task_id: string;
+	from_status: TaskStatus | null;
+	to_status: TaskStatus;
+	actor: TaskActor;
+	reason: string | null;
+	at: number;
 }
 
 const toTask = (r: TaskSql): TaskRow => ({
@@ -183,6 +214,7 @@ export class TaskLedger {
 					now,
 					now,
 				);
+			this.#recordTransition(taskId, null, "working", "bot", "registered", now);
 			return this.require(taskId);
 		})();
 	}
@@ -222,9 +254,10 @@ export class TaskLedger {
 
 	/**
 	 * Moves a task. The bot (`actor: "bot"`) can never reach `done`/`cancelled`; only a human close does, from any
-	 * open state. Closed tasks never move. Same-state moves are no-ops.
+	 * open state. Closed tasks never move. Same-state moves are no-ops. Each real move appends one history line in the
+	 * same transaction.
 	 */
-	transition(taskId: string, to: TaskStatus, actor: TaskActor): TaskRow {
+	transition(taskId: string, to: TaskStatus, actor: TaskActor, reason?: string): TaskRow {
 		return this.#db.transaction(() => {
 			const row = this.require(taskId);
 			if (row.status === to) return row;
@@ -244,6 +277,7 @@ export class TaskLedger {
 			this.#db
 				.query("UPDATE tasks SET status = ?, updated_at = ?, closed_at = ? WHERE task_id = ?")
 				.run(to, now, HUMAN_ONLY.includes(to) ? now : null, taskId);
+			this.#recordTransition(taskId, row.status, to, actor, reason ?? null, now);
 			return this.require(taskId);
 		})();
 	}
@@ -270,9 +304,48 @@ export class TaskLedger {
 		this.#db.query("UPDATE tasks SET reminded_at = ? WHERE task_id = ?").run(at, taskId);
 	}
 
-	/** Deletes the row of a registration that failed before the agent started (never a started task). */
+	/** The task's status history in `transition_id` order (empty for tasks registered before the history existed). */
+	history(taskId: string): TaskTransitionRow[] {
+		return (
+			this.#db
+				.query("SELECT * FROM task_transitions WHERE task_id = ? ORDER BY transition_id")
+				.all(taskId) as TransitionSql[]
+		).map((r) => ({
+			transitionId: r.transition_id,
+			taskId: r.task_id,
+			fromStatus: r.from_status,
+			toStatus: r.to_status,
+			actor: r.actor,
+			reason: r.reason,
+			at: r.at,
+		}));
+	}
+
+	#recordTransition(
+		taskId: string,
+		from: TaskStatus | null,
+		to: TaskStatus,
+		actor: TaskActor,
+		reason: string | null,
+		at: number,
+	): void {
+		this.#db
+			.query(
+				"INSERT INTO task_transitions (task_id, from_status, to_status, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(taskId, from, to, actor, reason, at);
+	}
+
+	/**
+	 * Deletes the row of a registration that failed before the agent started (never a started task), with its history
+	 * lines first (foreign keys). The only path that removes history lines.
+	 */
 	discard(taskId: string): void {
-		this.#db.query("DELETE FROM tasks WHERE task_id = ? AND status = 'working'").run(taskId);
+		this.#db.transaction(() => {
+			if (this.#db.query("SELECT 1 FROM tasks WHERE task_id = ? AND status = 'working'").get(taskId) === null) return;
+			this.#db.query("DELETE FROM task_transitions WHERE task_id = ?").run(taskId);
+			this.#db.query("DELETE FROM tasks WHERE task_id = ?").run(taskId);
+		})();
 	}
 
 	close(): void {

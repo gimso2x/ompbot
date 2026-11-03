@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { OWNER_NAME_PATTERN } from "../src/dispatch/omp";
-import { checkTask, summarizeJudgement } from "../src/tasks/checker";
+import { checkTask, summarizeJudgement, type TaskJudgement } from "../src/tasks/checker";
 import {
 	acceptanceItems,
 	agentNameOf,
@@ -128,7 +128,23 @@ describe("document round trip", () => {
 		);
 		expect(parsed.sections.get("AC-1")).toEqual({ commits: ["abc1234 feat"], tests: ["bun test → 5 pass"], files: [] });
 		expect(parsed.sections.get("AC-2")?.files).toEqual(["README.md"]);
-		expect(parseOutcome(renderOutcome(meta.taskId)).sections.size).toBe(0);
+		expect(parseOutcome(renderOutcome(meta.taskId))).toEqual({ sections: new Map(), summary: [] });
+	});
+
+	test("the 요약 section is the summary wherever it sits, and never leaks into or out of AC evidence", () => {
+		const acs = "## AC-1\n- commit: abc1234 feat\n- test: bun test → 5 pass\n## AC-2\n- file: README.md\n";
+		const summary = "## 요약\n- 로그가 회전합니다.\n\n• bun test 5 pass\n* 남은 위험 없음\n- commit: def5678 x\n";
+		const alone = parseOutcome(`# T Outcome 증거\n${acs}`);
+		const before = parseOutcome(`# T Outcome 증거\n${summary}${acs}`);
+		const after = parseOutcome(`# T Outcome 증거\n${acs}${summary}`);
+		const lines = ["로그가 회전합니다.", "bun test 5 pass", "남은 위험 없음", "commit: def5678 x"];
+		expect(before.summary).toEqual(lines);
+		expect(after.summary).toEqual(lines);
+		expect(alone.summary).toEqual([]);
+		expect(before.sections).toEqual(alone.sections);
+		expect(after.sections).toEqual(alone.sections);
+		// A later top-level heading ends the summary.
+		expect(parseOutcome("## 요약\n하나\n# 메모\n둘\n").summary).toEqual(["하나"]);
 	});
 });
 
@@ -156,6 +172,28 @@ describe("checkTask table", () => {
 		});
 		expect(result.evidence["AC-1"]).toEqual(["commit abc1234 feat"]);
 		expect(summarizeJudgement(result, "working")).toBe("AC 2/2 · 단계 1/1 · working · 2026-10-26T15:04:05+09:00");
+	});
+
+	test("the summary is carried but never judged: missing, empty or written, reached and problems stay the same", async () => {
+		const verdict = ({ reached, problems, reachKey }: TaskJudgement) => ({
+			reached,
+			problems,
+			reachKey,
+		});
+		const none = await checkTask(base);
+		const empty = await checkTask({ ...base, outcome: `${renderOutcome(meta.taskId)}${outcome}` });
+		const written = await checkTask({ ...base, outcome: `## 요약\n- 하나\n- 둘\n${outcome}` });
+		expect(none.summary).toEqual([]);
+		expect(empty.summary).toEqual([]);
+		expect(written.summary).toEqual(["하나", "둘"]);
+		expect(verdict(empty)).toEqual(verdict(none));
+		expect(verdict(written)).toEqual(verdict(none));
+		expect(none.reached).toBe(true);
+		const notReached = { ...base, spec: checked(["AC-1"]) };
+		expect(verdict(await checkTask({ ...notReached, outcome: `## 요약\n- 하나\n${outcome}` }))).toEqual(
+			verdict(await checkTask(notReached)),
+		);
+		expect((await checkTask({ ...base, outcome: undefined })).summary).toEqual([]);
 	});
 
 	test("the reach key changes when evidence changes", async () => {

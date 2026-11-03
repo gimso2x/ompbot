@@ -55,6 +55,7 @@ export interface OriginRouterDeps {
 	onEscalate?: MailboxDeps["onEscalate"];
 	/** Owner notice for a provider usage limit seen in a turn's omp retry events; see `MailboxDeps`. */
 	onProviderLimit?: MailboxDeps["onProviderLimit"];
+	onSessionMismatch?: MailboxDeps["onSessionMismatch"];
 }
 
 /** Owns one `OriginMailbox` per origin key. */

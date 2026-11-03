@@ -208,7 +208,8 @@ export function renderProgress(taskId: string, now: number): string {
 	].join("\n");
 }
 
-export const renderOutcome = (taskId: string): string => `# ${taskId} Outcome 증거\n`;
+/** Title, then an empty `## 요약` the agent fills with the 2~3 lines the owner reads on the Outcome card. */
+export const renderOutcome = (taskId: string): string => `# ${taskId} Outcome 증거\n## 요약\n`;
 
 // ---- parsers ----
 
@@ -337,21 +338,32 @@ export interface AcEvidence {
 
 export interface ParsedOutcome {
 	sections: Map<string, AcEvidence>;
+	/** Non-blank lines of `## 요약`, list markers (`- `, `* `, `• `) stripped; `[]` without that section. */
+	summary: string[];
 }
 
 export function parseOutcome(text: string): ParsedOutcome {
 	const sections = new Map<string, AcEvidence>();
+	const summary: string[] = [];
 	let current: AcEvidence | undefined;
+	let inSummary = false;
 	for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
 		const line = raw.trim();
 		const heading = /^## (AC-\d+)\s*$/.exec(line);
 		if (heading !== null) {
 			current = sections.get(heading[1] as string) ?? { commits: [], tests: [], files: [] };
 			sections.set(heading[1] as string, current);
+			inSummary = false;
 			continue;
 		}
 		if (/^#{1,2} /.test(line)) {
 			current = undefined;
+			inSummary = /^## 요약\s*$/.test(line);
+			continue;
+		}
+		if (inSummary) {
+			const entry = line.replace(/^[-*•]\s+/, "");
+			if (entry !== "") summary.push(entry);
 			continue;
 		}
 		const item = /^- (commit|test|file):\s*(.*)$/.exec(line);
@@ -361,5 +373,5 @@ export function parseOutcome(text: string): ParsedOutcome {
 		else if (item[1] === "test") current.tests.push(value);
 		else current.files.push(value);
 	}
-	return { sections };
+	return { sections, summary };
 }

@@ -240,7 +240,7 @@ export async function resumeTask(
 		link = await cardLink(deps, row, started.paneId);
 	}
 	if (row.status !== "working") {
-		deps.ledger.transition(row.taskId, "working", "bot");
+		deps.ledger.transition(row.taskId, "working", "bot", "resume dispatch");
 		await setStatusReaction(deps.transport, deps.log, row.threadRef, "working");
 	}
 	// A resumed task gets a fresh staleness baseline: the agent has not had a chance to update PROGRESS.md yet.

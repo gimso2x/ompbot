@@ -90,70 +90,54 @@ export function formatAcceptedCard(
 
 const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
-/** `1148 pass 0 fail … Ran 1168 tests` leaves 20 unaccounted for (skip/todo): say so instead of hiding it. */
-function withUncounted(line: string): string {
-	const pass = /(\d+)\s+pass\b/.exec(line);
-	const fail = /(\d+)\s+fail\b/.exec(line);
-	const ran = /Ran\s+(\d+)\s+tests?\b/.exec(line);
-	if (pass === null || ran === null || /\bskip\b/.test(line)) return line;
-	const rest = Number(ran[1]) - Number(pass[1]) - Number(fail?.[1] ?? 0);
-	return rest > 0 ? `${line} (pass·fail 밖 ${rest}개: skip 등)` : line;
-}
+const MAX_SUMMARY_LINES = 3;
 
 /**
- * Each criterion with its text and the numbers of its evidence, then each distinct evidence line once. Criteria that
- * cite the very same commit-only evidence are flagged: the bot checks that the commit exists, not that it meets them.
+ * Criteria that cite the very same commit-only evidence are flagged: the bot checks that the commit exists, not that
+ * it meets them.
  */
-function evidenceBlock(row: TaskRow, judgement: TaskJudgement): string[] {
-	const distinct: string[] = [];
-	const numberOf = (line: string): number => {
-		const at = distinct.indexOf(line);
-		if (at >= 0) return at + 1;
-		distinct.push(line);
-		return distinct.length;
-	};
+function sharedCommitWarnings(row: TaskRow, judgement: TaskJudgement): string[] {
 	const shared = new Map<string, string[]>();
-	const criteria = row.acceptance.map((item) => {
+	for (const item of row.acceptance) {
 		const lines = judgement.evidence[item.id] ?? [];
 		if (lines.length > 0 && lines.every((line) => line.startsWith("commit "))) {
 			const key = lines.join("\n");
 			shared.set(key, [...(shared.get(key) ?? []), item.id]);
 		}
-		const refs = lines.length === 0 ? "(증거 없음)" : lines.map((line) => `[${numberOf(line)}]`).join("");
-		// Registered texts often repeat their own id (`AC-1: …`); show it once.
-		const text = item.text.startsWith(`${item.id}:`) ? item.text.slice(item.id.length + 1).trim() : item.text;
-		return `• ${item.id} ${clip(text, 100)} — ${refs}`;
-	});
-	const warnings = [...shared.values()]
+	}
+	return [...shared.values()]
 		.filter((ids) => ids.length >= 2)
 		.map(
 			(ids) =>
 				`⚠️ 증거 약함: ${ids.join("·")}가 같은 커밋 증거만 댔습니다. 커밋이 각 기준을 채우는지는 봇이 판정하지 않습니다.`,
 		);
-	return [
-		"*수락기준*",
-		...criteria,
-		"",
-		"*증거*",
-		...distinct.map((line, index) => `[${index + 1}] ${clip(withUncounted(line), 200)}`),
-		...(warnings.length === 0 ? [] : ["", ...warnings]),
-	];
 }
 
+/**
+ * The owner reads the agent's outcome.md `## 요약` (at most three lines), not the criteria and evidence: those stay in
+ * outcome.md, which the `*근거*` line points to.
+ */
 export function formatReachedNotice(
 	row: TaskRow,
 	judgement: TaskJudgement,
 	ownerUserId: string,
 	link?: string,
 ): string {
+	const outcomePath = `docs/tasks/${row.taskId}/outcome.md`;
+	const summary =
+		judgement.summary.length === 0
+			? [`⚠️ 요약 없음 — ${outcomePath}를 직접 봐 주세요.`]
+			: judgement.summary.slice(0, MAX_SUMMARY_LINES).map((line) => `• ${clip(line, 200)}`);
+	const warnings = sharedCommitWarnings(row, judgement);
 	return [
 		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)}) <@${ownerUserId}>`,
 		"",
-		...evidenceBlock(row, judgement),
+		...summary,
+		...(warnings.length === 0 ? [] : ["", ...warnings]),
 		"",
 		`*질문*: 브랜치 \`${row.branch}\`를 main에 머지할까요?`,
 		'*답하는 법*: 이 스레드에 "머지해"라고 답하면 봇이 close→merge→push·워크트리 정리까지 하고, 서비스 반영(재시작)이 필요하면 그때 승인을 따로 요청합니다. 고칠 점이 있으면 그 내용을 적어 주세요.',
-		`*변경 보기*: \`git -C ${row.worktree} log --oneline main..${row.branch}\` (${hostLabelOf(row)})`,
+		`*근거*: \`${outcomePath}\` · \`git -C ${row.worktree} log --oneline main..${row.branch}\` (${hostLabelOf(row)})`,
 		...boardFooter(link),
 	].join("\n");
 }

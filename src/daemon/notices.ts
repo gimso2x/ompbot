@@ -1,4 +1,5 @@
-import type { ProviderLimitInfo, StallEscalation, TurnFailureEscalation } from "../core/mailbox";
+import { basename } from "node:path";
+import type { ProviderLimitInfo, SessionMismatchInfo, StallEscalation, TurnFailureEscalation } from "../core/mailbox";
 import { COMMAND_TEXT } from "../core/types";
 import type { Gate } from "../ops/gates";
 import { redact } from "../redact";
@@ -72,6 +73,11 @@ export function formatPendingDispatchNotice(
 		// (/new-ompbot with a wedged abort) is invisible there, so the hint must not promise it can be cancelled.
 		`대기 중인 일반 메시지는 \`${COMMAND_TEXT.queue}\`에서 취소할 수 있습니다.`,
 	].join("\n");
+}
+
+/** `⚠️ 이전 세션을 잇지 못하고…`: the thread's child opened another session than the one to resume (file names only). */
+export function formatSessionMismatchNotice(info: SessionMismatchInfo): string {
+	return `⚠️ 이전 세션을 잇지 못하고 다른 세션으로 열었습니다. 앞 대화 맥락이 없을 수 있습니다. (기대 ${basename(info.expected)} · 실제 ${basename(info.actual)})`;
 }
 
 /** `🚨 [자가진단] 게이트 … 열림`: a health gate just opened; a gate still open past 24h says how long it has stood. */

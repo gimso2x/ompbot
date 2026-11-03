@@ -1,4 +1,5 @@
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { turnAnswerParts } from "../omp/answers";
@@ -150,7 +151,24 @@ export interface MailboxDeps {
 	onProviderLimit?: (info: ProviderLimitInfo) => void;
 	/** True while a restart drain runs: messages are recorded `pending` only — no new turn, no steer, no command. */
 	isDraining?: () => boolean;
+	/** A child opened another session file than the one to resume; once per (origin, epoch), never blocks the turn. */
+	onSessionMismatch?: (info: SessionMismatchInfo) => void;
 }
+
+export interface SessionMismatchInfo {
+	originKey: string;
+	/** Thread of the message whose turn (or command) opened the session. */
+	threadRef: string;
+	/** The file to resume: `/resume-ompbot`'s pin, else the newest session of the epoch dir before the child started. */
+	expected: string;
+	/** The file the child reported as open. */
+	actual: string;
+}
+
+/** Outcome of `openOriginSession`: `mismatch` only when both files are known and resolve to different paths. */
+export type SessionOpenCheck =
+	| { mismatch: true; expected: string; actual: string }
+	| { mismatch: false; expected: string | undefined; actual: string | undefined };
 
 interface ActiveTurn {
 	opRef: string;
@@ -174,16 +192,36 @@ interface ActiveTurn {
 }
 
 /**
- * Binds the origin's session in a started driver: the file pinned by `/resume-ompbot`, else the newest session of the
- * origin's session dir. Recovery uses the same rule so it reads the session the turn ran in.
+ * The session file the next child open should resume: the file pinned by `/resume-ompbot`, else the newest session of
+ * the origin's session dir (undefined for an empty or missing dir). Read it before the child starts — a started child
+ * may already have created a new file in the dir.
  */
-export async function openOriginSession(driver: OmpSessionDriver, origin: OriginRow): Promise<void> {
+export function sessionToResume(origin: OriginRow): string | undefined {
+	if (origin.sessionFile !== null) return origin.sessionFile;
+	return existsSync(origin.sessionDir) ? newestSessionFile(origin.sessionDir) : undefined;
+}
+
+/**
+ * Binds the origin's session in a started driver: the file pinned by `/resume-ompbot`, else the newest session of the
+ * origin's session dir. Recovery uses the same rule so it reads the session the turn ran in. Then compares the file
+ * the child reports as open with `expected` (`sessionToResume`, read before start); no verdict when either is unknown.
+ */
+export async function openOriginSession(
+	driver: OmpSessionDriver,
+	origin: OriginRow,
+	expected: string | undefined,
+): Promise<SessionOpenCheck> {
 	if (origin.sessionFile === null) {
 		await driver.openSession();
-		return;
+	} else {
+		const { cancelled } = await driver.switchSession(origin.sessionFile);
+		if (cancelled) throw new OmpDriverError("rpc_error", `switch_session cancelled: ${origin.sessionFile}`);
 	}
-	const { cancelled } = await driver.switchSession(origin.sessionFile);
-	if (cancelled) throw new OmpDriverError("rpc_error", `switch_session cancelled: ${origin.sessionFile}`);
+	const actual = (await driver.state()).sessionFile;
+	if (expected !== undefined && actual !== undefined && resolve(expected) !== resolve(actual)) {
+		return { mismatch: true, expected, actual };
+	}
+	return { mismatch: false, expected, actual };
 }
 
 const MAX_LISTED = 30;
@@ -294,6 +332,8 @@ export class OriginMailbox {
 	#acceptingDispatch = true;
 	/** Failed turns in a row; a completed turn resets it (`성공 시 리셋`). */
 	#consecFailures = 0;
+	/** Epochs whose session mismatch was already passed to `onSessionMismatch` (memory only: a restart may tell again). */
+	readonly #mismatchNoticed = new Set<number>();
 
 	constructor(deps: MailboxDeps) {
 		this.#deps = deps;
@@ -680,7 +720,7 @@ export class OriginMailbox {
 	/** Opens the origin's session in a driver and starts one turn for the row; nothing is recorded on failure. */
 	async #startTurn(row: InboundRow, text: string): Promise<void> {
 		const { store, log, originKey } = this.#deps;
-		const driver = await this.#ensureDriver();
+		const driver = await this.#ensureDriver(row.threadRef);
 		// Read the cursor right before the prompt: extensions append entries after open.
 		const entryCursor = await driver.leafId();
 		const opRef = await driver.prompt(this.#firstTurnPrompt(row, text));
@@ -778,9 +818,10 @@ export class OriginMailbox {
 		}
 	}
 
-	async #ensureDriver(): Promise<OmpSessionDriver> {
+	/** The running child, or a new one bound to the origin's session; `threadRef` is where a session mismatch is told. */
+	async #ensureDriver(threadRef: string): Promise<OmpSessionDriver> {
 		if (this.#driver) return this.#driver;
-		const { store, originKey, driverFactory } = this.#deps;
+		const { store, originKey, driverFactory, log } = this.#deps;
 		const origin = store.getOrigin(originKey);
 		if (!origin) throw new OmpDriverError("not_started", `unknown origin ${originKey}`);
 		// Freshness must be read before the child exists: a spawned omp child (and the fake driver's `start()`)
@@ -788,13 +829,22 @@ export class OriginMailbox {
 		// session created moments ago at startup. An epoch dir with no session file is the only trustworthy
 		// "this session will be the first" signal — the one moment thread context may be injected.
 		this.#freshSession = epochDirIsFresh(origin.sessionDir);
+		const expected = sessionToResume(origin);
 		const driver = driverFactory(originKey, origin.sessionDir);
 		await driver.start();
+		let check: SessionOpenCheck;
 		try {
-			await openOriginSession(driver, origin);
+			check = await openOriginSession(driver, origin, expected);
 		} catch (error) {
 			await driver.stop();
 			throw error;
+		}
+		if (check.mismatch) {
+			log.warn("session_resume_mismatch", { origin: originKey, expected: check.expected, actual: check.actual });
+			if (!this.#mismatchNoticed.has(origin.epoch)) {
+				this.#mismatchNoticed.add(origin.epoch);
+				this.#deps.onSessionMismatch?.({ originKey, threadRef, expected: check.expected, actual: check.actual });
+			}
 		}
 		await this.#applySettings(driver, origin);
 		this.#unsubscribe = [
@@ -1014,7 +1064,7 @@ export class OriginMailbox {
 		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
 		let text: string;
 		try {
-			text = await this.#commandReply(command, opRef);
+			text = await this.#commandReply(command, opRef, threadRef);
 		} catch (error) {
 			const reason = error instanceof OmpDriverError ? error.message : String(error);
 			log.error("command_failed", { origin: originKey, command: command.kind, error: reason });
@@ -1025,7 +1075,7 @@ export class OriginMailbox {
 	}
 
 	/** Answer text of a command; throws when omp refuses it (the caller turns that into a `[turn failed]` notice). */
-	async #commandReply({ kind, arg }: ParsedCommand, opRef: string): Promise<string> {
+	async #commandReply({ kind, arg }: ParsedCommand, opRef: string, threadRef: string): Promise<string> {
 		const busyText = `⏳ 작업 중에는 쓸 수 없습니다. 끝난 뒤 다시 보내거나 \`${COMMAND_TEXT.queue}\`로 확인하세요.`;
 		switch (kind) {
 			case "status":
@@ -1039,23 +1089,23 @@ export class OriginMailbox {
 				return `사용법: \`${COMMAND_TEXT.followup} <메시지>\` — 진행 중인 작업에 끼워 넣지 않고 끝난 뒤 다음 작업으로 보냅니다.`;
 			case "model":
 				if (arg !== "" && this.#turn) return busyText;
-				return await this.#modelCommand(arg);
+				return await this.#modelCommand(arg, threadRef);
 			case "thinking":
 				if (arg !== "" && this.#turn) return busyText;
-				return await this.#thinkingCommand(arg);
+				return await this.#thinkingCommand(arg, threadRef);
 			case "compact":
 				if (this.#turn) return busyText;
-				return await this.#compactCommand(arg);
+				return await this.#compactCommand(arg, threadRef);
 			case "resume":
 				if (arg !== "" && this.#turn) return busyText;
-				return await this.#resumeCommand(arg);
+				return await this.#resumeCommand(arg, threadRef);
 			case "new":
 				throw new Error("unreachable: /new is handled by #newEpoch");
 		}
 	}
 
-	async #modelCommand(arg: string): Promise<string> {
-		const driver = await this.#ensureDriver();
+	async #modelCommand(arg: string, threadRef: string): Promise<string> {
+		const driver = await this.#ensureDriver(threadRef);
 		const models = await driver.availableModels();
 		if (arg === "") {
 			const state = await driver.state();
@@ -1085,8 +1135,8 @@ export class OriginMailbox {
 		return `🔀 모델을 ${applied}(으)로 바꿨습니다. 이 대화방의 다음 작업부터 적용됩니다.`;
 	}
 
-	async #thinkingCommand(arg: string): Promise<string> {
-		const driver = await this.#ensureDriver();
+	async #thinkingCommand(arg: string, threadRef: string): Promise<string> {
+		const driver = await this.#ensureDriver(threadRef);
 		const levels = await driver.thinkingLevels();
 		if (arg === "") {
 			const state = await driver.state();
@@ -1105,8 +1155,8 @@ export class OriginMailbox {
 		return `🧠 thinking을 ${level}(으)로 바꿨습니다.`;
 	}
 
-	async #compactCommand(instructions: string): Promise<string> {
-		const driver = await this.#ensureDriver();
+	async #compactCommand(instructions: string, threadRef: string): Promise<string> {
+		const driver = await this.#ensureDriver(threadRef);
 		let result: OmpCompactResult;
 		try {
 			result = await driver.compact(instructions === "" ? undefined : instructions);
@@ -1122,7 +1172,7 @@ export class OriginMailbox {
 		return `🗜 컨텍스트를 압축했습니다 (압축 전 약 ${result.tokensBefore.toLocaleString("en-US")} 토큰).${summary === "" ? "" : `\n요약: ${summary}`}`;
 	}
 
-	async #resumeCommand(arg: string): Promise<string> {
+	async #resumeCommand(arg: string, threadRef: string): Promise<string> {
 		const { store, originKey, log } = this.#deps;
 		const sessions = listSavedSessions(dirname(this.#deps.sessionDirFor(originKey, 1)));
 		const current = this.#driver ? (await this.#driver.state()).sessionFile : undefined;
@@ -1141,7 +1191,7 @@ export class OriginMailbox {
 		await this.#stopDriver();
 		store.newEpoch(originKey, dirname(picked.file), undefined, picked.file);
 		log.info("session_resumed", { origin: originKey, session: picked.id });
-		await this.#ensureDriver();
+		await this.#ensureDriver(threadRef);
 		return `▶️ 세션 ${picked.id.slice(0, 8)}을(를) 이어갑니다. ${picked.preview}`;
 	}
 

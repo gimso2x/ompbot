@@ -7,7 +7,7 @@ import type { ProcessRunner } from "../src/dispatch/omp";
 import { acceptanceItems, docsDirOf, renderOutcome, renderProgress, renderSpec } from "../src/tasks/docs";
 import { evaluateTask } from "../src/tasks/evaluate";
 import { createTaskHostOps } from "../src/tasks/host";
-import { openTaskLedger, TaskLedger, TaskTransitionError } from "../src/tasks/ledger";
+import { migrateTaskSchema, openTaskLedger, TASK_SCHEMA, TaskLedger, TaskTransitionError } from "../src/tasks/ledger";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
 
@@ -84,6 +84,65 @@ describe("TaskLedger", () => {
 		expect(ledger.get(other.taskId)).toBeDefined();
 		ledger.discard(row.taskId);
 		expect(ledger.get(row.taskId)).toBeUndefined();
+	});
+
+	test("history: registration line, one line per real move, none for no-ops or refused moves", () => {
+		const now = { ms: 10 };
+		const ledger = ledgerAt(now);
+		const row = ledger.register(base);
+		const lines = () => ledger.history(row.taskId).map((h) => [h.fromStatus, h.toStatus, h.actor, h.reason, h.at]);
+		expect(lines()).toEqual([[null, "working", "bot", "registered", 10]]);
+		now.ms = 20;
+		ledger.transition(row.taskId, "working", "bot"); // same state: no-op
+		expect(() => ledger.transition(row.taskId, "done", "bot")).toThrow(TaskTransitionError);
+		ledger.transition(row.taskId, "review", "bot", "outcome reached AC 2/2");
+		now.ms = 30;
+		ledger.transition(row.taskId, "done", "human", "close --as done");
+		expect(() => ledger.transition(row.taskId, "working", "bot")).toThrow(TaskTransitionError); // closed
+		expect(lines()).toEqual([
+			[null, "working", "bot", "registered", 10],
+			["working", "review", "bot", "outcome reached AC 2/2", 20],
+			["review", "done", "human", "close --as done", 30],
+		]);
+		const ids = ledger.history(row.taskId).map((h) => h.transitionId);
+		expect(ids).toEqual([...ids].sort((a, b) => a - b));
+		expect(ledger.history("T-19990101-01")).toEqual([]);
+	});
+
+	test("a failed history insert rolls the status change back", () => {
+		const db = new Database(":memory:", { strict: true });
+		const ledger = new TaskLedger(db, { clock: { now: () => 1 } });
+		const row = ledger.register(base);
+		db.run("CREATE TRIGGER fail_history BEFORE INSERT ON task_transitions BEGIN SELECT RAISE(ABORT, 'injected'); END");
+		expect(() => ledger.transition(row.taskId, "review", "bot")).toThrow("injected");
+		expect(ledger.require(row.taskId).status).toBe("working");
+		expect(ledger.history(row.taskId)).toHaveLength(1);
+	});
+
+	test("discard drops the history lines too, with foreign keys on", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run("PRAGMA foreign_keys = ON");
+		const ledger = new TaskLedger(db, { clock: { now: () => 1 } });
+		const row = ledger.register(base);
+		ledger.discard(row.taskId);
+		expect(ledger.get(row.taskId)).toBeUndefined();
+		expect(db.query("SELECT COUNT(*) AS n FROM task_transitions").get()).toEqual({ n: 0 });
+	});
+
+	test("migration adds the history table to a database that predates it, leaving task rows alone", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run(TASK_SCHEMA.slice(0, TASK_SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS task_transitions")));
+		db.run(
+			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+		);
+		const before = db.query("SELECT * FROM tasks").all();
+		migrateTaskSchema(db);
+		expect(db.query("SELECT * FROM tasks").all()).toEqual(before);
+		const ledger = new TaskLedger(db, { clock: { now: () => 7 } });
+		expect(ledger.history("T-20261001-01")).toEqual([]);
+		ledger.transition("T-20261001-01", "working", "bot", "resume dispatch");
+		expect(ledger.history("T-20261001-01").map((h) => [h.fromStatus, h.toStatus])).toEqual([["review", "working"]]);
 	});
 });
 
@@ -326,9 +385,16 @@ describe("ompbot tasks (CLI)", () => {
 		// Local worktree docs do not exist: show reports a judgement with problems, never "reached".
 		const show = await runMain(home.dir, ["tasks", "show", row.taskId]);
 		expect(show.code).toBe(0);
-		const shown = JSON.parse(show.stdout) as { judgement: { reached: boolean; problems: string[] }; summary: string };
+		const shown = JSON.parse(show.stdout) as {
+			judgement: { reached: boolean; problems: string[] };
+			summary: string;
+			history: Array<{ fromStatus: string | null; toStatus: string; actor: string; reason: string | null }>;
+		};
 		expect(shown.judgement.reached).toBe(false);
 		expect(shown.summary).toContain("AC 0/2");
+		expect(shown.history).toMatchObject([
+			{ fromStatus: null, toStatus: "working", actor: "bot", reason: "registered" },
+		]);
 
 		expect((await runMain(home.dir, ["tasks", "close", row.taskId])).code).toBe(2);
 		expect((await runMain(home.dir, ["tasks", "close", "T-19990101-01", "--as", "done"])).code).toBe(1);
@@ -339,5 +405,17 @@ describe("ompbot tasks (CLI)", () => {
 		const again = await runMain(home.dir, ["tasks", "close", row.taskId, "--as", "done"]);
 		expect(again.code).toBe(1);
 		expect(again.stderr).toContain("이미 cancelled");
+		const history = JSON.parse((await runMain(home.dir, ["tasks", "show", row.taskId])).stdout).history as Array<{
+			transitionId: number;
+			fromStatus: string | null;
+			toStatus: string;
+			actor: string;
+			reason: string | null;
+		}>;
+		expect(history.map((h) => [h.fromStatus, h.toStatus, h.actor, h.reason])).toEqual([
+			[null, "working", "bot", "registered"],
+			["working", "cancelled", "human", "close --as cancelled"],
+		]);
+		expect(history[0]?.transitionId).toBeLessThan(history[1]?.transitionId ?? 0);
 	});
 });

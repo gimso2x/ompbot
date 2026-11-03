@@ -64,6 +64,7 @@ import {
 	formatGateOpenNotice,
 	formatPendingDispatchNotice,
 	formatProviderLimitNotice,
+	formatSessionMismatchNotice,
 	formatStallNotice,
 	formatTurnEscalationNotice,
 } from "./notices";
@@ -501,6 +502,7 @@ export class Daemon {
 			onActivity: (info) => void this.#adapter?.setActivity(info.threadRef, redact(info.activity)),
 			onEscalate: (info) => this.#escalateTurnFailures(info),
 			onProviderLimit: (info) => this.#notifyProviderLimit(info),
+			onSessionMismatch: (info) => this.#postThreadNotices([info.threadRef], formatSessionMismatchNotice(info)),
 			onStallEscalate: (info) => {
 				const target = this.#store;
 				if (target === undefined) return;

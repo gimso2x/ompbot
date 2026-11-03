@@ -45,6 +45,8 @@ export interface TaskJudgement {
 	current: string;
 	/** Per-AC evidence lines (`commit …`, `test …`, `file …`) as written, for the report. */
 	evidence: Record<string, string[]>;
+	/** outcome.md `## 요약` lines as parsed (`[]` without the file); shown on the card, never part of the judgement. */
+	summary: string[];
 	/** Fingerprint of everything the judgement stands on — the dedup key of the "reached" notice. */
 	reachKey: string;
 	/** Human-readable unmet conditions; empty exactly when `reached`. */
@@ -151,6 +153,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		},
 		current: progress?.current ?? "",
 		evidence,
+		summary: outcome?.summary ?? [],
 		reachKey: digest({ spec: specDoc?.acceptance, evidence, updatedAt }),
 		problems,
 	};

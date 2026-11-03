@@ -1,4 +1,4 @@
-import { type DriverFactory, openOriginSession } from "../core/mailbox";
+import { type DriverFactory, openOriginSession, sessionToResume } from "../core/mailbox";
 import { promptTextOf } from "../core/types";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
@@ -64,9 +64,14 @@ export async function recoverDispatched(deps: RecoveryDeps): Promise<RecoveryRes
 		let openError: unknown;
 		if (origin) {
 			try {
+				const expected = sessionToResume(origin);
 				driver = deps.driverFactory(originKey, origin.sessionDir);
 				await driver.start();
-				await openOriginSession(driver, origin);
+				const check = await openOriginSession(driver, origin, expected);
+				// Log only: every settled row below already gets its own answer or interrupted notice in the thread.
+				if (check.mismatch) {
+					log.warn("session_resume_mismatch", { origin: originKey, expected: check.expected, actual: check.actual });
+				}
 			} catch (error) {
 				openError = error;
 				await driver?.stop().catch(() => undefined);

@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { HerdrBoardConfig } from "../src/dispatch/board";
 import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
+import type { ApprovalDetail, ApprovalResult } from "../src/safety/approval";
 import type { HostToolDef } from "../src/safety/host-tools";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
@@ -80,14 +81,22 @@ interface Harness {
 	herdr: string[][];
 	agents: Set<string>;
 	failAgentStart: { value: boolean };
+	approvals: Array<{ summary: string; detail: ApprovalDetail }>;
 }
 
 function harness(
-	options: { threadRef?: string | undefined; withTasks?: boolean; board?: HerdrBoardConfig } = {},
+	options: {
+		threadRef?: string | undefined;
+		withTasks?: boolean;
+		board?: HerdrBoardConfig;
+		/** What the owner's approval card answers; absent → the tool has no approver. */
+		approval?: ApprovalResult;
+	} = {},
 ): Harness {
 	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => NOW } });
 	const transport = new FakeSlackTransport();
 	const host = fakeHost();
+	const approvals: Harness["approvals"] = [];
 	const herdr: string[][] = [];
 	const agents = new Set<string>();
 	const failAgentStart = { value: false };
@@ -124,6 +133,14 @@ function harness(
 		run,
 		log: noop,
 		...(options.board === undefined ? {} : { herdrBoard: options.board }),
+		...(options.approval === undefined
+			? {}
+			: {
+					approve: async (summary: string, detail: ApprovalDetail) => {
+						approvals.push({ summary, detail });
+						return options.approval as ApprovalResult;
+					},
+				}),
 		...(options.withTasks === false
 			? {}
 			: {
@@ -137,7 +154,7 @@ function harness(
 					},
 				}),
 	});
-	return { tool, ledger, transport, host, herdr, agents, failAgentStart };
+	return { tool, ledger, transport, host, herdr, agents, failAgentStart, approvals };
 }
 
 const call = (h: Harness, params: Record<string, unknown>) =>
@@ -333,6 +350,12 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		expect(prompt?.[4]).toEndWith("리뷰 반영해");
 		expect(h.herdr.some((cmd) => cmd[2] === "start")).toBe(false);
 		expect(h.ledger.require("T-20261026-01").status).toBe("working");
+		expect(h.ledger.history("T-20261026-01").at(-1)).toMatchObject({
+			fromStatus: "review",
+			toStatus: "working",
+			actor: "bot",
+			reason: "resume dispatch",
+		});
 		const reactions = h.transport.calls.filter((c) => c.method === "addReaction" || c.method === "removeReaction");
 		expect(reactions.at(-1)).toMatchObject({ method: "addReaction", name: "hourglass_flowing_sand" });
 		expect(reactions.some((c) => c.method === "removeReaction" && c.name === "mag")).toBe(true);
@@ -362,5 +385,121 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		const h = await started();
 		const out = await call(h, { mode: "herdr", name: "t-20261026-01" });
 		expect(out).toContain("▸ T-20261026-01 AC 0/2 · 단계 0/1 · working · 2026-10-26T15:00:00+09:00");
+	});
+});
+
+describe("ompbot_dispatch handoff risk scan", () => {
+	const HIGH = "정리 후 git push --force origin main 해";
+	const HIGH_RULES = "git_push_force, git_push_protected";
+	/** A herdr call that hands `text` to an agent (start+prompt, resume prompt, follow-up prompt, ssh prompt). */
+	const delivered = (h: Harness, text: string) =>
+		h.herdr.some((cmd) => cmd.includes("prompt") && cmd.some((word) => word.endsWith(text)));
+	const BRANCHES: Array<{
+		name: string;
+		setup?: (h: Harness) => Promise<void>;
+		params: (task: string) => Record<string, unknown>;
+	}> = [
+		{ name: "taskSpec new", params: (task) => ({ taskSpec: GOOD_SPEC, task }) },
+		{
+			name: "taskSpec resume",
+			setup: async (h) => {
+				await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+				h.herdr.length = 0;
+				h.transport.calls.length = 0;
+			},
+			params: (task) => ({ taskSpec: { id: "T-20261026-01" }, task }),
+		},
+		{ name: "host remote start", params: (task) => ({ host: "wsl", name: "remote-x", task }) },
+		{ name: "herdr follow-up", params: (task) => ({ mode: "herdr", name: "plain", task }) },
+	];
+	const REFUSALS: Array<[string, ApprovalResult | undefined, string]> = [
+		["denied", "denied", "denied"],
+		["timeout", "timeout", "timeout"],
+		["a thread reply", { replied: "응" }, "replied"],
+		["no approver", undefined, "no_approver"],
+	];
+
+	for (const branch of BRANCHES) {
+		for (const [label, approval, outcome] of REFUSALS) {
+			test(`${branch.name}: high_risk + ${label} is refused before any herdr call`, async () => {
+				const h = harness(approval === undefined ? {} : { approval });
+				await branch.setup?.(h);
+				const rows = h.ledger.list().length;
+				await expect(call(h, branch.params(HIGH))).rejects.toThrow(
+					`위험 검사에서 막혔습니다(${outcome}): ${HIGH_RULES}.`,
+				);
+				expect(h.herdr).toEqual([]);
+				expect(h.approvals).toHaveLength(approval === undefined ? 0 : 1);
+				// No worktree, docs or registry row for a refused new task; a resumed one is left as it was.
+				expect(h.ledger.list()).toHaveLength(rows);
+				if (branch.setup === undefined) expect(h.host.calls).toEqual([]);
+			});
+		}
+
+		test(`${branch.name}: high_risk + approved delivers the brief and says so`, async () => {
+			const h = harness({ approval: "approved" });
+			await branch.setup?.(h);
+			const out = await call(h, branch.params(HIGH));
+			expect(delivered(h, HIGH)).toBe(true);
+			expect(out.split("\n").at(-1)).toBe(`위험 검사: high_risk 승인됨 (${HIGH_RULES})`);
+			expect(h.approvals).toEqual([
+				{
+					summary: "herdr 위임 지시문에 고위험 명령이 있습니다",
+					detail: {
+						action: [`L1 git_push_force: ${HIGH}`, `L1 git_push_protected: ${HIGH}`].join("\n"),
+						impact: "승인하면 이 지시문이 사람 없이 워커에서 실행됩니다",
+					},
+				},
+			]);
+		});
+	}
+
+	test("an approved high_risk new task is registered at L3 at least", async () => {
+		const raised = harness({ approval: "approved" });
+		await call(raised, { taskSpec: GOOD_SPEC, task: HIGH });
+		expect(raised.ledger.require("T-20261026-01").risk).toBe("L3");
+		const kept = harness({ approval: "approved" });
+		await call(kept, { taskSpec: { ...GOOD_SPEC, risk: "L4" }, task: HIGH });
+		expect(kept.ledger.require("T-20261026-01").risk).toBe("L4");
+	});
+
+	test("a new task is scanned on task, title, goal, scope and background, not exclusions or acceptance", async () => {
+		const inGoal = harness({ approval: "denied" });
+		await expect(
+			call(inGoal, { taskSpec: { ...GOOD_SPEC, goal: "운영 DB에서 DROP TABLE logs 실행" }, task: "go" }),
+		).rejects.toThrow("sql_destructive");
+		const inExclusions = harness({ approval: "denied" });
+		const out = await call(inExclusions, {
+			taskSpec: { ...GOOD_SPEC, exclusions: ["git reset --hard"], acceptance: ["git push --force 없이 끝난다"] },
+			task: "go",
+		});
+		expect(out).toContain("T-20261026-01 등록·시작했습니다");
+		expect(inExclusions.approvals).toEqual([]);
+	});
+
+	test("clear briefs never ask and return the unchanged result", async () => {
+		const h = harness({ approval: "denied" });
+		const out = await call(h, { mode: "herdr", name: "plain", task: "로그 회전을 구현해" });
+		expect(out).toBe('후속 지시를 plain에 전달했습니다. 진행 확인: ompbot_dispatch {mode:"herdr", name:"plain"}');
+		expect(h.approvals).toEqual([]);
+	});
+
+	test("advisory briefs go out without asking and end with the advisory line", async () => {
+		const h = harness({ approval: "denied" });
+		const out = await call(h, {
+			mode: "herdr",
+			name: "plain",
+			task: "bun install 뒤 테스트를 돌린다\n머지·push·데몬 재시작(systemctl --user restart ompbot)은 하지 않는다",
+		});
+		expect(delivered(h, "하지 않는다")).toBe(true);
+		expect(out.split("\n").at(-1)).toBe("위험 검사: advisory (package_install, service_control)");
+		expect(h.approvals).toEqual([]);
+	});
+
+	test("simple mode is not scanned", async () => {
+		const h = harness({ approval: "denied" });
+		await call(h, { task: HIGH });
+		expect(h.approvals).toEqual([]);
+		expect(h.herdr.map((cmd) => cmd.slice(0, 3))).toEqual([["omp", "-p", HIGH]]);
 	});
 });

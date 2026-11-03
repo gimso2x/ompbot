@@ -52,19 +52,32 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		decision: { question: "", recommend: "", impact: "" },
 		current: "S1",
 		evidence: {},
+		summary: [],
 		reachKey: "k1",
 		problems: [],
 		...over,
 	};
 }
 
+const SUMMARY = ["로그 파일이 10MB를 넘으면 회전합니다.", "bun test 5 pass 0 fail, 스펙 밖 예외 없음."];
+
 const reachedJudgement = (over: Partial<TaskJudgement> = {}): TaskJudgement =>
 	judgement({
 		reached: true,
 		acChecked: 2,
 		evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["test bun test → 5 pass"] },
+		summary: SUMMARY,
 		...over,
 	});
+
+/** The text of the first Outcome card a fresh rig posts for `over`. */
+async function reachedCard(over: Partial<TaskJudgement> = {}): Promise<string> {
+	const r = rig();
+	r.next.value = { ok: true, judgement: reachedJudgement(over) };
+	await r.sweeper.sweep();
+	const post = posts(r)[0];
+	return post && "text" in post ? post.text : "";
+}
 
 interface Rig {
 	sweeper: TaskSweeper;
@@ -148,6 +161,12 @@ describe("TaskSweeper", () => {
 		r.next.value = { ok: true, judgement: reachedJudgement() };
 		await r.sweeper.sweep();
 		expect(r.ledger.require(r.row.taskId).status).toBe("review");
+		expect(r.ledger.history(r.row.taskId).at(-1)).toMatchObject({
+			fromStatus: "working",
+			toStatus: "review",
+			actor: "bot",
+			reason: "outcome reached AC 2/2",
+		});
 		expect(added(r)).toEqual(["mag"]);
 		expect(
 			reactions(r).some((c) => c.method === "removeReaction" && "name" in c && c.name === "hourglass_flowing_sand"),
@@ -159,8 +178,6 @@ describe("TaskSweeper", () => {
 		expect(text.split("\n")[0]).toStartWith("🔍 Outcome 도달 · 로그 회전");
 		expect(text.split("\n")[0]).toContain("2/2");
 		expect(text.split("\n")[0]).toEndWith("(local/t-20261026-01 · T-20261026-01) <@UOWN>");
-		expect(text).toContain("• AC-1 하나 — [1]\n• AC-2 둘 — [2]");
-		expect(text).toContain("[1] commit abc1234 feat\n[2] test bun test → 5 pass");
 		expect(text).not.toContain("증거 약함");
 		expect(text).toContain("git -C /r/repo-t-20261026-01 log --oneline main..task/T-20261026-01");
 		expect(text).toContain('"머지해"라고 답하면 봇이 close→merge→push');
@@ -181,31 +198,58 @@ describe("TaskSweeper", () => {
 		expect(posts(r)).toHaveLength(2);
 	});
 
-	test("Outcome notice lists shared evidence once, flags commit-only evidence shared by criteria, counts unreported tests", async () => {
-		const r = rig();
-		const ran = "test bun test → 1148 pass 0 fail / Ran 1168 tests across 67 files.";
-		r.next.value = {
-			ok: true,
-			judgement: reachedJudgement({
-				evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat", ran] },
-			}),
-		};
-		await r.sweeper.sweep();
-		const post = posts(r)[0];
-		const text = post && "text" in post ? post.text : "";
-		expect(text).toContain("• AC-1 하나 — [1]\n• AC-2 둘 — [1][2]");
-		expect(text).toContain(`[1] commit abc1234 feat\n[2] ${ran} (pass·fail 밖 20개: skip 등)`);
-		expect(text).not.toContain("증거 약함"); // AC-2 has its own test line
+	test("Outcome card shows the worker's summary lines, not the criteria or the evidence list", async () => {
+		const text = await reachedCard();
+		const lines = text.split("\n");
+		expect(lines.slice(1, 5)).toEqual(["", `• ${SUMMARY[0]}`, `• ${SUMMARY[1]}`, ""]);
+		expect(text).not.toContain("*수락기준*");
+		expect(text).not.toContain("*증거*");
+		expect(text).not.toContain("[1] commit");
+		expect(text).not.toContain("abc1234");
+		expect(text).not.toContain("• AC-1");
+		expect(text).not.toContain("요약 없음");
+	});
 
-		const same = rig();
-		same.next.value = {
-			ok: true,
-			judgement: reachedJudgement({ evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat"] } }),
-		};
-		await same.sweeper.sweep();
-		const flagged = posts(same)[0];
-		const flaggedText = flagged && "text" in flagged ? flagged.text : "";
-		expect(flaggedText).toContain("[1] commit abc1234 feat\n\n⚠️ 증거 약함: AC-1·AC-2가 같은 커밋 증거만 댔습니다.");
+	test("no summary: one warning line in its place", async () => {
+		const text = await reachedCard({ summary: [] });
+		expect(text.split("\n").slice(1, 4)).toEqual([
+			"",
+			"⚠️ 요약 없음 — docs/tasks/T-20261026-01/outcome.md를 직접 봐 주세요.",
+			"",
+		]);
+		expect(text).not.toContain("• ");
+	});
+
+	test("a long summary: the first three lines, each clipped to 200 characters", async () => {
+		const long = "가".repeat(250);
+		const text = await reachedCard({ summary: ["하나", long, "셋", "넷", "다섯"] });
+		const bullets = text.split("\n").filter((line) => line.startsWith("• "));
+		expect(bullets).toEqual(["• 하나", `• ${"가".repeat(199)}…`, "• 셋"]);
+		for (const line of bullets) expect(line.slice(2).length).toBeLessThanOrEqual(200);
+		expect(text).not.toContain("넷");
+	});
+
+	test("criteria citing the same commit-only evidence still raise the weak-evidence warning", async () => {
+		const shared = { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat"] };
+		const flagged = await reachedCard({ evidence: shared });
+		expect(flagged).toContain(
+			`• ${SUMMARY[1]}\n\n⚠️ 증거 약함: AC-1·AC-2가 같은 커밋 증거만 댔습니다. 커밋이 각 기준을 채우는지는 봇이 판정하지 않습니다.\n\n*질문*`,
+		);
+		// A criterion with its own test line is not commit-only.
+		const own = await reachedCard({
+			evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat", "test bun test → 5 pass"] },
+		});
+		expect(own).not.toContain("증거 약함");
+	});
+
+	test("the card closes with the question, how to answer and where the evidence lives", async () => {
+		const lines = (await reachedCard()).split("\n");
+		expect(lines.slice(-3)).toEqual([
+			"*질문*: 브랜치 `task/T-20261026-01`를 main에 머지할까요?",
+			'*답하는 법*: 이 스레드에 "머지해"라고 답하면 봇이 close→merge→push·워크트리 정리까지 하고, 서비스 반영(재시작)이 필요하면 그때 승인을 따로 요청합니다. 고칠 점이 있으면 그 내용을 적어 주세요.',
+			"*근거*: `docs/tasks/T-20261026-01/outcome.md` · `git -C /r/repo-t-20261026-01 log --oneline main..task/T-20261026-01` (local)",
+		]);
+		expect(lines.join("\n")).not.toContain("*변경 보기*");
 	});
 
 	test("blocked: 🚧 and one owner-mention report per reason; unblocking returns to ⏳", async () => {
@@ -237,6 +281,23 @@ describe("TaskSweeper", () => {
 		r.next.value = { ok: true, judgement: judgement({ blocked: true, blockedReason: "다른 사유" }) };
 		await r.sweeper.sweep();
 		expect(posts(r)).toHaveLength(2);
+		// Each sweep move is one history line carrying the PROGRESS reason.
+		expect(r.ledger.history(r.row.taskId).map((h) => [h.fromStatus, h.toStatus, h.actor, h.reason])).toEqual([
+			[null, "working", "bot", "registered"],
+			["working", "blocked", "bot", "토큰 없음"],
+			["blocked", "working", "bot", "PROGRESS status: working"],
+			["working", "blocked", "bot", "다른 사유"],
+		]);
+	});
+
+	test("blocked without a written reason is recorded as the PROGRESS status", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked" }) };
+		await r.sweeper.sweep();
+		expect(r.ledger.history(r.row.taskId).at(-1)).toMatchObject({
+			toStatus: "blocked",
+			reason: "PROGRESS status: blocked",
+		});
 	});
 
 	test("blocked with a decision request: question, recommendation and impact, then the board card", async () => {

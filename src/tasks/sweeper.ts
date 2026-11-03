@@ -147,7 +147,7 @@ export class TaskSweeper {
 		let status = row.status;
 		if (judgement.blocked) {
 			if (status === "working") {
-				ledger.transition(row.taskId, "blocked", "bot");
+				ledger.transition(row.taskId, "blocked", "bot", judgement.blockedReason || "PROGRESS status: blocked");
 				status = "blocked";
 				await setStatusReaction(this.#deps.transport, log, row.threadRef, "blocked");
 				actions.push("working → blocked, 🚧");
@@ -159,14 +159,14 @@ export class TaskSweeper {
 			return this.#result(row, status, judgement, actions);
 		}
 		if (status === "blocked") {
-			ledger.transition(row.taskId, "working", "bot");
+			ledger.transition(row.taskId, "working", "bot", "PROGRESS status: working");
 			status = "working";
 			await setStatusReaction(this.#deps.transport, log, row.threadRef, "working");
 			actions.push("blocked → working, ⏳");
 		}
 
 		if (judgement.reached) {
-			ledger.transition(row.taskId, "review", "bot");
+			ledger.transition(row.taskId, "review", "bot", `outcome reached AC ${judgement.acChecked}/${judgement.acTotal}`);
 			status = "review";
 			await setStatusReaction(this.#deps.transport, log, row.threadRef, "review");
 			actions.push("working → review, 🔍");

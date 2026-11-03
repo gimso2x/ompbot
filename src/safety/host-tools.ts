@@ -112,9 +112,21 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 		return channel;
 	};
 	// The dispatch tool is a chat-surface feature: DM and channel sessions only (lanes, monitors, review never).
-	const dispatchDeps =
+	const dispatchDeps: DispatchToolDeps | undefined =
 		deps.ompExecutable !== undefined && slackOriginChannel(deps.originKey) !== undefined
-			? { ...deps, ompExecutable: deps.ompExecutable }
+			? {
+					...deps,
+					ompExecutable: deps.ompExecutable,
+					// A high_risk herdr brief asks the owner on the same card as `ompbot_request_approval`.
+					approve: (summary, detail, signal) => {
+						const target = needChannel();
+						return deps.broker.ask(target, summary, {
+							signal,
+							detail,
+							origin: { originKey: deps.originKey, channel: target, threadTs: deps.threadTs?.() },
+						});
+					},
+				}
 			: undefined;
 	const dispatch = dispatchDeps === undefined ? undefined : buildDispatchTool(dispatchDeps);
 	return [
