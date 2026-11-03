@@ -1,0 +1,11 @@
+[Unit]
+Description=ompbot daily database backup (consistent snapshot + quick_check + retention)
+
+[Service]
+Type=oneshot
+Environment=PATH=@PATH@
+ExecStart=@BUN@ @REPO_DIR@/src/main.ts backup
+TimeoutStartSec=10min
+
+# No After= needed: the snapshot is made with VACUUM INTO on the database file itself and
+# works whether or not the daemon is running.

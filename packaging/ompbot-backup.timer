@@ -1,0 +1,10 @@
+[Unit]
+Description=ompbot daily backup timer (04:30 local, catch-up after downtime)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

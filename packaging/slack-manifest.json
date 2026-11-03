@@ -1,0 +1,102 @@
+{
+	"display_information": {
+		"name": "ompbot",
+		"description": "오너 전용 omp 코딩 에이전트 봇 — DM이나 초대된 채널에서 일을 시키면 같은 스레드에서 답합니다.",
+		"background_color": "#2b2d42"
+	},
+	"features": {
+		"app_home": {
+			"home_tab_enabled": false,
+			"messages_tab_enabled": true,
+			"messages_tab_read_only_enabled": false
+		},
+		"bot_user": {
+			"display_name": "ompbot",
+			"always_online": true
+		},
+		"slash_commands": [
+			{
+				"command": "/new-ompbot",
+				"description": "ompbot 대화를 새로 시작",
+				"should_escape": false
+			},
+			{
+				"command": "/status-ompbot",
+				"description": "ompbot 상태 확인",
+				"should_escape": false
+			},
+			{
+				"command": "/model-ompbot",
+				"description": "모델 보기·바꾸기",
+				"usage_hint": "[번호|provider/id|이름 일부]",
+				"should_escape": false
+			},
+			{
+				"command": "/thinking-ompbot",
+				"description": "thinking 수준 보기·바꾸기",
+				"usage_hint": "[off|low|medium|high]",
+				"should_escape": false
+			},
+			{
+				"command": "/compact-ompbot",
+				"description": "컨텍스트 압축",
+				"usage_hint": "[요약 지시]",
+				"should_escape": false
+			},
+			{
+				"command": "/resume-ompbot",
+				"description": "저장된 세션 목록·이어가기",
+				"usage_hint": "[번호|세션 ID]",
+				"should_escape": false
+			},
+			{
+				"command": "/queue-ompbot",
+				"description": "진행 중인 작업과 대기열 보기·대기 취소",
+				"usage_hint": "[drop <번호>]",
+				"should_escape": false
+			},
+			{
+				"command": "/followup-ompbot",
+				"description": "끝난 뒤 다음 작업으로 보내기",
+				"usage_hint": "<메시지>",
+				"should_escape": false
+			},
+			{
+				"command": "/usage-ompbot",
+				"description": "토큰·비용 사용량 보기",
+				"should_escape": false
+			}
+		]
+	},
+	"oauth_config": {
+		"scopes": {
+			"bot": [
+				"channels:history",
+				"channels:read",
+				"chat:write",
+				"groups:history",
+				"groups:read",
+				"im:history",
+				"im:read",
+				"im:write",
+				"mpim:history",
+				"mpim:read",
+				"reactions:write",
+				"files:read",
+				"files:write",
+				"commands"
+			]
+		}
+	},
+	"settings": {
+		"event_subscriptions": {
+			"bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
+		},
+		"interactivity": {
+			"is_enabled": true
+		},
+		"socket_mode_enabled": true,
+		"org_deploy_enabled": false,
+		"token_rotation_enabled": false
+	}
+}

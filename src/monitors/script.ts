@@ -1,0 +1,161 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { resolveScript, SCRIPT_TIMEOUT_MS } from "./spec";
+
+/** The payload handed to the agent is cut to this many chars (the script is not killed for it). */
+export const MAX_SCRIPT_OUTPUT_CHARS = 8000;
+/** Memory bound for the output that feeds the hash and the wake gate; the rest is dropped. */
+const MAX_SCRIPT_COLLECT_CHARS = 4 * 1024 * 1024;
+/** The stderr tail attached to the monitor_script log event (stdout keeps the gate, the hash and the wake call). */
+export const MAX_SCRIPT_STDERR_TAIL_CHARS = 2000;
+/** How long the stdio streams may still take to close after "exit": a detached background child holding a pipe
+ * end delays "close" to the timeout (a setsid daemon: forever, which would stall the monitor). */
+const STREAM_CLOSE_GRACE_MS = 1000;
+const TRUNCATION_MARK = "\n...[truncated]...\n";
+const EMPTY_HASH = createHash("sha256").update("").digest("hex");
+
+export interface ScriptResult {
+	/** Exit code 0: the watch condition holds and the monitor fires. */
+	fired: boolean;
+	exitCode: number | null;
+	timedOut: boolean;
+	/** Trimmed output cut to `MAX_SCRIPT_OUTPUT_CHARS` (the last line is kept). */
+	stdout: string;
+	/** Trimmed stderr cut to `MAX_SCRIPT_STDERR_TAIL_CHARS` (feeds only the monitor_script log tail). */
+	stderr: string;
+	/** sha256 of the whole trimmed output, not of the cut payload. */
+	outputHash: string;
+	/** The whole output's last non-empty line is `{"wakeAgent": false}`. */
+	wakeOff: boolean;
+	/** Why it did not run at all (path check or spawn failure). */
+	error?: string;
+}
+
+/**
+ * Runs a watch script once. The command is re-checked against the scripts root on every run (a symlink swapped
+ * after `add` must not escape), it gets a minimal environment, and the whole process group is killed on timeout.
+ */
+export async function runScript(
+	command: readonly string[],
+	options: { scriptsRoot: string; timeoutMs?: number; cwd: string; monitorId?: string },
+): Promise<ScriptResult> {
+	let real: string;
+	try {
+		real = resolveScript(command, options.scriptsRoot);
+	} catch (error) {
+		return {
+			fired: false,
+			exitCode: null,
+			timedOut: false,
+			stdout: "",
+			stderr: "",
+			outputHash: EMPTY_HASH,
+			wakeOff: false,
+			error: String(error instanceof Error ? error.message : error),
+		};
+	}
+	const child = spawn(real, command.slice(1), {
+		cwd: options.cwd,
+		// stderr is piped for the monitor_script log tail; it never touches the gate, the hash or the wake call.
+		stdio: ["ignore", "pipe", "pipe"],
+		detached: true,
+		env: {
+			PATH: process.env.PATH ?? "/usr/bin:/bin",
+			LANG: process.env.LANG ?? "C.UTF-8",
+			...(options.monitorId === undefined ? {} : { OMPBOT_MONITOR_ID: options.monitorId }),
+		},
+	});
+	let stdout = "";
+	child.stdout?.setEncoding("utf8");
+	child.stdout?.on("data", (chunk: string) => {
+		if (stdout.length < MAX_SCRIPT_COLLECT_CHARS) stdout += chunk;
+	});
+	// Bounded like stdout; only the last `MAX_SCRIPT_STDERR_TAIL_CHARS` chars reach the log.
+	let stderr = "";
+	child.stderr?.setEncoding("utf8");
+	child.stderr?.on("data", (chunk: string) => {
+		if (stderr.length < MAX_SCRIPT_COLLECT_CHARS) stderr += chunk;
+	});
+	const done = Promise.withResolvers<{ code: number | null; spawnError?: string }>();
+	child.once("error", (error) => done.resolve({ code: null, spawnError: error.message }));
+	child.once("close", (code) => done.resolve({ code }));
+	// "close" additionally waits for every stdio stream, so a background child that outlives the
+	// script while holding a pipe end delays it to the timeout (a setsid daemon: forever). The
+	// code is already known at "exit": give the streams a short grace to drain, then take the
+	// code and drop the streams with whatever output arrived.
+	child.once("exit", (code) => {
+		const drain = setTimeout(() => {
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			done.resolve({ code });
+		}, STREAM_CLOSE_GRACE_MS);
+		child.once("close", () => clearTimeout(drain));
+	});
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		try {
+			if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+		} catch {
+			child.kill("SIGKILL");
+		}
+	}, options.timeoutMs ?? SCRIPT_TIMEOUT_MS);
+	const { code, spawnError } = await done.promise;
+	clearTimeout(timer);
+	if (spawnError !== undefined) {
+		return {
+			fired: false,
+			exitCode: null,
+			timedOut: false,
+			stdout: "",
+			stderr: "",
+			outputHash: EMPTY_HASH,
+			wakeOff: false,
+			error: spawnError,
+		};
+	}
+	// Hash and wake gate come from the whole output; only the payload handed to the agent is cut.
+	const full = stdout.trim();
+	return {
+		fired: !timedOut && code === 0,
+		exitCode: code,
+		timedOut,
+		stdout: capPayload(full),
+		stderr: tailOf(stderr.trim()),
+		outputHash: createHash("sha256").update(full).digest("hex"),
+		wakeOff: isWakeGateOff(full),
+	};
+}
+
+/** Cuts `text` to its last `MAX_SCRIPT_STDERR_TAIL_CHARS` chars (the failure reason sits at the end of stderr). */
+function tailOf(text: string): string {
+	if (text.length <= MAX_SCRIPT_STDERR_TAIL_CHARS) return text;
+	return text.slice(-MAX_SCRIPT_STDERR_TAIL_CHARS);
+}
+
+/** Cuts `text` to the payload cap but keeps its last non-empty line, so a trailing wake gate survives the cut. */
+function capPayload(text: string): string {
+	if (text.length <= MAX_SCRIPT_OUTPUT_CHARS) return text;
+	const tail = text.slice(text.lastIndexOf("\n") + 1).trim();
+	if (tail === "" || tail.length > MAX_SCRIPT_OUTPUT_CHARS / 2) return text.slice(0, MAX_SCRIPT_OUTPUT_CHARS);
+	const keep = MAX_SCRIPT_OUTPUT_CHARS - tail.length - TRUNCATION_MARK.length;
+	return `${text.slice(0, keep)}${TRUNCATION_MARK}${tail}`;
+}
+
+/**
+ * Wake gate (hermes monitor mode): the script's last non-empty stdout line being exactly `{"wakeAgent": false}`
+ * means "the check ran, stay quiet" — the agent turn and the delivery are both skipped.
+ */
+export function isWakeGateOff(stdout: string): boolean {
+	const lines = stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line !== "");
+	const last = lines[lines.length - 1];
+	if (last === undefined) return false;
+	try {
+		return (JSON.parse(last) as { wakeAgent?: unknown } | null)?.wakeAgent === false;
+	} catch {
+		return false;
+	}
+}

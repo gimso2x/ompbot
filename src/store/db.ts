@@ -1,0 +1,1510 @@
+import { Database } from "bun:sqlite";
+import { parseThreadRef, THREAD_LINK_PREFIX, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { COMMAND_OP_REF, parseCommand } from "../core/types";
+import {
+	assertLaneTransition,
+	LANE_ORIGIN_PREFIX,
+	type LaneHistoryEntry,
+	type LaneMeta,
+	type LaneRow,
+	type LaneStatus,
+} from "../lanes/status";
+import { countIncident, resolveIncidents } from "../monitors/incidents";
+import {
+	MONITOR_ORIGIN_PREFIX,
+	MonitorLedger,
+	type MonitorRow,
+	monitorOrigin,
+	withoutMarkerLines,
+} from "../monitors/ledger";
+import { TaskLedger } from "../tasks/ledger";
+import {
+	assertInboundTransition,
+	type DeliveryEvent,
+	type DeliveryFacts,
+	type DeliveryState,
+	FRESHNESS_MS,
+	type InboundState,
+	StoreError,
+	transitionDelivery,
+} from "./transitions";
+
+/** Words a placeholder answer uses when omp returned no text (mailbox writes it); a monitor treats it as a failure. */
+const EMPTY_ANSWER = "(응답 없음)";
+
+/** Op ref suffix of the copy delivery of a completion report / monitor event (same origin, distinct unique key). */
+export const LOG_COPY_SUFFIX = ":log-copy";
+const MONITOR_COPY_SUFFIX = ":copy";
+/** Op ref infix of the pointer a steered message's own thread gets (`<opRef>:steer:<n>`). */
+const STEER_NOTICE_SUFFIX = ":steer:";
+const STEER_NOTICE_HEAD = "↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어";
+/** Head of a failed-turn notice delivery (`failedNotice` in the mailbox); never recall material. */
+const TURN_FAILED_HEAD = "[turn failed]";
+/** How far back recall candidates reach. */
+const RECALL_WINDOW_MS = 90 * 24 * 60 * 60_000;
+/** First line of a chat answer that closes a task: only these are copied to the log channel. */
+const COMPLETION_MARKER = /^(?:✅|:white_check_mark:) 완료/;
+
+/** The same alert scope+sign stays quiet for this long after an owner notice (monitor incident cadence). */
+export const ALERT_INCIDENT_REPEAT_MS = 24 * 60 * 60_000;
+
+/** Outcome of counting one alert occurrence: whether to notify the owner now, and how the condition has stood. */
+export interface AlertIncident {
+	notify: boolean;
+	/** Occurrences counted in this alert period (first alert included). */
+	count: number;
+	/** When this alert period started; `now - firstAt` is how long the condition has stood. */
+	firstAt: number;
+	/**
+	 * True when this same condition had already alerted the owner and never resolved — the row's standing state
+	 * before this occurrence. A daemon restart reads it to keep "an alerted open must report its recovery" true
+	 * across processes (the in-memory gate bookkeeping starts empty).
+	 */
+	standing: boolean;
+}
+
+export type { DeliveryState, InboundState } from "./transitions";
+export { StoreError } from "./transitions";
+
+export interface StoreClock {
+	now(): number;
+}
+
+export interface StoreOptions {
+	path: string;
+	clock: StoreClock;
+	/** Applied to every body / text / error string before it is stored. */
+	redact: (text: string) => string;
+	/** Fallback Slack channel for monitor output before any owner DM is known. */
+	ownerSlackUserId?: string;
+	/** Slack channel (the #log ledger) that gets a copy of every completion report; absent = no copies. */
+	logChannel?: string | undefined;
+	hooks?: {
+		/** Runs inside the answer transaction after inbound rows became `answered`, before delivery rows exist. */
+		afterInboundAnswered?: () => void;
+		/** Observes every delivery state change (`from` is "new" for a freshly inserted row). Must not throw. */
+		onDeliveryState?: (change: { deliveryId: number; from: DeliveryState | "new"; to: DeliveryState }) => void;
+	};
+}
+
+export interface OriginRow {
+	originKey: string;
+	epoch: number;
+	sessionDir: string;
+	updatedAt: number;
+	/** Session file pinned by `/resume-ompbot`; opened instead of the newest session of `sessionDir`. */
+	sessionFile: string | null;
+	/** `provider/model` chosen with `/model-ompbot`; applied every time the omp child opens the session. */
+	model: string | null;
+	/** Thinking level chosen with `/thinking-ompbot`; applied like `model`. */
+	thinking: string | null;
+}
+
+/** Per-origin runtime settings kept across idle release, restarts and `/new-ompbot`. */
+export type OriginSettings = Pick<OriginRow, "model" | "thinking">;
+
+export interface InboundRow {
+	platformMessageId: string;
+	originKey: string;
+	epoch: number;
+	textRef: string;
+	state: InboundState;
+	createdAt: number;
+	dispatchedAt: number | null;
+	opRef: string | null;
+	/** omp session `leafId` (entry-id string) read right before dispatch; null when the session had no entries. */
+	entryCursor: string | null;
+	/** Slack thread the reply goes to (`<channel>:<thread_ts>`); backfilled from platform_message_id for pre-migration rows. */
+	threadRef: string;
+}
+
+export interface DeliveryRow {
+	deliveryId: number;
+	originKey: string;
+	opRef: string;
+	part: number;
+	threadRef: string;
+	body: string;
+	state: DeliveryState;
+	attempts: number;
+	nextAt: number;
+	redelivered: boolean;
+	createdAt: number;
+	lastError: string | null;
+}
+
+/** One ledger row a recall search may quote: an owner message (`inbound`) or a confirmed bot answer (`delivery`). */
+export interface RecallCandidate {
+	kind: "inbound" | "delivery";
+	originKey: string;
+	threadRef: string;
+	createdAt: number;
+	/** First 1200 characters of the message or answer. */
+	text: string;
+	opRef: string | null;
+}
+
+/**
+ * Approval card ledger. `origin_key`/`origin_thread_ref` map a card back to the conversation that asked (NULL on rows
+ * from before the mapping existed), `reply_ts`/`reply_text` hold the owner's thread reply that settled it as `replied`.
+ */
+const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
+	approval_id TEXT PRIMARY KEY,
+	channel TEXT NOT NULL,
+	message_ts TEXT NOT NULL,
+	summary TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'pending'
+		CHECK (status IN ('pending','approved','denied','expired','replied')),
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL,
+	decided_at INTEGER,
+	origin_key TEXT,
+	origin_thread_ref TEXT,
+	reply_ts TEXT,
+	reply_text TEXT
+);`;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS origins (
+	origin_key TEXT PRIMARY KEY,
+	epoch INTEGER NOT NULL,
+	session_dir TEXT NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inbound (
+	inbound_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	platform_message_id TEXT NOT NULL UNIQUE,
+	origin_key TEXT NOT NULL REFERENCES origins(origin_key),
+	epoch INTEGER NOT NULL,
+	text_ref TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK (state IN ('pending','dispatched','answered','failed_notified','discarded')),
+	created_at INTEGER NOT NULL,
+	dispatched_at INTEGER,
+	op_ref TEXT,
+	entry_cursor TEXT,
+	thread_ref TEXT,
+	last_event_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS inbound_origin_state ON inbound(origin_key, state);
+CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
+CREATE INDEX IF NOT EXISTS inbound_origin_op ON inbound(origin_key, op_ref);
+CREATE TABLE IF NOT EXISTS deliveries (
+	delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	origin_key TEXT NOT NULL,
+	op_ref TEXT NOT NULL,
+	part INTEGER NOT NULL,
+	thread_ref TEXT NOT NULL,
+	body TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK (state IN ('pending','inflight','confirmed','failed_ambiguous','expired')),
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_at INTEGER NOT NULL,
+	redelivered INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL,
+	last_error TEXT,
+	UNIQUE (origin_key, op_ref, part)
+);
+CREATE INDEX IF NOT EXISTS deliveries_state_next ON deliveries(state, next_at);
+CREATE INDEX IF NOT EXISTS deliveries_created ON deliveries(created_at);
+CREATE INDEX IF NOT EXISTS deliveries_thread ON deliveries(thread_ref);
+CREATE TABLE IF NOT EXISTS lanes (
+	name TEXT PRIMARY KEY,
+	title TEXT NOT NULL,
+	thread_ref TEXT NOT NULL UNIQUE,
+	origin_key TEXT NOT NULL UNIQUE,
+	cwd TEXT NOT NULL,
+	session_dir TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'working'
+		CHECK (status IN ('working','done-claimed','not-done','closed')),
+	history TEXT NOT NULL DEFAULT '[]',
+	meta TEXT NOT NULL DEFAULT '{}',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slack_cursors (
+	cursor_key TEXT PRIMARY KEY,
+	last_ts TEXT NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+${APPROVALS_DDL}
+CREATE TABLE IF NOT EXISTS alert_incidents (
+	incident_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	scope TEXT NOT NULL,
+	signature TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'alerted' CHECK (status IN ('alerted','resolved')),
+	count INTEGER NOT NULL DEFAULT 1,
+	first_at INTEGER NOT NULL,
+	last_at INTEGER NOT NULL,
+	alerted_at INTEGER NOT NULL,
+	UNIQUE (scope, signature)
+);
+CREATE TABLE IF NOT EXISTS thread_mutes (
+	thread_ref TEXT PRIMARY KEY,
+	muted_at INTEGER NOT NULL
+);
+`;
+
+interface LaneSql {
+	name: string;
+	title: string;
+	thread_ref: string;
+	origin_key: string;
+	cwd: string;
+	session_dir: string;
+	status: LaneStatus;
+	history: string;
+	meta: string;
+	created_at: number;
+	updated_at: number;
+}
+
+const toLane = (r: LaneSql): LaneRow => ({
+	name: r.name,
+	title: r.title,
+	threadRef: r.thread_ref,
+	originKey: r.origin_key,
+	cwd: r.cwd,
+	sessionDir: r.session_dir,
+	status: r.status,
+	history: JSON.parse(r.history) as LaneHistoryEntry[],
+	meta: JSON.parse(r.meta) as LaneMeta,
+	createdAt: r.created_at,
+	updatedAt: r.updated_at,
+});
+
+/** The registry keeps the newest entries only; a lane that lives for weeks must not grow without bound. */
+const MAX_LANE_HISTORY = 200;
+
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "replied";
+
+export interface ApprovalRow {
+	approvalId: string;
+	channel: string;
+	messageTs: string;
+	status: ApprovalStatus;
+	originKey: string | null;
+	originThreadRef: string | null;
+	replyTs: string | null;
+	replyText: string | null;
+}
+
+interface ApprovalSql {
+	approval_id: string;
+	channel: string;
+	message_ts: string;
+	status: ApprovalStatus;
+	origin_key: string | null;
+	origin_thread_ref: string | null;
+	reply_ts: string | null;
+	reply_text: string | null;
+}
+
+interface OriginSql {
+	origin_key: string;
+	epoch: number;
+	session_dir: string;
+	updated_at: number;
+	session_file: string | null;
+	model: string | null;
+	thinking: string | null;
+}
+interface InboundSql {
+	platform_message_id: string;
+	origin_key: string;
+	epoch: number;
+	text_ref: string;
+	state: InboundState;
+	created_at: number;
+	dispatched_at: number | null;
+	op_ref: string | null;
+	entry_cursor: string | null;
+	thread_ref: string | null;
+}
+interface DeliverySql {
+	delivery_id: number;
+	origin_key: string;
+	op_ref: string;
+	part: number;
+	thread_ref: string;
+	body: string;
+	state: DeliveryState;
+	attempts: number;
+	next_at: number;
+	redelivered: number;
+	created_at: number;
+	last_error: string | null;
+}
+
+const toOrigin = (r: OriginSql): OriginRow => ({
+	originKey: r.origin_key,
+	epoch: r.epoch,
+	sessionDir: r.session_dir,
+	updatedAt: r.updated_at,
+	sessionFile: r.session_file,
+	model: r.model,
+	thinking: r.thinking,
+});
+
+const toInbound = (r: InboundSql): InboundRow => ({
+	platformMessageId: r.platform_message_id,
+	originKey: r.origin_key,
+	epoch: r.epoch,
+	textRef: r.text_ref,
+	state: r.state,
+	createdAt: r.created_at,
+	dispatchedAt: r.dispatched_at,
+	opRef: r.op_ref,
+	entryCursor: r.entry_cursor,
+	threadRef: r.thread_ref ?? r.platform_message_id,
+});
+
+const toDelivery = (r: DeliverySql): DeliveryRow => ({
+	deliveryId: r.delivery_id,
+	originKey: r.origin_key,
+	opRef: r.op_ref,
+	part: r.part,
+	threadRef: r.thread_ref,
+	body: r.body,
+	state: r.state,
+	attempts: r.attempts,
+	nextAt: r.next_at,
+	redelivered: r.redelivered === 1,
+	createdAt: r.created_at,
+	lastError: r.last_error,
+});
+
+export class Store {
+	private readonly db: Database;
+	private readonly clock: StoreClock;
+	private readonly redact: (text: string) => string;
+	private readonly hooks: NonNullable<StoreOptions["hooks"]>;
+	/** Deliveries that were inflight when the previous process died; re-queued with redelivered=1 at open. */
+	readonly recoveredInflight: number;
+	/** Monitor definitions, slots and events; shares this connection so answers settle in the same transaction. */
+	readonly monitors: MonitorLedger;
+	/** [TASK] registry; shares this connection. */
+	readonly tasks: TaskLedger;
+	private readonly ownerSlackUserId: string | undefined;
+	private logChannel: string | undefined;
+
+	/** Config reload: answers recorded from now on copy to the new #log channel (none when undefined). */
+	setLogChannel(channel: string | undefined): void {
+		this.logChannel = channel;
+	}
+
+	constructor(options: StoreOptions) {
+		this.clock = options.clock;
+		this.ownerSlackUserId = options.ownerSlackUserId;
+		this.logChannel = options.logChannel;
+		this.redact = options.redact;
+		this.hooks = options.hooks ?? {};
+		this.db = new Database(options.path, { create: true, strict: true });
+		this.db.run("PRAGMA journal_mode = WAL");
+		this.db.run("PRAGMA synchronous = NORMAL");
+		this.db.run("PRAGMA foreign_keys = ON");
+		this.db.run("PRAGMA busy_timeout = 5000");
+		this.db.run(SCHEMA);
+		this.migrate();
+		this.monitors = new MonitorLedger(this.db, { clock: options.clock, redact: options.redact });
+		this.tasks = new TaskLedger(this.db, { clock: options.clock });
+		this.recoveredInflight = this.db
+			.query("UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'inflight'")
+			.run(this.clock.now()).changes;
+	}
+
+	close(): void {
+		this.db.close();
+	}
+
+	// ---- origins ----
+
+	ensureOrigin(originKey: string, sessionDir: string): OriginRow {
+		const now = this.clock.now();
+		this.db
+			.query(
+				"INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, ?, ?) ON CONFLICT DO NOTHING",
+			)
+			.run(originKey, sessionDir, now);
+		return this.requireOrigin(originKey);
+	}
+
+	getOrigin(originKey: string): OriginRow | undefined {
+		const row = this.db.query("SELECT * FROM origins WHERE origin_key = ?").get(originKey) as OriginSql | null;
+		return row ? toOrigin(row) : undefined;
+	}
+
+	/** Backfill watermark for a target (`ch:<channel>` / `thr:<channel>:<rootTs>`); undefined before the first pass. */
+	getCursor(cursorKey: string): string | undefined {
+		const row = this.db.query("SELECT last_ts FROM slack_cursors WHERE cursor_key = ?").get(cursorKey) as
+			| { last_ts: string }
+			| undefined;
+		return row?.last_ts;
+	}
+
+	/** Advances a backfill watermark (INSERT OR REPLACE); callers only move it forward. */
+	setCursor(cursorKey: string, lastTs: string): void {
+		this.db
+			.query(
+				"INSERT INTO slack_cursors (cursor_key, last_ts, updated_at) VALUES (?, ?, ?) ON CONFLICT(cursor_key) DO UPDATE SET last_ts = excluded.last_ts, updated_at = excluded.updated_at",
+			)
+			.run(cursorKey, lastTs, this.clock.now());
+	}
+
+	deleteCursor(cursorKey: string): void {
+		this.db.query("DELETE FROM slack_cursors WHERE cursor_key = ?").run(cursorKey);
+	}
+
+	/** Stored backfill cursor keys starting with `prefix` (compared literally, no LIKE wildcards), sorted. */
+	listCursorKeys(prefix: string): string[] {
+		const rows = this.db
+			.query("SELECT cursor_key FROM slack_cursors WHERE substr(cursor_key, 1, length(?1)) = ?1 ORDER BY cursor_key")
+			.all(prefix) as Array<{ cursor_key: string }>;
+		return rows.map((row) => row.cursor_key);
+	}
+
+	createApproval(input: {
+		approvalId: string;
+		channel: string;
+		messageTs: string;
+		summary: string;
+		createdAt: number;
+		expiresAt: number;
+		/** The conversation that asked and the thread the request came from (absent for lane/legacy callers). */
+		originKey?: string | undefined;
+		originThreadRef?: string | undefined;
+	}): void {
+		this.db
+			.query(
+				"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+			)
+			.run(
+				input.approvalId,
+				input.channel,
+				input.messageTs,
+				this.redact(input.summary),
+				input.createdAt,
+				input.expiresAt,
+				input.originKey ?? null,
+				input.originThreadRef ?? null,
+			);
+	}
+
+	getApproval(approvalId: string): ApprovalRow | undefined {
+		const row = this.db.query("SELECT * FROM approvals WHERE approval_id = ?").get(approvalId) as ApprovalSql | null;
+		return row === null
+			? undefined
+			: {
+					approvalId: row.approval_id,
+					channel: row.channel,
+					messageTs: row.message_ts,
+					status: row.status,
+					originKey: row.origin_key,
+					originThreadRef: row.origin_thread_ref,
+					replyTs: row.reply_ts,
+					replyText: row.reply_text,
+				};
+	}
+
+	/**
+	 * Settles a pending, not-yet-due approval as `replied` with the owner's thread reply. Same `status = 'pending'`
+	 * guard as a click, so a reply racing a click, the sweeper or a timeout reports `false`.
+	 */
+	replyApproval(approvalId: string, replyTs: string, text: string, now: number): boolean {
+		return (
+			this.db
+				.query(
+					"UPDATE approvals SET status = 'replied', decided_at = ?, reply_ts = ?, reply_text = ? WHERE approval_id = ? AND status = 'pending' AND expires_at > ?",
+				)
+				.run(now, replyTs, this.redact(text), approvalId, now).changes === 1
+		);
+	}
+
+	/**
+	 * Resolves a pending approval; the `WHERE status = 'pending'` guard makes the second click (or a click racing the
+	 * sweeper) a no-op that reports `false`, replacing the in-memory map's atomic pop.
+	 */
+	decideApproval(approvalId: string, status: "approved" | "denied" | "expired", now: number): boolean {
+		// A due-but-unswept row is expired by contract: a late click must not approve it (the sweeper would have
+		// refused). Marking it `expired` is always allowed — that is the sweeper's own honest outcome.
+		const guard = status === "expired" ? "" : " AND expires_at > ?";
+		const params = status === "expired" ? [status, now, approvalId] : [status, now, approvalId, now];
+		return (
+			this.db
+				.query(`UPDATE approvals SET status = ?, decided_at = ? WHERE approval_id = ? AND status = 'pending'${guard}`)
+				.run(...params).changes === 1
+		);
+	}
+
+	/** Expires every still-pending approval that is due (or all of them when `due` is false — the boot sweep). */
+	expirePendingApprovals(now: number, due = true): Array<{ approvalId: string; channel: string; messageTs: string }> {
+		return this.db.transaction((): Array<{ approvalId: string; channel: string; messageTs: string }> => {
+			const rows = this.db
+				.query(
+					`SELECT approval_id, channel, message_ts FROM approvals
+					 WHERE status = 'pending' AND (${due ? "expires_at <= ?" : "1 = 1"})`,
+				)
+				.all(...(due ? [now] : [])) as Array<{ approval_id: string; channel: string; message_ts: string }>;
+			if (rows.length === 0) return [];
+			this.db
+				.query(
+					`UPDATE approvals SET status = 'expired', decided_at = ?
+					 WHERE status = 'pending' AND (${due ? "expires_at <= ?" : "1 = 1"})`,
+				)
+				.run(...(due ? [now, now] : [now]));
+			return rows.map((row) => ({ approvalId: row.approval_id, channel: row.channel, messageTs: row.message_ts }));
+		})();
+	}
+
+	/** Answered owner turns on one origin (the skill-review cadence counts these). */
+	countAnswered(originKey: string): number {
+		const row = this.db
+			.query("SELECT COUNT(*) AS n FROM inbound WHERE origin_key = ? AND state = 'answered'")
+			.get(originKey) as { n: number } | null;
+		return row?.n ?? 0;
+	}
+
+	/** Slack origin keys (`slack/dm/<id>`, `slack/ch/<id>`) — backfill channel targets. */
+	listSlackOrigins(): string[] {
+		const rows = this.db
+			.query("SELECT origin_key FROM origins WHERE origin_key LIKE 'slack/%' ORDER BY origin_key")
+			.all() as Array<{ origin_key: string }>;
+		return rows.map((row) => row.origin_key);
+	}
+
+	/**
+	 * Threads the bot answered in recently (deliveries carry `<channel>:<rootTs>`), newest first — backfill thread
+	 * targets. The 7-day window and cap mirror the upstream participated-thread tracking. Top-level posts
+	 * (`<channel>:-`: slash-command answers, log-channel copies) have no thread to read, so they are never targets.
+	 */
+	listSlackThreadTargets(since: number, limit: number): Array<{ channel: string; rootTs: string }> {
+		const rows = this.db
+			.query(
+				`SELECT origin_key, thread_ref, MAX(created_at) AS last FROM deliveries
+				 WHERE thread_ref IS NOT NULL AND thread_ref NOT LIKE ? AND origin_key LIKE 'slack/%' AND created_at >= ?
+				 GROUP BY origin_key, thread_ref ORDER BY last DESC LIMIT ?`,
+			)
+			.all(`%:${TOP_LEVEL_TS}`, since, limit) as Array<{ origin_key: string; thread_ref: string }>;
+		const targets: Array<{ channel: string; rootTs: string }> = [];
+		for (const row of rows) {
+			const parsed = parseThreadRef(row.thread_ref);
+			if (parsed === undefined) continue;
+			targets.push({ channel: parsed.channel, rootTs: parsed.threadTs });
+		}
+		return targets;
+	}
+
+	/**
+	 * `/new`: bump the epoch, switch session dir, discard still-pending inbound of the old epoch. With `opRef` the
+	 * discarded rows are linked to that op, so the command's delivery also finishes their thread status messages.
+	 */
+	newEpoch(originKey: string, sessionDir: string, opRef?: string, sessionFile?: string): OriginRow {
+		this.db.transaction(() => {
+			this.requireOrigin(originKey);
+			this.db
+				.query(
+					"UPDATE origins SET epoch = epoch + 1, session_dir = ?, session_file = ?, updated_at = ? WHERE origin_key = ?",
+				)
+				.run(sessionDir, sessionFile ?? null, this.clock.now(), originKey);
+			this.db
+				.query(
+					"UPDATE inbound SET state = 'discarded', op_ref = COALESCE(?, op_ref) WHERE origin_key = ? AND state = 'pending'",
+				)
+				.run(opRef ?? null, originKey);
+		})();
+		return this.requireOrigin(originKey);
+	}
+
+	/** `null` clears a setting (back to the omp default); `undefined` leaves it unchanged. */
+	setOriginSettings(originKey: string, settings: Partial<OriginSettings>): OriginRow {
+		const origin = this.requireOrigin(originKey);
+		this.db
+			.query("UPDATE origins SET model = ?, thinking = ?, updated_at = ? WHERE origin_key = ?")
+			.run(
+				settings.model === undefined ? origin.model : settings.model,
+				settings.thinking === undefined ? origin.thinking : settings.thinking,
+				this.clock.now(),
+				originKey,
+			);
+		return this.requireOrigin(originKey);
+	}
+
+	// ---- inbound ----
+
+	/** Whether an owner message was recorded in this thread (a channel thread the bot is already part of). */
+	hasInboundThread(threadRef: string): boolean {
+		return this.db.query("SELECT 1 FROM inbound WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
+	}
+
+	/** Idempotent on platform_message_id: a second insert of the same id returns the existing row. */
+	recordInbound(input: { originKey: string; platformMessageId: string; textRef: string; threadRef?: string }): {
+		inserted: boolean;
+		row: InboundRow;
+	} {
+		const origin = this.requireOrigin(input.originKey);
+		const result = this.db
+			.query(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(platform_message_id) DO NOTHING",
+			)
+			.run(
+				input.platformMessageId,
+				input.originKey,
+				origin.epoch,
+				this.redact(input.textRef),
+				this.clock.now(),
+				input.threadRef ?? input.platformMessageId,
+			);
+		return { inserted: result.changes === 1, row: this.requireInbound(input.platformMessageId) };
+	}
+
+	getInbound(platformMessageId: string): InboundRow | undefined {
+		const row = this.db
+			.query("SELECT * FROM inbound WHERE platform_message_id = ?")
+			.get(platformMessageId) as InboundSql | null;
+		return row ? toInbound(row) : undefined;
+	}
+
+	listInbound(filter: { originKey?: string; state?: InboundState } = {}): InboundRow[] {
+		const rows = this.db
+			.query(
+				"SELECT * FROM inbound WHERE (?1 IS NULL OR origin_key = ?1) AND (?2 IS NULL OR state = ?2) ORDER BY inbound_id",
+			)
+			.all(filter.originKey ?? null, filter.state ?? null) as InboundSql[];
+		return rows.map(toInbound);
+	}
+
+	/** Per-state inbound row counts (`GROUP BY`); lets /status count without loading every row. */
+	countInboundByState(): Partial<Record<InboundState, number>> {
+		const counts: Partial<Record<InboundState, number>> = {};
+		for (const row of this.db.query("SELECT state, COUNT(*) AS n FROM inbound GROUP BY state").all() as Array<{
+			state: InboundState;
+			n: number;
+		}>) {
+			counts[row.state] = row.n;
+		}
+		return counts;
+	}
+
+	/**
+	 * Distinct origin keys of inbound rows, in first-appearance order (`MIN(inbound_id)`) — the /status origin list,
+	 * computed in SQL so the ledger can grow without the report growing with it.
+	 */
+	distinctInboundOrigins(): string[] {
+		const rows = this.db
+			.query("SELECT origin_key FROM inbound GROUP BY origin_key ORDER BY MIN(inbound_id)")
+			.all() as Array<{ origin_key: string }>;
+		return rows.map((row) => row.origin_key);
+	}
+
+	/** pending -> dispatched. Records the op_ref and the omp leafId cursor taken just before dispatch. */
+	markDispatched(platformMessageId: string, input: { opRef: string; entryCursor: string | null }): InboundRow {
+		const current = this.requireInbound(platformMessageId);
+		assertInboundTransition(current.state, "dispatched");
+		this.db
+			.query(
+				"UPDATE inbound SET state = 'dispatched', dispatched_at = ?, op_ref = ?, entry_cursor = ? WHERE platform_message_id = ?",
+			)
+			.run(this.clock.now(), input.opRef, input.entryCursor, platformMessageId);
+		return this.requireInbound(platformMessageId);
+	}
+
+	/** pending|dispatched -> discarded. With `opRef` the row is re-linked to that op (see `newEpoch`). */
+	discard(platformMessageId: string, opRef?: string): InboundRow {
+		const current = this.requireInbound(platformMessageId);
+		assertInboundTransition(current.state, "discarded");
+		this.db
+			.query("UPDATE inbound SET state = 'discarded', op_ref = COALESCE(?, op_ref) WHERE platform_message_id = ?")
+			.run(opRef ?? null, platformMessageId);
+		return this.requireInbound(platformMessageId);
+	}
+
+	/** The op's running turn just emitted an omp event: stamps every still-dispatched row of it (steered rows too). */
+	touchDispatched(originKey: string, opRef: string): void {
+		this.db
+			.query("UPDATE inbound SET last_event_at = ? WHERE origin_key = ? AND op_ref = ? AND state = 'dispatched'")
+			.run(this.clock.now(), originKey, opRef);
+	}
+
+	/** Distinct Slack threads of every inbound row that belongs to the op (the whole steered batch, not only the lead). */
+	threadsOfOp(originKey: string, opRef: string): string[] {
+		const rows = this.db
+			.query("SELECT DISTINCT thread_ref FROM inbound WHERE origin_key = ? AND op_ref = ? ORDER BY thread_ref")
+			.all(originKey, opRef) as Array<{ thread_ref: string }>;
+		return rows.map((row) => row.thread_ref);
+	}
+
+	/**
+	 * Earliest inbound row of a Slack thread other than the given message — normally the thread root, which was
+	 * dispatched to the parent channel's origin and is therefore invisible to the thread-reply session.
+	 */
+	getThreadRootInbound(threadRef: string, excludeMessageId: string): InboundRow | undefined {
+		const row = this.db
+			.query("SELECT * FROM inbound WHERE thread_ref = ? AND platform_message_id != ? ORDER BY inbound_id LIMIT 1")
+			.get(threadRef, excludeMessageId) as InboundSql | null;
+		return row === null ? undefined : toInbound(row);
+	}
+
+	/**
+	 * Recall candidates of one Slack conversation space, newest first: owner messages and confirmed first-part bot
+	 * answers of the last 90 days whose origin AND thread both belong to `channel` (a DM origin's steer pointer into
+	 * a channel thread is excluded by the origin test), other than the `excludeThreadRef` thread and top-level posts.
+	 * Chat commands, command answers, failure notices and steer pointers are dropped after the query.
+	 */
+	listRecallCandidates(channel: string, excludeThreadRef: string, limit: number): RecallCandidate[] {
+		const chEsc = channel.replace(/[\\%_]/g, (c) => `\\${c}`);
+		const scope = `(origin_key = 'slack/dm/' || $ch OR origin_key = 'slack/ch/' || $ch
+			OR origin_key LIKE 'slack/ch/' || $chEsc || '/t/%' ESCAPE '\\')
+			AND thread_ref LIKE $chEsc || ':%' ESCAPE '\\' AND thread_ref <> $ch || ':-' AND thread_ref <> $exclude
+			AND created_at >= $since`;
+		const rows = this.db
+			.query(
+				`SELECT 'inbound' AS kind, origin_key, thread_ref, created_at, substr(text_ref, 1, 1200) AS text, op_ref
+				 FROM inbound WHERE ${scope} AND state <> 'discarded'
+				 UNION ALL
+				 SELECT 'delivery' AS kind, origin_key, thread_ref, created_at, substr(body, 1, 1200) AS text, op_ref
+				 FROM deliveries WHERE ${scope} AND state = 'confirmed' AND part = 0
+				 ORDER BY created_at DESC LIMIT $limit`,
+			)
+			.all({
+				$ch: channel,
+				$chEsc: chEsc,
+				$exclude: excludeThreadRef,
+				$since: this.clock.now() - RECALL_WINDOW_MS,
+				$limit: limit,
+			}) as Array<{
+			kind: RecallCandidate["kind"];
+			origin_key: string;
+			thread_ref: string;
+			created_at: number;
+			text: string;
+			op_ref: string | null;
+		}>;
+		const candidates: RecallCandidate[] = [];
+		for (const row of rows) {
+			const bookkeeping =
+				row.kind === "inbound"
+					? parseCommand(row.text) !== undefined
+					: (row.op_ref !== null && COMMAND_OP_REF.test(row.op_ref)) ||
+						row.text.startsWith(STEER_NOTICE_HEAD) ||
+						row.text.startsWith(TURN_FAILED_HEAD);
+			if (bookkeeping) continue;
+			candidates.push({
+				kind: row.kind,
+				originKey: row.origin_key,
+				threadRef: row.thread_ref,
+				createdAt: row.created_at,
+				text: row.text,
+				opRef: row.op_ref,
+			});
+		}
+		return candidates;
+	}
+
+	/**
+	 * Distinct threads of the op's `discarded` rows — a `/queue-ompbot drop` target, re-linked to the command's op
+	 * by `discard()`. The delivery carrying the op finishes these threads' ⏳ status as `🚫 취소됨` instead of ✅/⚠️.
+	 */
+	discardedThreadsOfOp(originKey: string, opRef: string): string[] {
+		const rows = this.db
+			.query(
+				"SELECT DISTINCT thread_ref FROM inbound WHERE origin_key = ? AND op_ref = ? AND state = 'discarded' ORDER BY thread_ref",
+			)
+			.all(originKey, opRef) as Array<{ thread_ref: string }>;
+		return rows.map((row) => row.thread_ref);
+	}
+
+	/**
+	 * Slack conversations with an inbound message since `since`, each with the thread of its newest message (newest
+	 * first, at most `limit`) — the restart notice targets. Monitor origins never take inbound from people.
+	 */
+	recentConversations(since: number, limit: number): Array<{ originKey: string; threadRef: string }> {
+		const rows = this.db
+			.query(
+				`SELECT i.origin_key, i.thread_ref FROM inbound i
+				 JOIN (SELECT origin_key, MAX(inbound_id) AS last FROM inbound WHERE created_at >= ? AND thread_ref IS NOT NULL
+				       AND origin_key NOT LIKE 'monitor/%' GROUP BY origin_key) r ON r.last = i.inbound_id
+				 ORDER BY i.inbound_id DESC LIMIT ?`,
+			)
+			.all(since, limit) as Array<{ origin_key: string; thread_ref: string }>;
+		return rows.map((row) => ({ originKey: row.origin_key, threadRef: row.thread_ref }));
+	}
+
+	/** Newest recorded thread of an origin (its current conversation); where a file upload lands by default. */
+	latestInboundThread(originKey: string): string | undefined {
+		const row = this.db
+			.query("SELECT thread_ref FROM inbound WHERE origin_key = ? ORDER BY inbound_id DESC LIMIT 1")
+			.get(originKey) as { thread_ref: string } | undefined;
+		return row?.thread_ref;
+	}
+
+	/**
+	 * One transaction: every dispatched inbound row of the op becomes `answered` and the delivery rows are created.
+	 * Any throw in between rolls both back. Re-recording the same (origin, op_ref, part) is a no-op.
+	 */
+	recordAnswer(input: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		parts: readonly string[];
+	}): DeliveryRow[] {
+		if (input.parts.length === 0) throw new StoreError("invalid_argument", "recordAnswer needs at least one part");
+		if (input.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return this.recordMonitorAnswer(input);
+		return this.db.transaction(() => {
+			const steered = this.steeredThreads(input);
+			this.closeDispatched(input.originKey, input.opRef, "answered");
+			this.hooks.afterInboundAnswered?.();
+			const rows = input.parts.map((body, part) => this.insertDelivery(input, part, body));
+			this.notifySteeredThreads(input, steered, input.parts.join("\n"));
+			this.copyCompletion(input);
+			return rows;
+		})();
+	}
+
+	/**
+	 * Other threads of a chat turn's still-dispatched rows: messages steered into a turn another thread started. Read
+	 * before the rows close, so a replayed answer (rows already answered) finds none and notifies nothing twice.
+	 */
+	private steeredThreads(input: { originKey: string; opRef: string; threadRef: string }): string[] {
+		if (!input.originKey.startsWith("slack/")) return [];
+		const rows = this.db
+			.query(
+				"SELECT DISTINCT thread_ref FROM inbound WHERE origin_key = ? AND op_ref = ? AND state = 'dispatched' AND thread_ref != ? ORDER BY thread_ref",
+			)
+			.all(input.originKey, input.opRef, input.threadRef) as Array<{ thread_ref: string }>;
+		return rows.map((row) => row.thread_ref);
+	}
+
+	/**
+	 * One pointer per steered thread: the answer (or failure notice) went to the turn's thread, so the other thread
+	 * gets its first line and a `{{thread-link:…}}` the adapter turns into a permalink. Op ref `<opRef>:steer:<n>`.
+	 */
+	private notifySteeredThreads(
+		input: { originKey: string; opRef: string; threadRef: string },
+		threads: readonly string[],
+		body: string,
+	): void {
+		if (threads.length === 0) return;
+		const first = (body.split("\n").find((line) => line.trim() !== "") ?? "").trim().slice(0, 200);
+		const answered = parseThreadRef(input.threadRef);
+		const link =
+			answered === undefined || answered.threadTs === TOP_LEVEL_TS
+				? ""
+				: `${THREAD_LINK_PREFIX}${answered.channel}:${answered.threadTs}}}`;
+		threads.forEach((threadRef, n) => {
+			this.insertDelivery(
+				{ originKey: input.originKey, opRef: `${input.opRef}${STEER_NOTICE_SUFFIX}${n}`, threadRef },
+				0,
+				`${STEER_NOTICE_HEAD}\n> ${first}${link}`,
+			);
+		});
+	}
+
+	/**
+	 * The single choke point where chat answers become deliveries also writes the log-channel copy of a completion
+	 * report: a Slack chat or work-lane answer (never commands) whose first non-empty line starts with `✅ 완료`.
+	 * The copy is one delivery on `<logChannel>:-` under `<opRef>:log-copy`, so a replayed answer inserts nothing new.
+	 */
+	private copyCompletion(input: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		parts: readonly string[];
+	}): void {
+		if (this.logChannel === undefined || COMMAND_OP_REF.test(input.opRef)) return;
+		if (!input.originKey.startsWith("slack/") && !input.originKey.startsWith(LANE_ORIGIN_PREFIX)) return;
+		const body = input.parts.join("\n");
+		const first = body.split("\n").find((line) => line.trim() !== "");
+		if (first === undefined || !COMPLETION_MARKER.test(first.trim())) return;
+		const requested = parseThreadRef(input.threadRef);
+		const channel = requested?.channel ?? "";
+		const where = input.originKey.startsWith(LANE_ORIGIN_PREFIX)
+			? `작업 레인 ${input.originKey.slice(LANE_ORIGIN_PREFIX.length)}`
+			: channel.startsWith("D")
+				? "DM"
+				: `<#${channel}>`;
+		const link =
+			requested === undefined || requested.threadTs === TOP_LEVEL_TS
+				? ""
+				: `${THREAD_LINK_PREFIX}${requested.channel}:${requested.threadTs}}}`;
+		this.insertDelivery(
+			{
+				originKey: input.originKey,
+				opRef: `${input.opRef}${LOG_COPY_SUFFIX}`,
+				threadRef: threadRefOf(this.logChannel, TOP_LEVEL_TS),
+			},
+			0,
+			`📒 완료 보고 사본 · ${where}${link}\n${body}`,
+		);
+	}
+
+	/**
+	 * One transaction: dispatched inbound of the op -> `failed_notified` plus a single notice delivery (part 0).
+	 * A monitor origin has no notice: the event retries with backoff, and only the final failure notifies the owner,
+	 * so this returns `undefined` for it until then.
+	 */
+	recordTurnFailure(input: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		notice: string;
+	}): DeliveryRow | undefined {
+		if (input.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return this.recordMonitorFailure(input);
+		return this.db.transaction(() => {
+			const steered = this.steeredThreads(input);
+			this.closeDispatched(input.originKey, input.opRef, "failed_notified");
+			const row = this.insertDelivery(input, 0, input.notice);
+			this.notifySteeredThreads(input, steered, input.notice);
+			return row;
+		})();
+	}
+
+	// ---- monitors ----
+
+	/** The owner's live DM origin key (`slack/dm/<id>`), newest by updated_at — undefined before the owner ever DM'd. */
+	ownerDmOrigin(): string | undefined {
+		const row = this.db
+			.query("SELECT origin_key FROM origins WHERE origin_key LIKE 'slack/dm/%' ORDER BY updated_at DESC LIMIT 1")
+			.get() as { origin_key: string } | null;
+		return row?.origin_key;
+	}
+
+	/** Slack channel for monitor output: the owner's known DM, else the owner user id (Slack opens that DM). */
+	ownerChannel(): string {
+		const origin = this.ownerDmOrigin();
+		return origin !== undefined ? origin.slice("slack/dm/".length) : (this.ownerSlackUserId ?? "");
+	}
+
+	/** Thread ref of a top-level (non-threaded) post in the owner DM. */
+	topLevelThreadRef(): string {
+		return `${this.ownerChannel()}:${TOP_LEVEL_TS}`;
+	}
+
+	/** Monitor event ids of the dispatched inbound rows of an op (message ids are `monitor:<id>:<event>:<attempt>`). */
+	private monitorEventsOfOp(originKey: string, opRef: string): number[] {
+		const rows = this.db
+			.query("SELECT platform_message_id FROM inbound WHERE origin_key = ? AND op_ref = ? AND state = 'dispatched'")
+			.all(originKey, opRef) as Array<{ platform_message_id: string }>;
+		const ids: number[] = [];
+		for (const row of rows) {
+			const match = /^monitor:[^:]+:(\d+):\d+$/.exec(row.platform_message_id);
+			if (match?.[1] !== undefined) ids.push(Number(match[1]));
+		}
+		return ids;
+	}
+
+	private recordMonitorAnswer(input: { originKey: string; opRef: string; parts: readonly string[] }): DeliveryRow[] {
+		return this.db.transaction(() => {
+			const eventIds = this.monitorEventsOfOp(input.originKey, input.opRef);
+			this.closeDispatched(input.originKey, input.opRef, "answered");
+			this.hooks.afterInboundAnswered?.();
+			const text = input.parts.join("\n");
+			const delivered: DeliveryRow[] = [];
+			for (const [part, eventId] of eventIds.entries()) {
+				if (text.trim() === EMPTY_ANSWER) {
+					this.failMonitorEvent(eventId, "[turn failed] empty_answer");
+					continue;
+				}
+				const settled = this.monitors.settleAnswered(eventId, text);
+				if (settled === undefined) continue;
+				// A monitor that ran to a normal answer is healthy: its open incidents resolve.
+				this.monitors.resolveMonitorIncidents(settled.event.monitorId);
+				const monitor = this.monitors.getMonitor(settled.event.monitorId);
+				if (!settled.report) {
+					// Every settled event of a copy-channel monitor also lands there once, whether or not it was reported.
+					this.insertMonitorCopy(
+						input,
+						part,
+						monitor,
+						`⏰ ${settled.monitorName}\n${withoutMarkerLines(text) || "알릴 내용 없음"}`,
+					);
+					continue;
+				}
+				delivered.push(this.postMonitorReport(input, part, eventId, settled.monitorName, monitor, text));
+			}
+			return delivered;
+		})();
+	}
+
+	/**
+	 * Settles one waiting event of a `verbatim` monitor in one transaction, without a turn or an inbound row: its stored
+	 * payload is the answer and is posted exactly like a turn's report; an empty payload ends as `no_report` with no
+	 * post and no copy. Returns false when the event was not waiting to run.
+	 */
+	deliverMonitorVerbatim(eventId: number, opRef: string): boolean {
+		return this.db.transaction((): boolean => {
+			const settled = this.monitors.settleVerbatim(eventId, opRef);
+			if (settled === undefined) return false;
+			this.monitors.resolveMonitorIncidents(settled.event.monitorId);
+			if (!settled.report) return true;
+			const originKey = monitorOrigin(settled.event.monitorId);
+			const monitor = this.monitors.getMonitor(settled.event.monitorId);
+			this.postMonitorReport(
+				{ originKey, opRef },
+				0,
+				eventId,
+				settled.monitorName,
+				monitor,
+				settled.event.answer ?? "",
+			);
+			return true;
+		})();
+	}
+
+	/**
+	 * The report of one settled monitor event, shared by the turn and verbatim paths: `⏰ <name>\n<text>` at the top
+	 * level of the monitor's channel (the owner DM when it has none), linked to the event, plus its copy.
+	 */
+	private postMonitorReport(
+		input: { originKey: string; opRef: string },
+		part: number,
+		eventId: number,
+		monitorName: string,
+		monitor: MonitorRow | undefined,
+		text: string,
+	): DeliveryRow {
+		const channel = monitor?.channel;
+		const body = `⏰ ${monitorName}\n${text}`;
+		const row = this.insertDelivery(
+			{
+				originKey: input.originKey,
+				opRef: input.opRef,
+				threadRef: channel ? threadRefOf(channel, TOP_LEVEL_TS) : this.topLevelThreadRef(),
+			},
+			part,
+			body,
+		);
+		this.monitors.attachDelivery(eventId, row.deliveryId);
+		this.insertMonitorCopy(input, part, monitor, body);
+		return row;
+	}
+
+	/** A top-level copy (`<opRef>:copy`) of a settled monitor event in the monitor's copy channel, if it has one. */
+	private insertMonitorCopy(
+		input: { originKey: string; opRef: string },
+		part: number,
+		monitor: MonitorRow | undefined,
+		body: string,
+	): void {
+		if (!monitor?.copyChannel) return;
+		this.insertDelivery(
+			{
+				originKey: input.originKey,
+				opRef: `${input.opRef}${MONITOR_COPY_SUFFIX}`,
+				threadRef: threadRefOf(monitor.copyChannel, TOP_LEVEL_TS),
+			},
+			part,
+			body,
+		);
+	}
+
+	private recordMonitorFailure(input: { originKey: string; opRef: string; notice: string }): DeliveryRow | undefined {
+		return this.db.transaction(() => {
+			const eventIds = this.monitorEventsOfOp(input.originKey, input.opRef);
+			this.closeDispatched(input.originKey, input.opRef, "failed_notified");
+			let notice: DeliveryRow | undefined;
+			for (const eventId of eventIds) notice = this.failMonitorEvent(eventId, input.notice) ?? notice;
+			return notice;
+		})();
+	}
+
+	/** Counts one failed attempt; the final failure (retries spent) posts a single notice to the owner DM. */
+	failMonitorEvent(eventId: number, error: string): DeliveryRow | undefined {
+		return this.db.transaction(() => {
+			const settled = this.monitors.settleFailed(eventId, error);
+			if (!settled?.terminal) return undefined;
+			// Same monitor + same normalized error inside the repeat window stays quiet (hermes incident dedup).
+			const incident = this.monitors.recordMonitorIncident(settled.event.monitorId, error, this.clock.now());
+			if (!incident.notify) return undefined;
+			const reason = error.replace(/^\[turn failed\]\s*/, "").replace(/\s+—.*$/, "");
+			const repeat = incident.count > 1 ? ` · 반복 ${incident.count}회차` : "";
+			return this.insertDelivery(
+				{
+					originKey: monitorOrigin(settled.event.monitorId),
+					opRef: `monitor-notice:${eventId}`,
+					threadRef: this.topLevelThreadRef(),
+				},
+				0,
+				`⏰ ${settled.monitorName}\n⚠️ 모니터 실행이 ${settled.event.attempts}번 실패해 재시도를 멈췄습니다 (failed_no_retry${repeat}): ${reason}`,
+			);
+		})();
+	}
+
+	// ---- alert incidents (owner-notice repeat suppression) ----
+
+	/**
+	 * Counts one occurrence of an alert condition and decides whether the owner should be told (the shared incident
+	 * state machine — see `monitors/incidents`): the first occurrence alerts, the same (scope, normalized sign) within
+	 * `repeatMs` stays quiet, a still-standing condition re-alerts after `repeatMs`, and a resolved condition that
+	 * comes back reopens loudly (monitor incident semantics, used by the turn-failure escalation and the daemon's
+	 * gate sweep). `standing` reports the row's pre-call state, so a restarting daemon can rebuild "the owner was
+	 * already alerted" from the ledger alone.
+	 */
+	recordAlertIncident(scope: string, sign: string, now: number, repeatMs = ALERT_INCIDENT_REPEAT_MS): AlertIncident {
+		return countIncident(this.db, "alert_incidents", scope, sign, now, repeatMs);
+	}
+
+	/** Marks the scope's open incidents resolved, so the same condition re-alerts when it comes back. */
+	resolveAlertIncidents(scope: string): void {
+		resolveIncidents(this.db, "alert_incidents", scope);
+	}
+
+	// ---- thread mutes ----
+
+	/** Whether the owner muted this thread with `!shutup` (channel threads): addressed messages there stay quiet. */
+	isThreadMuted(threadRef: string): boolean {
+		return this.db.query("SELECT 1 FROM thread_mutes WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
+	}
+
+	/** Records or clears a thread mute (`!shutup`, `!unshutup`, or the owner mentioning the bot); idempotent. */
+	setThreadMute(threadRef: string, muted: boolean): void {
+		if (muted) {
+			this.db
+				.query("INSERT INTO thread_mutes (thread_ref, muted_at) VALUES (?, ?) ON CONFLICT(thread_ref) DO NOTHING")
+				.run(threadRef, this.clock.now());
+		} else {
+			this.db.query("DELETE FROM thread_mutes WHERE thread_ref = ?").run(threadRef);
+		}
+	}
+
+	// ---- deliveries ----
+
+	getDelivery(deliveryId: number): DeliveryRow | undefined {
+		const row = this.db.query("SELECT * FROM deliveries WHERE delivery_id = ?").get(deliveryId) as DeliverySql | null;
+		return row ? toDelivery(row) : undefined;
+	}
+
+	listDeliveries(filter: { originKey?: string; state?: DeliveryState } = {}): DeliveryRow[] {
+		const rows = this.db
+			.query(
+				"SELECT * FROM deliveries WHERE (?1 IS NULL OR origin_key = ?1) AND (?2 IS NULL OR state = ?2) ORDER BY delivery_id",
+			)
+			.all(filter.originKey ?? null, filter.state ?? null) as DeliverySql[];
+		return rows.map(toDelivery);
+	}
+
+	/**
+	 * Confirmed first-part deliveries other origins posted into a Slack thread, oldest first — answers the
+	 * thread's own session has never seen (the root's answers come from the parent channel's origin).
+	 */
+	listThreadForeignDeliveries(threadRef: string, excludeOriginKey: string, limit: number): DeliveryRow[] {
+		const rows = this.db
+			.query(
+				`SELECT * FROM deliveries
+				 WHERE thread_ref = ? AND origin_key != ? AND state = 'confirmed' AND part = 0
+				 ORDER BY delivery_id DESC LIMIT ?`,
+			)
+			.all(threadRef, excludeOriginKey, limit) as DeliverySql[];
+		return rows.map(toDelivery).reverse();
+	}
+
+	/** Per-state delivery row counts (`GROUP BY`); lets /status count without loading every body. */
+	countDeliveriesByState(): Partial<Record<DeliveryState, number>> {
+		const counts: Partial<Record<DeliveryState, number>> = {};
+		for (const row of this.db.query("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{
+			state: DeliveryState;
+			n: number;
+		}>) {
+			counts[row.state] = row.n;
+		}
+		return counts;
+	}
+
+	/** Expires pending rows older than 24h. failed_ambiguous rows are never touched. Returns how many expired. */
+	sweepExpired(): number {
+		const now = this.clock.now();
+		return this.db.transaction(() => {
+			let expired = 0;
+			for (const row of this.selectDeliveries("state = 'pending' AND created_at <= ?", [now - FRESHNESS_MS])) {
+				if (this.applyEvent(row, "expire_check", now).state === "expired") expired++;
+			}
+			return expired;
+		})();
+	}
+
+	/** Sweeps stale rows, then moves due pending deliveries (next_at <= now) to inflight and returns them. */
+	claimDue(limit = 20): DeliveryRow[] {
+		const now = this.clock.now();
+		this.sweepExpired();
+		return this.db.transaction(() =>
+			this.selectDeliveries("state = 'pending' AND next_at <= ? ORDER BY delivery_id LIMIT ?", [now, limit]).map(
+				(row) => this.applyEvent(row, "claim", now),
+			),
+		)();
+	}
+
+	confirmDelivery(deliveryId: number): DeliveryRow {
+		return this.applyEvent(this.requireDelivery(deliveryId), "confirmed", this.clock.now());
+	}
+
+	/** A send that definitely did not happen: backoff, or expired after 5 failures / 24h. */
+	failDelivery(deliveryId: number, error: string): DeliveryRow {
+		return this.applyEvent(this.requireDelivery(deliveryId), "definitive_failure", this.clock.now(), error);
+	}
+
+	/** A send whose outcome is unknown. Sticky; never resent or expired automatically. */
+	markAmbiguous(deliveryId: number, error: string): DeliveryRow {
+		return this.applyEvent(this.requireDelivery(deliveryId), "ambiguous", this.clock.now(), error);
+	}
+
+	/**
+	 * Startup recovery only: a `failed_ambiguous` delivery younger than the freshness window goes back to `pending`
+	 * with redelivered=1, so the owner gets it again with the "중복 가능" header. Returns how many were requeued.
+	 */
+	requeueAmbiguous(): number {
+		const now = this.clock.now();
+		return this.db
+			.query(
+				"UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'failed_ambiguous' AND ? - created_at < ?",
+			)
+			.run(now, now, FRESHNESS_MS).changes;
+	}
+
+	// ---- lanes (work lane registry) ----
+
+	/** New lane in `working`; its origin row is created in the same transaction. Name, thread and origin are unique. */
+	insertLane(input: {
+		name: string;
+		title: string;
+		threadRef: string;
+		originKey: string;
+		cwd: string;
+		sessionDir: string;
+		meta: LaneMeta;
+	}): LaneRow {
+		const now = this.clock.now();
+		const history: LaneHistoryEntry[] = [{ at: now, event: "created" }];
+		this.db.transaction(() => {
+			this.ensureOrigin(input.originKey, input.sessionDir);
+			this.db
+				.query(
+					"INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, history, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					input.name,
+					this.redact(input.title),
+					input.threadRef,
+					input.originKey,
+					input.cwd,
+					input.sessionDir,
+					JSON.stringify(history),
+					JSON.stringify(input.meta),
+					now,
+					now,
+				);
+		})();
+		return this.requireLane(input.name);
+	}
+
+	getLane(name: string): LaneRow | undefined {
+		const row = this.db.query("SELECT * FROM lanes WHERE name = ?").get(name) as LaneSql | null;
+		return row ? toLane(row) : undefined;
+	}
+
+	getLaneByThread(threadRef: string): LaneRow | undefined {
+		const row = this.db.query("SELECT * FROM lanes WHERE thread_ref = ?").get(threadRef) as LaneSql | null;
+		return row ? toLane(row) : undefined;
+	}
+
+	getLaneByOrigin(originKey: string): LaneRow | undefined {
+		const row = this.db.query("SELECT * FROM lanes WHERE origin_key = ?").get(originKey) as LaneSql | null;
+		return row ? toLane(row) : undefined;
+	}
+
+	listLanes(filter: { status?: LaneStatus } = {}): LaneRow[] {
+		const rows = this.db
+			.query("SELECT * FROM lanes WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at, name")
+			.all(filter.status ?? null) as LaneSql[];
+		return rows.map(toLane);
+	}
+
+	/** Lanes that still occupy a slot of the concurrency cap (everything but `closed`). */
+	countOpenLanes(): number {
+		const row = this.db.query("SELECT COUNT(*) AS n FROM lanes WHERE status != 'closed'").get() as { n: number };
+		return row.n;
+	}
+
+	/** Changes the status (validated against the lane state machine) and appends a history entry in one write. */
+	transitionLane(
+		name: string,
+		to: LaneStatus,
+		entry: Omit<LaneHistoryEntry, "at">,
+		metaPatch: Partial<LaneMeta> = {},
+	): LaneRow {
+		const current = this.requireLane(name);
+		assertLaneTransition(current.status, to);
+		return this.writeLane(current, to, entry, metaPatch);
+	}
+
+	/** Appends history and/or merges meta without a status change. */
+	patchLane(name: string, entry: Omit<LaneHistoryEntry, "at"> | undefined, metaPatch: Partial<LaneMeta>): LaneRow {
+		const current = this.requireLane(name);
+		return this.writeLane(current, current.status, entry, metaPatch);
+	}
+
+	private writeLane(
+		current: LaneRow,
+		status: LaneStatus,
+		entry: Omit<LaneHistoryEntry, "at"> | undefined,
+		metaPatch: Partial<LaneMeta>,
+	): LaneRow {
+		const now = this.clock.now();
+		const history = entry
+			? [
+					...current.history,
+					{ ...entry, ...(entry.detail === undefined ? {} : { detail: this.redact(entry.detail) }), at: now },
+				].slice(-MAX_LANE_HISTORY)
+			: current.history;
+		const meta = { ...current.meta, ...metaPatch };
+		this.db
+			.query("UPDATE lanes SET status = ?, history = ?, meta = ?, updated_at = ? WHERE name = ?")
+			.run(status, JSON.stringify(history), JSON.stringify(meta), now, current.name);
+		return this.requireLane(current.name);
+	}
+
+	private requireLane(name: string): LaneRow {
+		const lane = this.getLane(name);
+		if (!lane) throw new StoreError("not_found", `lane ${name}`);
+		return lane;
+	}
+
+	// ---- internals ----
+
+	/**
+	 * Adds `inbound.thread_ref` (backfilled from platform_message_id), `inbound.last_event_at` and the `origins`
+	 * session/model columns to databases created before they existed. The `inbound_thread` index lives here too:
+	 * it must be created after the `thread_ref` column may have been added above, so a pre-migration ledger can
+	 * still be opened. The `approvals_status` index lives here for the same reason: it must be created after the
+	 * approvals rebuild may have replaced the table.
+	 */
+	private migrate(): void {
+		const originColumns = this.db.query("PRAGMA table_info(origins)").all() as Array<{ name: string }>;
+		for (const column of ["session_file", "model", "thinking"]) {
+			if (!originColumns.some((existing) => existing.name === column)) {
+				this.db.run(`ALTER TABLE origins ADD COLUMN ${column} TEXT`);
+			}
+		}
+		const columns = this.db.query("PRAGMA table_info(inbound)").all() as Array<{ name: string }>;
+		if (!columns.some((column) => column.name === "thread_ref")) {
+			this.db.run("ALTER TABLE inbound ADD COLUMN thread_ref TEXT");
+		}
+		if (!columns.some((column) => column.name === "last_event_at")) {
+			this.db.run("ALTER TABLE inbound ADD COLUMN last_event_at INTEGER");
+		}
+		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
+		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");
+		this.migrateApprovals();
+		// The approvals status index lives here, not in SCHEMA: the rebuild above drops whatever index the old
+		// table carried (a RENAME follows the table, the DROP kills it), so a pre-'replied' ledger would end this
+		// open without it. This runs after every open, so the sweep's status = 'pending' scan stays indexed.
+		this.db.run("CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)");
+	}
+
+	/**
+	 * The `replied` status widens a CHECK constraint, which SQLite cannot ALTER: an approvals table without it is
+	 * rebuilt (rename, create, copy, drop) in one transaction. Old rows keep their data; the new columns are NULL.
+	 */
+	private migrateApprovals(): void {
+		const current = this.db
+			.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approvals'")
+			.get() as {
+			sql: string;
+		} | null;
+		if (current === null || current.sql.includes("'replied'")) return;
+		this.db.transaction(() => {
+			this.db.run("ALTER TABLE approvals RENAME TO approvals_old");
+			this.db.run(APPROVALS_DDL);
+			this.db.run(
+				"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at) SELECT approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at FROM approvals_old",
+			);
+			this.db.run("DROP TABLE approvals_old");
+		})();
+	}
+
+	private requireOrigin(originKey: string): OriginRow {
+		const origin = this.getOrigin(originKey);
+		if (!origin) throw new StoreError("unknown_origin", originKey);
+		return origin;
+	}
+
+	private requireInbound(platformMessageId: string): InboundRow {
+		const row = this.getInbound(platformMessageId);
+		if (!row) throw new StoreError("not_found", `inbound ${platformMessageId}`);
+		return row;
+	}
+
+	private requireDelivery(deliveryId: number): DeliveryRow {
+		const row = this.getDelivery(deliveryId);
+		if (!row) throw new StoreError("not_found", `delivery ${deliveryId}`);
+		return row;
+	}
+
+	private selectDeliveries(where: string, params: (string | number)[]): DeliveryRow[] {
+		return (this.db.query(`SELECT * FROM deliveries WHERE ${where}`).all(...params) as DeliverySql[]).map(toDelivery);
+	}
+
+	private closeDispatched(originKey: string, opRef: string, to: "answered" | "failed_notified"): void {
+		assertInboundTransition("dispatched", to);
+		this.db
+			.query("UPDATE inbound SET state = ? WHERE origin_key = ? AND op_ref = ? AND state = 'dispatched'")
+			.run(to, originKey, opRef);
+	}
+
+	private insertDelivery(
+		input: { originKey: string; opRef: string; threadRef: string },
+		part: number,
+		body: string,
+	): DeliveryRow {
+		const now = this.clock.now();
+		const inserted = this.db
+			.query(
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(origin_key, op_ref, part) DO NOTHING",
+			)
+			.run(input.originKey, input.opRef, part, input.threadRef, this.redact(body), now, now);
+		const row = toDelivery(
+			this.db
+				.query("SELECT * FROM deliveries WHERE origin_key = ? AND op_ref = ? AND part = ?")
+				.get(input.originKey, input.opRef, part) as DeliverySql,
+		);
+		if (inserted.changes === 1) this.emitDeliveryState(row.deliveryId, "new", row.state);
+		return row;
+	}
+
+	private applyEvent(row: DeliveryRow, event: DeliveryEvent, now: number, error?: string): DeliveryRow {
+		const facts: DeliveryFacts = {
+			state: row.state,
+			attempts: row.attempts,
+			nextAt: row.nextAt,
+			redelivered: row.redelivered,
+			createdAt: row.createdAt,
+		};
+		const next = transitionDelivery(facts, event, now);
+		if (next === facts) return row;
+		this.db
+			.query(
+				"UPDATE deliveries SET state = ?, attempts = ?, next_at = ?, redelivered = ?, last_error = COALESCE(?, last_error) WHERE delivery_id = ?",
+			)
+			.run(
+				next.state,
+				next.attempts,
+				next.nextAt,
+				next.redelivered ? 1 : 0,
+				error === undefined ? null : this.redact(error),
+				row.deliveryId,
+			);
+		this.emitDeliveryState(row.deliveryId, row.state, next.state);
+		return this.requireDelivery(row.deliveryId);
+	}
+
+	/** A failing observer (e.g. a full disk under the logger) must never abort or roll back a ledger transition. */
+	private emitDeliveryState(deliveryId: number, from: DeliveryState | "new", to: DeliveryState): void {
+		try {
+			this.hooks.onDeliveryState?.({ deliveryId, from, to });
+		} catch {
+			// observers only; the transition itself is already durable
+		}
+	}
+}
+
+export function openStore(options: StoreOptions): Store {
+	return new Store(options);
+}

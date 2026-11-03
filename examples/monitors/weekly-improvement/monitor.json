@@ -1,0 +1,9 @@
+{
+	"name": "주간 개선 회의",
+	"trigger": { "kind": "cron", "schedule": "0 6 * * 0", "timezone": "Asia/Seoul" },
+	"instruction": "주간 개선 회의를 연다. 절차 파일의 순서를 그대로 따른다.",
+	"overlap": "skip",
+	"model": "anthropic/claude-opus-5-5",
+	"thinking": "high",
+	"procedureFiles": ["@OMPBOT_HOME@/scripts/weekly-improvement-procedure.md"]
+}

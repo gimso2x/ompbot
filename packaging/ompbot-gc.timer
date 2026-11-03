@@ -1,0 +1,9 @@
+[Unit]
+Description=ompbot daily gc timer (04:45 local, after the 04:30 backup; catch-up after downtime)
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

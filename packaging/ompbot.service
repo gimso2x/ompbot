@@ -1,0 +1,17 @@
+[Unit]
+Description=ompbot (Slack bot driving omp --mode rpc)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=@PATH@
+ExecStart=@BUN@ @REPO_DIR@/src/main.ts daemon
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

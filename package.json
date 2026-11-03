@@ -1,0 +1,23 @@
+{
+	"name": "ompbot",
+	"version": "0.1.0",
+	"private": true,
+	"license": "MIT",
+	"type": "module",
+	"bin": {
+		"ompbot": "src/main.ts"
+	},
+	"scripts": {
+		"test": "bun test",
+		"check": "biome check . && tsc --noEmit",
+		"smoke-omp": "OMPBOT_E2E_OMP=1 bun test test/omp-smoke.e2e.test.ts test/omp-rpc.contract.test.ts"
+	},
+	"dependencies": {
+		"@slack/web-api": "^8.2.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.15",
+		"@types/bun": "^1.4.3",
+		"typescript": "^7.0.2"
+	}
+}

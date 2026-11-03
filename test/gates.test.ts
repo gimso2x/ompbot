@@ -1,0 +1,539 @@
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readSweepHeartbeat } from "../src/daemon/heartbeat";
+import { STAMP_FILE } from "../src/ops/backup";
+import {
+	collectGates,
+	INBOUND_STARVATION_MS,
+	MONITOR_OVERDUE_MS,
+	ORIGIN_SILENT_MS,
+	SOCKET_DOWN_MS,
+	SWEEP_STALLED_MS,
+} from "../src/ops/gates";
+
+let home: string;
+let now: number;
+
+beforeEach(() => {
+	home = mkdtempSync(join(tmpdir(), "ompbot-gates-"));
+	now = Date.now();
+});
+
+afterEach(() => {
+	rmSync(home, { recursive: true, force: true });
+});
+
+const DDL = `
+CREATE TABLE inbound (
+	inbound_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	platform_message_id TEXT NOT NULL UNIQUE,
+	origin_key TEXT NOT NULL,
+	epoch INTEGER NOT NULL,
+	text_ref TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending',
+	created_at INTEGER NOT NULL,
+	dispatched_at INTEGER,
+	last_event_at INTEGER
+);
+CREATE TABLE deliveries (
+	delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	origin_key TEXT NOT NULL,
+	op_ref TEXT NOT NULL,
+	part INTEGER NOT NULL,
+	thread_ref TEXT NOT NULL,
+	body TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending',
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_at INTEGER NOT NULL,
+	redelivered INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL,
+	last_error TEXT,
+	UNIQUE (origin_key, op_ref, part)
+);
+CREATE TABLE lanes (
+	name TEXT PRIMARY KEY,
+	status TEXT NOT NULL DEFAULT 'working',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE monitors (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE monitor_events (
+	event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	monitor_id TEXT NOT NULL,
+	slot_at INTEGER NOT NULL,
+	stage TEXT NOT NULL,
+	payload TEXT,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at INTEGER,
+	inbound_id TEXT,
+	answer TEXT,
+	error TEXT,
+	delivery_id INTEGER,
+	skipped_by INTEGER,
+	manual INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+`;
+
+function seedDb(mutate: (db: Database) => void): void {
+	const db = new Database(join(home, "ompbot.db"), { create: true, strict: true });
+	db.run(DDL);
+	mutate(db);
+	db.close();
+}
+
+function gateState(name: string): { state: string; detail: string } {
+	const gate = collectGates({ homeDir: home, now }).find((g) => g.name === name);
+	if (gate === undefined) throw new Error(`gate ${name} not found`);
+	return { state: gate.state, detail: gate.detail };
+}
+
+/** Writes a stamp whose ts field is `ageMs` in the past. */
+function writeStamp(ageMs: number): void {
+	mkdirSync(join(home, "backups"), { recursive: true });
+	writeFileSync(
+		join(home, "backups", STAMP_FILE),
+		`ts=${new Date(now - ageMs).toISOString()} file=ompbot-x.db bytes=1 sha256=abc integrity=ok check=quick_check\n`,
+	);
+}
+
+/** Writes a sweep heartbeat `ageMs` old (fake clock: no waiting), optionally with an observed loop delay. */
+function writeHeartbeat(ageMs: number, loopMs = 0): void {
+	writeFileSync(join(home, "sweep-heartbeat"), `ts=${new Date(now - ageMs).toISOString()} loop_ms=${loopMs}\n`, {
+		mode: 0o600,
+	});
+}
+
+describe("collectGates", () => {
+	test("all gates close for a freshly backed-up, idle bot", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:1.1', 'slack/dm/D', 1, 't', 'answered', ?, ?)",
+				[now, now],
+			);
+			db.run(
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('slack/dm/D', 'op1', 0, '1.1', 'b', 'confirmed', ?, ?)",
+				[now, now],
+			);
+			db.run("INSERT INTO lanes (name, status, created_at, updated_at) VALUES ('l1', 'closed', ?, ?)", [now, now]);
+		});
+		for (const name of [
+			"backup_age",
+			"sweep_stalled",
+			"slack_disconnected",
+			"inbound_starved",
+			"deliveries_overdue",
+			"lanes_stuck",
+			"monitors_failed",
+			"monitors_stalled",
+			"turns_failing",
+		]) {
+			expect(gateState(name).state).toBe("closed");
+		}
+	});
+
+	test("backup_age opens without a stamp and after the 36h window", () => {
+		expect(gateState("backup_age").state).toBe("open");
+		expect(gateState("backup_age").detail).toBe("stamp=missing");
+		writeStamp(37 * 3_600_000);
+		expect(gateState("backup_age").state).toBe("open");
+		writeStamp(1 * 3_600_000);
+		expect(gateState("backup_age").state).toBe("closed");
+	});
+
+	test("sweep_stalled: missing stamp is closed (nothing to judge); the gate opens past 3 sweeps", () => {
+		writeStamp(0);
+		expect(gateState("sweep_stalled")).toEqual({ state: "closed", detail: "stamp=missing" });
+		// The heartbeat ages on the fake clock alone: exactly three sweeps is still alive, one past opens.
+		writeHeartbeat(SWEEP_STALLED_MS);
+		expect(gateState("sweep_stalled").state).toBe("closed");
+		writeHeartbeat(SWEEP_STALLED_MS + 1);
+		expect(gateState("sweep_stalled").state).toBe("open");
+		// A daemon dated ahead of `now` is corruption, not an immortal heartbeat (same rule as backup_age).
+		writeHeartbeat(-2 * 60 * 60_000);
+		expect(gateState("sweep_stalled")).toEqual({ state: "open", detail: "ts_in_future" });
+	});
+
+	test("readSweepHeartbeat parses the observed loop delay and falls back gracefully", () => {
+		expect(readSweepHeartbeat(home)).toBeUndefined();
+		writeHeartbeat(0, 137);
+		expect(readSweepHeartbeat(home)).toMatchObject({ loopMs: 137 });
+		writeFileSync(join(home, "sweep-heartbeat"), "ts=not-a-date loop_ms=x\n");
+		const parsed = readSweepHeartbeat(home);
+		expect(parsed?.loopMs).toBeUndefined();
+		expect(Number.isNaN(parsed?.ts.getTime() ?? NaN)).toBe(false); // mtime fallback
+	});
+
+	/** Writes a heartbeat stamped now with extra raw fields (socket, draining). */
+	function writeFields(fields: string): void {
+		writeFileSync(join(home, "sweep-heartbeat"), `ts=${new Date(now).toISOString()} loop_ms=0 ${fields}\n`, {
+			mode: 0o600,
+		});
+	}
+
+	function resetDb(): void {
+		rmSync(join(home, "ompbot.db"), { force: true });
+	}
+
+	test("heartbeat round-trip: socket and draining fields parse; malformed or absent fields stay undefined", () => {
+		writeFields(`socket=down socket_since=${new Date(now - 5_000).toISOString()} draining=1`);
+		const parsed = readSweepHeartbeat(home);
+		expect(parsed?.socket).toEqual({ state: "down", since: new Date(now - 5_000) });
+		expect(parsed?.draining).toBe(true);
+		writeFields(`socket=up socket_since=${new Date(now).toISOString()} draining=0`);
+		expect(readSweepHeartbeat(home)).toMatchObject({ socket: { state: "up" }, draining: false });
+		writeFields("socket=weird socket_since=nope draining=2");
+		const bad = readSweepHeartbeat(home);
+		expect(bad?.socket).toBeUndefined();
+		expect(bad?.draining).toBeUndefined();
+		writeHeartbeat(0);
+		expect(readSweepHeartbeat(home)?.socket).toBeUndefined();
+		expect(readSweepHeartbeat(home)?.draining).toBeUndefined();
+	});
+
+	test("slack_disconnected: exactly 10 minutes down opens, 1 ms less is closed; up and unknown are closed", () => {
+		writeStamp(0);
+		const down = (ageMs: number) =>
+			writeFields(`socket=down socket_since=${new Date(now - ageMs).toISOString()} draining=0`);
+		down(SOCKET_DOWN_MS);
+		expect(gateState("slack_disconnected")).toEqual({ state: "open", detail: "socket=down minutes=10" });
+		down(SOCKET_DOWN_MS - 1);
+		expect(gateState("slack_disconnected").state).toBe("closed");
+		writeFields(`socket=up socket_since=${new Date(now - 3 * SOCKET_DOWN_MS).toISOString()} draining=0`);
+		expect(gateState("slack_disconnected").state).toBe("closed");
+		writeHeartbeat(0);
+		expect(gateState("slack_disconnected")).toEqual({ state: "closed", detail: "socket=unknown" });
+	});
+
+	describe("monitors_stalled", () => {
+		const CRON = '{"kind":"cron","schedule":"*/5 * * * *","timezone":"UTC"}';
+		const INTERVAL = '{"kind":"interval","intervalMs":300000}';
+
+		/** Interval trigger: next fire = cursor_at + intervalMs, so cursor_at is set to put it `overdueMs` in the past. */
+		function seedMonitor(overdueMs: number, trigger = INTERVAL, cursorAt = now - overdueMs - 300_000): void {
+			seedDb((db) => {
+				db.run("ALTER TABLE monitors ADD COLUMN trigger_json TEXT");
+				db.run("ALTER TABLE monitors ADD COLUMN cursor_at INTEGER");
+				db.run(
+					"INSERT INTO monitors (id, name, enabled, created_at, updated_at, trigger_json, cursor_at) VALUES ('m1', 'n1', 1, ?, ?, ?, ?)",
+					[now, now, trigger, cursorAt],
+				);
+			});
+		}
+
+		test("a cron monitor 2h behind opens; draining closes it; a heartbeat without draining is closed heartbeat=old", () => {
+			writeStamp(0);
+			writeFields("draining=0");
+			seedMonitor(0, CRON, now - 2 * 3_600_000);
+			expect(gateState("monitors_stalled").state).toBe("open");
+			expect(gateState("monitors_stalled").detail).toMatch(/^overdue=1$/);
+			writeFields("draining=1");
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "draining" });
+			writeHeartbeat(0);
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "heartbeat=old" });
+		});
+
+		test("boundary: next fire exactly 15 minutes past opens, 1 ms less is closed", () => {
+			writeStamp(0);
+			writeFields("draining=0");
+			seedMonitor(MONITOR_OVERDUE_MS);
+			expect(gateState("monitors_stalled")).toEqual({ state: "open", detail: "overdue=1" });
+			resetDb();
+			seedMonitor(MONITOR_OVERDUE_MS - 1);
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
+		});
+
+		test("old schema is closed schema=old; unparsable trigger is skipped; disabled never counts", () => {
+			writeStamp(0);
+			writeFields("draining=0");
+			seedDb(() => {});
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "schema=old" });
+			resetDb();
+			seedMonitor(2 * 3_600_000, "not json");
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
+			resetDb();
+			seedMonitor(2 * 3_600_000);
+			const db = new Database(join(home, "ompbot.db"), { strict: true });
+			db.run("UPDATE monitors SET enabled = 0");
+			db.close();
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
+		});
+
+		test("db missing: closed db=missing", () => {
+			writeStamp(0);
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "db=missing" });
+		});
+	});
+
+	test("a hung turn (old dispatched inbound) opens inbound_starved", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:2.1', 'slack/dm/D', 1, 't', 'dispatched', ?, ?)",
+				[now - 60_000, now - 11 * 60_000],
+			);
+		});
+		expect(gateState("inbound_starved").state).toBe("open");
+	});
+
+	test("inbound_starved measures silence since the last omp event, not the turn's age", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			const insert =
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES (?, 'slack/dm/D', 1, 't', 'dispatched', ?, ?, ?)";
+			db.run(insert, ["C:3.1", now - 36 * 60_000, now - 35 * 60_000, now - 9 * 60_000]);
+		});
+		expect(gateState("inbound_starved")).toEqual({ state: "closed", detail: "silent_old=0" });
+
+		now += 2 * 60_000;
+		expect(gateState("inbound_starved")).toEqual({ state: "open", detail: "silent_old=1" });
+	});
+
+	describe("origin_silent", () => {
+		const pending = (db: Database, id: string, origin: string, ageMs: number) =>
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at) VALUES (?, ?, 1, 't', 'pending', ?)",
+				[id, origin, now - ageMs],
+			);
+
+		test("a message pending 15 minutes opens it; one minute younger does not; monitor rows never count", () => {
+			writeStamp(0);
+			seedDb((db) => {
+				pending(db, "C:10.1", "slack/dm/D", ORIGIN_SILENT_MS - 60_000);
+				pending(db, "C:10.2", "monitor/m1", 2 * ORIGIN_SILENT_MS);
+			});
+			expect(gateState("origin_silent")).toEqual({ state: "closed", detail: "waiting=0" });
+			now += 60_000;
+			expect(gateState("origin_silent")).toEqual({ state: "open", detail: "waiting=1 origins=1 oldest_min=15" });
+		});
+
+		test("queued behind a turn still emitting events is closed; behind a hung turn it opens", () => {
+			writeStamp(0);
+			seedDb((db) => {
+				pending(db, "C:11.1", "slack/dm/D", 20 * 60_000);
+				db.run(
+					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:11.0', 'slack/dm/D', 1, 't', 'dispatched', ?, ?, ?)",
+					[now - 30 * 60_000, now - 30 * 60_000, now - 60_000],
+				);
+			});
+			expect(gateState("origin_silent").state).toBe("closed");
+			now += INBOUND_STARVATION_MS;
+			expect(gateState("origin_silent").state).toBe("open");
+		});
+
+		test("a restart drain holds pending rows on purpose: closed while draining", () => {
+			writeStamp(0);
+			seedDb((db) => pending(db, "C:12.1", "slack/dm/D", 2 * ORIGIN_SILENT_MS));
+			writeFields("draining=1");
+			expect(gateState("origin_silent")).toEqual({ state: "closed", detail: "draining" });
+			writeFields("draining=0");
+			expect(gateState("origin_silent").state).toBe("open");
+		});
+	});
+
+	test("a turn waiting on a pending approval card is not starved; once the card is decided it is", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:4.1', 'slack/ch/C/t/1.1', 1, 't', 'dispatched', ?, ?, ?)",
+				[now - 21 * 60_000, now - 20 * 60_000, now - 20 * 60_000],
+			);
+			db.run(
+				"CREATE TABLE approvals (approval_id TEXT PRIMARY KEY, status TEXT NOT NULL, origin_key TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
+			);
+			db.run(
+				"INSERT INTO approvals VALUES ('E:5.5', 'pending', 'slack/ch/C/t/1.1', ?, ?), ('E:6.6', 'pending', NULL, ?, ?)",
+				[now - 20 * 60_000, now + 10 * 60_000, now - 20 * 60_000, now + 10 * 60_000],
+			);
+		});
+		expect(gateState("inbound_starved")).toEqual({ state: "closed", detail: "silent_old=0" });
+
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run("UPDATE approvals SET status = 'approved' WHERE approval_id = 'E:5.5'");
+		db.close();
+		expect(gateState("inbound_starved")).toEqual({ state: "open", detail: "silent_old=1" });
+	});
+
+	test("stuck delivery pump opens deliveries_overdue but sticky ambiguous does not", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run(
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('o', 'op1', 0, 't', 'b', 'pending', ?, ?)",
+				[now - 11 * 60_000, now - 3_600_000],
+			);
+			db.run(
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('o', 'op2', 0, 't', 'b', 'failed_ambiguous', ?, ?)",
+				[now - 3_600_000, now - 3_600_000],
+			);
+		});
+		expect(gateState("deliveries_overdue").state).toBe("open");
+		expect(gateState("deliveries_overdue").detail).toBe("overdue=1");
+		// Only the pending row gates; the ambiguous row is visible in status instead.
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run("UPDATE deliveries SET state = 'confirmed' WHERE op_ref = 'op1'");
+		db.close();
+		expect(gateState("deliveries_overdue").state).toBe("closed");
+	});
+
+	test("an old working lane opens lanes_stuck", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run("INSERT INTO lanes (name, status, created_at, updated_at) VALUES ('l1', 'working', ?, ?)", [
+				now - 25 * 3_600_000,
+				now - 25 * 3_600_000,
+			]);
+		});
+		expect(gateState("lanes_stuck").state).toBe("open");
+	});
+
+	describe("lanes_stuck: orphan, running and approval-wait lanes", () => {
+		const old = () => now - 25 * 3_600_000;
+
+		/**
+		 * The real ledger's columns on top of the shared DDL (pre-history lanes table, no approvals): lanes get
+		 * origin_key and history, approvals the schema's status/origin_key/created_at/expires_at (ms epoch, like
+		 * `ApprovalBroker`'s `now + timeoutMs`). Returns a working lane inserter whose last activity is `at`.
+		 */
+		function laneLedger(db: Database): (name: string, at: number) => void {
+			db.run("ALTER TABLE lanes ADD COLUMN origin_key TEXT");
+			db.run("ALTER TABLE lanes ADD COLUMN history TEXT");
+			db.run(
+				"CREATE TABLE approvals (approval_id TEXT PRIMARY KEY, status TEXT NOT NULL, origin_key TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
+			);
+			return (name, at) =>
+				db.run(
+					"INSERT INTO lanes (name, status, origin_key, history, created_at, updated_at) VALUES (?, 'working', ?, ?, ?, ?)",
+					[name, `ompbot/work/${name}`, JSON.stringify([{ at, event: "created" }]), at, at],
+				);
+		}
+
+		function turn(db: Database, origin: string, dispatchedAt: number, lastEventAt: number): void {
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES (?, ?, 1, 't', 'dispatched', ?, ?, ?)",
+				[`${origin}:${dispatchedAt}`, origin, dispatchedAt, dispatchedAt, lastEventAt],
+			);
+		}
+
+		function pendingApproval(db: Database, origin: string, expiresAt: number): void {
+			db.run(
+				"INSERT INTO approvals (approval_id, status, origin_key, created_at, expires_at) VALUES (?, 'pending', ?, ?, ?)",
+				[`E:${origin}`, origin, expiresAt - 30 * 60_000, expiresAt],
+			);
+		}
+
+		test("lanes_stuck counts only orphan working lanes: a running turn or a pending approval keeps it closed", () => {
+			writeStamp(0);
+			const seedLanes = (withOrphan: boolean) =>
+				seedDb((db) => {
+					const lane = laneLedger(db);
+					lane("running", old());
+					turn(db, "ompbot/work/running", now - 60_000, now - 60_000);
+					lane("approval", old());
+					pendingApproval(db, "ompbot/work/approval", now + 10 * 60_000);
+					if (withOrphan) lane("orphan", old());
+				});
+			seedLanes(true);
+			expect(gateState("lanes_stuck")).toEqual({ state: "open", detail: "working_old=1 running=1 approval_wait=1" });
+			rmSync(join(home, "ompbot.db"), { force: true });
+			seedLanes(false);
+			expect(gateState("lanes_stuck")).toEqual({ state: "closed", detail: "working_old=0 running=1 approval_wait=1" });
+		});
+
+		test("an expired card still marked pending (expireStale failing, sweep alive) waits on nobody: the lane is an orphan, the turn starved", () => {
+			writeStamp(0);
+			writeHeartbeat(0);
+			seedDb((db) => {
+				laneLedger(db)("approval", old());
+				pendingApproval(db, "ompbot/work/approval", now - 60_000);
+				// A chat turn hung behind the same kind of stale card.
+				turn(db, "slack/ch/C/t/1.1", now - 20 * 60_000, now - 20 * 60_000);
+				pendingApproval(db, "slack/ch/C/t/1.1", now - 60_000);
+			});
+			expect(gateState("sweep_stalled").state).toBe("closed");
+			expect(gateState("lanes_stuck")).toEqual({ state: "open", detail: "working_old=1 running=0 approval_wait=0" });
+			expect(gateState("inbound_starved")).toEqual({ state: "open", detail: "silent_old=1" });
+		});
+
+		test("a turn that keeps emitting events but was dispatched before the lane's 24h silence does not exempt the lane", () => {
+			writeStamp(0);
+			seedDb((db) => {
+				laneLedger(db)("busy", old());
+				turn(db, "ompbot/work/busy", old(), now - 60_000);
+			});
+			expect(gateState("lanes_stuck")).toEqual({ state: "open", detail: "working_old=1 running=0 approval_wait=0" });
+		});
+	});
+
+	test("recent failed_no_retry on an enabled monitor opens monitors_failed", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			db.run("INSERT INTO monitors (id, name, enabled, created_at, updated_at) VALUES ('m1', '아침', 1, ?, ?)", [
+				now,
+				now,
+			]);
+			db.run(
+				"INSERT INTO monitor_events (monitor_id, slot_at, stage, created_at, updated_at) VALUES ('m1', ?, 'failed_no_retry', ?, ?)",
+				[now - 3_600_000, now - 3_600_000, now - 3_600_000],
+			);
+		});
+		expect(gateState("monitors_failed").state).toBe("open");
+		// Old failures do not gate: they already notified once.
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run("UPDATE monitor_events SET updated_at = ?", [now - 48 * 3_600_000]);
+		db.close();
+		expect(gateState("monitors_failed").state).toBe("closed");
+	});
+
+	test("three recent [turn failed] notices open turns_failing; fewer or older ones do not", () => {
+		writeStamp(0);
+		seedDb((db) => {
+			const insert =
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('slack/dm/D', ?, 0, 't', ?, 'confirmed', ?, ?)";
+			db.run(insert, ["op0", "ECHO fine", now, now - 5 * 60_000]);
+			db.run(insert, ["op1", "[turn failed] rpc_error — 다시 보내 주세요", now, now - 10 * 60_000]);
+			db.run(insert, ["op2", "[turn failed] rpc_error — 다시 보내 주세요", now, now - 20 * 60_000]);
+			db.run(insert, ["op3", "[turn failed] omp_exited code=137 — 다시 보내 주세요", now, now - 30 * 60_000]);
+		});
+		expect(gateState("turns_failing")).toEqual({ state: "open", detail: "recent=3" });
+
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run("UPDATE deliveries SET created_at = ? WHERE op_ref = 'op3'", [now - 2 * 3_600_000]);
+		db.close();
+		expect(gateState("turns_failing")).toEqual({ state: "closed", detail: "recent=2" });
+	});
+
+	test("a database without any table keeps the db gates closed while backup_age still reports", () => {
+		// No db file at all.
+		expect(gateState("inbound_starved").detail).toBe("db=missing");
+		expect(gateState("inbound_starved").state).toBe("closed");
+		expect(gateState("backup_age").state).toBe("open");
+	});
+
+	test("omp_runtime opens for a too-old bun or a missing omp, closes for a usable install, and is omitted without omp", () => {
+		const runtimeGate = (ompExecutable: string) =>
+			collectGates({ homeDir: home, now, ompExecutable }).find((g) => g.name === "omp_runtime");
+		const launcher = (bunRange: string) => {
+			const root = mkdtempSync(join(home, "pkg-"));
+			mkdirSync(join(root, "dist"));
+			writeFileSync(join(root, "package.json"), JSON.stringify({ engines: { bun: bunRange } }));
+			writeFileSync(join(root, "dist", "cli.js"), "#!/usr/bin/env bun\n");
+			return join(root, "dist", "cli.js");
+		};
+		expect(runtimeGate(launcher(">=999.0.0"))).toMatchObject({ state: "open" });
+		expect(runtimeGate(launcher(">=999.0.0"))?.detail).toStartWith("bun_too_old ");
+		expect(runtimeGate(launcher(`>=${Bun.version}`))).toMatchObject({ state: "closed", detail: "ok" });
+		expect(runtimeGate(join(home, "no-such-omp"))).toMatchObject({ state: "open" });
+		expect(collectGates({ homeDir: home, now }).some((g) => g.name === "omp_runtime")).toBe(false);
+	});
+});

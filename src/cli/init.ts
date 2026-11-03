@@ -1,0 +1,72 @@
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { parseArgs } from "node:util";
+import { defaultHomeDir, HOME_MODE, SECRET_MODE } from "../config";
+
+export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>]
+                                 create the home (0700), secrets/ (0700), the workspace and a minimal config.json (0600);
+                                 --omp defaults to omp on PATH, --workspace to <home>/workspace; never writes tokens and
+                                 never touches an existing config.json (exit 2)
+`;
+
+const OWNER_ID = /^U[A-Z0-9]{8,}$/;
+
+function fail(message: string): number {
+	process.stderr.write(`init: ${message}\n${INIT_USAGE}`);
+	return 2;
+}
+
+/** `ompbot init`: every argument is checked before anything is created, so a refused run leaves no trace. */
+export function initCommand(args: string[], env: Record<string, string | undefined>): number {
+	let values: { owner?: string; omp?: string; workspace?: string };
+	try {
+		({ values } = parseArgs({
+			args,
+			options: { owner: { type: "string" }, omp: { type: "string" }, workspace: { type: "string" } },
+		}));
+	} catch (error) {
+		return fail(error instanceof Error ? error.message : String(error));
+	}
+	if (values.owner === undefined || !OWNER_ID.test(values.owner)) {
+		return fail("--owner must be a Slack member id (U followed by 8+ uppercase letters or digits)");
+	}
+	const omp = values.omp === undefined ? Bun.which("omp", { PATH: env.PATH ?? "" }) : resolve(values.omp);
+	if (omp === null) return fail("omp not found on PATH; pass --omp <absolute path to omp>");
+	if (!existsSync(omp)) return fail(`--omp ${omp} does not exist`);
+
+	const homeDir = resolve(defaultHomeDir(env));
+	const configPath = join(homeDir, "config.json");
+	if (existsSync(configPath)) return fail(`${configPath} already exists; nothing changed`);
+	const workspaceDir = resolve(values.workspace ?? join(homeDir, "workspace"));
+	const secretsDir = join(homeDir, "secrets");
+
+	mkdirSync(homeDir, { recursive: true, mode: HOME_MODE });
+	chmodSync(homeDir, HOME_MODE);
+	mkdirSync(secretsDir, { recursive: true, mode: HOME_MODE });
+	chmodSync(secretsDir, HOME_MODE);
+	mkdirSync(workspaceDir, { recursive: true });
+	const config = {
+		schemaVersion: 1,
+		ownerSlackUserId: values.owner,
+		slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+		ompExecutable: omp,
+		workspaceDir,
+		sessionRetentionDays: 30,
+	};
+	writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: SECRET_MODE, flag: "wx" });
+	chmodSync(configPath, SECRET_MODE);
+
+	const homePrefix = env.OMPBOT_HOME === undefined ? "" : `OMPBOT_HOME=${homeDir} `;
+	process.stdout.write(
+		[
+			`init_done home=${homeDir} config=${configPath} workspace=${workspaceDir}`,
+			"next: put the two Slack tokens into files (never into chat or shell history), then run doctor:",
+			"  umask 077",
+			`  cat > ${join(secretsDir, "slack-bot-token")}   # paste xoxb-… then Ctrl-D`,
+			`  cat > ${join(secretsDir, "slack-app-token")}   # paste xapp-… then Ctrl-D`,
+			`  ${homePrefix}bun src/main.ts doctor`,
+			"",
+		].join("\n"),
+	);
+	return 0;
+}
