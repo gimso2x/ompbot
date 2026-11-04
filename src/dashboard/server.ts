@@ -39,7 +39,27 @@ const HEALTH = /^\/(?:.*\/)?healthz$/;
 const BOARD = /^\/(?:.*\/)?api\/board$/;
 const BOARD_EVENTS = /^\/(?:.*\/)?api\/board\/events$/;
 const PANE = /^\/(?:.*\/)?api\/pane\/(conversation|plan)$/;
+const MANIFEST = /^\/(?:.*\/)?manifest\.webmanifest$/;
+const ICON = /^\/(?:.*\/)?icons\/(icon-192|icon-512|icon-maskable-512|apple-touch-icon)\.png$/;
 const KEEP_ALIVE_MS = 15_000;
+
+/** Web app manifest for "install as app" in Chrome/Edge; URLs are relative so any tunnel prefix keeps working. */
+const WEB_MANIFEST = JSON.stringify({
+	id: "./",
+	name: "ompbot 현황판",
+	short_name: "ompbot",
+	start_url: "./",
+	scope: "./",
+	display: "standalone",
+	background_color: "#0D0F12",
+	theme_color: "#15181D",
+	lang: "ko",
+	icons: [
+		{ src: "icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+		{ src: "icons/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+		{ src: "icons/icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+	],
+});
 const DEBOUNCE_MS = 200;
 
 const COMMON_HEADERS = {
@@ -48,7 +68,7 @@ const COMMON_HEADERS = {
 	"referrer-policy": "no-referrer",
 };
 const PAGE_CSP =
-	"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+	"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const jsonReply = (body: unknown, status: number, head: boolean): Response =>
 	new Response(head ? null : JSON.stringify(body), {
@@ -145,7 +165,7 @@ function boardEvents(
 }
 
 /**
- * Read-only: GET and HEAD of the page, the snapshot JSON, a health line and — with a board — the board JSON, its event
+ * Read-only: GET and HEAD of the page, the snapshot JSON, a health line, the web app manifest and its icons and — with a board — the board JSON, its event
  * stream and GET-only reads of a board card's conversation and plan. Nothing here changes any state.
  */
 export function startDashboardServer(options: DashboardServerOptions): Server<undefined> {
@@ -183,6 +203,14 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 			const url = new URL(request.url);
 			const { pathname } = url;
 			if (HEALTH.test(pathname)) return reply("ok", "text/plain; charset=utf-8");
+			if (MANIFEST.test(pathname)) return reply(WEB_MANIFEST, "application/manifest+json; charset=utf-8");
+			const icon = ICON.exec(pathname);
+			if (icon !== null) {
+				const file = Bun.file(new URL(`./icons/${icon[1]}.png`, import.meta.url));
+				return new Response(head ? null : file, {
+					headers: { ...COMMON_HEADERS, "content-type": "image/png", "cache-control": "max-age=86400" },
+				});
+			}
 			const pane = PANE.exec(pathname);
 			if (BOARD.test(pathname) || BOARD_EVENTS.test(pathname) || pane !== null) {
 				if (board === undefined || fanout === undefined) return jsonReply({ error: "board_disabled" }, 404, head);

@@ -3,6 +3,8 @@
  * for the files the agent edits. Renderer and parser live together so the format has one definition.
  */
 
+import { parseChecks, SignalSyntaxError } from "./signals";
+
 export const TASK_RISKS = ["L0", "L1", "L2", "L3", "L4"] as const;
 export type TaskRisk = (typeof TASK_RISKS)[number];
 
@@ -89,6 +91,16 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const assumptions = record.assumptions;
 	if (assumptions !== undefined && typeof assumptions !== "string")
 		throw new TaskSpecError("taskSpec.assumptions는 문자열이어야 합니다");
+	const acceptance = textList(record, "acceptance", 1);
+	// A malformed `[check: …]` is refused here, not discovered at judgement time.
+	acceptance.forEach((text, index) => {
+		try {
+			parseChecks(text);
+		} catch (error) {
+			if (!(error instanceof SignalSyntaxError)) throw error;
+			throw new TaskSpecError(`taskSpec.acceptance[${index}]의 check 형식 오류: ${error.message}`);
+		}
+	});
 	return {
 		kind: "new",
 		spec: {
@@ -97,7 +109,7 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 			goal: requireText(record, "goal"),
 			scope: textList(record, "scope", 0),
 			exclusions: textList(record, "exclusions", 0),
-			acceptance: textList(record, "acceptance", 1),
+			acceptance,
 			repo: repo.replace(/\/+$/, ""),
 			...(background === undefined || oneLine(background) === "" ? {} : { background: background.trim() }),
 			...(assumptions === undefined || oneLine(assumptions) === "" ? {} : { assumptions: oneLine(assumptions) }),

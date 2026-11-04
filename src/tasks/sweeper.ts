@@ -3,7 +3,7 @@ import type { HerdrAgentStatusResult } from "../dispatch/omp";
 import type { FreezeState } from "../ops/freeze";
 import type { TaskJudgement } from "./checker";
 import { digest, summarizeJudgement } from "./checker";
-import type { TaskEvaluation } from "./evaluate";
+import type { TaskCheckCache, TaskEvaluation } from "./evaluate";
 import type { TaskLedger, TaskRow } from "./ledger";
 import {
 	formatBlockedNotice,
@@ -40,7 +40,8 @@ function unmetLines(problems: readonly string[]): string[] {
 
 export interface TaskSweepDeps {
 	ledger: TaskLedger;
-	evaluate(row: TaskRow): Promise<TaskEvaluation>;
+	/** Judges a task; `checks` is the sweeper's check-result cache, to hand to `evaluateTask` so checks run. */
+	evaluate(row: TaskRow, checks: TaskCheckCache): Promise<TaskEvaluation>;
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state no reminder is sent to the agent. */
 	frozen?: () => FreezeState | undefined;
 	/** Sends a prompt to the task's herdr agent. */
@@ -80,6 +81,8 @@ export class TaskSweeper {
 	readonly #seenUpdated = new Map<string, number>();
 	/** Tasks whose held reminder was already logged during the current freeze (one `task_remind_frozen` per freeze). */
 	readonly #remindHeld = new Set<string>();
+	/** `[check: …]` results per task HEAD (in memory: a restart runs the checks again). */
+	readonly #checks: TaskCheckCache = new Map();
 
 	constructor(deps: TaskSweepDeps) {
 		this.#deps = deps;
@@ -113,7 +116,7 @@ export class TaskSweeper {
 		const actions: string[] = [];
 		let evaluation: TaskEvaluation;
 		try {
-			evaluation = await this.#deps.evaluate(row);
+			evaluation = await this.#deps.evaluate(row, this.#checks);
 		} catch (error) {
 			evaluation = { ok: false, error: error instanceof Error ? error.message : String(error) };
 		}

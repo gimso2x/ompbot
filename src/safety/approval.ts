@@ -25,6 +25,7 @@ export type CardReplyResult =
 	| { kind: "route"; originKey: string };
 
 export const APPROVAL_ACTION_PREFIX = "ompbot:approval";
+export const CHOICE_ACTION_PREFIX = "ompbot:choice";
 /** An unanswered card counts as denied after this long; the deadline is shown under its buttons. */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
 const SUMMARY_LIMIT = 2500;
@@ -96,6 +97,19 @@ function approvalButtons(channel: string, ts: string): ActionButton[] {
 
 function deadlineNote(expiresAt: number, timeoutMs: number): string {
 	return `⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(${Math.round(timeoutMs / 60_000)}분)`;
+}
+
+/** `ompbot:choice:<n>:<channel>:<ts>`: button `n` of the choice card `<channel>:<ts>` (no colon in either, as above). */
+export function choiceActionId(index: number, channel: string, ts: string): string {
+	return `${CHOICE_ACTION_PREFIX}:${index}:${channel}:${ts}`;
+}
+
+export function parseChoiceActionId(actionId: string): { index: number; channel: string; ts: string } | undefined {
+	const parts = actionId.split(":");
+	if (parts.length !== 5 || `${parts[0]}:${parts[1]}` !== CHOICE_ACTION_PREFIX) return undefined;
+	const [, , index, channel, ts] = parts;
+	if (index === undefined || !/^\d+$/.test(index) || !channel || !ts) return undefined;
+	return { index: Number(index), channel, ts };
 }
 
 export function parseApprovalActionId(
@@ -170,6 +184,50 @@ interface Pending {
 	recorded: boolean;
 }
 
+/** A choice card (`ApprovalBroker.choose`): an omp dialog put to the owner in the asking conversation. */
+export interface ChoiceCard {
+	/** Card body; redacted and cut by the broker. */
+	text: string;
+	/** Button labels; button `n` carries `ompbot:choice:<n>:<channel>:<ts>`. Empty: the owner answers by reply only. */
+	buttons: readonly string[];
+	/** What an unanswered card turns into, for the deadline line (`…까지 답이 없으면 <fallback>로 처리됩니다`). */
+	fallback: string;
+	/** Deadline of this card; default: the broker's `timeoutMs`. */
+	timeoutMs?: number | undefined;
+}
+
+/** One owner input on a choice card: a button click or a text answer (card-thread or conversation reply). */
+export type ChoiceEvent = { kind: "choice"; index: number } | { kind: "text"; text: string };
+/** What waiting on a choice card yields: owner input, or the end of the wait (deadline, withdrawn by the caller). */
+export type ChoiceResult = ChoiceEvent | { kind: "timeout" } | { kind: "cancelled" };
+
+/** An open choice card. Inputs queue up until read; `timeout`/`cancelled` end it and are returned from then on. */
+export interface ChoiceCardHandle {
+	next(): Promise<ChoiceResult>;
+	/** Rewrites the open card (a partly answered `ask`); no-op once closed. */
+	update(text: string, buttons: readonly string[]): Promise<void>;
+	/** Final card text: the body plus `finalLine`, buttons removed. `answer` (what was chosen) settles the ledger row as replied. */
+	close(finalLine: string, answer?: string): Promise<void>;
+}
+
+interface ChoicePending {
+	originKey: string;
+	buttons: number;
+	/** Queues one owner input; false once the card is closed or ended. */
+	push: (event: ChoiceEvent) => boolean;
+	isOpen: () => boolean;
+	/** Card-thread reply ts already taken (a backfill replay is a duplicate). */
+	replies: Set<string>;
+}
+
+/**
+ * Choice-card ledger rows expire this long after the card's own deadline: the card's timer settles it first and
+ * writes the real outcome, so the approval sweeper never races it to an approval-worded card.
+ */
+const CHOICE_LEDGER_GRACE_MS = 60_000;
+/** Slack: at most 75 characters per button label. */
+const BUTTON_LABEL_LIMIT = 75;
+
 /** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
 function cutCodePointSafe(text: string, limit: number): string {
 	if (text.length <= limit) return text;
@@ -209,6 +267,7 @@ export class ApprovalBroker {
 	readonly #timers: ApprovalTimers;
 	readonly #clock: { now(): number };
 	readonly #pending = new Map<string, Pending>();
+	readonly #choices = new Map<string, ChoicePending>();
 
 	constructor(options: ApprovalBrokerOptions) {
 		this.#options = options;
@@ -376,6 +435,164 @@ export class ApprovalBroker {
 		return result;
 	}
 
+	/**
+	 * Posts a choice card in the asking conversation (`origin`'s thread) and returns it open: button clicks, replies
+	 * in the card's thread and the conversation's own replies (`answerDialog`) queue up as `ChoiceEvent`s. The card
+	 * ends at its deadline (`timeout`) or when `signal` aborts (`cancelled`). The ledger keeps one approval row per
+	 * card, so a daemon restart expires a card left open, exactly like an approval card.
+	 */
+	async choose(
+		origin: ApprovalOrigin,
+		card: ChoiceCard,
+		options: { signal?: AbortSignal | undefined } = {},
+	): Promise<ChoiceCardHandle> {
+		const { signal } = options;
+		const { port, log, store } = this.#options;
+		const now = this.#clock.now();
+		const timeoutMs = card.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+		let body = cutCodePointSafe(redact(card.text), CARD_LIMIT);
+		const note = `⏳ ${DEADLINE_FORMAT.format(now + timeoutMs)}까지 답이 없으면 ${card.fallback}로 처리됩니다`;
+		const target = {
+			conversationId: origin.channel,
+			...(origin.threadTs === undefined ? {} : { threadId: origin.threadTs }),
+		};
+		// Reply-only cards carry the deadline in the text: the port shows `buttonsNote` only under buttons.
+		const posted = await port.post(target, { text: card.buttons.length === 0 ? `${body}\n${note}` : body });
+		const channel = posted.conversationId;
+		const ts = posted.messageId;
+		const key = `${channel}:${ts}`;
+		const render = (text: string, labels: readonly string[]) =>
+			labels.length === 0
+				? { text: `${text}\n${note}` }
+				: {
+						text,
+						buttons: labels.map((label, index) => ({
+							actionId: choiceActionId(index, channel, ts),
+							label: cutCodePointSafe(redact(label), BUTTON_LABEL_LIMIT),
+							value: String(index),
+						})),
+						buttonsNote: note,
+					};
+		try {
+			store.createApproval({
+				approvalId: key,
+				channel,
+				messageTs: ts,
+				summary: cutCodePointSafe(body, SUMMARY_LIMIT),
+				createdAt: now,
+				expiresAt: now + timeoutMs + CHOICE_LEDGER_GRACE_MS,
+				originKey: origin.originKey,
+				...(origin.threadTs === undefined ? {} : { originThreadRef: `${origin.channel}:${origin.threadTs}` }),
+			});
+		} catch (error) {
+			log.warn("choice_record_failed", { channel, ts, error: String(error) });
+		}
+		const queue: ChoiceResult[] = [];
+		let wake: (() => void) | undefined;
+		let ended: ChoiceResult | undefined;
+		let closed = false;
+		const enqueue = (result: ChoiceResult): void => {
+			queue.push(result);
+			wake?.();
+		};
+		const end = (result: { kind: "timeout" } | { kind: "cancelled" }): void => {
+			if (ended !== undefined || closed) return;
+			ended = result;
+			enqueue(result);
+		};
+		const timer = this.#timers.set(() => end({ kind: "timeout" }), timeoutMs);
+		const onAbort = () => end({ kind: "cancelled" });
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const pending: ChoicePending = {
+			originKey: origin.originKey,
+			buttons: card.buttons.length,
+			push: (event) => {
+				if (closed || ended !== undefined) return false;
+				enqueue(event);
+				return true;
+			},
+			isOpen: () => !closed && ended === undefined,
+			replies: new Set(),
+		};
+		this.#choices.set(key, pending);
+		const release = (): void => {
+			closed = true;
+			this.#timers.clear(timer);
+			signal?.removeEventListener("abort", onAbort);
+			this.#choices.delete(key);
+		};
+		try {
+			if (card.buttons.length > 0) await port.edit(posted, render(body, card.buttons));
+		} catch (error) {
+			log.warn("choice_buttons_failed", { channel, ts, error: String(error) });
+		}
+		log.info("choice_requested", { channel, ts, origin: origin.originKey, buttons: card.buttons.length });
+		if (signal?.aborted) onAbort();
+		return {
+			next: async () => {
+				for (;;) {
+					const head = queue.shift();
+					if (head !== undefined) {
+						// A terminal result stays readable: every later read returns it too.
+						if (head.kind === "timeout" || head.kind === "cancelled") queue.unshift(head);
+						return head;
+					}
+					const arrived = Promise.withResolvers<void>();
+					wake = arrived.resolve;
+					await arrived.promise;
+					wake = undefined;
+				}
+			},
+			update: async (text, labels) => {
+				if (closed) return;
+				body = cutCodePointSafe(redact(text), CARD_LIMIT);
+				pending.buttons = labels.length;
+				try {
+					await port.edit(
+						posted,
+						labels.length === 0 ? { ...render(body, labels), buttons: [] } : render(body, labels),
+					);
+				} catch (error) {
+					log.warn("choice_update_failed", { channel, ts, error: String(error) });
+				}
+			},
+			close: async (finalLine, answer) => {
+				if (closed) return;
+				release();
+				try {
+					if (answer === undefined) store.decideApproval(key, "expired", this.#clock.now());
+					else store.replyApproval(key, `choice:${ts}`, answer, this.#clock.now());
+				} catch (error) {
+					log.warn("choice_decide_failed", { channel, ts, error: String(error) });
+				}
+				log.info("choice_resolved", {
+					channel,
+					ts,
+					outcome: ended?.kind ?? (answer === undefined ? "closed" : "answered"),
+				});
+				try {
+					await port.edit(posted, { text: `${body}\n${cutCodePointSafe(redact(finalLine), 400)}`, buttons: [] });
+				} catch (error) {
+					log.warn("choice_final_update_failed", { channel, ts, error: String(error) });
+				}
+			},
+		};
+	}
+
+	/** Choice cards of `originKey` still waiting for the owner. */
+	openDialogs(originKey: string): number {
+		let open = 0;
+		for (const choice of this.#choices.values()) if (choice.originKey === originKey && choice.isOpen()) open += 1;
+		return open;
+	}
+
+	/** The owner's plain message in the asking conversation answers its one open choice card; false otherwise. */
+	answerDialog(originKey: string, text: string): boolean {
+		const open = [...this.#choices.values()].filter((choice) => choice.originKey === originKey && choice.isOpen());
+		const only = open.length === 1 ? open[0] : undefined;
+		return only?.push({ kind: "text", text }) ?? false;
+	}
+
 	/** One pointer line in the asking thread (or the channel's main view) naming the escalation card; best effort. */
 	async #postPointer(
 		origin: ApprovalOrigin,
@@ -406,6 +623,14 @@ export class ApprovalBroker {
 	 */
 	handleCardReply(reply: { approvalId: string; ts: string; text: string }): CardReplyResult | undefined {
 		const { store, log } = this.#options;
+		// An open choice card takes every reply in its thread as one more answer (an `ask` card may need several).
+		const choice = this.#choices.get(reply.approvalId);
+		if (choice?.replies.has(reply.ts)) return { kind: "duplicate" };
+		if (choice?.push({ kind: "text", text: reply.text })) {
+			choice.replies.add(reply.ts);
+			log.info("choice_reply", { id: reply.approvalId, ts: reply.ts });
+			return { kind: "settled" };
+		}
 		const row = store.getApproval(reply.approvalId);
 		if (row === undefined) return undefined;
 		// A backfill replay of the reply that settled the card: consumed already.
@@ -446,9 +671,27 @@ export class ApprovalBroker {
 		return { platform: this.#options.port.platform, conversationId, messageId };
 	}
 
-	/** Returns true when the click settled a pending request. */
+	/** Returns true when the click settled a pending request (or was taken by an open choice card). */
 	handleAction(action: { actionId: string; userId: string }): boolean {
 		const { log, ownerUserId } = this.#options;
+		const choice = parseChoiceActionId(action.actionId);
+		if (choice !== undefined) {
+			if (action.userId !== ownerUserId) {
+				log.warn("choice_click_ignored", { user: action.userId, reason: "not_owner" });
+				return false;
+			}
+			const pending = this.#choices.get(`${choice.channel}:${choice.ts}`);
+			if (
+				pending === undefined ||
+				choice.index >= pending.buttons ||
+				!pending.push({ kind: "choice", index: choice.index })
+			) {
+				log.info("choice_click_ignored", { user: action.userId, reason: "not_open" });
+				return false;
+			}
+			log.info("choice_click", { user: action.userId, index: choice.index });
+			return true;
+		}
 		const parsed = parseApprovalActionId(action.actionId);
 		if (!parsed) return false;
 		if (action.userId !== ownerUserId) {

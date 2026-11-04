@@ -132,10 +132,17 @@ export function formatReachedNotice(
 			? [`⚠️ 요약 없음 — ${outcomePath}를 직접 봐 주세요.`]
 			: judgement.summary.slice(0, MAX_SUMMARY_LINES).map((line) => `• ${clip(line, 200)}`);
 	const warnings = sharedCommitWarnings(row, judgement);
+	// The count only: what the commands printed stays out of the card.
+	const passed = judgement.checks.filter((check) => check.ok).length;
+	const checks =
+		judgement.checks.length === 0
+			? []
+			: [`✅ check ${passed}/${judgement.checks.length} 통과 — 봇이 워크트리에서 직접 다시 실행했습니다.`];
 	return [
 		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
 		"",
 		...summary,
+		...checks,
 		...(warnings.length === 0 ? [] : ["", ...warnings]),
 		"",
 		`*질문*: 브랜치 \`${row.branch}\`를 main에 머지할까요?`,

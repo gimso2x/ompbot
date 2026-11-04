@@ -35,7 +35,7 @@ import { MonitorScheduler } from "../monitors/scheduler";
 import { buildMonitorTools } from "../monitors/tools";
 import { WebhookServer } from "../monitors/webhook";
 import type { ClaudeApprovalHook } from "../omp/claude-driver";
-import type { OmpSessionDriver } from "../omp/driver";
+import type { OmpDialogAnswerer, OmpSessionDriver } from "../omp/driver";
 import { readConfigText, recordLastGoodConfig } from "../ops/apply";
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState } from "../ops/gates";
@@ -52,6 +52,7 @@ import {
 	skillDirOf,
 } from "../review/skills";
 import { ApprovalBroker } from "../safety/approval";
+import { answerDialogOnSlack } from "../safety/choice";
 import { buildHostTools, type HostToolDef } from "../safety/host-tools";
 import { type CoreSink, type DeliverySource, SlackAdapter } from "../slack/adapter";
 import { type BackfillDeps, BackfillRunner, type ChannelTarget, channelCursorKey } from "../slack/backfill";
@@ -94,6 +95,9 @@ import {
 } from "./status";
 
 const MEDIA_SWEEP_INTERVAL_MS = 60 * 60_000;
+/** A plain message while 2+ choice cards of the conversation wait: it is not taken as an answer (`dialogs.ambiguous`). */
+const DIALOG_AMBIGUOUS_NOTICE =
+	"❓ 답을 기다리는 질문 카드가 여러 개라 이 메시지는 답으로 쓰지 않았습니다 — 답할 질문 카드의 스레드에 답장해 주세요(또는 버튼)";
 /** Gate sweep cadence of the self-diagnosis loop (0 disables it). */
 export const DEFAULT_GATE_SWEEP_MS = 5 * 60_000;
 /**
@@ -401,6 +405,29 @@ export class Daemon {
 		};
 	}
 
+	/**
+	 * Owner answers to the omp child's dialogs (select/confirm/input/editor/ask) as choice cards in the thread of the
+	 * origin's running turn. Undefined when the origin has no Slack channel (monitors) — the driver then cancels them.
+	 */
+	answerDialogsFor(originKey: string): OmpDialogAnswerer | undefined {
+		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
+		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : parseChatOrigin(originKey)?.conversationId;
+		if (channel === undefined) return undefined;
+		return (request, signal) => {
+			const threadTs = this.#uploadThreadTs(originKey, lane?.threadRef);
+			const ask = () =>
+				answerDialogOnSlack(
+					this.#approval,
+					{ originKey, channel, ...(threadTs === undefined ? {} : { threadTs }) },
+					request,
+					signal,
+				);
+			// Like host tools: the owner can take minutes, so stall alerts rest and `drain` counts the wait.
+			const mailbox = this.#router?.mailbox(originKey);
+			return mailbox ? mailbox.trackHostTool(ask) : ask();
+		};
+	}
+
 	/** Working directory of the omp child: the project of a work lane, the bot workspace otherwise. */
 	cwdFor(originKey: string): string {
 		return (
@@ -514,7 +541,14 @@ export class Daemon {
 			idleStopMs: config.idleTimeoutMinutes === undefined ? undefined : config.idleTimeoutMinutes * 60_000,
 			...(config.model === undefined ? {} : { defaultModel: config.model }),
 			onStall: (info) => void this.#adapter?.setStalled(info.threadRef, info.stalled),
-			onActivity: (info) => void this.#adapter?.setActivity(info.threadRef, redact(info.activity)),
+			onProgress: ({ threadRef, progress }) =>
+				void this.#adapter?.setProgress(threadRef, {
+					...progress,
+					recentTools: progress.recentTools.map((tool) => redact(tool)),
+					...(progress.todo?.current === undefined
+						? {}
+						: { todo: { ...progress.todo, current: redact(progress.todo.current) } }),
+				}),
 			onEscalate: (info) => this.#escalateTurnFailures(info),
 			onProviderLimit: (info) => this.#notifyProviderLimit(info),
 			onSessionMismatch: (info) => this.#postThreadNotices([info.threadRef], formatSessionMismatchNotice(info)),
@@ -527,6 +561,11 @@ export class Daemon {
 				const target = this.#store;
 				if (target === undefined) return;
 				void this.#adapter?.postNotice(target.ownerChannel(), formatStallNotice(info));
+			},
+			dialogs: {
+				open: (originKey) => this.#approval.openDialogs(originKey),
+				answer: (originKey, text) => this.#approval.answerDialog(originKey, text),
+				ambiguous: (info) => this.#postThreadNotices([info.threadRef], DIALOG_AMBIGUOUS_NOTICE),
 			},
 			driverFactory: (origin, dir) => this.#makeDriver(origin, dir),
 		});
@@ -706,7 +745,8 @@ export class Daemon {
 				ledger: store.tasks,
 				// dispatchHosts is a reloadable field: read the live config, not the boot snapshot.
 				frozen: this.#frozen,
-				evaluate: (row) => evaluateTask(row, resolveTaskHost(row.host, this.#options.config.dispatchHosts)),
+				evaluate: (row, checks) =>
+					evaluateTask(row, resolveTaskHost(row.host, this.#options.config.dispatchHosts), checks),
 				remind: (row, text) => {
 					const entry = row.host === null ? undefined : this.#options.config.dispatchHosts?.[row.host];
 					return herdrPromptExisting(row.agent, text, {

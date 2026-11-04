@@ -5,7 +5,7 @@ import type { ChannelPort } from "../channel/port";
 import { parseChatOrigin } from "../core/origin-key";
 import { buildDispatchTool, type DispatchToolDeps } from "../dispatch/tool";
 import type { Logger } from "../log";
-import { maskKnownFragments, redact } from "../redact";
+import { maskKnownFragments, redact, secretShapes } from "../redact";
 import type { ApprovalBroker, ApprovalDetail } from "./approval";
 import { isInside } from "./inside";
 
@@ -32,8 +32,7 @@ export const UPLOAD_SCAN_CARRY_CHARS = 4096;
  * `redact`'s secret shapes, except that an `sk-` key needs 20+ characters after `sk-` / `sk-ant-`: binary data decoded
  * as UTF-8 is full of short `sk-…` runs. Chat masking (`redact`) keeps the shorter shape.
  */
-const UPLOAD_SECRET_PATTERN =
-	/xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}/;
+const UPLOAD_SECRET_PATTERN = new RegExp(secretShapes("{20,}"));
 
 /** The upload verdict on one scanned span: a token-shaped string or a fragment of an indexed secret value. */
 export function hasUploadSecret(text: string): boolean {

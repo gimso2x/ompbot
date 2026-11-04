@@ -167,6 +167,12 @@ const fakeHostOps = (): TaskHostOps => ({
 	removeWorktree: async () => undefined,
 	writeFile: async () => ({ ok: false, error: "read-only" }),
 	commitDocs: async () => ({ ok: false, error: "read-only" }),
+	runCheck: async () => {
+		throw new Error("the dashboard never runs checks");
+	},
+	headOf: async () => {
+		throw new Error("the dashboard never runs checks");
+	},
 });
 
 interface FakeRunner {

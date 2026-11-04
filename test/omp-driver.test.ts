@@ -2,7 +2,14 @@ import { afterAll, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { OmpDriverError, type OmpEntries, type OmpEvent, type OmpFinal } from "../src/omp/driver";
+import {
+	type OmpDialogAnswerer,
+	type OmpDialogResponse,
+	OmpDriverError,
+	type OmpEntries,
+	type OmpEvent,
+	type OmpFinal,
+} from "../src/omp/driver";
 import { buildChildEnv } from "../src/omp/env";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import {
@@ -249,7 +256,7 @@ async function until(condition: () => boolean, timeoutMs = 2000): Promise<void> 
 	}
 }
 
-test("tapExtensionUi emits events from chunk-split lines and instantly cancels unanswerable dialogs", async () => {
+test("tapExtensionUi without an answerer emits events from chunk-split lines and instantly cancels every dialog", async () => {
 	const encoder = new TextEncoder();
 	const dialogs = ["select", "confirm", "input", "editor", "ask"];
 	const payload = [
@@ -317,6 +324,89 @@ test("tapExtensionUi swallows stream errors after processing earlier chunks", as
 	await expect(tap).resolves.toBeUndefined();
 	expect(events).toEqual([{ type: "extension_ui_request", method: "select", id: "u1" }]);
 	expect(replies).toEqual([{ type: "extension_ui_response", id: "u1", cancelled: true }]);
+});
+
+/** A live stdout stand-in: frames are written one line at a time while the tap runs. */
+function liveTap(answer: OmpDialogAnswerer) {
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const stream = new ReadableStream<Uint8Array>({
+		start(c) {
+			controller = c;
+		},
+	});
+	const replies: Array<Record<string, unknown>> = [];
+	let wanted: { count: number; resolve: () => void } | undefined;
+	const tap = tapExtensionUi(
+		stream,
+		() => undefined,
+		(frame) => {
+			replies.push(frame);
+			if (wanted !== undefined && replies.length >= wanted.count) wanted.resolve();
+		},
+		answer,
+	);
+	const send = (frame: Record<string, unknown>) =>
+		controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "extension_ui_request", ...frame })}\n`));
+	/** Resolves once `count` responses were written. */
+	const untilReplies = (count: number): Promise<void> => {
+		if (replies.length >= count) return Promise.resolve();
+		const reached = Promise.withResolvers<void>();
+		wanted = { count, resolve: reached.resolve };
+		return reached.promise;
+	};
+	return {
+		replies,
+		untilReplies,
+		send,
+		close: () => {
+			controller.close();
+			return tap;
+		},
+	};
+}
+
+test("tapExtensionUi hands dialogs to the answerer and writes its response; undefined, a throw or a bad frame is cancelled", async () => {
+	const seen: string[] = [];
+	const live = liveTap(async (request) => {
+		seen.push(request.method);
+		if (request.method === "select") return { value: request.options[1] ?? "" };
+		if (request.method === "confirm") return undefined;
+		throw new Error("boom");
+	});
+	live.send({ method: "select", id: "u1", title: "t", options: ["a", "b"] });
+	live.send({ method: "confirm", id: "u2", title: "t", message: "m" });
+	live.send({ method: "input", id: "u3", title: "t" });
+	live.send({ method: "select", id: "u4", title: "t" }); // no options: never reaches the answerer
+	live.send({ method: "notify", id: "u5", message: "hi" }); // not a dialog: no response
+	await live.untilReplies(4);
+	await live.close();
+	expect(seen).toEqual(["select", "confirm", "input"]);
+	expect(new Set(live.replies.map((frame) => JSON.stringify(frame)))).toEqual(
+		new Set(
+			[
+				{ type: "extension_ui_response", id: "u4", cancelled: true },
+				{ type: "extension_ui_response", id: "u1", value: "b" },
+				{ type: "extension_ui_response", id: "u2", cancelled: true },
+				{ type: "extension_ui_response", id: "u3", cancelled: true },
+			].map((frame) => JSON.stringify(frame)),
+		),
+	);
+});
+
+test("tapExtensionUi: omp's cancel aborts the waiting answer and its late response is never written", async () => {
+	const late = Promise.withResolvers<OmpDialogResponse>();
+	const aborted = Promise.withResolvers<void>();
+	const live = liveTap(async (_request, signal) => {
+		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		return late.promise;
+	});
+	live.send({ method: "select", id: "u1", title: "t", options: ["a"] });
+	live.send({ method: "cancel", id: "c1", targetId: "u1" });
+	await aborted.promise;
+	late.resolve({ value: "a" });
+	await late.promise;
+	await live.close();
+	expect(live.replies).toEqual([]);
 });
 
 /**
@@ -451,7 +541,10 @@ interface FakeRpcClientModule {
  * `<root>/bin/omp` (only realpath'ed and stat'ed), the fixture rpc-client module, and a stub `@oh-my-pi/pi-utils`
  * for `Bun.resolveSync`. Paths are derived from the realpath so the test imports the exact module the driver does.
  */
-function fakeOmpPackage(dir: string): { ompExecutable: string; clientModule: string } {
+function fakeOmpPackage(
+	dir: string,
+	options: { spawnChild?: boolean } = {},
+): { ompExecutable: string; clientModule: string; utilsModule: string } {
 	const bin = join(dir, "fake-omp-pkg", "bin");
 	mkdirSync(bin, { recursive: true });
 	const ompExecutable = join(bin, "omp");
@@ -460,18 +553,37 @@ function fakeOmpPackage(dir: string): { ompExecutable: string; clientModule: str
 	const root = dirname(dirname(realpathSync(ompExecutable)));
 	const clientModule = join(root, "src/modes/rpc/rpc-client.ts");
 	mkdirSync(dirname(clientModule), { recursive: true });
-	writeFileSync(clientModule, FAKE_RPC_CLIENT_SOURCE);
+	writeFileSync(
+		clientModule,
+		options.spawnChild === true
+			? FAKE_RPC_CLIENT_SOURCE.replace(
+					"async start(): Promise<void> {}",
+					"async start(): Promise<void> { (this.options as { spawn(args: string[]): unknown }).spawn([]); }",
+				)
+			: FAKE_RPC_CLIENT_SOURCE,
+	);
 	const utilsDir = join(root, "node_modules/@oh-my-pi/pi-utils");
 	mkdirSync(utilsDir, { recursive: true });
 	writeFileSync(
 		join(utilsDir, "package.json"),
 		JSON.stringify({ name: "@oh-my-pi/pi-utils", version: "0.0.0-fake", type: "module", main: "index.js" }),
 	);
+	const utilsModule = join(utilsDir, "index.js");
 	writeFileSync(
-		join(utilsDir, "index.js"),
-		"export const ptree = { spawn() { throw new Error('ptree.spawn is not expected in unit tests'); } };\n",
+		utilsModule,
+		options.spawnChild === true
+			? [
+					"// A child that never exits; what the driver writes to its stdin is kept in `written`.",
+					"export const written = [];",
+					"export const ptree = { spawn() { return {",
+					"  pid: 4242, stdin: { write(data) { written.push(String(data)); } },",
+					"  stdout: new ReadableStream({ start() {} }), peekStderr: () => '', kill() {}, exited: new Promise(() => {}),",
+					"}; } };",
+					"",
+				].join("\n")
+			: "export const ptree = { spawn() { throw new Error('ptree.spawn is not expected in unit tests'); } };\n",
 	);
-	return { ompExecutable, clientModule };
+	return { ompExecutable, clientModule, utilsModule };
 }
 
 test("RpcOmpDriver buffers a final that arrives before prompt() resolves, then delivers it on admission", async () => {
@@ -561,6 +673,30 @@ test("RpcOmpDriver session event: forwards retry/fallback session events once an
 	} finally {
 		await driver.stop();
 	}
+});
+
+test("RpcOmpDriver opts in to the ask dialog only when an answerer is injected", async () => {
+	const optIns: unknown[] = [];
+	for (const answerDialog of [undefined, async () => ({ value: "x" })] as const) {
+		const dir = tempDir("ompbot-fakeomp-");
+		const tree = fakeOmpPackage(dir, { spawnChild: true });
+		const driver = new RpcOmpDriver({
+			ompExecutable: tree.ompExecutable,
+			cwd: dir,
+			sessionDir: join(dir, "s"),
+			bunExecutable: process.execPath,
+			...(answerDialog === undefined ? {} : { answerDialog }),
+		});
+		await driver.start();
+		try {
+			const utils = (await import(tree.utilsModule)) as { written: string[] };
+			const frames = utils.written.map((line) => JSON.parse(line) as { type?: string; enabled?: unknown });
+			optIns.push(...frames.filter((frame) => frame.type === "set_ask_dialog").map((frame) => frame.enabled));
+		} finally {
+			await driver.stop();
+		}
+	}
+	expect(optIns).toEqual([false, true]);
 });
 
 test("missingRpcMethods names onSessionEvent when the RpcClient class lacks it", () => {

@@ -51,7 +51,7 @@ export interface OriginRouterDeps {
 	monitorStallAbortMs?: MailboxDeps["monitorStallAbortMs"];
 	/** Owner escalation of a stalled turn (DM once per turn); see `MailboxDeps`. */
 	onStallEscalate?: MailboxDeps["onStallEscalate"];
-	onActivity?: MailboxDeps["onActivity"];
+	onProgress?: MailboxDeps["onProgress"];
 	/** Owner escalation for a run of failed turns (the bot's own "나 망가짐" report); see `MailboxDeps`. */
 	onEscalate?: MailboxDeps["onEscalate"];
 	/** Owner notice for a provider usage limit seen in a turn's omp retry events; see `MailboxDeps`. */
@@ -59,6 +59,8 @@ export interface OriginRouterDeps {
 	onSessionMismatch?: MailboxDeps["onSessionMismatch"];
 	/** Thread notice for a turn aborted on a tool repeat loop; see `MailboxDeps`. */
 	onStuckLoop?: MailboxDeps["onStuckLoop"];
+	/** Owner dialogs a plain message may answer; see `MailboxDeps.dialogs`. */
+	dialogs?: MailboxDeps["dialogs"];
 }
 
 /** Owns one `OriginMailbox` per origin key. */

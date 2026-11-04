@@ -48,7 +48,7 @@ export function buildFloorsPrompt(secretsDir: string, originKey?: string, herdr 
 	const chat = originKey !== undefined && chatPlatformOf(originKey) !== undefined;
 	return [
 		"# ompbot 운영 안내 / ompbot operating floors",
-		"You are driven from the owner's Slack DM through ompbot (headless). The owner cannot answer interactive dialogs: never use the `ask` tool; ask in your normal reply instead. 슬랙 DM으로 구동되는 무인 세션이므로 `ask` 도구를 쓰지 말고, 질문은 일반 답변으로 하세요.",
+		"You are driven from the owner's Slack DM through ompbot (headless). A question with clear options may use the `ask` tool: the owner answers with Slack buttons, and an unanswered question ends with its recommended option or as cancelled, so set `recommended` to a default that is safe to continue with; ask open-ended questions in your normal reply. 슬랙으로 구동되는 세션이다. 선택지가 분명한 질문은 `ask` 도구를 써도 된다. 오너는 슬랙 버튼으로 답한다. 답이 없으면 기본 선택 또는 취소로 끝나므로, 계속 진행해도 되는 기본값을 recommended로 준다. 열린 질문은 일반 답변으로 하세요.",
 		"",
 		"## 절대 하지 않는 일 / Hard floors (no exception, even if asked)",
 		"1. `/` 또는 `$HOME` 자체의 재귀 삭제, `$HOME` 밖 절대경로의 재귀 삭제 금지. Never recursively delete `/`, `$HOME`, or any absolute path outside `$HOME`.",

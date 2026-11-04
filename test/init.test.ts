@@ -115,6 +115,16 @@ describe("ompbot init", () => {
 		});
 	}
 
+	test("a non-executable --omp exits 2 and creates nothing", () => {
+		const home = freshHome();
+		const omp = join(tempDir("ompbot-init-omp-"), "omp");
+		writeFileSync(omp, "#!/bin/sh\n", { mode: 0o644 });
+		const run = init(["--owner", OWNER, "--omp", omp], home);
+		expect(run.code).toBe(2);
+		expect(run.err).toContain("is not executable");
+		expect(existsSync(home)).toBe(false);
+	});
+
 	test("no omp on PATH and no --omp exits 2 and creates nothing", () => {
 		const home = freshHome();
 		const run = init(["--owner", OWNER], home, tempDir("ompbot-init-empty-path-"));

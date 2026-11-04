@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import type { TurnProgress } from "../core/mailbox";
 import {
 	isOwner,
 	normalizeInbound,
@@ -33,7 +34,7 @@ import {
 } from "./transport";
 
 export const STATUS_MIN_INTERVAL_MS = 15_000;
-/** Longest activity text shown in a running status line (`⏳ 작업 중 · mm:ss · <activity>`). */
+/** Longest text of one progress line (a tool call, the current todo item) in the running status message. */
 const ACTIVITY_MAX = 60;
 export const DENIED_TEXT = "권한 없음: 이 봇은 오너만 사용할 수 있습니다.";
 /** Inbound attachment budget (hermes-agent parity: images get more room than documents). */
@@ -221,8 +222,8 @@ interface StatusEntry {
 	final: FinalOutcome | undefined;
 	/** The turn has emitted no omp event for the stall window; the status shows `STALL_STATUS_TEXT`. */
 	stalled: boolean;
-	/** Latest `tool_execution_start` of the turn, shown after the elapsed time (`⏳ 작업 중 · mm:ss · <activity>`). */
-	latestActivity: string | undefined;
+	/** The turn's progress summary (`setProgress`), shown under the first status line. */
+	progress: TurnProgress | undefined;
 	statusDone: boolean;
 	reactionsDone: boolean;
 }
@@ -249,6 +250,37 @@ function oneLine(text: string, max: number): string {
 		.replace(/[\p{Cc}\u2028\u2029]+/gu, " ")
 		.trim()
 		.slice(0, max);
+}
+
+/** One progress line: a single line of at most `ACTIVITY_MAX`, never ending in a lone high surrogate. */
+function progressLine(text: string): string {
+	const cut = oneLine(text, ACTIVITY_MAX);
+	return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
+/**
+ * The running status message: `⏳ 작업 중 · mm:ss · 도구 N회` (or the stalled text and the elapsed time), then the
+ * todo, steer, retry and recent-tool lines; a line whose value is 0 or unknown is left out.
+ */
+function runningStatusText(stalled: boolean, elapsedMs: number, progress: TurnProgress | undefined): string {
+	const tools = progress?.tools ?? 0;
+	const head = stalled
+		? `${STALL_STATUS_TEXT} · ${formatElapsed(elapsedMs)}`
+		: `⏳ 작업 중 · ${formatElapsed(elapsedMs)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
+	if (progress === undefined) return head;
+	const lines = [head];
+	const { todo } = progress;
+	if (todo !== undefined && todo.total > 0) {
+		const current = todo.current === undefined ? "" : progressLine(todo.current);
+		lines.push(`📋 ${todo.done}/${todo.total}${current === "" ? "" : ` · ${current}`}`);
+	}
+	if (progress.steers > 0) lines.push(`📨 추가 메시지 ${progress.steers}건 반영`);
+	if (progress.retries > 0) lines.push(`🔁 모델 재시도 ${progress.retries}회`);
+	for (const tool of progress.recentTools) {
+		const line = progressLine(tool);
+		if (line !== "") lines.push(`· ${line}`);
+	}
+	return lines.join("\n");
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -746,7 +778,7 @@ export class SlackAdapter {
 			showStatus,
 			final: undefined,
 			stalled: false,
-			latestActivity: undefined,
+			progress: undefined,
 			statusDone: false,
 			reactionsDone: false,
 		};
@@ -794,16 +826,14 @@ export class SlackAdapter {
 	}
 
 	/**
-	 * The daemon reports the turn's latest `tool_execution_start`. The text is stored at once (the next 15s
+	 * The daemon reports the turn's progress (tool calls, todo, steers, retries). It is stored at once (the next 15s
 	 * update shows it); an extra update is coaxed out only when the cadence already allows one, so a turn with
 	 * many tool calls still updates the status at most once per interval.
 	 */
-	async setActivity(threadRef: string, activity: string): Promise<void> {
+	async setProgress(threadRef: string, progress: TurnProgress): Promise<void> {
 		const entry = this.statuses.get(threadRef);
 		if (!entry || entry.final !== undefined) return;
-		// never a lone high surrogate at the cut
-		const cut = oneLine(activity, ACTIVITY_MAX);
-		entry.latestActivity = /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+		entry.progress = progress;
 		await entry.setup;
 		if (
 			entry.statusTs !== undefined &&
@@ -815,9 +845,7 @@ export class SlackAdapter {
 	}
 
 	private async updateRunning(threadRef: string, entry: StatusEntry, statusTs: string): Promise<void> {
-		const label = entry.stalled ? STALL_STATUS_TEXT : "⏳ 작업 중";
-		const activity = entry.stalled || !entry.latestActivity ? "" : ` · ${entry.latestActivity}`;
-		const text = `${label} · ${formatElapsed(this.clock.now() - entry.startedAt)}${activity}`;
+		const text = runningStatusText(entry.stalled, this.clock.now() - entry.startedAt, entry.progress);
 		try {
 			await this.call("chat.update", () =>
 				this.transport.updateMessage({ channel: entry.channel, ts: statusTs, text }),
@@ -848,7 +876,7 @@ export class SlackAdapter {
 				showStatus: false,
 				final: undefined,
 				stalled: false,
-				latestActivity: undefined,
+				progress: undefined,
 				statusDone: false,
 				reactionsDone: false,
 			};

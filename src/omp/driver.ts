@@ -78,6 +78,41 @@ export interface OmpEvent {
 	[key: string]: unknown;
 }
 
+/** One question of an omp `ask` dialog (`RpcAskDialogQuestion`, omp 18.16 rpc-types.ts). */
+export interface OmpAskQuestion {
+	id: string;
+	question: string;
+	header?: string;
+	options: Array<{ label: string; description?: string }>;
+	multi?: boolean;
+	/** Index of the option omp answers with when the dialog times out. */
+	recommended?: number;
+}
+
+/** A dialog omp asks the host to answer (`extension_ui_request` with an owner-answerable method). */
+export type OmpDialogRequest =
+	| { method: "select"; id: string; title: string; options: string[]; timeout?: number }
+	| { method: "confirm"; id: string; title: string; message: string; timeout?: number }
+	| { method: "input"; id: string; title: string; placeholder?: string; timeout?: number; secret?: boolean }
+	| { method: "editor"; id: string; title: string; prefill?: string }
+	| { method: "ask"; id: string; questions: OmpAskQuestion[]; timeout?: number };
+
+/** The body of the `extension_ui_response` frame that answers an `OmpDialogRequest`. */
+export type OmpDialogResponse =
+	| { value: string }
+	| { confirmed: boolean }
+	| { cancelled: true; timedOut?: boolean }
+	| { answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }> };
+
+/**
+ * Answers one omp dialog for the owner. `signal` aborts when omp withdraws the dialog (its own timeout or an aborted
+ * turn); the answer is then dropped. `undefined` or a throw is answered `cancelled` (fail-closed).
+ */
+export type OmpDialogAnswerer = (
+	request: OmpDialogRequest,
+	signal: AbortSignal,
+) => Promise<OmpDialogResponse | undefined>;
+
 export interface OmpFinal {
 	/** Id returned by the `prompt` call that started the turn. */
 	opRef: string;

@@ -9,6 +9,7 @@ import {
 	parseSpec,
 	stripAcPrefix,
 } from "./docs";
+import { checkSignalsOf } from "./signals";
 
 export const COMMIT_HASH = /^[0-9a-f]{7,40}$/;
 const TEST_EVIDENCE = /\S.*(?:→|->)\s*\S/;
@@ -22,6 +23,38 @@ export interface CheckInput {
 	outcome: string | undefined;
 	/** Whether a commit is the task's own: on its branch after the docs commit (injected: `commitOnTaskBranch`). */
 	commitCheck(hash: string): Promise<CommitCheck>;
+	/**
+	 * Runs the `[check: …]` signals of the snapshot in the task worktree (injected by the sweep only). Called once all
+	 * other conditions are met; absent → checks are not run and the judgement stands on the documents alone.
+	 */
+	runChecks?(checks: readonly TaskCheckRequest[]): Promise<TaskChecksRun>;
+}
+
+/** One signal of one criterion's `[check: …]`, as registered. */
+export interface TaskCheckRequest {
+	id: string;
+	signal: string;
+}
+
+export interface TaskCheck extends TaskCheckRequest {
+	ok: boolean;
+	detail: string;
+}
+
+/** `deferred`: the checks were not run (e.g. uncommitted changes) and this is why; otherwise every result at `head`. */
+export type TaskChecksRun = { deferred: string } | { head: string; results: TaskCheck[] };
+
+const CHECK_DETAIL_MAX = 120;
+
+/** Every check signal of the registered criteria; a malformed block becomes one signal that fails when run. */
+export function taskChecksOf(snapshot: readonly AcceptanceItem[]): TaskCheckRequest[] {
+	return snapshot.flatMap((item) => {
+		try {
+			return checkSignalsOf(item.text).map((signal) => ({ id: item.id, signal }));
+		} catch {
+			return [{ id: item.id, signal: item.text.slice(item.text.lastIndexOf("[check:")) }];
+		}
+	});
 }
 
 /**
@@ -54,6 +87,8 @@ export interface TaskJudgement {
 	evidence: Record<string, string[]>;
 	/** outcome.md `## 요약` lines as parsed (`[]` without the file); shown on the card, never part of the judgement. */
 	summary: string[];
+	/** `[check: …]` results the sweep ran for this judgement; `[]` when the task has none or they were not run. */
+	checks: TaskCheck[];
 	/** Fingerprint of everything the judgement stands on — the dedup key of the "reached" notice. */
 	reachKey: string;
 	/** The registered acceptance items with their spec.md checkbox, for display (not part of the judgement). */
@@ -147,6 +182,19 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 	if (blocked)
 		problems.push(`PROGRESS.md status가 blocked입니다${progress?.blockedReason ? `: ${progress.blockedReason}` : ""}`);
 
+	// The checks run last and only on an otherwise complete task: a run is a real process in the worktree.
+	const requests = taskChecksOf(input.snapshot);
+	let checkRun: { head: string; results: TaskCheck[] } | undefined;
+	if (requests.length > 0 && problems.length === 0 && input.runChecks !== undefined) {
+		const run = await input.runChecks(requests);
+		if ("deferred" in run) problems.push(run.deferred);
+		else {
+			checkRun = run;
+			for (const check of run.results.filter((result) => !result.ok))
+				problems.push(`check ${check.id} 실패: ${check.detail.slice(0, CHECK_DETAIL_MAX)}`);
+		}
+	}
+
 	const steps: ProgressStep[] = progress?.steps ?? [];
 	const updatedAt = progress?.updated ?? "";
 	const reached = problems.length === 0;
@@ -171,7 +219,15 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		current: progress?.current ?? "",
 		evidence,
 		summary: outcome?.summary ?? [],
-		reachKey: digest({ spec: specDoc?.acceptance, evidence, updatedAt }),
+		checks: checkRun?.results ?? [],
+		// `head`/`checks` are absent (dropped by JSON) without a check run, so such a task keeps its former key.
+		reachKey: digest({
+			spec: specDoc?.acceptance,
+			evidence,
+			updatedAt,
+			head: checkRun?.head,
+			checks: checkRun?.results,
+		}),
 		acceptance: input.snapshot.map((item) => ({
 			id: item.id,
 			text: stripAcPrefix(item.text),

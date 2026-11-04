@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	utimesSync,
@@ -15,7 +16,13 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { doctorCommand } from "../src/cli/index";
-import { isProviderLimit, type ProviderLimitInfo, type StallEscalation, toolActivityText } from "../src/core/mailbox";
+import {
+	isProviderLimit,
+	type ProviderLimitInfo,
+	type StallEscalation,
+	type TurnProgress,
+	toolActivityText,
+} from "../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
 import {
@@ -120,7 +127,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 	let stalls: Array<{ originKey: string; threadRef: string; stalled: boolean; silentMs: number }>;
 	let escalations: StallEscalation[];
 	let providerLimits: ProviderLimitInfo[];
-	let activities: Array<{ originKey: string; threadRef: string; activity: string }>;
+	let activities: Array<{ originKey: string; threadRef: string; progress: TurnProgress }>;
 	let driverOptions: FakeOmpDriverOptions;
 
 	beforeEach(() => {
@@ -144,7 +151,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			onStall: (info) => stalls.push(info),
 			onStallEscalate: (info) => escalations.push(info),
 			onProviderLimit: (info) => providerLimits.push(info),
-			onActivity: (info) => activities.push(info),
+			onProgress: (info) => activities.push(info),
 			driverFactory: (_origin, sessionDir) => {
 				const driver = new OpsDriver({ ...driverOptions, sessionDir, store: sessions });
 				drivers.push(driver);
@@ -481,7 +488,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		expect(starved()?.state).toBe("open");
 	});
 
-	test("tool_execution_start reaches onActivity as one line: tool name plus short args of the running turn", async () => {
+	test("tool_execution_start reaches onProgress: the tool count and one line per call (tool name plus short args)", async () => {
 		driverOptions.toolCalls = [
 			{ name: "bash", args: { command: "git status", cwd: "/tmp" } },
 			{ name: "read", args: { file_path: "a.ts" } },
@@ -490,12 +497,58 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		await router.route(record);
 		// The fake driver reports tool calls from a macrotask (socket delivery), after the turn is recorded.
 		await untilLine(() => activities.length >= 2);
+		const base = { steers: 0, retries: 0 };
 		expect(activities).toEqual([
-			{ originKey: ORIGIN, threadRef: record.threadRef, activity: "bash command=git status" },
-			{ originKey: ORIGIN, threadRef: record.threadRef, activity: "read file_path=a.ts" },
+			{
+				originKey: ORIGIN,
+				threadRef: record.threadRef,
+				progress: { ...base, tools: 1, recentTools: ["bash command=git status"] },
+			},
+			{
+				originKey: ORIGIN,
+				threadRef: record.threadRef,
+				progress: { ...base, tools: 2, recentTools: ["bash command=git status", "read file_path=a.ts"] },
+			},
 		]);
 		// The events still count as turn events: no stall is raised while tools keep starting.
 		expect(lines.some((l) => l.includes("event=stall_alert"))).toBe(false);
+	});
+
+	test("progress: todo results, steered messages and model retries reach onProgress; view reads and errors do not", async () => {
+		const record = msg("job");
+		await router.route(record);
+		const driver = drivers[0];
+		if (!driver) throw new Error("no driver was started");
+		const phases = [
+			{
+				name: "구현",
+				tasks: [
+					{ content: "드라이버", status: "completed" },
+					{ content: "카드", status: "in_progress" },
+					{ content: "버린 일", status: "abandoned" },
+					{ content: "문서", status: "pending" },
+				],
+			},
+		];
+		const todoEnd = (op: string, isError = false): OmpEvent => ({
+			type: "tool_execution_end",
+			toolName: "todo",
+			isError,
+			result: { content: [], details: { op, phases } },
+		});
+		driver.fire(todoEnd("view"));
+		driver.fire(todoEnd("done", true));
+		expect(activities).toEqual([]);
+		driver.fire(todoEnd("start"));
+		driver.fire({ type: "auto_retry_start", attempt: 2, maxAttempts: 5, delayMs: 1, errorMessage: "timeout" });
+		await router.route(msg("추가 지시"));
+		const todo = { done: 1, total: 3, current: "카드" };
+		expect(activities.map((a) => a.progress)).toEqual([
+			{ tools: 0, recentTools: [], steers: 0, retries: 0, todo },
+			{ tools: 0, recentTools: [], steers: 0, retries: 2, todo },
+			{ tools: 0, recentTools: [], steers: 1, retries: 2, todo },
+		]);
+		expect(activities.every((a) => a.threadRef === record.threadRef)).toBe(true);
 	});
 
 	const ZAI_LIMIT_ERROR =
@@ -708,7 +761,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		await transport.waitForPosts((text) => text.includes("ECHO long task"));
 	});
 
-	test("the running status shows '⏳ 작업 중 · mm:ss · <활동>' and the stall text still wins over it", async () => {
+	test("the running status shows '⏳ 작업 중 · mm:ss · 도구 N회' plus the tool lines, and the stall text takes the first line", async () => {
 		await startDaemon(true, [{ name: "bash", args: { command: "git status" } }]);
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "long task" });
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
@@ -720,13 +773,14 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const withActivity = transport.waitForUpdate((text) => text.includes("bash command=git status"));
 		await daemon.sweep();
 		await withActivity;
-		expect(transport.updates.at(-1)).toMatch(/^⏳ 작업 중 · \d{2}:\d{2} · bash command=git status$/);
+		expect(transport.updates.at(-1)).toMatch(/^⏳ 작업 중 · \d{2}:\d{2} · 도구 1회\n· bash command=git status$/);
 
-		// Silence replaces the activity line with the stall text, not the other way round.
+		// Silence puts the stall text on the first line; the progress lines stay under it.
 		clock.advance(STALL_MS);
 		await daemon.sweep();
-		expect(transport.updates.at(-1)?.startsWith(STALL_STATUS_TEXT)).toBe(true);
-		expect(transport.updates.at(-1)?.includes("bash")).toBe(false);
+		const stalled = transport.updates.at(-1)?.split("\n") ?? [];
+		expect(stalled[0]?.startsWith(`${STALL_STATUS_TEXT} · `)).toBe(true);
+		expect(stalled.slice(1)).toEqual(["· bash command=git status"]);
 
 		// Events resume: back to ⏳ with the last known activity.
 		driver.fire({ type: "message_update" });
@@ -1165,6 +1219,50 @@ describe("ompbot doctor claude agent checks", () => {
 		expect(lines[0]).toContain("ok claude: ");
 		expect(lines[1]).toContain("fail claude auth:");
 		expect(lines[1]).toContain(join(dir, ".claude", ".credentials.json"));
+	});
+});
+
+describe("ompbot doctor omp runtime check", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ompbot-doctor-runtime-"));
+		mkdirSync(join(dir, "secrets"));
+		writeFileSync(join(dir, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(dir, "secrets", "slack-app-token"), "xapp-TEST-0\n", { mode: 0o600 });
+	});
+	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+	async function runtimeLine(ompExecutable: string): Promise<string | undefined> {
+		writeFileSync(
+			join(dir, "config.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				ownerSlackUserId: "UOWNER0",
+				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				ompExecutable,
+				workspaceDir: "workspace",
+			}),
+			{ mode: 0o600 },
+		);
+		const lines: string[] = [];
+		await runDoctor(dir, (line) => lines.push(line));
+		return lines.find((line) => line.includes("omp runtime"));
+	}
+
+	function launcher(bunRange: string): string {
+		const root = mkdtempSync(join(dir, "pkg-"));
+		mkdirSync(join(root, "dist"));
+		writeFileSync(join(root, "package.json"), JSON.stringify({ engines: { bun: bunRange } }));
+		writeFileSync(join(root, "dist", "cli.js"), "#!/usr/bin/env bun\n", { mode: 0o755 });
+		return join(root, "dist", "cli.js");
+	}
+
+	test("a standalone binary or a too-old bun fails; the package launcher with a satisfied bun passes", async () => {
+		expect(await runtimeLine(process.execPath)).toStartWith("fail omp runtime: omp_launcher_standalone ");
+		expect(await runtimeLine(launcher(">=999.0.0"))).toStartWith("fail omp runtime: bun_too_old ");
+		const ok = launcher(`>=${Bun.version}`);
+		expect(await runtimeLine(ok)).toBe(`ok omp runtime: launcher=${realpathSync(ok)}`);
 	});
 });
 

@@ -38,10 +38,28 @@ export const RESTART_FIELDS = [
 	"herdr",
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
-/** Never read by the daemon: `ompbot gc` / `ompbot backup` load config.json themselves on every run. */
-export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes"] as const satisfies ReadonlyArray<
+/**
+ * Never read by the daemon: `ompbot gc` / `ompbot backup` load config.json themselves on every run, and the
+ * `ompbot dashboard` service reads `dashboard` when it starts (`systemctl --user restart ompbot-dashboard`).
+ */
+export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "dashboard"] as const satisfies ReadonlyArray<
 	keyof OmpbotConfig
 >;
+
+/**
+ * Compile-time guard: a new config field must land in one of the three lists, or `reload` never reports it.
+ * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, not from a setting in it.
+ */
+type UnclassifiedField = Exclude<
+	keyof OmpbotConfig,
+	| (typeof LIVE_FIELDS)[number]
+	| (typeof RESTART_FIELDS)[number]
+	| (typeof CLI_FIELDS)[number]
+	| "schemaVersion"
+	| "homeDir"
+	| "configPath"
+>;
+const _everyFieldClassified: [UnclassifiedField] extends [never] ? true : never = true;
 
 export interface ReloadPlan {
 	/** The config the daemon runs with after the reload: live fields from the new file, everything else unchanged. */

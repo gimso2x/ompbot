@@ -70,6 +70,12 @@ function fakeHost(): FakeHost {
 			if (host.failCommit !== undefined) return { ok: false, error: host.failCommit };
 			return { ok: true, value: "abc1234" };
 		},
+		async runCheck() {
+			throw new Error("dispatch never runs checks");
+		},
+		async headOf() {
+			throw new Error("dispatch never runs checks");
+		},
 	};
 	return host;
 }

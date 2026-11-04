@@ -1,6 +1,6 @@
 # 주간 개선 회의 회의록 형식
 
-`meeting.py`가 검사·기록하는 회의록 형식이다. 설치 방법은 저장소 README의 모니터 절을 본다.
+`meeting.py`가 검사·기록하는 회의록 형식이다. 설치 방법은 [docs/guide.md의 모니터 절](../../../docs/guide.md#모니터)을 본다.
 
 회의록 경로: `~/.ompbot/workspace/meetings/<YYYY>-W<ww>.md`(ISO 주차, KST). 형식:
 

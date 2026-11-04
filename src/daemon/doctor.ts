@@ -1,9 +1,10 @@
-import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { WebClient } from "@slack/web-api";
 import { ConfigError, HOME_MODE, loadConfig, type OmpbotConfig, readSlackTokens, SECRET_MODE } from "../config";
+import { checkOmpRuntime } from "../omp/runtime-check";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
 import { readVersion } from "./tools";
@@ -74,6 +75,19 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 			report(version !== "unknown", "omp", `${config.ompExecutable} ${version}`);
 		} catch {
 			report(false, "omp", `${config.ompExecutable} not executable`);
+		}
+
+		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
+		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere).
+		const runtimeBun = Bun.which("bun");
+		if (runtimeBun !== null && existsSync(config.ompExecutable)) {
+			const cliPath = realpathSync(config.ompExecutable);
+			const problem = checkOmpRuntime(cliPath, runtimeBun);
+			report(
+				problem === undefined,
+				"omp runtime",
+				problem === undefined ? `launcher=${cliPath}` : `${problem.code} ${problem.message}`,
+			);
 		}
 
 		if (config.webhook !== undefined) {

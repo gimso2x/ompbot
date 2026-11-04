@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultHomeDir, HOME_MODE, SECRET_MODE } from "../config";
@@ -33,6 +33,11 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 	const omp = values.omp === undefined ? Bun.which("omp", { PATH: env.PATH ?? "" }) : resolve(values.omp);
 	if (omp === null) return fail("omp not found on PATH; pass --omp <absolute path to omp>");
 	if (!existsSync(omp)) return fail(`--omp ${omp} does not exist`);
+	try {
+		accessSync(omp, constants.X_OK);
+	} catch {
+		return fail(`--omp ${omp} is not executable`);
+	}
 
 	const homeDir = resolve(defaultHomeDir(env));
 	const configPath = join(homeDir, "config.json");

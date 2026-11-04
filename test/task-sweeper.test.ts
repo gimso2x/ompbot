@@ -54,6 +54,7 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		current: "S1",
 		evidence: {},
 		summary: [],
+		checks: [],
 		reachKey: "k1",
 		acceptance: [],
 		steps: [],

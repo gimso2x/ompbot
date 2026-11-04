@@ -4,7 +4,7 @@
 
 설치부터 운영까지 ompbot의 모든 동작을 정리한 레퍼런스입니다.
 
-- **시작하기:** [요구 사항](#요구-사항) · [코어와 설치본](#코어와-설치본) · [설치](#설치) · [설정 파일](#5-설정-파일-ompbotconfigjson) · [서비스 등록](#7-서비스-등록)
+- **시작하기:** [요구 사항](#요구-사항) · [코어와 설치본](#코어와-설치본) · [설치](#설치) · [설정 파일](#5-설정-파일-ompbotconfigjson) · [서비스 등록](#7-서비스-등록) · [AI 에이전트에게 설치 맡기기](#ai-에이전트에게-설치-맡기기)
 - **쓰기:** [대화](#대화) · [명령](#명령) · [승인](#승인) · [페르소나와 답변 형식](#페르소나와-답변-형식) · [claude 에이전트](#claude-에이전트)
 - **맡기기:** [작업 위임](#작업-위임) · [`[TASK]` 상태 문서](#task-상태-문서) · [작업 레인](#작업-레인) · [모니터](#모니터)
 - **운영:** [CLI](#운영) · [동결(킬스위치)](#동결킬스위치) · [재시작과 drain](#재시작과-drain) · [설정 반영](#재시작-없이-설정-반영) · [놓친 메시지 백필](#놓친-메시지-백필) · [건강 게이트](#건강-게이트와-자가-보고) · [백업](#백업) · [스킬 리뷰](#스킬-리뷰)
@@ -29,9 +29,18 @@
 
 ## 요구 사항
 
-- Linux, systemd user 세션(재부팅 후 자동 시작을 원하면 `loginctl enable-linger $USER`)
-- [Bun](https://bun.sh) 1.4 이상
-- omp가 설치돼 있고 로그인돼 있어야 합니다(`omp --version`, 모델 하나 이상 사용 가능). ompbot은 omp의 기존 `~/.omp/agent` 설정을 그대로 씁니다.
+- Linux, systemd user 세션(재부팅 후 자동 시작을 원하면 `loginctl enable-linger $USER`). WSL2에서도 됩니다. `/etc/wsl.conf`의 `[boot]`에 `systemd=true`를 넣고 Windows에서 `wsl --shutdown`으로 다시 시작한 뒤 `systemctl --user status`가 응답하는지 확인하세요. WSL은 마지막 창을 닫으면 멈출 수 있으니 상시 운영은 Linux 서버가 낫습니다.
+- [Bun](https://bun.sh): 설치한 omp의 `engines.bun` 이상(omp 18.16 기준 1.4.4). 낮으면 `bun upgrade`. `doctor`의 `omp runtime` 줄이 이 조건을 확인합니다.
+- omp(oh-my-pi)를 **bun 패키지로** 설치하고 로그인해 둡니다. ompbot은 omp의 기존 `~/.omp/agent` 설정을 그대로 씁니다.
+
+  ```sh
+  bun install -g @oh-my-pi/pi-coding-agent
+  readlink -f "$(command -v omp)"   # …/@oh-my-pi/pi-coding-agent/dist/cli.js 여야 합니다
+  omp login                         # 모델 공급자 하나 이상 로그인(브라우저 OAuth 또는 API 키)
+  omp --version
+  ```
+
+  단독 실행 파일(컴파일된 바이너리) 형태의 omp는 ompbot이 RPC 자식으로 쓸 수 없어 `omp_launcher_standalone`으로 거부합니다. `readlink` 결과가 `dist/cli.js`가 아니면 위 명령으로 다시 설치하세요.
 - (선택) 대화 에이전트를 Claude Code CLI로 쓰려면(`"agent": "claude"`) [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)가 설치돼 있고 로그인돼 있어야 합니다(`claude --version`, `claude` 한 번 실행해 `/login` 완료 — 자격은 `~/.claude/` 아래에만 둡니다). omp는 여전히 설치돼 있어야 합니다(dispatch 등 일부 도구가 씁니다). 자세한 차이는 [claude 에이전트](#claude-에이전트) 참고
 - Slack 워크스페이스 관리자 권한(앱 생성용)
 - (선택) 장기 위임에는 herdr와 config `"herdr": {}`가, 원격 위임에는 대상 호스트로의 ssh(`BatchMode`)가 필요합니다. [herdr(선택)](#herdr선택) 참고.
@@ -45,7 +54,7 @@
 ### 1. 소스 받기
 
 ```sh
-git clone <저장소 URL> ~/work/ompbot
+git clone <이 저장소의 clone URL> ~/work/ompbot
 cd ~/work/ompbot
 bun install
 bun test          # 전부 통과해야 합니다(실제 omp E2E는 기본으로 건너뜀)
@@ -136,7 +145,7 @@ chmod 600 ~/.ompbot/secrets/*
 bun src/main.ts doctor
 ```
 
-홈 권한 0700, 토큰 파일 0600과 접두사, omp·bun 경로와 버전, Slack `auth.test`, 백업 번들 존재·나이(36시간)를 확인하며, 토큰 값은 출력하지 않습니다. config에 `herdr`가 있으면 로컬 `<herdr.bin 또는 herdr> --version`을 돌려 `ok herdr: <경로> <버전>` 또는 `fail herdr: <경로> <사유>`를 내고, 실패면 종료 코드가 1이 됩니다. config에 `dispatchHosts`가 있으면 이어서 호스트마다 `ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh> true`를 돌려 `ok dispatch host <이름>: ssh <별칭>` 또는 `fail dispatch host <이름>: <ssh stderr 첫 줄> (warning only)`를 한 줄씩 냅니다. 꺼 둔 호스트일 수 있어 이 줄은 경고일 뿐 종료 코드를 바꾸지 않습니다. 처음 설치할 때는 백업이 아직 없어 `backup bundle` 줄만 `stamp=missing`으로 실패합니다. 나머지 줄이 모두 `ok`면 다음 단계로 가고, [백업](#백업)을 등록하거나 `bun src/main.ts backup`을 한 번 돌리면 이 줄도 `ok`가 됩니다.
+홈 권한 0700, 토큰 파일 0600과 접두사, omp·bun 경로와 버전, omp 런타임(`omp runtime`: 패키지 launcher인지, bun이 omp의 `engines.bun`을 만족하는지 — 데몬이 omp를 띄우기 전마다 하는 검사와 같습니다), Slack `auth.test`, 백업 번들 존재·나이(36시간)를 확인하며, 토큰 값은 출력하지 않습니다. config에 `herdr`가 있으면 로컬 `<herdr.bin 또는 herdr> --version`을 돌려 `ok herdr: <경로> <버전>` 또는 `fail herdr: <경로> <사유>`를 내고, 실패면 종료 코드가 1이 됩니다. config에 `dispatchHosts`가 있으면 이어서 호스트마다 `ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh> true`를 돌려 `ok dispatch host <이름>: ssh <별칭>` 또는 `fail dispatch host <이름>: <ssh stderr 첫 줄> (warning only)`를 한 줄씩 냅니다. 꺼 둔 호스트일 수 있어 이 줄은 경고일 뿐 종료 코드를 바꾸지 않습니다. 처음 설치할 때는 백업이 아직 없어 `backup bundle` 줄만 `stamp=missing`으로 실패합니다. 나머지 줄이 모두 `ok`면 다음 단계로 갑니다. `ompbot.db`는 데몬이 처음 뜰 때 만들어지므로 그 전의 `backup`은 `db_missing`으로 실패합니다. 서비스를 띄운 뒤 `bun src/main.ts backup`을 한 번 돌리거나 [백업](#백업) 타이머가 돌면 이 줄도 `ok`가 됩니다.
 
 ### 7. 서비스 등록
 
@@ -155,6 +164,26 @@ systemctl --user status ompbot
 유닛은 `KillMode=mixed`로 정지 때 데몬 본체에만 SIGTERM을 보냅니다. 기본값이면 omp 자식이 cgroup SIGTERM을 먼저 받아 `omp_exit expected=false`가 찍히고 drain이 턴을 마무리할 시간도 없어지기 때문이며, 데몬이 끝나면 남은 프로세스는 바로, 데몬이 `TimeoutStopSec=90` 안에 끝나지 않으면 함께 SIGKILL됩니다. 이미 설치한 호스트는 설치된 `ompbot.service`를 `units render --dry-run` 출력과 맞추거나(옮겨 두고 `units render`로 다시 쓰기) 두 줄을 직접 고친 뒤 `systemctl --user daemon-reload` 하면 다음 재시작부터 적용됩니다.
 
 봇에게 DM을 보내 👀와 답이 오면 설치가 끝난 것입니다. 매일 백업 타이머는 [백업](#백업)에서 등록합니다.
+
+### AI 에이전트에게 설치 맡기기
+
+사람이 해야 하는 일은 Slack 앱 만들기, 토큰 붙여넣기, `omp login`의 브라우저 인증뿐입니다. 나머지는 저장소를 읽고 셸을 실행할 수 있는 코딩 에이전트(Claude Code, Codex, omp 등)에게 맡길 수 있습니다. `init`·`doctor`·`units render`·`gates`는 결과를 종료 코드로 알려 주므로 에이전트가 성공 여부를 스스로 확인할 수 있습니다. 아래를 그대로 붙여넣으세요.
+
+```text
+Install this repository (ompbot) into the systemd user session on this Linux machine. Follow the "요구 사항" (Requirements) and "설치" (Installation) sections of docs/guide.md.
+
+1. Check that `systemctl --user status` responds. If this is WSL2 and it does not, tell me how to add systemd=true under [boot] in /etc/wsl.conf, then stop.
+2. Check `bun --version`. If bun is missing, install it. If it is older than engines.bun in the package.json of the omp installed in step 3, run `bun upgrade`.
+3. If omp is missing, install it with `bun install -g @oh-my-pi/pi-coding-agent`. Do not use the standalone executable (install script or binary release); ompbot rejects it as omp_launcher_standalone. Confirm that `readlink -f "$(command -v omp)"` resolves to .../@oh-my-pi/pi-coding-agent/dist/cli.js.
+4. `omp login` is interactive, so I will run it myself. Just tell me the command; when I say I am done, verify with `omp --version`.
+5. Run `bun install && bun test && bun run check` and confirm 0 failures.
+6. Ask me for my Slack member ID (starts with U), then run `bun src/main.ts init --owner <ID>`.
+7. I will create the Slack app myself. Walk me through docs/guide.md "2. Slack 앱 만들기" (Create the Slack app) step by step. Never take tokens over chat. I will write them myself in a terminal with `umask 077; cat > ~/.ompbot/secrets/slack-bot-token` (bot token) and `cat > ~/.ompbot/secrets/slack-app-token` (app token). Only check that both files are mode 0600; never read or print their contents.
+8. Run `bun src/main.ts doctor`. At this point exactly one line, `backup bundle: stamp=missing`, should fail (expected, because the DB does not exist yet). If any other line fails, report that line and its cause, then stop.
+9. Run `bun src/main.ts units render`, then `systemctl --user daemon-reload`, then `systemctl --user enable --now ompbot ompbot-backup.timer ompbot-gc.timer`. Confirm daemon_ready appears in `journalctl --user -u ompbot -n 50`.
+10. Run `bun src/main.ts backup` once, then run `bun src/main.ts doctor` again. This time every line must be ok.
+11. Finally, ask me to send the bot any DM. At every step, report the actual output and any failure verbatim; never claim a success you did not verify.
+```
 
 ## 사용법
 
@@ -193,7 +222,7 @@ systemctl --user status ompbot
 | `!resume <번호\|세션 ID 앞 4자 이상>` | 그 세션을 이어갑니다. 대기 중이던 메시지는 버려지고, 이후 대화는 그 세션에 쌓입니다 |
 | `/queue-ompbot` · `!queue` | 진행 중인 작업과 대기열(끼워넣기 대기, 다음 작업)을 번호와 함께 보여 줍니다. 채널에서는 친 대화방의 것만 보이므로, 루트 작업의 대기열은 그 루트 스레드에 답글로 칩니다 |
 | `!queue drop <번호>` | 대기열에서 그 번호의 항목 하나만 취소합니다. 그 스레드의 ⏳ 상태 메시지는 `🚫 취소됨`으로 마무리됩니다 |
-| `/usage-ompbot` · `!usage` | 턴을 쓰지 않고 이 대화와 전체(보관 중인 omp 세션 파일)의 모델 호출 수·입력·출력·캐시 읽기 비율·비용을 답합니다. gc로 지운 옛 세션은 빠지고, `agent: "claude"`면 집계하지 않습니다. 매니페스트에 `/usage-ompbot`을 추가하기 전에는 `!usage`로 칩니다 |
+| `/usage-ompbot` · `!usage` | 턴을 쓰지 않고 이 대화와 전체(보관 중인 omp 세션 파일)의 모델 호출 수·입력·출력·캐시 읽기 비율·비용을 답합니다. gc로 지운 옛 세션은 빠지고, `agent: "claude"`면 집계하지 않습니다 |
 | `/followup-ompbot` · `!followup <메시지>` | 같은 대화방의 진행 중인 작업에 끼워 넣지 않고, 끝난 뒤 별도 작업으로 보냅니다(답도 그 메시지 스레드에 옵니다). 채널 루트로 치면 채널 본문 대화방 작업 뒤에 줄을 서므로, 진행 중인 루트 작업 뒤에 이어 보내려면 그 루트 스레드에 답글로 칩니다 |
 | `!shutup` · `!unshutup` | 채널·채널 스레드 전용. `!shutup`을 보낸 스레드는 오너 메시지에도 반응하지 않고, `!unshutup`이나 봇 멘션으로 풀립니다. 최상위에서 보내면 그 메시지의 스레드가 뮤트됩니다. 뮤트는 재시작에도 유지되고 DM에서는 안내만 합니다 |
 | `작업: <제목> @<절대경로>` | 그 경로에서 작업 레인을 엽니다([작업 레인](#작업-레인)) |
@@ -490,7 +519,7 @@ systemd-run --user --on-active=90 --unit=ompbot-restart \
 
 - **바로 반영(`changed`)**: `mentionFreeChannels`, `logChannel`, `escalationChannel`, `skillReviewTurns`, `dispatchHosts`, `herdrBoard`, `restartNotice`, `recallEnabled`. 다음 메시지·승인 카드·답·스윕부터 새 값을 씁니다. `dispatchHosts`·`herdrBoard`는 이미 떠 있는 omp 자식의 도구에는 들어가지 않고 다음에 뜨는 자식부터 적용됩니다(스윕 알림의 보드 링크는 바로 반영).
 - **재시작 필요(`restart_required`)**: `ownerSlackUserId`, `slack`, `ompExecutable`, `workspaceDir`, `model`, `thinking`, `idleTimeoutMinutes`, `watcherRoots`, `webhook`, `agent`, `claudeExecutable`, `herdr`(도구 스키마와 `[TASK]` 스윕을 시작 때 정함), `offsite`(데몬은 `offsite_age` 게이트를 둘지 판단하는 데만 읽고, 복제는 CLI가 실행할 때마다 config를 다시 읽습니다). 바뀐 것을 알려 주기만 하고 적용하지 않습니다.
-- **CLI 전용(`cli`)**: `sessionRetentionDays`, `maxBundleBytes`는 `gc`·`backup`이 실행할 때마다 직접 읽으므로 데몬과 무관합니다.
+- **CLI 전용(`cli`)**: `sessionRetentionDays`, `maxBundleBytes`는 `gc`·`backup`이 실행할 때마다 직접 읽으므로 데몬과 무관합니다. `dashboard`는 현황판 서비스가 시작할 때 읽으므로 `systemctl --user restart ompbot-dashboard`로 반영합니다.
 - 파일이 없거나 JSON·검증 오류가 있으면 아무것도 바꾸지 않고 `config_reload_failed`를 남기며, `reload`는 1로 끝납니다.
 
 ### 놓친 메시지 백필

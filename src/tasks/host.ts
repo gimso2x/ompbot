@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { dispatchEnv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
+import { dispatchEnv, type ProcessRunner, realProcessRunner, remoteShellQuote } from "../dispatch/omp";
 import type { CommitCheck } from "./checker";
 import { TASK_PATH_PATTERN } from "./docs";
 
@@ -39,6 +39,19 @@ export interface TaskHostOps {
 	commitOnTaskBranch(input: { worktree: string; branch: string; taskId: string; hash: string }): Promise<CommitCheck>;
 	/** Commits `docs/tasks/<taskId>` on the worktree's branch as `docs(task): <taskId> 4문서`; the value is the hash. */
 	commitDocs(input: { worktree: string; taskId: string }): Promise<HostResult<string>>;
+	/**
+	 * A `[check: command …]`: `argv` without a shell, cwd `worktree` (ssh: `cd` then each argument single-quoted),
+	 * killed after `timeoutMs`. `output` is stdout then stderr. Throws when the host cannot be reached.
+	 */
+	runCheck(input: { worktree: string; argv: string[]; timeoutMs: number }): Promise<CheckRun>;
+	/** The worktree's HEAD commit and whether `git status --porcelain` is empty; throws when git cannot answer. */
+	headOf(worktree: string): Promise<{ sha: string; clean: boolean }>;
+}
+
+export interface CheckRun {
+	code: number | null;
+	output: string;
+	timedOut: boolean;
 }
 
 export interface TaskHostOptions {
@@ -209,6 +222,38 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 				return { ok: false, error: `git rev-parse failed: ${hash.slice(0, 200)}` };
 			}
 			return { ok: true, value: hash };
+		},
+
+		async runCheck({ worktree, argv, timeoutMs }) {
+			assertPath(worktree);
+			// Locally the argv is the process itself; ssh joins its arguments into one remote shell line, so every
+			// argument is single-quoted there and the shell only sees `cd <worktree> && <argv>`.
+			const result =
+				sshTarget === undefined
+					? await run(argv, { cwd: worktree, timeoutMs, env })
+					: await run(sshCommand(sshTarget, ["cd", remoteShellQuote(worktree), "&&", ...argv.map(remoteShellQuote)]), {
+							timeoutMs,
+						});
+			if (sshTarget !== undefined && !result.timedOut && (result.code === null || result.code === SSH_FAILURE))
+				throw new Error(`cannot run check: host unreachable: ${unreachableReason(result)}`);
+			const output = [result.stdout, result.stderr ?? ""].filter((part) => part.trim() !== "").join("\n");
+			return { code: result.code, output, timedOut: result.timedOut };
+		},
+
+		async headOf(worktree) {
+			assertPath(worktree);
+			const git = async (...args: string[]) => {
+				const result = await exec(["git", "-C", worktree, ...args], GIT_TIMEOUT_MS);
+				if (unreachable(result)) throw new Error(`cannot read HEAD of ${worktree}: host unreachable`);
+				if (result.code !== 0)
+					throw new Error(
+						`cannot read HEAD of ${worktree}: git ${args[0]} failed: ${result.stdout.trim().slice(0, 160)}`,
+					);
+				return result.stdout.trim();
+			};
+			const sha = await git("rev-parse", "HEAD");
+			if (!FULL_HASH.test(sha)) throw new Error(`cannot read HEAD of ${worktree}: ${sha.slice(0, 80)}`);
+			return { sha, clean: (await git("status", "--porcelain")) === "" };
 		},
 	};
 }

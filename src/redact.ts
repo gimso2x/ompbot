@@ -3,9 +3,14 @@
 
 export const REDACTED = "[REDACTED]";
 
-// xox[abposre]-, xapp-, sk-ant-, sk-, GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_). `sk-` needs a non-alphanumeric left edge so words like "task-1" or "risk-free" survive.
-const SECRET_PATTERN =
-	/xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9]{20,}/g;
+/**
+ * xox[abposre]-, xapp-, sk-ant-, sk-, GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_) as one regex source. `sk-` needs a
+ * non-alphanumeric left edge so words like "task-1" or "risk-free" survive; `skRun` is the quantifier of the key body
+ * after `sk-` / `sk-ant-`, the only part the upload check (`safety/host-tools.ts`) sets differently.
+ */
+export const secretShapes = (skRun: string): string =>
+	`xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}`;
+const SECRET_PATTERN = new RegExp(secretShapes("+"), "g");
 
 export type Redactor = (text: string) => string;
 

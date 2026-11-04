@@ -2,7 +2,11 @@ import { accessSync, constants, existsSync, mkdirSync, realpathSync } from "node
 import { dirname, join, resolve } from "node:path";
 import type { HostToolDef } from "../safety/host-tools";
 import {
+	type OmpAskQuestion,
 	type OmpCompactResult,
+	type OmpDialogAnswerer,
+	type OmpDialogRequest,
+	type OmpDialogResponse,
 	OmpDriverError,
 	type OmpEntries,
 	type OmpEvent,
@@ -159,18 +163,29 @@ export interface RpcOmpDriverOptions {
 	bunExecutable?: string;
 	/** Parent environment source (tests); default `process.env`. */
 	baseEnv?: Record<string, string | undefined>;
+	/**
+	 * Owner answers to omp's select/confirm/input/editor/ask dialogs (Slack cards). With it the driver opts in to the
+	 * `ask` dialog (`set_ask_dialog enabled:true`); without it every dialog is cancelled at once.
+	 */
+	answerDialog?: OmpDialogAnswerer;
 }
 
 /**
  * Wire-level `extension_ui_request` frames are not exposed by RpcClient outside `login()`, so tap raw stdout. Exported
- * so the headless boundary (partial frames, immediate dialog cancels) stays unit-testable.
+ * so the headless boundary (partial frames, dialog answers and cancels) stays unit-testable.
+ *
+ * Owner dialogs (`DIALOG_METHODS`) go to `answer` when one is given; without it, or when it returns `undefined`,
+ * throws, or the frame does not parse, the dialog is answered `cancelled` (fail-closed). omp's `method:"cancel"`
+ * (its own timeout or an aborted turn) aborts the waiting answer, and nothing is written for that dialog afterwards.
  */
 export async function tapExtensionUi(
 	stream: ReadableStream<Uint8Array>,
 	emit: (event: OmpEvent) => void,
 	reply: (frame: Record<string, unknown>) => void,
+	answer?: OmpDialogAnswerer,
 ): Promise<void> {
 	const decoder = new TextDecoder();
+	const waiting = new Map<string, AbortController>();
 	let buffer = "";
 	try {
 		for await (const chunk of stream) {
@@ -181,21 +196,117 @@ export async function tapExtensionUi(
 				buffer = buffer.slice(newline + 1);
 				newline = buffer.indexOf("\n");
 				if (!line.includes('"extension_ui_request"')) continue;
+				let frame: unknown;
 				try {
-					const frame: unknown = JSON.parse(line);
-					if (isRecord(frame) && frame.type === "extension_ui_request") {
-						emit({ type: "extension_ui_request", method: frame.method, id: frame.id });
-						if (typeof frame.method === "string" && UNANSWERABLE_DIALOGS.has(frame.method)) {
-							reply({ type: "extension_ui_response", id: frame.id, cancelled: true });
-						}
-					}
+					frame = JSON.parse(line);
 				} catch {
-					// not a complete JSON frame; ignore
+					continue; // not a complete JSON frame; ignore
 				}
+				if (!isRecord(frame) || frame.type !== "extension_ui_request") continue;
+				emit({ type: "extension_ui_request", method: frame.method, id: frame.id });
+				if (frame.method === "cancel" && typeof frame.targetId === "string") {
+					waiting.get(frame.targetId)?.abort();
+					waiting.delete(frame.targetId);
+					continue;
+				}
+				if (typeof frame.method !== "string" || !DIALOG_METHODS.has(frame.method)) continue;
+				const request = answer === undefined ? undefined : parseDialogRequest(frame);
+				if (answer === undefined || request === undefined) {
+					reply({ type: "extension_ui_response", id: frame.id, cancelled: true });
+					continue;
+				}
+				const controller = new AbortController();
+				waiting.set(request.id, controller);
+				void answerDialog(answer, request, controller.signal).then((response) => {
+					if (controller.signal.aborted) return; // omp already settled it; a late answer must not land
+					waiting.delete(request.id);
+					reply({ type: "extension_ui_response", id: request.id, ...response });
+				});
 			}
 		}
 	} catch {
 		// stream closed with the child
+	}
+	// The child is gone: nobody reads an answer anymore, so close the cards still waiting.
+	for (const controller of waiting.values()) controller.abort();
+}
+
+/** The answerer's response, or `cancelled` when it has none or throws (fail-closed). */
+async function answerDialog(
+	answer: OmpDialogAnswerer,
+	request: OmpDialogRequest,
+	signal: AbortSignal,
+): Promise<OmpDialogResponse> {
+	try {
+		return (await answer(request, signal)) ?? { cancelled: true };
+	} catch {
+		return { cancelled: true };
+	}
+}
+
+const optionalString = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+
+/** One `ask` question from the wire, or undefined when its shape is not omp's. */
+function parseAskQuestion(value: unknown): OmpAskQuestion | undefined {
+	if (!isRecord(value) || typeof value.id !== "string" || typeof value.question !== "string") return undefined;
+	if (!Array.isArray(value.options)) return undefined;
+	const options: OmpAskQuestion["options"] = [];
+	for (const option of value.options) {
+		if (!isRecord(option) || typeof option.label !== "string") return undefined;
+		const description = optionalString(option.description);
+		options.push(description === undefined ? { label: option.label } : { label: option.label, description });
+	}
+	const header = optionalString(value.header);
+	const recommended = typeof value.recommended === "number" ? value.recommended : undefined;
+	return {
+		id: value.id,
+		question: value.question,
+		options,
+		...(header === undefined ? {} : { header }),
+		...(value.multi === true ? { multi: true } : {}),
+		...(recommended === undefined ? {} : { recommended }),
+	};
+}
+
+/** A dialog frame as an `OmpDialogRequest`; undefined when a required field is missing (it is then cancelled). */
+function parseDialogRequest(frame: Record<string, unknown>): OmpDialogRequest | undefined {
+	const { id, title } = frame;
+	if (typeof id !== "string") return undefined;
+	const timeout = typeof frame.timeout === "number" ? frame.timeout : undefined;
+	const withTimeout = timeout === undefined ? {} : { timeout };
+	switch (frame.method) {
+		case "select":
+			if (typeof title !== "string" || !Array.isArray(frame.options)) return undefined;
+			if (!frame.options.every((option) => typeof option === "string")) return undefined;
+			return { method: "select", id, title, options: frame.options as string[], ...withTimeout };
+		case "confirm":
+			if (typeof title !== "string" || typeof frame.message !== "string") return undefined;
+			return { method: "confirm", id, title, message: frame.message, ...withTimeout };
+		case "input": {
+			if (typeof title !== "string") return undefined;
+			const placeholder = optionalString(frame.placeholder);
+			return {
+				method: "input",
+				id,
+				title,
+				...(placeholder === undefined ? {} : { placeholder }),
+				...withTimeout,
+				...(frame.secret === true ? { secret: true } : {}),
+			};
+		}
+		case "editor": {
+			if (typeof title !== "string") return undefined;
+			const prefill = optionalString(frame.prefill);
+			return { method: "editor", id, title, ...(prefill === undefined ? {} : { prefill }) };
+		}
+		case "ask": {
+			if (!Array.isArray(frame.questions) || frame.questions.length === 0) return undefined;
+			const questions = frame.questions.map(parseAskQuestion);
+			if (questions.some((question) => question === undefined)) return undefined;
+			return { method: "ask", id, questions: questions as OmpAskQuestion[], ...withTimeout };
+		}
+		default:
+			return undefined;
 	}
 }
 
@@ -208,8 +319,8 @@ function toDriverError(error: unknown): unknown {
 	});
 }
 
-/** Dialogs nobody can answer in a headless session: they are cancelled at once instead of hanging the turn. */
-const UNANSWERABLE_DIALOGS = new Set(["select", "confirm", "input", "editor", "ask"]);
+/** Dialogs only a person can answer: the owner through `answerDialog`, else cancelled at once instead of hanging the turn. */
+const DIALOG_METHODS: ReadonlySet<string> = new Set(["select", "confirm", "input", "editor", "ask"]);
 
 /**
  * `leafId()` without moving the whole session through the pipe: reads `get_entries(since=cache.since)` so only the
@@ -329,6 +440,7 @@ export class RpcOmpDriver implements OmpSessionDriver {
 					forTap,
 					(event) => this.#emit(event),
 					(frame) => this.#writeRaw(frame),
+					options.answerDialog,
 				);
 				this.#child = child;
 				void child.exited.then(
@@ -361,8 +473,10 @@ export class RpcOmpDriver implements OmpSessionDriver {
 			throw error;
 		}
 		this.#client = client;
-		// Headless bot: never opt in to the ask dialog (explicit false so a default change cannot enable it).
-		this.#writeRaw({ type: "set_ask_dialog", id: "ompbot-ask-dialog-off", enabled: false });
+		// `ask` arrives as one dialog only when someone answers it; otherwise explicit false, so a default change cannot
+		// enable a dialog nobody answers.
+		const askDialog = options.answerDialog !== undefined;
+		this.#writeRaw({ type: "set_ask_dialog", id: `ompbot-ask-dialog-${askDialog ? "on" : "off"}`, enabled: askDialog });
 	}
 
 	#emit(event: OmpEvent): void {

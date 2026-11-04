@@ -2222,6 +2222,11 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ompbot 현황판</title>
+<link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15181D" media="(prefers-color-scheme: dark)">
 <style>${STYLE}</style>
 </head>
 <body${open === undefined ? "" : ' class="detail-open"'}>

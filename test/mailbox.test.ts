@@ -1364,3 +1364,95 @@ describe("mailbox: tool repeat loop (stuck-loop)", () => {
 		}
 	});
 });
+
+describe("mailbox: an owner message answers the origin's one open omp dialog", () => {
+	const DIALOG_ORIGIN = "slack/dm/D7";
+	let answers: string[];
+	let ambiguous: Array<{ originKey: string; threadRef: string }>;
+	let open: number;
+	let opened: FakeOmpDriver[];
+
+	function dialogMailbox(): OriginMailbox {
+		return new OriginMailbox({
+			originKey: DIALOG_ORIGIN,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new FakeOmpDriver({ holdTurns: true, sessionDir, store: sessionStore });
+				opened.push(driver);
+				return driver;
+			},
+			dialogs: {
+				open: (originKey) => (originKey === DIALOG_ORIGIN ? open : 0),
+				answer: (originKey, text) => {
+					if (originKey !== DIALOG_ORIGIN || open !== 1) return false;
+					answers.push(text);
+					open = 0;
+					return true;
+				},
+				ambiguous: (info) => ambiguous.push(info),
+			},
+		});
+	}
+
+	beforeEach(() => {
+		answers = [];
+		ambiguous = [];
+		open = 0;
+		opened = [];
+	});
+
+	test("one open dialog: the message becomes its answer, is not steered, and is answered with the turn", async () => {
+		const mailbox = dialogMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: DIALOG_ORIGIN });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			open = 1;
+			const reply = msg("B로 가자", { originKey: DIALOG_ORIGIN, threadRef: lead.threadRef });
+			await mailbox.enqueue(reply);
+			expect(answers).toEqual(["B로 가자"]);
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual([]);
+			const row = store.getInbound(reply.platformMessageId);
+			expect(row?.state).toBe("dispatched");
+			expect(row?.opRef).toBe(store.getInbound(lead.platformMessageId)?.opRef ?? "missing");
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.getInbound(reply.platformMessageId)?.state).toBe("answered");
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("two open dialogs: the message is not consumed, the owner is told once, and it is steered as before", async () => {
+		const mailbox = dialogMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: DIALOG_ORIGIN });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			open = 2;
+			const reply = msg("B로 가자", { originKey: DIALOG_ORIGIN, threadRef: lead.threadRef });
+			await mailbox.enqueue(reply);
+			expect(answers).toEqual([]);
+			expect(ambiguous).toEqual([{ originKey: DIALOG_ORIGIN, threadRef: lead.threadRef }]);
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual(["steer:B로 가자"]);
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("a command is never taken as a dialog answer", async () => {
+		const mailbox = dialogMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: DIALOG_ORIGIN });
+			await mailbox.enqueue(lead);
+			open = 1;
+			await mailbox.enqueue(msg("/status-ompbot", { originKey: DIALOG_ORIGIN, threadRef: lead.threadRef }));
+			expect(answers).toEqual([]);
+		} finally {
+			await mailbox.close();
+		}
+	});
+});

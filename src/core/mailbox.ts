@@ -156,8 +156,11 @@ export interface MailboxDeps {
 	 * of the same turn do not call it.
 	 */
 	onStall?: (info: { originKey: string; threadRef: string; stalled: boolean; silentMs: number }) => void;
-	/** Called on every `tool_execution_start` of a running turn; `activity` is a one-line status text. */
-	onActivity?: (info: { originKey: string; threadRef: string; activity: string }) => void;
+	/**
+	 * The running turn's progress changed (a tool started, a todo result, a steer delivered, a model retry); `progress`
+	 * is a snapshot of the whole summary. Raw texts: redact before they reach Slack.
+	 */
+	onProgress?: (info: { originKey: string; threadRef: string; progress: TurnProgress }) => void;
 	/** Owner escalation for a run of failed turns: the bot reporting "나 망가짐" by itself. */
 	onEscalate?: (info: TurnFailureEscalation) => void;
 	/** A turn's omp retry reported a provider usage limit; once per turn, on the actor chain (never await Slack). */
@@ -171,6 +174,70 @@ export interface MailboxDeps {
 	 * (a final that settled it first sends nothing). Called on the actor chain, so it must never await Slack.
 	 */
 	onStuckLoop?: (info: StuckLoopInfo) => void;
+	/** omp dialogs (select/confirm/input/editor/ask cards) waiting on the owner; absent: messages never answer one. */
+	dialogs?: OpenDialogs;
+}
+
+/** The owner-facing omp dialogs of each origin (`ApprovalBroker.choose` cards), as the mailbox sees them. */
+export interface OpenDialogs {
+	/** Dialogs of the origin still waiting for an answer. */
+	open(originKey: string): number;
+	/** Settles the origin's one open dialog with the owner's text; false when there was not exactly one to settle. */
+	answer(originKey: string, text: string): boolean;
+	/** A plain message arrived while 2+ dialogs wait: tell the owner where to answer (never awaits Slack). */
+	ambiguous(info: { originKey: string; threadRef: string }): void;
+}
+
+/** What the running status message shows of a turn besides its elapsed time. */
+export interface TurnProgress {
+	/** `tool_execution_start` events of the turn. */
+	tools: number;
+	/** The newest tool calls (`toolActivityText`), oldest first, at most `RECENT_TOOLS`. */
+	recentTools: string[];
+	/** From the last state-changing `todo` result: completed/total tasks (abandoned ones excluded) and the first in-progress task. */
+	todo?: { done: number; total: number; current?: string };
+	/** Owner messages steered into the turn. */
+	steers: number;
+	/** omp's model retry attempt (`auto_retry_start.attempt`); 0 without retries. */
+	retries: number;
+}
+
+/** Tool lines a status message lists. */
+export const RECENT_TOOLS = 3;
+
+/**
+ * Todo summary of a `todo` tool result (`details: {op, phases}`, omp `tools/todo.ts`); undefined for `view` reads,
+ * errors and shapes it does not know.
+ */
+export function todoProgress(result: unknown): TurnProgress["todo"] | undefined {
+	if (typeof result !== "object" || result === null || !("details" in result)) return undefined;
+	const details = result.details;
+	if (typeof details !== "object" || details === null || !("phases" in details) || !Array.isArray(details.phases)) {
+		return undefined;
+	}
+	if ("op" in details && details.op === "view") return undefined;
+	let done = 0;
+	let total = 0;
+	let current: string | undefined;
+	for (const phase of details.phases as unknown[]) {
+		if (typeof phase !== "object" || phase === null || !("tasks" in phase) || !Array.isArray(phase.tasks))
+			return undefined;
+		for (const task of phase.tasks as unknown[]) {
+			if (typeof task !== "object" || task === null || !("status" in task)) return undefined;
+			if (task.status === "abandoned") continue;
+			total += 1;
+			if (task.status === "completed") done += 1;
+			if (
+				task.status === "in_progress" &&
+				current === undefined &&
+				"content" in task &&
+				typeof task.content === "string"
+			) {
+				current = task.content;
+			}
+		}
+	}
+	return current === undefined ? { done, total } : { done, total, current };
 }
 
 export interface SessionMismatchInfo {
@@ -209,6 +276,8 @@ interface ActiveTurn {
 	providerLimitSeen: boolean;
 	/** Tool repeat-loop counts of this turn (reset per turn). */
 	stuck: StuckDetector;
+	/** What the status message shows (`onProgress`). */
+	progress: TurnProgress;
 }
 
 /**
@@ -594,6 +663,11 @@ export class OriginMailbox {
 		if (event.type === "auto_retry_start") {
 			errorMessage = event.errorMessage;
 			maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : 0;
+			const retrying = this.#turn;
+			if (retrying && typeof event.attempt === "number" && event.attempt > retrying.progress.retries) {
+				retrying.progress.retries = event.attempt;
+				this.#reportProgress(retrying);
+			}
 		} else if (event.type === "auto_retry_end") {
 			errorMessage = event.success === false ? event.finalError : undefined;
 		} else {
@@ -619,11 +693,19 @@ export class OriginMailbox {
 			this.#deps.log.info("tool_start", { origin: this.#deps.originKey, tool });
 			const turn = this.#turn;
 			if (tool !== undefined && turn) {
-				this.#deps.onActivity?.({
-					originKey: this.#deps.originKey,
-					threadRef: turn.threadRef,
-					activity: toolActivityText(tool, event.args),
-				});
+				turn.progress.tools += 1;
+				turn.progress.recentTools = [...turn.progress.recentTools, toolActivityText(tool, event.args)].slice(
+					-RECENT_TOOLS,
+				);
+				this.#reportProgress(turn);
+			}
+		}
+		// The claude driver reports `tool_execution_start` only, so its turns show the tool lines and nothing else.
+		if (event.type === "tool_execution_end" && event.toolName === "todo" && event.isError !== true && this.#turn) {
+			const todo = todoProgress(event.result);
+			if (todo !== undefined) {
+				this.#turn.progress.todo = todo;
+				this.#reportProgress(this.#turn);
 			}
 		}
 		const now = this.#deps.clock.now();
@@ -643,6 +725,19 @@ export class OriginMailbox {
 			silentMs,
 			opRef: turn.opRef,
 			count: turn.stallCount,
+		});
+	}
+
+	#reportProgress(turn: ActiveTurn): void {
+		const { progress } = turn;
+		this.#deps.onProgress?.({
+			originKey: this.#deps.originKey,
+			threadRef: turn.threadRef,
+			progress: {
+				...progress,
+				recentTools: [...progress.recentTools],
+				...(progress.todo ? { todo: { ...progress.todo } } : {}),
+			},
 		});
 	}
 
@@ -706,7 +801,37 @@ export class OriginMailbox {
 		}
 		const command = parseCommand(record.text);
 		if (command && command.kind !== "followup") await this.#runCommand(row, command);
+		else if (command === undefined && (await this.#answerDialog(row))) return;
 		else await this.#drain();
+	}
+
+	/**
+	 * A plain owner message while the running turn waits on exactly one owner dialog: it becomes that dialog's answer
+	 * (never a steer) and rides the turn's opRef, so the turn's final settles it as answered. With 2+ open dialogs the
+	 * owner is told to answer in a card's thread and the message takes the normal path.
+	 */
+	async #answerDialog(row: InboundRow): Promise<boolean> {
+		const { dialogs, store, originKey, log } = this.#deps;
+		const turn = this.#turn;
+		const driver = this.#driver;
+		if (dialogs === undefined || turn === undefined || driver === undefined) return false;
+		const open = dialogs.open(originKey);
+		if (open === 0) return false;
+		if (open > 1) {
+			log.info("dialog_reply_ambiguous", { origin: originKey, id: row.platformMessageId, open });
+			dialogs.ambiguous({ originKey, threadRef: row.threadRef });
+			return false;
+		}
+		if (!dialogs.answer(originKey, row.textRef)) return false;
+		let entryCursor: string | null = null;
+		try {
+			entryCursor = await driver.leafId();
+		} catch (error) {
+			log.warn("dialog_answer_cursor_failed", { origin: originKey, id: row.platformMessageId, error: String(error) });
+		}
+		store.markDispatched(row.platformMessageId, { opRef: turn.opRef, entryCursor });
+		log.info("dialog_answered", { origin: originKey, id: row.platformMessageId, opRef: turn.opRef });
+		return true;
 	}
 
 	/**
@@ -755,6 +880,8 @@ export class OriginMailbox {
 				return false;
 			}
 			log.info("steer_delivered", { origin: originKey, id: row.platformMessageId, opRef: turn.opRef });
+			turn.progress.steers += 1;
+			this.#reportProgress(turn);
 			return true;
 		}
 		let failure: unknown;
@@ -805,6 +932,7 @@ export class OriginMailbox {
 			stallEscalated: false,
 			providerLimitSeen: false,
 			stuck: createStuckDetector(),
+			progress: { tools: 0, recentTools: [], steers: 0, retries: 0 },
 		};
 		this.#lastEventAt = this.#deps.clock.now();
 		this.#eventPersistedAt = this.#lastEventAt;

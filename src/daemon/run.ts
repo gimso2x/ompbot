@@ -188,6 +188,7 @@ export async function runDaemon(
 							config.herdr !== undefined,
 						),
 						hostTools: daemon.hostToolsFor(origin),
+						answerDialog: daemon.answerDialogsFor(origin),
 					}),
 	});
 	claimSignals();
