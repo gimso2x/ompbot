@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { dispatchEnv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
+import type { CommitCheck } from "./checker";
 import { TASK_PATH_PATTERN } from "./docs";
 
 export type HostResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -11,7 +12,12 @@ const RUNNER_STDOUT_CAP = 64_000;
 const GIT_TIMEOUT_MS = 60_000;
 const IO_TIMEOUT_MS = 20_000;
 const HEX_HASH = /^[0-9a-f]{7,40}$/;
+/** A full object name (sha1 or sha256) as `rev-parse` and `log --format=%H` print it. */
+const FULL_HASH = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const TASK_ID = /^T-\d{8}-\d{2,}$/;
+
+/** The task branch's first commit (`commitDocs`); `commitOnTaskBranch` finds the branch base by it. */
+const docsCommitMessage = (taskId: string): string => `docs(task): ${taskId} 4문서`;
 /** ssh's own failure code (connection, auth); a remote command's code never is 255 here. */
 const SSH_FAILURE = 255;
 
@@ -26,8 +32,11 @@ export interface TaskHostOps {
 	writeFile(path: string, content: string): Promise<HostResult<null>>;
 	/** `value: undefined` = the file does not exist; an unreachable host is a failure, never "missing". */
 	readFile(path: string): Promise<HostResult<string | undefined>>;
-	/** `git cat-file -e <hash>^{commit}`; throws when the host cannot be asked (never answers "no" for "unknown"). */
-	commitExists(worktree: string, hash: string): Promise<boolean>;
+	/**
+	 * Whether `hash` is a commit on `branch` after the branch's `docs(task): <taskId> 4문서` commit; throws when the host
+	 * cannot be asked or git fails unexpectedly (never answers "no" for "unknown").
+	 */
+	commitOnTaskBranch(input: { worktree: string; branch: string; taskId: string; hash: string }): Promise<CommitCheck>;
 	/** Commits `docs/tasks/<taskId>` on the worktree's branch as `docs(task): <taskId> 4문서`; the value is the hash. */
 	commitDocs(input: { worktree: string; taskId: string }): Promise<HostResult<string>>;
 }
@@ -134,24 +143,55 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 			return { ok: true, value: result.stdout };
 		},
 
-		async commitExists(worktree, hash) {
+		async commitOnTaskBranch({ worktree, branch, taskId, hash }) {
 			assertPath(worktree);
-			if (!HEX_HASH.test(hash)) return false;
-			const result =
-				sshTarget === undefined
-					? await run(["git", "-C", worktree, "cat-file", "-e", `${hash}^{commit}`], { timeoutMs: GIT_TIMEOUT_MS, env })
-					: await run(sshCommand(sshTarget, ["git", "-C", worktree, "cat-file", "-e", `${hash}^{commit}`]), {
-							timeoutMs: GIT_TIMEOUT_MS,
-						});
-			if (unreachable(result)) throw new Error(`cannot check commit ${hash}: host unreachable`);
-			return result.code === 0;
+			assertBranch(branch);
+			if (!TASK_ID.test(taskId)) throw new Error(`unsafe task id: ${taskId}`);
+			if (!HEX_HASH.test(hash)) return "missing";
+			const git = async (...args: string[]) => {
+				const result = await exec(["git", "-C", worktree, ...args], GIT_TIMEOUT_MS);
+				if (unreachable(result)) throw new Error(`cannot check commit ${hash}: host unreachable`);
+				return result;
+			};
+			const failed = (step: string, result: { stdout: string }) =>
+				new Error(`cannot check commit ${hash}: git ${step} failed: ${result.stdout.trim().slice(0, 160)}`);
+			/** `merge-base --is-ancestor`: 0 yes, 1 no, anything else is git failing, not an answer. */
+			const ancestor = async (older: string, newer: string): Promise<boolean> => {
+				const result = await git("merge-base", "--is-ancestor", older, newer);
+				if (result.code !== 0 && result.code !== 1) throw failed("merge-base", result);
+				return result.code === 0;
+			};
+
+			if ((await git("cat-file", "-e", `${hash}^{commit}`)).code !== 0) return "missing";
+			// The docs commit opens the task branch; the oldest one carrying its message is the base.
+			const message = docsCommitMessage(taskId);
+			const grep = `--grep=${message}`;
+			const log = await git(
+				"log",
+				"--format=%H",
+				"--fixed-strings",
+				sshTarget === undefined ? grep : `'${grep}'`,
+				branch,
+			);
+			if (log.code !== 0) throw failed("log", log);
+			const base = log.stdout
+				.split("\n")
+				.map((line) => line.trim())
+				.filter((line) => FULL_HASH.test(line))
+				.at(-1);
+			if (base === undefined) return "no_base";
+			const parsed = await git("rev-parse", `${hash}^{commit}`);
+			const full = parsed.stdout.trim();
+			if (parsed.code !== 0 || !FULL_HASH.test(full)) throw failed("rev-parse", parsed);
+			if (full === base) return "not_on_branch";
+			return (await ancestor(base, full)) && (await ancestor(full, branch)) ? "ok" : "not_on_branch";
 		},
 
 		async commitDocs({ worktree, taskId }) {
 			assertPath(worktree);
 			if (!TASK_ID.test(taskId)) throw new Error(`unsafe task id: ${taskId}`);
 			const dir = `docs/tasks/${taskId}`;
-			const message = `docs(task): ${taskId} 4문서`;
+			const message = docsCommitMessage(taskId);
 			// ssh joins its arguments into one remote shell line: the fixed message is quoted there, passed bare locally.
 			const steps = [
 				["git", "-C", worktree, "add", "--", dir],

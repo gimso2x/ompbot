@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { OWNER_NAME_PATTERN } from "../src/dispatch/omp";
-import { checkTask, summarizeJudgement, type TaskJudgement } from "../src/tasks/checker";
+import { type CommitCheck, checkTask, summarizeJudgement, type TaskJudgement } from "../src/tasks/checker";
 import {
 	acceptanceItems,
 	agentNameOf,
@@ -156,8 +156,8 @@ describe("checkTask table", () => {
 	const progress = (status = "working", extra = ""): string =>
 		`---\ntask: ${meta.taskId}\nstatus: ${status}\nupdated: 2026-10-26T15:04:05+09:00\ncurrent: S1\nnext: x\nblocked_reason: ${extra}\n---\n# 단계\n- [x] S1: a | 완료 조건: b | 증거: commit abc1234\n`;
 	const outcome = "## AC-1\n- commit: abc1234 feat\n## AC-2\n- test: bun test → 5 pass\n";
-	const exists = async (hash: string) => hash === "abc1234";
-	const base = { snapshot, spec: checked(["AC-1", "AC-2"]), progress: progress(), outcome, commitExists: exists };
+	const commitCheck = async (hash: string): Promise<CommitCheck> => (hash === "abc1234" ? "ok" : "missing");
+	const base = { snapshot, spec: checked(["AC-1", "AC-2"]), progress: progress(), outcome, commitCheck };
 
 	test("everything in order is reached", async () => {
 		const result = await checkTask(base);
@@ -219,6 +219,16 @@ describe("checkTask table", () => {
 			"commit that does not exist",
 			{ outcome: "## AC-1\n- commit: deadbee feat\n## AC-2\n- test: a → b\n" },
 			"deadbee가 워크트리 저장소에 없습니다",
+		],
+		[
+			"commit that is not the task's own",
+			{ commitCheck: async (): Promise<CommitCheck> => "not_on_branch" },
+			"commit abc1234는 task 브랜치(<4문서 커밋 이후)의 새 커밋이 아닙니다",
+		],
+		[
+			"task branch without its docs commit",
+			{ commitCheck: async (): Promise<CommitCheck> => "no_base" },
+			"task 브랜치에서 4문서 커밋을 찾지 못해 commit abc1234를 확인할 수 없습니다",
 		],
 		["bad hash", { outcome: "## AC-1\n- commit: HEAD\n## AC-2\n- test: a → b\n" }, "해시 형식이 아닙니다"],
 		["blocked", { progress: progress("blocked", "토큰 없음") }, "blocked"],

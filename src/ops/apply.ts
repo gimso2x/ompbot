@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { DrainWaitResult } from "../cli/drain";
+import { parseChatOrigin } from "../core/origin-key";
 import { type BackupResult, backupStamp } from "./backup";
 import type { Gate } from "./gates";
 
@@ -22,7 +23,11 @@ const READY_POLL_MS = 1_000;
 export const DEFAULT_DRAIN_TIMEOUT_MIN = 60;
 export const SYSTEMD_UNIT = "ompbot";
 
-export const REPORT_ORIGIN_PATTERN = /^slack\/(ch|dm)\/[A-Z0-9]+$/;
+/** The apply report goes to a Slack DM or channel origin (`slack/ch/<C>`, `slack/dm/<D>`), never a thread origin. */
+export const isReportOrigin = (originKey: string): boolean => {
+	const ref = parseChatOrigin(originKey);
+	return ref?.platform === "slack" && ref.threadId === undefined;
+};
 export const REPORT_THREAD_PATTERN = /^\d+\.\d+$/;
 export const STAMP_PATTERN = /^\d{8}-\d{6}$/;
 /** The config copies `apply` itself makes (`config.json.bak-<stamp>-apply`); hand-made bak names never match. */

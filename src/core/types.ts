@@ -68,6 +68,19 @@ export function promptTextOf(text: string): string {
 	return command?.kind === "followup" ? command.arg : text;
 }
 
+/** Where the request itself starts in a turn prompt that carries context blocks (thread context, recall). */
+export const CURRENT_REQUEST_MARKER = "[현재 요청]";
+
+/** A new turn's prompt: the context blocks, then the marker and the request; the request as is without blocks. */
+export function composeTurnPrompt(blocks: readonly string[], text: string): string {
+	return blocks.length === 0 ? text : `${blocks.join("\n\n")}\n\n${CURRENT_REQUEST_MARKER}\n${text}`;
+}
+
+/** Whether a session's user entry is the prompt `composeTurnPrompt` built for `promptText`, with or without blocks. */
+export function isTurnPromptFor(entryText: string, promptText: string): boolean {
+	return entryText === promptText || entryText.endsWith(`\n\n${CURRENT_REQUEST_MARKER}\n${promptText}`);
+}
+
 /** Per-thread mute toggles the adapter handles itself (bookkeeping, never an omp prompt). */
 export type ThreadMuteCommand = "shutup" | "unshutup";
 

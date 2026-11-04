@@ -19,6 +19,7 @@ import {
 	approvalActionId,
 	parseApprovalActionId,
 } from "../src/safety/approval";
+import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { openStore, type Store } from "../src/store/db";
 
@@ -569,7 +570,7 @@ function makeBroker(
 	timeoutMs?: number,
 ): ApprovalBroker {
 	return new ApprovalBroker({
-		transport,
+		port: new SlackChannel(transport),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: approvalStore,

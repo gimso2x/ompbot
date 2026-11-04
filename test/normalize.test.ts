@@ -7,7 +7,6 @@ import {
 	originKeyForMessage,
 	parseThreadRef,
 	QUOTED_HEADER,
-	slackOriginChannel,
 	stripFenceLookalikes,
 	unescapeSlackText,
 	wrapQuoted,
@@ -105,16 +104,12 @@ describe("originKeyForMessage (thread-scoped sessions)", () => {
 		expect(r.accept && r.inbound.threadRef).toBe("C1:1799999999.000001");
 	});
 
-	test("isThreadOrigin and slackOriginChannel classify origins", () => {
+	test("isThreadOrigin classifies origins", () => {
 		expect(isThreadOrigin("slack/ch/C1/t/100.1")).toBe(true);
 		expect(isThreadOrigin("slack/ch/C1")).toBe(false);
 		expect(isThreadOrigin("slack/dm/D1")).toBe(false);
 		expect(isThreadOrigin("ompbot/work/lane")).toBe(false);
 		expect(isThreadOrigin("monitor/m1")).toBe(false);
-		expect(slackOriginChannel("slack/ch/C1/t/100.1")).toBe("C1");
-		expect(slackOriginChannel("slack/ch/C1")).toBe("C1");
-		expect(slackOriginChannel("slack/dm/D1")).toBe("D1");
-		expect(slackOriginChannel("ompbot/work/lane")).toBeUndefined();
 	});
 });
 

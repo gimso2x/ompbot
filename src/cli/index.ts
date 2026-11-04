@@ -16,6 +16,7 @@ import { collectGates } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
 import { OffsiteError, type OffsiteResult, runOffsite } from "../ops/offsite";
 import { APPLY_USAGE, applyCommand } from "./apply";
+import { DASHBOARD_USAGE, dashboardCommand } from "./dashboard";
 import { DRAIN_USAGE, drainCommand } from "./drain";
 import { INIT_USAGE, initCommand } from "./init";
 import { MONITORS_USAGE, monitorsCommand } from "./monitors";
@@ -52,7 +53,7 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   inject --origin <slack/dm/ID|slack/ch/ID> --as-owner --text <t> [--quoted <q>] [--thread <ts>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -414,6 +415,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return await tasksCommand(rest, homeDir);
 			case "skills":
 				return skillsCommand(rest, env);
+			case "dashboard":
+				return await dashboardCommand(rest, homeDir);
 			default:
 				process.stderr.write(USAGE);
 				return command === undefined || command === "--help" || command === "help" ? 0 : 2;

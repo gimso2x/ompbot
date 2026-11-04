@@ -8,6 +8,7 @@ import { type HerdrAgentStatusResult, setLocalHerdrBin } from "../src/dispatch/o
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { TaskJudgement } from "../src/tasks/checker";
 import {
@@ -54,6 +55,8 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		evidence: {},
 		summary: [],
 		reachKey: "k1",
+		acceptance: [],
+		steps: [],
 		problems: [],
 		...over,
 	};
@@ -128,7 +131,7 @@ function rig(over: Partial<Pick<TaskSweepDeps, "boardLink" | "log" | "frozen">> 
 			statusCalls.count += 1;
 			return agent.value;
 		},
-		transport,
+		transport: new SlackChannel(transport),
 		ownerUserId: "UOWN",
 		now: () => clock.ms,
 		log: noop,
@@ -463,7 +466,7 @@ describe("TaskSweeper", () => {
 			},
 			remind: async () => ({ ok: true }),
 			agentStatus: async () => ({ ok: true, status: "idle" }),
-			transport: r.transport,
+			transport: new SlackChannel(r.transport),
 			ownerUserId: "UOWN",
 			now: () => r.clock.ms,
 			log: noop,
@@ -604,6 +607,117 @@ describe("TaskSweeper", () => {
 		expect(r.statusCalls.count).toBe(2);
 	});
 
+	test("an idle agent with unmet conditions is nudged once with the problem list, well before 30 minutes", async () => {
+		const r = rig();
+		const problems = ["AC-1: spec.md 체크박스가 [x]가 아닙니다", "AC-2: commit 또는 test 증거가 없습니다"];
+		r.next.value = { ok: true, judgement: judgement({ problems }) };
+		r.clock.ms = T0 + 5 * MIN;
+		const [first] = await r.sweeper.sweep();
+		expect(r.reminders).toEqual([
+			"Outcome 판정이 아직 미도달입니다. 아래를 채우거나, 진행할 수 없으면 PROGRESS.md status를 blocked로 바꾸고 사유를 적으세요.\n- AC-1: spec.md 체크박스가 [x]가 아닙니다\n- AC-2: commit 또는 test 증거가 없습니다",
+		]);
+		expect(first?.actions).toEqual(["unmet nudge to agent"]);
+		expect(r.ledger.require(r.row.taskId).remindedAt).toBe(r.clock.ms);
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(1);
+	});
+
+	test("changed unmet conditions nudge an idle or done agent once more", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ problems: ["AC-1: outcome.md에 절이 없습니다"] }) };
+		r.clock.ms = T0 + MIN;
+		await r.sweeper.sweep();
+		r.agent.value = { ok: true, status: "done" };
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep(); // same problems while done: nothing
+		expect(r.reminders).toHaveLength(1);
+		r.next.value = { ok: true, judgement: judgement({ problems: ["AC-2: commit 또는 test 증거가 없습니다"] }) };
+		r.clock.ms += 5 * MIN;
+		const [changed] = await r.sweeper.sweep();
+		expect(changed?.actions).toEqual(["unmet nudge to agent"]);
+		expect(r.reminders).toHaveLength(2);
+		expect(r.reminders[1]?.split("\n").slice(1)).toEqual(["- AC-2: commit 또는 test 증거가 없습니다"]);
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(2);
+	});
+
+	test("no nudge for a busy, waiting, vanished, unknown or unanswerable agent, nor while frozen", async () => {
+		const unmet = judgement({ problems: ["AC-1: spec.md 체크박스가 [x]가 아닙니다"] });
+		const statuses: HerdrAgentStatusResult[] = [
+			{ ok: true, status: "working" },
+			{ ok: true, status: "blocked" },
+			{ ok: true, status: "gone" },
+			{ ok: true, status: "unknown" },
+			{ ok: false, error: "agent list failed" },
+		];
+		for (const value of statuses) {
+			const r = rig();
+			r.agent.value = value;
+			r.next.value = { ok: true, judgement: unmet };
+			r.clock.ms = T0 + 5 * MIN;
+			const [result] = await r.sweeper.sweep();
+			expect(r.reminders).toEqual([]);
+			expect(result?.actions).not.toContain("unmet nudge to agent");
+			expect(Object.keys(r.ledger.require(r.row.taskId).notices).some((key) => key.startsWith("unmet:"))).toBe(false);
+		}
+		const state: { value: { since: string; reason: string; by: string } | undefined } = {
+			value: { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" },
+		};
+		const frozen = rig({ frozen: () => state.value });
+		frozen.next.value = { ok: true, judgement: unmet };
+		frozen.clock.ms = T0 + 5 * MIN;
+		await frozen.sweeper.sweep();
+		expect(frozen.reminders).toEqual([]);
+		state.value = undefined; // the nudge follows the unfreeze
+		await frozen.sweeper.sweep();
+		expect(frozen.reminders).toHaveLength(1);
+	});
+
+	test("a failed nudge records nothing and is tried again on the next sweep", async () => {
+		const warnings: string[] = [];
+		const r = rig({ log: { info() {}, warn: (event) => warnings.push(event) } });
+		r.next.value = { ok: true, judgement: judgement({ problems: ["AC-1: outcome.md에 절이 없습니다"] }) };
+		r.remindOk.value = false;
+		r.clock.ms = T0 + 5 * MIN;
+		const [failed] = await r.sweeper.sweep();
+		expect(failed?.actions).toEqual([]);
+		expect(warnings).toContain("task_remind_failed");
+		expect(r.ledger.require(r.row.taskId)).toMatchObject({ notices: {}, remindedAt: null });
+		r.remindOk.value = true;
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(1);
+		expect(r.reminders[0]).toStartWith("Outcome 판정이 아직 미도달입니다.");
+	});
+
+	test("the 30-minute reminder carries the unmet list, and one sweep sends the agent at most one prompt", async () => {
+		const r = rig();
+		const problems = Array.from({ length: 10 }, (_, i) => `AC-${i + 1}: ${"가".repeat(i === 0 ? 250 : 3)}`);
+		r.next.value = { ok: true, judgement: judgement({ problems }) };
+		r.clock.ms = T0 + STALE_REMIND_MS; // the nudge and the reminder are both due: only the nudge goes
+		const [first] = await r.sweeper.sweep();
+		expect(first?.actions).toEqual(["unmet nudge to agent"]);
+		expect(r.reminders).toHaveLength(1);
+
+		r.clock.ms += STALE_REMIND_MS;
+		const [second] = await r.sweeper.sweep();
+		expect(second?.actions).toEqual(["stale reminder to agent"]);
+		expect(r.reminders).toHaveLength(2);
+		const lines = (r.reminders[1] ?? "").split("\n");
+		expect(lines[0]).toBe(
+			"PROGRESS.md가 60분 넘게 갱신되지 않았습니다. 지금 단계와 다음 행동을 PROGRESS.md의 updated·current·next에 반영하세요. 한 단계가 30분을 넘으면 30분마다 중간 갱신합니다.",
+		);
+		expect(lines.slice(1)).toEqual([
+			`- AC-1: ${"가".repeat(194)}`,
+			...problems.slice(1, 8).map((problem) => `- ${problem}`),
+			"- …외 2개",
+		]);
+		// The nudge carries the same list.
+		expect((r.reminders[0] ?? "").split("\n").slice(1)).toEqual(lines.slice(1));
+	});
+
 	test("syncReaction puts the single reaction of the closed status on the root", async () => {
 		const r = rig();
 		r.ledger.transition(r.row.taskId, "done", "human");
@@ -637,7 +751,7 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 				return { code: 0, stdout: JSON.stringify({ result: { agents } }), timedOut: false };
 			},
 			config: { ...home.config, herdr: {} },
-			transport,
+			slack: new SlackChannel(transport),
 			clock,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
@@ -767,7 +881,7 @@ describe("daemon: herdr off (config without herdr)", () => {
 				return { code: 0, stdout: JSON.stringify({ result: { agents: [] } }), timedOut: false };
 			},
 			config,
-			transport: new WaitingTransport(),
+			slack: new SlackChannel(new WaitingTransport()),
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",

@@ -156,6 +156,52 @@ describe("host ops (fake runner)", () => {
 		};
 		return { commands, run };
 	}
+	const commitInput = { worktree: "/r/wt", branch: "task/T-20261026-01", taskId: "T-20261026-01", hash: "abc1234" };
+
+	test("remote: the commit check runs each git step over ssh; an unreachable host or failing git throws", async () => {
+		const BASE = "b".repeat(40);
+		const FULL = `abc1234${"0".repeat(33)}`;
+		const answers = (over: Record<string, { code: number | null; stdout?: string; timedOut?: boolean }> = {}) =>
+			recorder((cmd) => {
+				const step = cmd[10] ?? "";
+				const stdout: Record<string, string> = { log: `${"c".repeat(40)}\n${BASE}\n`, "rev-parse": `${FULL}\n` };
+				const fallback = stdout[step];
+				return over[step] ?? { code: 0, stdout: fallback };
+			});
+		const { commands, run } = answers();
+		expect(await createTaskHostOps({ sshTarget: "wsl", run }).commitOnTaskBranch(commitInput)).toBe("ok");
+		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--", "git", "-C", "/r/wt"];
+		expect(commands).toEqual([
+			[...ssh, "cat-file", "-e", "abc1234^{commit}", "2>&1"],
+			[
+				...ssh,
+				"log",
+				"--format=%H",
+				"--fixed-strings",
+				"'--grep=docs(task): T-20261026-01 4문서'",
+				"task/T-20261026-01",
+				"2>&1",
+			],
+			[...ssh, "rev-parse", "abc1234^{commit}", "2>&1"],
+			[...ssh, "merge-base", "--is-ancestor", BASE, FULL, "2>&1"],
+			[...ssh, "merge-base", "--is-ancestor", FULL, "task/T-20261026-01", "2>&1"],
+		]);
+
+		const check = (over: Parameters<typeof answers>[0]) =>
+			createTaskHostOps({ sshTarget: "wsl", run: answers(over).run }).commitOnTaskBranch(commitInput);
+		for (const step of ["cat-file", "log", "rev-parse", "merge-base"]) {
+			await expect(check({ [step]: { code: 255, stdout: "ssh: no route" } })).rejects.toThrow("host unreachable");
+			await expect(check({ [step]: { code: null, timedOut: true } })).rejects.toThrow("host unreachable");
+		}
+		await expect(check({ "merge-base": { code: 128, stdout: "fatal: bad object" } })).rejects.toThrow(
+			"git merge-base failed",
+		);
+		await expect(check({ log: { code: 128, stdout: "fatal: bad revision" } })).rejects.toThrow("git log failed");
+		expect(await check({ "cat-file": { code: 1 } })).toBe("missing");
+		expect(await check({ log: { code: 0, stdout: "" } })).toBe("no_base");
+		expect(await check({ "merge-base": { code: 1 } })).toBe("not_on_branch");
+		expect(await check({ "rev-parse": { code: 0, stdout: `${BASE}\n` } })).toBe("not_on_branch");
+	});
 
 	test("remote: an ssh that cannot connect reports ssh's own stderr as the unreachable reason", async () => {
 		const stderr = "ssh: connect to host x port 22: Connection refused";
@@ -165,14 +211,13 @@ describe("host ops (fake runner)", () => {
 		expect(await ops.readFile("/r/wt/spec.md")).toEqual({ ok: false, error: `host unreachable: ${stderr}` });
 	});
 
-	test("remote: ssh command lines for worktree add, existence, write, read and commit check", async () => {
+	test("remote: ssh command lines for worktree add, existence, write and read", async () => {
 		const { commands, run } = recorder(() => ({ code: 0, stdout: "ok" }));
 		const ops = createTaskHostOps({ sshTarget: "wsl", run });
 		await ops.createWorktree({ repo: "/r/repo", worktree: "/r/repo-t-20261026-01", branch: "task/T-20261026-01" });
 		await ops.pathExists("/r/repo-t-20261026-01");
 		await ops.writeFile("/r/repo-t-20261026-01/docs/tasks/T/spec.md", "안녕");
 		await ops.readFile("/r/x/spec.md");
-		await ops.commitExists("/r/wt", "abc1234");
 		await ops.removeWorktree({ repo: "/r/repo", worktree: "/r/wt", branch: "task/T-20261026-01" });
 		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--"];
 		expect(commands[0]).toEqual([
@@ -194,9 +239,8 @@ describe("host ops (fake runner)", () => {
 			`mkdir -p /r/repo-t-20261026-01/docs/tasks/T && test ! -e /r/repo-t-20261026-01/docs/tasks/T/spec.md && echo ${Buffer.from("안녕").toString("base64")} | base64 -d > /r/repo-t-20261026-01/docs/tasks/T/spec.md`,
 		);
 		expect(commands[3]).toEqual([...ssh, "cat", "/r/x/spec.md"]);
-		expect(commands[4]).toEqual([...ssh, "git", "-C", "/r/wt", "cat-file", "-e", "abc1234^{commit}"]);
-		expect(commands[5]?.slice(7, 12)).toEqual(["git", "-C", "/r/repo", "worktree", "remove"]);
-		expect(commands[6]?.slice(7)).toEqual(["git", "-C", "/r/repo", "branch", "-D", "task/T-20261026-01", "2>&1"]);
+		expect(commands[4]?.slice(7, 12)).toEqual(["git", "-C", "/r/repo", "worktree", "remove"]);
+		expect(commands[5]?.slice(7)).toEqual(["git", "-C", "/r/repo", "branch", "-D", "task/T-20261026-01", "2>&1"]);
 	});
 
 	test("remote: the docs commit quotes its fixed message for the remote shell", async () => {
@@ -239,12 +283,12 @@ describe("host ops (fake runner)", () => {
 		});
 		expect((await down.readFile("/r/a")).ok).toBe(false);
 		expect((await down.pathExists("/r/a")).ok).toBe(false);
-		await expect(down.commitExists("/r/wt", "abc1234")).rejects.toThrow("unreachable");
+		await expect(down.commitOnTaskBranch(commitInput)).rejects.toThrow("unreachable");
 		const timedOut = createTaskHostOps({ sshTarget: "wsl", run: recorder(() => ({ code: null, timedOut: true })).run });
 		expect((await timedOut.readFile("/r/a")).ok).toBe(false);
 		const missing = createTaskHostOps({ sshTarget: "wsl", run: recorder(() => ({ code: 1 })).run });
 		expect(await missing.readFile("/r/a")).toEqual({ ok: true, value: undefined });
-		expect(await missing.commitExists("/r/wt", "abc1234")).toBe(false);
+		expect(await missing.commitOnTaskBranch(commitInput)).toBe("missing");
 	});
 
 	test("paths and branches that are not shell-inert are refused before any command runs", async () => {
@@ -252,8 +296,10 @@ describe("host ops (fake runner)", () => {
 		const ops = createTaskHostOps({ sshTarget: "wsl", run });
 		await expect(ops.readFile("/r/a; rm -rf /")).rejects.toThrow("unsafe path");
 		await expect(ops.createWorktree({ repo: "/r", worktree: "/r-w", branch: "x;y" })).rejects.toThrow("unsafe branch");
+		expect(await ops.commitOnTaskBranch({ ...commitInput, hash: "HEAD; id" })).toBe("missing");
+		await expect(ops.commitOnTaskBranch({ ...commitInput, branch: "main; id" })).rejects.toThrow("unsafe branch");
+		await expect(ops.commitOnTaskBranch({ ...commitInput, taskId: "T-1; id" })).rejects.toThrow("unsafe task id");
 		expect(commands).toEqual([]);
-		expect(await ops.commitExists("/r/wt", "HEAD; id")).toBe(false);
 	});
 
 	describe("local, real temp git repo", () => {
@@ -263,7 +309,7 @@ describe("host ops (fake runner)", () => {
 		});
 		afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-		test("worktree add, docs write/read, commit existence, rollback", async () => {
+		test("worktree add, docs write/read, docs commit, rollback", async () => {
 			const repo = join(dir, "repo");
 			mkdirSync(repo);
 			const git = (...args: string[]) => {
@@ -298,8 +344,6 @@ describe("host ops (fake runner)", () => {
 			expect((await ops.writeFile(spec, "y")).ok).toBe(false);
 			expect(await ops.readFile(spec)).toEqual({ ok: true, value: "x" });
 			expect(await ops.readFile(join(worktree, "nope.md"))).toEqual({ ok: true, value: undefined });
-			expect(await ops.commitExists(worktree, head.slice(0, 10))).toBe(true);
-			expect(await ops.commitExists(worktree, "deadbeefdeadbeef")).toBe(false);
 
 			// The docs become the task branch's first commit; ops strips GIT_* env, so identity comes from repo config.
 			git("config", "user.name", "t");
@@ -319,6 +363,59 @@ describe("host ops (fake runner)", () => {
 			await ops.removeWorktree(input);
 			expect(await ops.pathExists(worktree)).toEqual({ ok: true, value: false });
 			expect(git("branch", "--list", "task/T-20261026-01")).toBe("");
+		});
+
+		test("commit evidence counts only commits on the task branch after its docs commit", async () => {
+			const repo = join(dir, "repo");
+			mkdirSync(repo);
+			const at =
+				(cwd: string) =>
+				(...args: string[]): string => {
+					const result = Bun.spawnSync(["git", "-C", cwd, ...args]);
+					if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+					return result.stdout.toString().trim();
+				};
+			const git = at(repo);
+			git("init", "-q", "-b", "main");
+			git("config", "user.name", "t");
+			git("config", "user.email", "t@t");
+			writeFileSync(join(repo, "a.txt"), "a");
+			git("add", "a.txt");
+			git("commit", "-q", "-m", "init");
+			const onMain = git("rev-parse", "HEAD");
+			const ops = createTaskHostOps({});
+			const taskId = "T-20261026-01";
+			const branch = `task/${taskId}`;
+			const worktree = `${repo}-t-20261026-01`;
+			expect(await ops.createWorktree({ repo, worktree, branch })).toEqual({ ok: true, value: null });
+			expect(await ops.writeFile(join(worktree, `docs/tasks/${taskId}/spec.md`), "x")).toEqual({
+				ok: true,
+				value: null,
+			});
+			const docs = await ops.commitDocs({ worktree, taskId });
+			const docsHash = docs.ok ? docs.value : "";
+			const wt = at(worktree);
+			writeFileSync(join(worktree, "b.txt"), "b");
+			wt("add", "b.txt");
+			wt("commit", "-q", "-m", "feat");
+			const onTask = wt("rev-parse", "HEAD");
+			git("checkout", "-q", "-b", "other", "main");
+			writeFileSync(join(repo, "c.txt"), "c");
+			git("add", "c.txt");
+			git("commit", "-q", "-m", "elsewhere");
+			const onOther = git("rev-parse", "HEAD");
+			git("branch", "task/T-20261026-02", "main");
+
+			const check = (hash: string, id = taskId) =>
+				ops.commitOnTaskBranch({ worktree, branch: `task/${id}`, taskId: id, hash });
+			expect(await check(onTask)).toBe("ok");
+			expect(await check(onTask.slice(0, 10))).toBe("ok");
+			expect(await check(onMain)).toBe("not_on_branch");
+			expect(await check(docsHash)).toBe("not_on_branch");
+			expect(await check(onOther)).toBe("not_on_branch");
+			expect(await check("deadbeefdeadbeef")).toBe("missing");
+			expect(await check("HEAD; id")).toBe("missing");
+			expect(await check(onMain, "T-20261026-02")).toBe("no_base");
 		});
 	});
 });

@@ -7,6 +7,7 @@ import {
 	parseOutcome,
 	parseProgress,
 	parseSpec,
+	stripAcPrefix,
 } from "./docs";
 
 export const COMMIT_HASH = /^[0-9a-f]{7,40}$/;
@@ -19,9 +20,15 @@ export interface CheckInput {
 	spec: string | undefined;
 	progress: string | undefined;
 	outcome: string | undefined;
-	/** Whether a commit exists in the task's worktree repository (injected: `git cat-file -e <hash>^{commit}`). */
-	commitExists(hash: string): Promise<boolean>;
+	/** Whether a commit is the task's own: on its branch after the docs commit (injected: `commitOnTaskBranch`). */
+	commitCheck(hash: string): Promise<CommitCheck>;
 }
+
+/**
+ * `ok`: on the task branch after its docs commit · `missing`: not in the repository · `not_on_branch`: anywhere else
+ * (main, another branch, the docs commit itself) · `no_base`: the branch has no docs commit to measure from.
+ */
+export type CommitCheck = "ok" | "missing" | "not_on_branch" | "no_base";
 
 export interface TaskJudgement {
 	reached: boolean;
@@ -49,11 +56,16 @@ export interface TaskJudgement {
 	summary: string[];
 	/** Fingerprint of everything the judgement stands on — the dedup key of the "reached" notice. */
 	reachKey: string;
+	/** The registered acceptance items with their spec.md checkbox, for display (not part of the judgement). */
+	acceptance: Array<{ id: string; text: string; checked: boolean }>;
+	/** PROGRESS.md steps as written, for display (not part of the judgement). */
+	steps: Array<{ id: string; text: string; done: boolean }>;
 	/** Human-readable unmet conditions; empty exactly when `reached`. */
 	problems: string[];
 }
 
-const digest = (value: unknown): string =>
+/** sha256 of the JSON form, first 12 hex characters: the dedup key of a notice. */
+export const digest = (value: unknown): string =>
 	createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 12);
 
 /**
@@ -121,8 +133,13 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 	}
 
 	for (const hash of commits) {
-		// A failed existence probe is an unmet condition, never a pass.
-		if (!(await input.commitExists(hash))) problems.push(`commit ${hash}가 워크트리 저장소에 없습니다`);
+		// Anything but a commit the task itself made is an unmet condition, never a pass.
+		const found = await input.commitCheck(hash);
+		if (found === "missing") problems.push(`commit ${hash}가 워크트리 저장소에 없습니다`);
+		else if (found === "not_on_branch")
+			problems.push(`commit ${hash}는 task 브랜치(<4문서 커밋 이후)의 새 커밋이 아닙니다`);
+		else if (found === "no_base")
+			problems.push(`task 브랜치에서 4문서 커밋을 찾지 못해 commit ${hash}를 확인할 수 없습니다`);
 	}
 
 	const status = progress?.status ?? "";
@@ -155,6 +172,12 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		evidence,
 		summary: outcome?.summary ?? [],
 		reachKey: digest({ spec: specDoc?.acceptance, evidence, updatedAt }),
+		acceptance: input.snapshot.map((item) => ({
+			id: item.id,
+			text: stripAcPrefix(item.text),
+			checked: checkedIds.has(item.id),
+		})),
+		steps: steps.map((step) => ({ id: step.id, text: step.text, done: step.done })),
 		problems,
 	};
 }

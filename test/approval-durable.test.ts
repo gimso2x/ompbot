@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { ApprovalBroker, type ApprovalStore, type ApprovalTimers } from "../src/safety/approval";
+import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackTransport } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
@@ -60,7 +61,7 @@ class ManualTimers implements ApprovalTimers {
 
 function makeBroker(transport: SlackTransport, timers: ApprovalTimers, now: () => number): ApprovalBroker {
 	return new ApprovalBroker({
-		transport,
+		port: new SlackChannel(transport),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: store as unknown as ApprovalStore,
@@ -201,6 +202,135 @@ describe("durable approvals", () => {
 		const final = await transport.finalized.promise;
 		expect(final.text).not.toContain("⛔ 거부됨");
 		expect(final.blocks).toEqual([]);
+	});
+
+	test("a ledger without the detail and link columns gains them; old rows stay and a second open is a no-op", () => {
+		const path = join(dir, "pre-detail.db");
+		const old = new Database(path);
+		old.run(
+			`CREATE TABLE approvals (approval_id TEXT PRIMARY KEY, channel TEXT NOT NULL, message_ts TEXT NOT NULL, summary TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','denied','expired','replied')),
+				created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, decided_at INTEGER, origin_key TEXT,
+				origin_thread_ref TEXT, reply_ts TEXT, reply_text TEXT)`,
+		);
+		old.run(
+			"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key) VALUES ('C1:1.1','C1','1.1','old card','pending',1000,90000,'slack/dm/D1')",
+		);
+		old.close();
+		for (let open = 0; open < 2; open++) {
+			const migrated = openStore({ path, clock: { now: () => 1_000 }, redact });
+			expect(migrated.getApproval("C1:1.1")).toMatchObject({ status: "pending", originKey: "slack/dm/D1" });
+			migrated.close();
+		}
+		const check = new Database(path, { readonly: true });
+		const names = (check.query("PRAGMA table_info(approvals)").all() as Array<{ name: string }>).map((c) => c.name);
+		expect(names).toEqual(expect.arrayContaining(["detail_json", "card_url", "origin_url"]));
+		expect(check.query("SELECT summary, detail_json, card_url, origin_url FROM approvals").all()).toEqual([
+			{ summary: "old card", detail_json: null, card_url: null, origin_url: null },
+		]);
+		check.close();
+	});
+
+	/** The raw ledger row of one card: what the dashboard reads. */
+	const rawRow = (id: string): { detail_json: string | null; card_url: string | null; origin_url: string | null } => {
+		const db = new Database(join(dir, "ompbot.db"), { readonly: true });
+		try {
+			return db.query("SELECT detail_json, card_url, origin_url FROM approvals WHERE approval_id = ?").get(id) as {
+				detail_json: string | null;
+				card_url: string | null;
+				origin_url: string | null;
+			};
+		} finally {
+			db.close();
+		}
+	};
+
+	test("ask stores the card's own redacted, cut detail; detail-less ask and request store NULL", async () => {
+		const transport = new CardTransport();
+		const timers = new ManualTimers();
+		const long = `rm -rf /srv/build ${"x".repeat(500)}`;
+		const done = makeBroker(transport, timers, () => 1_000).ask("D1", "clean build", {
+			detail: {
+				action: long,
+				why: "token xoxb-TEST-0 leaked",
+				impact: "key sk-TESTKEY123 rotates",
+				rollback: "deleted files are gone",
+			},
+		});
+		const { ts } = await transport.shown.promise;
+		const stored = JSON.parse(rawRow(`D1:${ts}`).detail_json ?? "null") as Record<string, string>;
+		expect(Object.keys(stored)).toEqual(["action", "why", "impact", "rollback"]);
+		expect(stored.action).toBe(long.slice(0, 400));
+		expect(stored.why).toBe("token [REDACTED] leaked");
+		expect(stored.impact).toBe("key [REDACTED] rotates");
+		const card = transport.calls.find((call) => call.method === "postMessage");
+		const cardText = card?.method === "postMessage" ? card.text : "";
+		for (const [label, key] of [
+			["할 일", "action"],
+			["이유", "why"],
+			["영향", "impact"],
+			["되돌릴 수 없는 이유", "rollback"],
+		] as const) {
+			expect(cardText).toContain(`• ${label}: ${stored[key]}`);
+		}
+		timers.fireAll();
+		expect(await done).toBe("timeout");
+		const raw = new Database(join(dir, "ompbot.db"), { readonly: true });
+		const dump = JSON.stringify(raw.query("SELECT * FROM approvals").all());
+		raw.close();
+		expect(dump).not.toContain("xoxb-");
+		expect(dump).not.toContain("sk-");
+
+		for (const [channel, start] of [
+			["D2", (broker: ApprovalBroker) => broker.ask("D2", "plain ask", { detail: { action: "  " } })],
+			["D3", (broker: ApprovalBroker) => broker.request("D3", "plain request")],
+		] as const) {
+			const next = new CardTransport();
+			const nextTimers = new ManualTimers();
+			const pending = start(makeBroker(next, nextTimers, () => 1_000));
+			const shown = await next.shown.promise;
+			expect(rawRow(`${channel}:${shown.ts}`).detail_json).toBeNull();
+			nextTimers.fireAll();
+			await pending;
+		}
+	});
+
+	test("ask stores the card and asking-thread permalinks; a throwing permalink leaves NULLs and the decision intact", async () => {
+		const transport = new CardTransport();
+		const timers = new ManualTimers();
+		const broker = makeBroker(transport, timers, () => 1_000);
+		const done = broker.ask("C9", "deploy", {
+			origin: { originKey: "slack/ch/C9/t/7.7", channel: "C9", threadTs: "7.7" },
+		});
+		const { ts } = await transport.shown.promise;
+		expect(rawRow(`C9:${ts}`)).toEqual({
+			detail_json: null,
+			card_url: `https://slack.test/archives/C9/p${ts.replace(".", "")}`,
+			origin_url: "https://slack.test/archives/C9/p77",
+		});
+		expect(broker.handleAction({ actionId: `ompbot:approval:approve:C9:${ts}`, userId: OWNER })).toBe(true);
+		expect(await done).toBe("approved");
+
+		// A fresh fake transport restarts its ts sequence, so each round asks in its own channel.
+		for (const [channel, decision, outcome] of [
+			["C7", "approve", "approved"],
+			["C8", "deny", "denied"],
+		] as const) {
+			const failing = new CardTransport();
+			failing.failNext.getPermalink = [new Error("slack down"), new Error("slack down")];
+			const failingBroker = makeBroker(failing, new ManualTimers(), () => 1_000);
+			const pending = failingBroker.ask(channel, "deploy", {
+				origin: { originKey: `slack/ch/${channel}/t/7.7`, channel, threadTs: "7.7" },
+			});
+			const shown = await failing.shown.promise;
+			expect(failing.count("getPermalink")).toBe(2);
+			expect(rawRow(`${channel}:${shown.ts}`)).toEqual({ detail_json: null, card_url: null, origin_url: null });
+			expect(
+				failingBroker.handleAction({ actionId: `ompbot:approval:${decision}:${channel}:${shown.ts}`, userId: OWNER }),
+			).toBe(true);
+			expect(await pending).toBe(outcome);
+			expect(store.getApproval(`${channel}:${shown.ts}`)?.status).toBe(outcome);
+		}
 	});
 
 	test("the buttons show the default 30-minute deadline in the owner's time zone", async () => {

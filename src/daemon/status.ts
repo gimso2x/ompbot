@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { dirname } from "node:path";
-import { isThreadOrigin, slackOriginChannel } from "../core/normalize";
+import { isThreadOrigin } from "../core/normalize";
+import { chatOriginKey, parseChatOrigin } from "../core/origin-key";
 import { DEFAULT_TIMEZONE, formatLocal } from "../monitors/cron";
 import { type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
 import { type FreezeState, readFreeze } from "../ops/freeze";
@@ -187,10 +188,12 @@ function renderOriginLines(origins: readonly OriginStatus[]): string[] {
 			lines.push(`• ${o.originKey} epoch=${o.epoch} omp_pid=${o.ompPid ?? "-"} ${o.busy ? "작업 중" : "대기"}`);
 			continue;
 		}
-		const channel = slackOriginChannel(o.originKey);
-		if (channel !== undefined) threadsPerChannel.set(channel, (threadsPerChannel.get(channel) ?? 0) + 1);
+		const ref = parseChatOrigin(o.originKey);
+		if (ref === undefined) continue;
+		const channel = chatOriginKey({ platform: ref.platform, kind: ref.kind, conversationId: ref.conversationId });
+		threadsPerChannel.set(channel, (threadsPerChannel.get(channel) ?? 0) + 1);
 	}
-	for (const [channel, count] of threadsPerChannel) lines.push(`• slack/ch/${channel} × ${count}스레드`);
+	for (const [channel, count] of threadsPerChannel) lines.push(`• ${channel} × ${count}스레드`);
 	return lines;
 }
 

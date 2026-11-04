@@ -1,3 +1,4 @@
+import type { ChannelPort } from "../channel/port";
 import { parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
 import type { BoardLinkResolver } from "../dispatch/board";
 import {
@@ -8,7 +9,6 @@ import {
 	herdrStartAgent,
 	type ProcessRunner,
 } from "../dispatch/omp";
-import type { SlackTransport } from "../slack/transport";
 import { summarizeJudgement } from "./checker";
 import {
 	acceptanceItems,
@@ -35,7 +35,7 @@ export interface TaskDispatchDeps {
 	threadRef(): string | undefined;
 	/** The [TASK] root message text, from the inbound ledger. */
 	rootText(threadRef: string): string | undefined;
-	transport: SlackTransport;
+	port: ChannelPort;
 	now(): number;
 	workspaceDir: string;
 	dispatchHosts?: Record<string, HostEntry>;
@@ -91,12 +91,13 @@ async function cardLink(deps: TaskDispatchDeps, row: TaskRow, paneId: string): P
 	return deps.boardLink === undefined ? undefined : await deps.boardLink(row.host, paneId);
 }
 
-/** Permalink of the task thread root (`chat.getPermalink`); the bare thread ref when Slack cannot resolve it. */
-async function threadLink(transport: SlackTransport, log: TaskSlackLog, threadRef: string): Promise<string> {
+/** Permalink of the task thread root; the bare thread ref when the platform cannot resolve it. */
+async function threadLink(port: ChannelPort, log: TaskSlackLog, threadRef: string): Promise<string> {
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return threadRef;
 	try {
-		return await transport.getPermalink({ channel: target.channel, ts: target.threadTs });
+		const root = { platform: port.platform, conversationId: target.channel, messageId: target.threadTs };
+		return (await port.permalink(root)) ?? threadRef;
 	} catch (error) {
 		log.warn("task_permalink_failed", { thread: threadRef, error: String(error) });
 		return threadRef;
@@ -155,7 +156,7 @@ export async function startTask(
 			worktree: row.worktree,
 			branch: row.branch,
 			agent: row.agent,
-			threadLink: await threadLink(deps.transport, deps.log, threadRef),
+			threadLink: await threadLink(deps.port, deps.log, threadRef),
 			registeredAt: row.createdAt,
 		};
 		const dir = docsDirOf(row.worktree, row.taskId);
@@ -188,8 +189,8 @@ export async function startTask(
 
 	deps.log.info("task_started", { task: row.taskId, host: row.host, agent: row.agent });
 	const link = await cardLink(deps, row, paneId);
-	const posted = await postToThread(deps.transport, deps.log, threadRef, formatAcceptedCard(row, spec, link));
-	await setStatusReaction(deps.transport, deps.log, threadRef, "working", []);
+	const posted = await postToThread(deps.port, deps.log, threadRef, formatAcceptedCard(row, spec, link));
+	await setStatusReaction(deps.port, deps.log, threadRef, "working", []);
 	const where = `${row.host ?? "local"}:${row.worktree}`;
 	return [
 		`${row.taskId} 등록·시작했습니다 (워크트리 ${where}, branch ${row.branch}, 에이전트 ${row.agent}, 기준 문서 ${docsDirOf(row.worktree, row.taskId)}).`,
@@ -241,7 +242,7 @@ export async function resumeTask(
 	}
 	if (row.status !== "working") {
 		deps.ledger.transition(row.taskId, "working", "bot", "resume dispatch");
-		await setStatusReaction(deps.transport, deps.log, row.threadRef, "working");
+		await setStatusReaction(deps.port, deps.log, row.threadRef, "working");
 	}
 	// A resumed task gets a fresh staleness baseline: the agent has not had a chance to update PROGRESS.md yet.
 	deps.ledger.setProgressAt(row.taskId, deps.now());

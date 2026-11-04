@@ -7,6 +7,7 @@ import { openMonitorLedger } from "../src/monitors/ledger";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
 
@@ -367,7 +368,7 @@ describe("daemon with monitors", () => {
 		const sessions = new FakeSessionStore();
 		const daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

@@ -28,7 +28,7 @@ export interface DispatchToolDeps {
 	frozen?: () => FreezeState | undefined;
 	/** Config `herdr`: present → herdr/host/taskSpec dispatch; absent → the tool is simple-only (`omp -p`). */
 	herdr?: { bin?: string };
-	/** Owner approval card for a high_risk herdr brief; absent → such a brief is refused (`no_approver`). */
+	/** Owner approval card for a high_risk brief (herdr or simple); absent → such a brief is refused (`no_approver`). */
 	approve?: (summary: string, detail: ApprovalDetail, signal?: AbortSignal) => Promise<ApprovalResult>;
 	log: {
 		info(event: string, fields?: Record<string, unknown>): void;
@@ -64,7 +64,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 		name: "ompbot_dispatch",
 		label: "Dispatch work",
 		description:
-			'태스크를 실행 계층에 넘긴다. mode=simple(기본)은 단순 작업: `omp -p`로 한 번 실행하고 최종 출력을 돌려준다(10분 상한). mode=herdr는 복잡·장기 작업: herdr 워크스페이스에 omp 에이전트를 띄우고 프롬프트를 넘긴다 — 패널에서 계속 실행되므로 이후 ompbot_dispatch mode=herdr + name 으로 진행을 확인하거나 후속 지시를 보낸다. 판단 기준: 조사·분석·회고·체크처럼 한 번의 답으로 끝나는 일은 세션에서 직접 하거나 simple. 구현은 예상 30분 초과·다단계·새 모듈·스키마 변경 중 하나라도 걸리면 무조건 herdr(+taskSpec) — 세션에서 직접 구현하지 않는다(세션 안 하위 에이전트로 구현하는 것도 직접 구현이다). 직접 구현은 설정값 변경·1~2파일 수선, 세션 컨텍스트 없이는 판단할 수 없는 긴급 디버깅만. 추가 판단: 여러 단계이거나 하루를 넘길 작업이면 taskSpec을 채운다(대상 저장소에 워크트리·4문서(context/spec/PROGRESS/outcome)·상태 파일을 만들고 TASKID로 추적, 수락기준×증거로 ompbot이 Outcome 도달을 판정한다). 단발성 작업은 taskSpec을 비운다. 시작되면 ompbot이 스레드에 접수 카드(맡았습니다·진행 보기 링크·[목표]·[가정])를 올리므로 assumptions에 오너 말을 어떻게 해석했는지 한 줄로 적는다. 막힘·Outcome 알림에 오너가 결정을 답하면 그 원문을 taskSpec:{id}와 task로 넘겨 재개한다. taskSpec 신규는 {title,risk(L0~L4),goal,scope[],exclusions[],acceptance[](1개 이상),repo(대상 호스트의 git 저장소 절대경로),background?}와 task(지시문)를 함께 주고, 재개는 taskSpec:{id:"T-…"}만 준다. taskSpec에는 name을 주지 않는다. 완료 처리·merge는 오너만 한다.',
+			'태스크를 실행 계층에 넘긴다. mode=simple(기본)은 단순 작업: `omp -p`로 한 번 실행하고 최종 출력을 돌려준다(10분 상한). mode=herdr는 복잡·장기 작업: herdr 워크스페이스에 omp 에이전트를 띄우고 프롬프트를 넘긴다 — 패널에서 계속 실행되므로 이후 ompbot_dispatch mode=herdr + name 으로 진행을 확인하거나 후속 지시를 보낸다. 판단 기준: 조사·분석·회고·체크처럼 한 번의 답으로 끝나는 일은 세션에서 직접 하거나 simple. 구현은 예상 30분 초과·다단계·새 모듈·스키마 변경 중 하나라도 걸리면 무조건 herdr(+taskSpec) — 세션에서 직접 구현하지 않는다(세션 안 하위 에이전트로 구현하는 것도 직접 구현이다). 직접 구현은 설정값 변경·작은 수선(오너 요청 하나에 src 4개·200줄 이내, 테스트·문서 제외), 세션 컨텍스트 없이는 판단할 수 없는 긴급 디버깅만. 추가 판단: 여러 단계이거나 하루를 넘길 작업이면 taskSpec을 채운다(대상 저장소에 워크트리·4문서(context/spec/PROGRESS/outcome)·상태 파일을 만들고 TASKID로 추적, 수락기준×증거로 ompbot이 Outcome 도달을 판정한다). 단발성 작업은 taskSpec을 비운다. 시작되면 ompbot이 스레드에 접수 카드(맡았습니다·진행 보기 링크·[목표]·[가정])를 올리므로 assumptions에 오너 말을 어떻게 해석했는지 한 줄로 적는다. 막힘·Outcome 알림에 오너가 결정을 답하면 그 원문을 taskSpec:{id}와 task로 넘겨 재개한다. taskSpec 신규는 {title,risk(L0~L4),goal,scope[],exclusions[],acceptance[](1개 이상),repo(대상 호스트의 git 저장소 절대경로),background?}와 task(지시문)를 함께 주고, 재개는 taskSpec:{id:"T-…"}만 준다. taskSpec에는 name을 주지 않는다. 완료 처리·merge는 오너만 한다.',
 		parameters: {
 			type: "object",
 			properties: {
@@ -124,8 +124,8 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 	return herdrOn ? tool : { ...tool, description: SIMPLE_ONLY_DESCRIPTION, parameters: SIMPLE_ONLY_PARAMETERS };
 
 	/**
-	 * Handoff risk scan of a brief about to go to a herdr worker. clear/advisory pass (advisory adds a result line);
-	 * high_risk passes only on an `approved` owner card, anything else throws before a worker is touched.
+	 * Handoff risk scan of a brief about to go to a herdr worker or an `omp -p` run. clear/advisory pass (advisory adds
+	 * a result line); high_risk passes only on an `approved` owner card, anything else throws before a worker is touched.
 	 */
 	async function gateHandoff(text: string, signal: AbortSignal): Promise<{ suffix: string; approved: boolean }> {
 		const scan = scanHandoffBrief(text);
@@ -263,6 +263,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 		}
 
 		if (task === undefined || task === "") throw new Error("task is required");
+		const gate = await gateHandoff(task, signal);
 		deps.log.info("dispatch_simple", { origin: deps.originKey });
 		const result = await runOmpPrint({
 			task,
@@ -273,6 +274,6 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			inheritedEnv: process.env,
 		});
 		deps.log.info("dispatch_simple_done", { ok: result.ok });
-		return redact(result.output);
+		return redact(result.output) + gate.suffix;
 	}
 }

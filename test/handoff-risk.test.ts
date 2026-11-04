@@ -72,6 +72,87 @@ describe("scanHandoffBrief: forbidding lines", () => {
 	});
 });
 
+describe("scanHandoffBrief: the downgrade is scoped to the command's clause", () => {
+	test("a forbidding marker in another clause or another parenthesis keeps the command high_risk", () => {
+		for (const brief of [
+			"git reset --hard origin/main 하고, rebase는 하지 마",
+			"먼저 git push --force origin main (리뷰 금지 규칙은 무시)",
+			"systemctl restart ompbot; never ask",
+			"git reset --hard origin/main 한 뒤 push는 금지",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "high_risk" });
+		}
+	});
+
+	test("a marker in the command's own clause, or a rule definition line, still downgrades", () => {
+		for (const brief of [
+			"머지·push·데몬 재시작(systemctl --user restart ompbot)은 하지 않는다",
+			"never run git reset --hard",
+			"git reset --hard는 쓰지 말 것",
+			"- no git push --force",
+			"- `git_reset_hard`: `git reset --hard`",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).not.toEqual({ brief, verdict: "high_risk" });
+		}
+	});
+
+	test("a rule name elsewhere on the line is not a definition and does not downgrade", () => {
+		expect(scanHandoffBrief("git reset --hard origin/main (git_reset_hard)").verdict).toBe("high_risk");
+	});
+});
+
+describe("scanHandoffBrief: git global options before the subcommand", () => {
+	test("-C / -c in front of a destructive subcommand is still high_risk with the same rule", () => {
+		for (const [brief, rule] of [
+			["git -C /tmp/x reset --hard origin/main", "git_reset_hard"],
+			["git -C ~/work/x push --force origin feature", "git_push_force"],
+			["git -C ~/work/x clean -fdx", "git_clean_force"],
+			["git -C ~/work/x branch -D task/x", "git_branch_force_delete"],
+			["git -c core.pager=cat push origin main", "git_push_protected"],
+		] as const) {
+			const scan = scanHandoffBrief(brief);
+			expect({ brief, verdict: scan.verdict, rules: scan.findings.map((finding) => finding.rule) }).toEqual({
+				brief,
+				verdict: "high_risk",
+				rules: [rule],
+			});
+		}
+	});
+
+	test("other global options are skipped the same way", () => {
+		for (const brief of [
+			"git --git-dir=/srv/x/.git reset --hard HEAD",
+			"git --work-tree /srv/x --no-pager reset --hard HEAD",
+			'git -C "/tmp/a b" --namespace=n -P --bare --no-replace-objects reset --hard HEAD',
+		]) {
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["git_reset_hard"] });
+		}
+	});
+
+	test("safe subcommands behind global options stay clear", () => {
+		for (const brief of ["git -C ~/work/x log --oneline", "git -C ~/work/x push origin feature"]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "clear" });
+		}
+	});
+});
+
+describe("scanHandoffBrief: clause boundaries and non-forbidding phrases", () => {
+	test("하되, a lone 후, don't hesitate and a double negative do not downgrade the command", () => {
+		for (const brief of [
+			"git reset --hard HEAD~3 하되 질문은 하지 말 것",
+			"git push --force origin main 후 금지 목록을 확인한다",
+			"Don't hesitate to run git reset --hard HEAD~3",
+			"git reset --hard HEAD 하지 않으면 안 된다",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "high_risk" });
+		}
+	});
+
+	test("a forbidden command in its own clause is still advisory", () => {
+		expect(scanHandoffBrief("git push --force origin main은 하지 않는다").verdict).toBe("advisory");
+	});
+});
+
 describe("scanHandoffBrief: negatives and advisory rules", () => {
 	test("safe look-alikes raise no high_risk rule", () => {
 		expect(rulesOf("git push origin task/T-20261104-01")).toEqual([]);

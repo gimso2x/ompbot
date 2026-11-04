@@ -58,7 +58,13 @@ function nextFinal(driver: FakeOmpDriver): Promise<OmpFinal> {
 async function dispatchedTurn(
 	id: string,
 	text: string,
-	options: { finish: boolean; cursor?: (leaf: string | null) => string | null; script?: () => FakeTurnMessage[] },
+	options: {
+		finish: boolean;
+		cursor?: (leaf: string | null) => string | null;
+		script?: () => FakeTurnMessage[];
+		/** What omp received instead of the row text (the mailbox puts recall/thread context in front). */
+		prompt?: string;
+	},
 ): Promise<{ opRef: string }> {
 	const driver = new FakeOmpDriver({
 		sessionDir: SESSION_DIR,
@@ -70,7 +76,7 @@ async function dispatchedTurn(
 	await driver.openSession();
 	const leaf = await driver.leafId();
 	const final = nextFinal(driver);
-	const opRef = await driver.prompt(text);
+	const opRef = await driver.prompt(options.prompt ?? text);
 	store.recordInbound({ originKey: ORIGIN, platformMessageId: id, textRef: text, threadRef: `D1:${id}` });
 	store.markDispatched(id, { opRef, entryCursor: options.cursor ? options.cursor(leaf) : leaf });
 	if (options.finish) await final;
@@ -160,6 +166,35 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		expect(result).toEqual({ answered: 1, interrupted: 0 });
 		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["ECHO B 작업"]);
 		expect(drivers[0]?.calls).toEqual([`switchSession:${pinned}`]);
+	});
+
+	test("a turn whose prompt carries context blocks before [현재 요청] is answered", async () => {
+		const prompt = "[이전 대화 회상]\n- 오너: 백업 경로\n\n[현재 요청]\n백업 경로 뭐였지";
+		await dispatchedTurn("m1", "백업 경로 뭐였지", { finish: true, prompt });
+		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
+		expect(result).toEqual({ answered: 1, interrupted: 0 });
+		expect(store.getInbound("m1")?.state).toBe("answered");
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([`ECHO ${prompt}`]);
+	});
+
+	test("a context-block prompt for another request, or an unfinished one, is interrupted", async () => {
+		await dispatchedTurn("m1", "백업 경로 뭐였지", {
+			finish: true,
+			prompt: "[이전 대화 회상]\n- 오너: 백업 경로\n\n[현재 요청]\n다른 질문",
+		});
+		expect(await recoverDispatched({ store, driverFactory: factory(), log: log() })).toEqual({
+			answered: 0,
+			interrupted: 1,
+		});
+		await dispatchedTurn("m2", "백업 경로 뭐였지", {
+			finish: false,
+			prompt: "[이전 대화 회상]\n- 오너: 백업 경로\n\n[현재 요청]\n백업 경로 뭐였지",
+		});
+		expect(await recoverDispatched({ store, driverFactory: factory(), log: log() })).toEqual({
+			answered: 0,
+			interrupted: 1,
+		});
+		expect(store.listDeliveries().map((d) => d.body)).toEqual([INTERRUPTED_NOTICE, INTERRUPTED_NOTICE]);
 	});
 
 	test("no assistant body after the prompt -> one interrupted notice, failed_notified, prompt never resent", async () => {

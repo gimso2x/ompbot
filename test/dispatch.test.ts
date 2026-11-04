@@ -15,6 +15,7 @@ import {
 	setLocalHerdrBin,
 } from "../src/dispatch/omp";
 import { buildDispatchTool, type DispatchToolDeps } from "../src/dispatch/tool";
+import type { ApprovalResult } from "../src/safety/approval";
 
 function runner(routes: Array<{ match: (cmd: string[]) => boolean; respond: (cmd: string[]) => RunProcessResult }>) {
 	return async (cmd: string[]): Promise<RunProcessResult> => {
@@ -80,6 +81,67 @@ describe("runOmpPrint (simple mode)", () => {
 		});
 		expect(failed.ok).toBe(false);
 		expect(failed.output).toBe("boom");
+	});
+});
+
+describe("simple mode risk gate", () => {
+	const signal = new AbortController().signal;
+	const HIGH = "git push --force origin main 로 맞춰";
+	function simpleTool(approval?: ApprovalResult) {
+		const runs: string[][] = [];
+		const approvals: string[] = [];
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			log: { info() {}, warn() {} },
+			run: async (cmd) => {
+				runs.push(cmd);
+				return { code: 0, stdout: "결과 요약\n", timedOut: false };
+			},
+			...(approval === undefined
+				? {}
+				: {
+						approve: async (summary: string) => {
+							approvals.push(summary);
+							return approval;
+						},
+					}),
+		});
+		return { built, runs, approvals };
+	}
+
+	const REFUSALS: Array<[string, ApprovalResult | undefined, string]> = [
+		["denied", "denied", "denied"],
+		["timeout", "timeout", "timeout"],
+		["a thread reply", { replied: "응" }, "replied"],
+		["no approver", undefined, "no_approver"],
+	];
+	for (const [label, approval, outcome] of REFUSALS) {
+		test(`high_risk + ${label} is refused and omp -p never runs`, async () => {
+			const { built, runs, approvals } = simpleTool(approval);
+			await expect(built.execute({ task: HIGH }, { signal })).rejects.toThrow(
+				`위험 검사에서 막혔습니다(${outcome}): git_push_force, git_push_protected.`,
+			);
+			expect(runs).toEqual([]);
+			expect(approvals).toHaveLength(approval === undefined ? 0 : 1);
+		});
+	}
+
+	test("high_risk + approved runs omp -p and ends with the approval line", async () => {
+		const { built, runs, approvals } = simpleTool("approved");
+		const out = await built.execute({ task: HIGH }, { signal });
+		expect(runs.map((cmd) => cmd.slice(0, 3))).toEqual([["omp", "-p", HIGH]]);
+		expect(approvals).toEqual(["herdr 위임 지시문에 고위험 명령이 있습니다"]);
+		expect(out).toBe("결과 요약\n위험 검사: high_risk 승인됨 (git_push_force, git_push_protected)");
+	});
+
+	test("a clear task never asks and returns the unchanged output", async () => {
+		const { built, runs, approvals } = simpleTool("denied");
+		expect(await built.execute({ task: "빌드 상태 요약" }, { signal })).toBe("결과 요약");
+		expect(runs).toHaveLength(1);
+		expect(approvals).toEqual([]);
 	});
 });
 

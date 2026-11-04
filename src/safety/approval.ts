@@ -1,7 +1,7 @@
+import type { ActionButton, ChannelPort, MessageRef } from "../channel/port";
 import type { Logger } from "../log";
 import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import { redact } from "../redact";
-import type { SlackTransport } from "../slack/transport";
 
 export type ApprovalDecision = "approve" | "deny";
 export type ApprovalOutcome = "approved" | "denied" | "timeout";
@@ -51,22 +51,32 @@ const DETAIL_SECTIONS: Array<{ key: keyof ApprovalDetail; label: string }> = [
 	{ key: "rollback", label: "되돌릴 수 없는 이유" },
 ];
 
+/** The filled sections, each redacted and cut to `FIELD_LIMIT`: the exact text the card shows and the ledger keeps. */
+function shownDetail(detail: ApprovalDetail | undefined): ApprovalDetail {
+	const shown: ApprovalDetail = {};
+	for (const { key } of DETAIL_SECTIONS) {
+		const value = detail?.[key];
+		if (value === undefined || value.trim() === "") continue;
+		shown[key] = cutCodePointSafe(redact(value), FIELD_LIMIT);
+	}
+	return shown;
+}
+
 /**
  * The card text: header (with the owner mention when the card is escalated, so it notifies) + the already-redacted,
- * already-cut summary, an optional `요청 위치` line, then one `• 라벨: 값` line per filled section.
+ * already-cut summary, an optional `요청 위치` line, then one `• 라벨: 값` line per filled (already shown) section.
  */
 function renderCard(
 	shownSummary: string,
-	detail: ApprovalDetail | undefined,
-	escalation: { ownerUserId: string; where: string } | undefined,
+	detail: ApprovalDetail,
+	escalation: { ownerMention: string; where: string } | undefined,
 ): string {
-	const header = escalation === undefined ? "🔐 승인 요청" : `🔐 승인 요청 <@${escalation.ownerUserId}>`;
+	const header = escalation === undefined ? "🔐 승인 요청" : `🔐 승인 요청 ${escalation.ownerMention}`;
 	const lines = [`${header}\n${shownSummary}`];
 	if (escalation !== undefined) lines.push(`요청 위치: ${escalation.where}`);
 	for (const { key, label } of DETAIL_SECTIONS) {
-		const value = detail?.[key];
-		if (value === undefined || value.trim() === "") continue;
-		lines.push(`• ${label}: ${cutCodePointSafe(redact(value), FIELD_LIMIT)}`);
+		const value = detail[key];
+		if (value !== undefined) lines.push(`• ${label}: ${value}`);
 	}
 	return cutCodePointSafe(lines.join("\n"), CARD_LIMIT);
 }
@@ -74,6 +84,18 @@ function renderCard(
 /** `ompbot:approval:<approve|deny>:<channel>:<ts>`; channel ids and message ts contain no colon. */
 export function approvalActionId(decision: ApprovalDecision, channel: string, ts: string): string {
 	return `${APPROVAL_ACTION_PREFIX}:${decision}:${channel}:${ts}`;
+}
+
+/** Approve/deny buttons of one card; their action ids carry the card's own message id. */
+function approvalButtons(channel: string, ts: string): ActionButton[] {
+	return [
+		{ actionId: approvalActionId("approve", channel, ts), label: "승인", value: "approve", style: "primary" },
+		{ actionId: approvalActionId("deny", channel, ts), label: "거부", value: "deny", style: "danger" },
+	];
+}
+
+function deadlineNote(expiresAt: number, timeoutMs: number): string {
+	return `⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(${Math.round(timeoutMs / 60_000)}분)`;
 }
 
 export function parseApprovalActionId(
@@ -106,6 +128,11 @@ export interface ApprovalStore {
 		expiresAt: number;
 		originKey?: string | undefined;
 		originThreadRef?: string | undefined;
+		/** The card's sections as shown (redacted, cut); the dashboard reads them back. */
+		detail?: ApprovalDetail | undefined;
+		/** Card and asking-thread permalinks; absent when the platform has none or the lookup failed. */
+		cardUrl?: string | undefined;
+		originUrl?: string | undefined;
 	}): void;
 	getApproval(approvalId: string):
 		| {
@@ -122,7 +149,7 @@ export interface ApprovalStore {
 }
 
 export interface ApprovalBrokerOptions {
-	transport: SlackTransport;
+	port: ChannelPort;
 	ownerUserId: string;
 	/** Slack channel that receives the cards of requests that carry an origin (`ask` with `origin`); absent: the origin's own channel. */
 	escalationChannel?: string | undefined;
@@ -209,16 +236,19 @@ export class ApprovalBroker {
 		return typeof result === "string" ? result : "denied";
 	}
 
-	/** `채널·스레드 링크` text of the requesting conversation; the link is best effort (falls back to the channel). */
-	async #whereOf(origin: ApprovalOrigin): Promise<string> {
+	/** `채널·스레드 링크` text of the requesting conversation; without a thread link it is the channel alone. */
+	#whereOf(origin: ApprovalOrigin, threadUrl: string | undefined): string {
 		const label = origin.channel.startsWith("D") ? "DM" : `<#${origin.channel}>`;
-		if (origin.threadTs === undefined) return label;
+		return threadUrl === undefined ? label : `${label} · <${threadUrl}|스레드 보기>`;
+	}
+
+	/** Best-effort link to one message; a failed lookup is logged and reads as no link. */
+	async #permalink(channel: string, ts: string): Promise<string | undefined> {
 		try {
-			const url = await this.#options.transport.getPermalink({ channel: origin.channel, ts: origin.threadTs });
-			return `${label} · <${url}|스레드 보기>`;
+			return await this.#options.port.permalink(this.#ref(channel, ts));
 		} catch (error) {
-			this.#options.log.warn("approval_permalink_failed", { channel: origin.channel, error: String(error) });
-			return label;
+			this.#options.log.warn("approval_permalink_failed", { channel, error: String(error) });
+			return undefined;
 		}
 	}
 
@@ -237,19 +267,26 @@ export class ApprovalBroker {
 		} = {},
 	): Promise<ApprovalResult> {
 		const { signal, detail, origin } = options;
-		const { transport, log, store } = this.#options;
+		const { port, log, store } = this.#options;
 		const escalation = this.#options.escalationChannel;
 		const escalated = origin !== undefined && escalation !== undefined && escalation !== requestChannel;
 		const channel = escalated ? escalation : requestChannel;
-		// Computed once: the card header and the ledger summary must show the exact same text.
+		// Computed once: the card header and the ledger summary (and sections) must show the exact same text.
 		const shown = cutCodePointSafe(redact(summary), SUMMARY_LIMIT);
+		const sections = shownDetail(detail);
+		const originUrl =
+			origin?.threadTs === undefined ? undefined : await this.#permalink(origin.channel, origin.threadTs);
 		const header = renderCard(
 			shown,
-			detail,
-			escalated ? { ownerUserId: this.#options.ownerUserId, where: await this.#whereOf(origin) } : undefined,
+			sections,
+			escalated
+				? { ownerMention: port.mentionUser(this.#options.ownerUserId), where: this.#whereOf(origin, originUrl) }
+				: undefined,
 		);
-		const posted = await transport.postMessage({ channel, text: header });
-		const key = `${channel}:${posted.ts}`;
+		const card = await port.post({ conversationId: channel }, { text: header });
+		const key = `${channel}:${card.messageId}`;
+		// Before the buttons go up (no click can arrive yet); a failed lookup only leaves the dashboard without a link.
+		const cardUrl = await this.#permalink(channel, card.messageId);
 		const now = this.#clock.now();
 		const timeoutMs = this.#options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
 		let recorded = true;
@@ -257,10 +294,13 @@ export class ApprovalBroker {
 			store.createApproval({
 				approvalId: key,
 				channel,
-				messageTs: posted.ts,
+				messageTs: card.messageId,
 				summary: shown,
 				createdAt: now,
 				expiresAt: now + timeoutMs,
+				detail: sections,
+				cardUrl,
+				originUrl,
 				...(origin === undefined
 					? {}
 					: {
@@ -270,7 +310,7 @@ export class ApprovalBroker {
 			});
 		} catch (error) {
 			recorded = false;
-			log.warn("approval_record_failed", { channel, ts: posted.ts, error: String(error) });
+			log.warn("approval_record_failed", { channel, ts: card.messageId, error: String(error) });
 		}
 		const decision = Promise.withResolvers<ApprovalResult>();
 		let settled = false;
@@ -291,23 +331,22 @@ export class ApprovalBroker {
 		let result: ApprovalResult = "denied";
 		try {
 			// The action ids carry the message's own ts, which exists only after the post.
-			await transport.updateMessage({
-				channel,
-				ts: posted.ts,
+			await port.edit(card, {
 				text: header,
-				blocks: this.#blocks(header, channel, posted.ts, now + timeoutMs, timeoutMs),
+				buttons: approvalButtons(channel, card.messageId),
+				buttonsNote: deadlineNote(now + timeoutMs, timeoutMs),
 			});
-			log.info("approval_requested", { channel, ts: posted.ts });
-			if (escalated) await this.#postPointer(origin, channel, posted.ts, shown);
+			log.info("approval_requested", { channel, ts: card.messageId });
+			if (escalated) await this.#postPointer(origin, channel, cardUrl, shown);
 			if (signal?.aborted) onAbort();
 			result = await decision.promise;
 			log.info("approval_resolved", {
 				channel,
-				ts: posted.ts,
+				ts: card.messageId,
 				outcome: typeof result === "string" ? result : "replied",
 			});
 		} catch (error) {
-			log.warn("approval_failed", { channel, ts: posted.ts, error: String(error) });
+			log.warn("approval_failed", { channel, ts: card.messageId, error: String(error) });
 		} finally {
 			this.#timers.clear(timer);
 			signal?.removeEventListener("abort", onAbort);
@@ -323,38 +362,38 @@ export class ApprovalBroker {
 					this.#clock.now(),
 				);
 			} catch (error) {
-				log.warn("approval_decide_failed", { channel, ts: posted.ts, error: String(error) });
+				log.warn("approval_decide_failed", { channel, ts: card.messageId, error: String(error) });
 			}
 		}
 		try {
-			await transport.updateMessage({
-				channel,
-				ts: posted.ts,
+			await port.edit(card, {
 				text: `${header}\n${aborted ? ABORTED_TEXT : typeof result === "string" ? FINAL_TEXT[result] : `💬 답장으로 처리됨: ${replyLine(result.replied)}`}`,
-				blocks: [],
+				buttons: [],
 			});
 		} catch (error) {
-			log.warn("approval_final_update_failed", { channel, ts: posted.ts, error: String(error) });
+			log.warn("approval_final_update_failed", { channel, ts: card.messageId, error: String(error) });
 		}
 		return result;
 	}
 
 	/** One pointer line in the asking thread (or the channel's main view) naming the escalation card; best effort. */
-	async #postPointer(origin: ApprovalOrigin, cardChannel: string, cardTs: string, shown: string): Promise<void> {
-		const { transport, log } = this.#options;
+	async #postPointer(
+		origin: ApprovalOrigin,
+		cardChannel: string,
+		cardUrl: string | undefined,
+		shown: string,
+	): Promise<void> {
+		const { port, log } = this.#options;
 		try {
-			let link = "";
-			try {
-				link = ` (<${await transport.getPermalink({ channel: cardChannel, ts: cardTs })}|카드 보기>)`;
-			} catch (error) {
-				log.warn("approval_permalink_failed", { channel: cardChannel, error: String(error) });
-			}
+			const link = cardUrl === undefined ? "" : ` (<${cardUrl}|카드 보기>)`;
 			const firstLine = cutCodePointSafe(shown.split("\n")[0] ?? "", 200);
-			await transport.postMessage({
-				channel: origin.channel,
-				...(origin.threadTs === undefined ? {} : { threadTs: origin.threadTs }),
-				text: `🔐 승인 요청을 <#${cardChannel}>에 올렸습니다 — ${firstLine}${link}`,
-			});
+			await port.post(
+				{
+					conversationId: origin.channel,
+					...(origin.threadTs === undefined ? {} : { threadId: origin.threadTs }),
+				},
+				{ text: `🔐 승인 요청을 <#${cardChannel}>에 올렸습니다 — ${firstLine}${link}` },
+			);
 		} catch (error) {
 			log.warn("approval_pointer_failed", { channel: origin.channel, error: String(error) });
 		}
@@ -387,15 +426,13 @@ export class ApprovalBroker {
 	 * the process) and rewrites their cards to say so, instead of leaving buttons that resolve to nothing.
 	 */
 	async expireStale(due = true): Promise<number> {
-		const { store, transport, log } = this.#options;
+		const { store, port, log } = this.#options;
 		const expired = store.expirePendingApprovals(this.#clock.now(), due);
 		for (const row of expired) {
 			try {
-				await transport.updateMessage({
-					channel: row.channel,
-					ts: row.messageTs,
+				await port.edit(this.#ref(row.channel, row.messageTs), {
 					text: `🔐 승인 요청\n${due ? FINAL_TEXT.timeout : "⌛ 데몬 재시작으로 만료됨 — 다시 요청해 주세요"}`,
-					blocks: [],
+					buttons: [],
 				});
 			} catch (error) {
 				log.warn("approval_expire_card_failed", { channel: row.channel, ts: row.messageTs, error: String(error) });
@@ -404,38 +441,9 @@ export class ApprovalBroker {
 		return expired.length;
 	}
 
-	#blocks(text: string, channel: string, ts: string, expiresAt: number, timeoutMs: number): unknown[] {
-		return [
-			{ type: "section", text: { type: "mrkdwn", text } },
-			{
-				type: "actions",
-				elements: [
-					{
-						type: "button",
-						style: "primary",
-						text: { type: "plain_text", text: "승인" },
-						action_id: approvalActionId("approve", channel, ts),
-						value: "approve",
-					},
-					{
-						type: "button",
-						style: "danger",
-						text: { type: "plain_text", text: "거부" },
-						action_id: approvalActionId("deny", channel, ts),
-						value: "deny",
-					},
-				],
-			},
-			{
-				type: "context",
-				elements: [
-					{
-						type: "mrkdwn",
-						text: `⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(${Math.round(timeoutMs / 60_000)}분)`,
-					},
-				],
-			},
-		];
+	/** A message of the approval conversation (card or asking thread) on the broker's port. */
+	#ref(conversationId: string, messageId: string): MessageRef {
+		return { platform: this.#options.port.platform, conversationId, messageId };
 	}
 
 	/** Returns true when the click settled a pending request. */

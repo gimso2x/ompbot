@@ -1,3 +1,4 @@
+import { parseChatOrigin } from "../core/origin-key";
 import type { Logger } from "../log";
 import type { HostToolDef } from "../safety/host-tools";
 import { DEFAULT_TIMEZONE, formatLocal } from "./cron";
@@ -12,9 +13,10 @@ import { MonitorSpecError, parseMonitorSpec } from "./spec";
 import { webhookUrl } from "./webhook";
 
 /** Only the owner-DM persona session registers monitors; monitor and lane sessions never get these tools. */
-const PERSONA_ORIGIN = /^slack\/dm\/[A-Z0-9]+$/;
-
-export const isPersonaOrigin = (originKey: string): boolean => PERSONA_ORIGIN.test(originKey);
+export const isPersonaOrigin = (originKey: string): boolean => {
+	const ref = parseChatOrigin(originKey);
+	return ref?.kind === "dm" && ref.threadId === undefined;
+};
 
 export interface MonitorToolDeps {
 	originKey: string;

@@ -13,6 +13,7 @@ import { clearFreeze, createFreezeProbe, freezePath, readFreeze, writeFreeze } f
 import { collectGates } from "../src/ops/gates";
 import { redact } from "../src/redact";
 import { SKILL_REVIEW_ORIGIN } from "../src/review/skills";
+import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 let dir: string;
@@ -237,7 +238,7 @@ describe("daemon under freeze", () => {
 		const transport = new WaitingTransport();
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -261,7 +262,7 @@ describe("daemon under freeze", () => {
 		const clock = { now: () => Date.now() };
 		daemon = new Daemon({
 			config: { ...home.config, skillReviewTurns: 1 },
-			transport,
+			slack: new SlackChannel(transport),
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",

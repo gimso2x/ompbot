@@ -19,6 +19,7 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { collectGates } from "../src/ops/gates";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
@@ -99,7 +100,7 @@ function harness(
 	const pending: Promise<unknown>[] = [];
 	const manager = new LaneManager({
 		store,
-		transport,
+		port: new SlackChannel(transport),
 		clock,
 		log,
 		sessionsRoot,
@@ -874,7 +875,7 @@ describe("lanes inside the daemon", () => {
 		const clock = { now: () => Date.now() };
 		const daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

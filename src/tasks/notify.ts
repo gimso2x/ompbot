@@ -1,5 +1,5 @@
+import { type ChannelPort, mentionToken, renderMentions } from "../channel/port";
 import { parseThreadRef } from "../core/normalize";
-import type { SlackTransport } from "../slack/transport";
 import type { TaskJudgement } from "./checker";
 import { TASK_STATUSES, type TaskRow, type TaskStatus } from "./ledger";
 
@@ -24,7 +24,7 @@ export interface TaskSlackLog {
  * reaction is not an error), then adds `to`. Slack failures are logged — a reaction never fails a task.
  */
 export async function setStatusReaction(
-	transport: SlackTransport,
+	port: ChannelPort,
 	log: TaskSlackLog,
 	threadRef: string,
 	to: TaskStatus,
@@ -32,20 +32,20 @@ export async function setStatusReaction(
 ): Promise<void> {
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return;
-	const where = { channel: target.channel, timestamp: target.threadTs };
+	const root = { platform: port.platform, conversationId: target.channel, messageId: target.threadTs };
 	for (const status of remove) {
-		await transport.removeReaction({ ...where, name: STATUS_REACTIONS[status] }).catch(() => undefined);
+		await port.react(root, STATUS_REACTIONS[status], false).catch(() => undefined);
 	}
-	await transport.addReaction({ ...where, name: STATUS_REACTIONS[to] }).catch((error: unknown) => {
+	await port.react(root, STATUS_REACTIONS[to], true).catch((error: unknown) => {
 		// `already_reacted` is the expected repeat; anything else is worth a line.
 		if (!String(error).includes("already_reacted"))
 			log.warn("task_reaction_failed", { thread: threadRef, error: String(error) });
 	});
 }
 
-/** Posts into the task thread; failures are logged and reported as `false`. */
+/** Posts into the task thread (owner mentions rendered for the port); failures are logged and reported as `false`. */
 export async function postToThread(
-	transport: SlackTransport,
+	port: ChannelPort,
 	log: TaskSlackLog,
 	threadRef: string,
 	text: string,
@@ -53,7 +53,10 @@ export async function postToThread(
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return false;
 	try {
-		await transport.postMessage({ channel: target.channel, threadTs: target.threadTs, text });
+		await port.post(
+			{ conversationId: target.channel, threadId: target.threadTs },
+			{ text: renderMentions(text, port) },
+		);
 		return true;
 	} catch (error) {
 		log.warn("task_post_failed", { thread: threadRef, error: String(error) });
@@ -130,7 +133,7 @@ export function formatReachedNotice(
 			: judgement.summary.slice(0, MAX_SUMMARY_LINES).map((line) => `• ${clip(line, 200)}`);
 	const warnings = sharedCommitWarnings(row, judgement);
 	return [
-		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)}) <@${ownerUserId}>`,
+		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
 		"",
 		...summary,
 		...(warnings.length === 0 ? [] : ["", ...warnings]),
@@ -151,7 +154,7 @@ export function formatBlockedNotice(
 ): string {
 	const { question, recommend, impact } = judgement.decision;
 	return [
-		`🚧 멈춤 · ${row.title} — 결정이 필요합니다. (${ownerTag(row)}) <@${ownerUserId}>`,
+		`🚧 멈춤 · ${row.title} — 결정이 필요합니다. (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
 		"",
 		`*사유*: ${judgement.blockedReason === "" ? "(적지 않음)" : judgement.blockedReason}`,
 		...(question === "" ? [] : [`*질문*: ${question}`]),
@@ -175,7 +178,7 @@ export const formatStaleNotice = (row: TaskRow, minutes: number, link?: string):
 /** The task's herdr agent vanished (dori `[LOST]`): the owner hears it once per progress base, with the resume call. */
 export function formatLostNotice(row: TaskRow, ownerUserId: string, link?: string): string {
 	return [
-		`👻 에이전트 없음 · ${row.title} — herdr에 \`${row.agent}\` 에이전트가 없습니다. (${ownerTag(row)}) <@${ownerUserId}>`,
+		`👻 에이전트 없음 · ${row.title} — herdr에 \`${row.agent}\` 에이전트가 없습니다. (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
 		`*재개*: \`ompbot_dispatch {mode:"herdr", taskSpec:{id:"${row.taskId}"}}\` — 같은 워크트리에서 에이전트를 다시 띄웁니다.`,
 		...boardFooter(link),
 	].join("\n");

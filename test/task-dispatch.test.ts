@@ -5,6 +5,7 @@ import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
 import type { ApprovalDetail, ApprovalResult } from "../src/safety/approval";
 import type { HostToolDef } from "../src/safety/host-tools";
+import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
 import type { HostResult, TaskHostOps } from "../src/tasks/host";
@@ -61,8 +62,8 @@ function fakeHost(): FakeHost {
 		async readFile(path) {
 			return { ok: true, value: host.files.get(path) };
 		},
-		async commitExists() {
-			return true;
+		async commitOnTaskBranch() {
+			return "ok" as const;
 		},
 		async commitDocs(input) {
 			host.calls.push(`commit ${input.worktree} ${input.taskId} [${[...host.files.keys()].length} files]`);
@@ -148,7 +149,7 @@ function harness(
 						ledger,
 						threadRef: () => ("threadRef" in options ? options.threadRef : "C1:100.1"),
 						rootText: () => "[TASK] L2 로그 회전\n목표: 회전",
-						transport,
+						port: new SlackChannel(transport),
 						now: () => NOW,
 						hostOps: () => host,
 					},
@@ -494,12 +495,5 @@ describe("ompbot_dispatch handoff risk scan", () => {
 		expect(delivered(h, "하지 않는다")).toBe(true);
 		expect(out.split("\n").at(-1)).toBe("위험 검사: advisory (package_install, service_control)");
 		expect(h.approvals).toEqual([]);
-	});
-
-	test("simple mode is not scanned", async () => {
-		const h = harness({ approval: "denied" });
-		await call(h, { task: HIGH });
-		expect(h.approvals).toEqual([]);
-		expect(h.herdr.map((cmd) => cmd.slice(0, 3))).toEqual([["omp", "-p", HIGH]]);
 	});
 });

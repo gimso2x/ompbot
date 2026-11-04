@@ -24,7 +24,8 @@ export async function evaluateTask(row: TaskRow, ops: TaskHostOps): Promise<Task
 			spec: text(spec),
 			progress: text(progress),
 			outcome: text(outcome),
-			commitExists: (hash) => ops.commitExists(row.worktree, hash),
+			commitCheck: (hash) =>
+				ops.commitOnTaskBranch({ worktree: row.worktree, branch: row.branch, taskId: row.taskId, hash }),
 		});
 		return { ok: true, judgement };
 	} catch (error) {

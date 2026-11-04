@@ -1,11 +1,11 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { slackOriginChannel } from "../core/normalize";
+import type { ChannelPort } from "../channel/port";
+import { parseChatOrigin } from "../core/origin-key";
 import { buildDispatchTool, type DispatchToolDeps } from "../dispatch/tool";
 import type { Logger } from "../log";
-import { redact } from "../redact";
-import type { SlackTransport } from "../slack/transport";
+import { maskKnownFragments, redact } from "../redact";
 import type { ApprovalBroker, ApprovalDetail } from "./approval";
 import { isInside } from "./inside";
 
@@ -20,12 +20,29 @@ export interface HostToolDef {
 }
 
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
-/** Files up to this size are scanned for token-like strings before they leave the machine. */
-const SCAN_BYTES = 2 * 1024 * 1024;
+/** Uploads are scanned for token-like strings in chunks of this many bytes (whole-file `redact` would need GBs). */
+export const UPLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
+/**
+ * Characters of each chunk's tail rescanned with the next chunk. Far above the longest prefix an upload pattern
+ * needs (`sk-ant-` + 20) and a value-index window (16 characters, plus any separators smudged into it), so a token
+ * across a chunk boundary is still caught.
+ */
+export const UPLOAD_SCAN_CARRY_CHARS = 4096;
+/**
+ * `redact`'s secret shapes, except that an `sk-` key needs 20+ characters after `sk-` / `sk-ant-`: binary data decoded
+ * as UTF-8 is full of short `sk-…` runs. Chat masking (`redact`) keeps the shorter shape.
+ */
+const UPLOAD_SECRET_PATTERN =
+	/xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}/;
+
+/** The upload verdict on one scanned span: a token-shaped string or a fragment of an indexed secret value. */
+export function hasUploadSecret(text: string): boolean {
+	return UPLOAD_SECRET_PATTERN.test(text) || maskKnownFragments(text) !== text;
+}
 
 export interface HostToolDeps {
 	originKey: string;
-	transport: SlackTransport;
+	port: ChannelPort;
 	broker: ApprovalBroker;
 	log: Logger;
 	/** The bot home; its `secrets` directory can never be uploaded. */
@@ -87,14 +104,31 @@ export function checkUploadable(
 		join(userHome, ".git-credentials"),
 		join(userHome, ".netrc"),
 		join(userHome, ".config", "gh"),
+		join(userHome, ".config", "gcloud"),
+		join(userHome, ".npmrc"),
+		join(userHome, ".kube"),
+		join(userHome, ".docker"),
 	].map(realOrSelf);
 	if (forbidden.some((dir) => isInside(real, dir))) throw new Error("upload refused: path is in a protected directory");
 	const stat = statSync(real);
 	if (!stat.isFile()) throw new Error("upload refused: not a regular file");
 	if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`upload refused: file larger than ${MAX_UPLOAD_BYTES} bytes`);
-	if (stat.size <= SCAN_BYTES) {
-		const text = readFileSync(real, "utf8");
-		if (redact(text) !== text) throw new Error("upload refused: file contains a token-like secret");
+	const fd = openSync(real, "r");
+	try {
+		const decoder = new TextDecoder();
+		const chunk = new Uint8Array(UPLOAD_SCAN_CHUNK_BYTES);
+		let carry = "";
+		for (;;) {
+			const read = readSync(fd, chunk, 0, chunk.length, null);
+			const text = carry + decoder.decode(chunk.subarray(0, read), { stream: read > 0 });
+			if (hasUploadSecret(text)) throw new Error("upload refused: file contains a token-like secret");
+			if (read === 0) break;
+			carry = text.slice(-UPLOAD_SCAN_CARRY_CHARS);
+			// `sk-` needs a non-alphanumeric left edge that the cut hides; a key starting there was judged whole already.
+			if (carry.startsWith("sk-")) carry = carry.slice(1);
+		}
+	} finally {
+		closeSync(fd);
 	}
 	return real;
 }
@@ -106,14 +140,15 @@ function stringParam(params: Record<string, unknown>, key: string): string | und
 
 /** The host tools registered with `set_host_tools` for one origin (an owner DM). */
 export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
-	const channel = deps.channel ?? slackOriginChannel(deps.originKey);
+	const chatOrigin = parseChatOrigin(deps.originKey);
+	const channel = deps.channel ?? chatOrigin?.conversationId;
 	const needChannel = (): string => {
 		if (channel === undefined) throw new Error(`origin is not a Slack conversation: ${deps.originKey}`);
 		return channel;
 	};
 	// The dispatch tool is a chat-surface feature: DM and channel sessions only (lanes, monitors, review never).
 	const dispatchDeps: DispatchToolDeps | undefined =
-		deps.ompExecutable !== undefined && slackOriginChannel(deps.originKey) !== undefined
+		deps.ompExecutable !== undefined && chatOrigin !== undefined
 			? {
 					...deps,
 					ompExecutable: deps.ompExecutable,
@@ -154,13 +189,14 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 				const comment = stringParam(params, "comment");
 				const title = stringParam(params, "title");
 				const threadTs = deps.threadTs?.();
-				const { fileId } = await deps.transport.uploadFile({
-					channel: target,
-					...(threadTs === undefined ? {} : { threadTs }),
-					filePath: real,
-					...(title === undefined ? {} : { title }),
-					...(comment === undefined ? {} : { comment: redact(comment) }),
-				});
+				const { fileId } = await deps.port.uploadFile(
+					{ conversationId: target, ...(threadTs === undefined ? {} : { threadId: threadTs }) },
+					{
+						path: real,
+						...(title === undefined ? {} : { title }),
+						...(comment === undefined ? {} : { comment: redact(comment) }),
+					},
+				);
 				deps.log.info("file_uploaded", {
 					origin: deps.originKey,
 					file: basename(real),

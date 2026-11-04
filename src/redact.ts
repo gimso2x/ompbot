@@ -91,7 +91,7 @@ export function secretIndexSize(): number {
  * Replaces every maximal run of the text that covers a known 16-char window with `REDACTED`. Runs on the
  * normalization-projected text and maps hits back to original offsets, so formatting split secrets still match.
  */
-function maskKnownFragments(text: string): string {
+export function maskKnownFragments(text: string): string {
 	if (secretWindows.size === 0 || text.length < WINDOW) return text;
 	const projected: string[] = [];
 	const originalIndex: number[] = [];

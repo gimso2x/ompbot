@@ -17,6 +17,7 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { gcSessions } from "../src/ops/gc";
 import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
+import { SlackChannel } from "../src/slack/channel";
 import { SlackCallError, type SlackTransport } from "../src/slack/transport";
 import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -112,7 +113,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 		const clock = { now: () => Date.now() };
 		daemon = new Daemon({
 			config: { ...home.config, mentionFreeChannels: [CH], herdr: {} },
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

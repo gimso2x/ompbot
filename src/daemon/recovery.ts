@@ -1,5 +1,5 @@
 import { type DriverFactory, openOriginSession, sessionToResume } from "../core/mailbox";
-import { promptTextOf } from "../core/types";
+import { isTurnPromptFor, promptTextOf } from "../core/types";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { turnAnswer } from "../omp/answers";
@@ -28,7 +28,8 @@ export interface RecoveryResult {
  */
 function finalAnswer(entries: readonly OmpEntry[], promptText: string, lastOnly: boolean): string | undefined {
 	const promptAt = entries.findIndex(
-		(entry) => entry.type === "message" && entry.message?.role === "user" && entryText(entry) === promptText,
+		(entry) =>
+			entry.type === "message" && entry.message?.role === "user" && isTurnPromptFor(entryText(entry), promptText),
 	);
 	if (promptAt === -1) return undefined;
 	const turn = entries.slice(promptAt + 1);

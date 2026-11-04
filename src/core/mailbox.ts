@@ -15,11 +15,14 @@ import { type HealedSessionModel, healSessionModelFile, newestSessionFile } from
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
 import type { InboundRow, OriginRow, Store } from "../store/db";
-import { slackOriginChannel, threadRefOfOrigin } from "./normalize";
+import { threadRefOfOrigin } from "./normalize";
+import { parseChatOrigin } from "./origin-key";
 import { buildRecallBlock } from "./recall";
 import { epochDirIsFresh, listSavedSessions, pickSession } from "./sessions";
+import { createStuckDetector, type StuckDetector, stuckCancelReason, stuckSteerText } from "./stuck";
 import {
 	COMMAND_TEXT,
+	composeTurnPrompt,
 	EVENT_PERSIST_MS,
 	IDLE_STOP_MS,
 	type InboundRecord,
@@ -91,6 +94,16 @@ export interface TurnFailureEscalation {
 	modelHealed: boolean;
 }
 
+/** A turn aborted because the same tool call kept returning the same result (`src/core/stuck.ts`). */
+export interface StuckLoopInfo {
+	originKey: string;
+	threadRef: string;
+	opRef: string;
+	toolName: string;
+	/** Identical calls of the turn when it was stopped. */
+	count: number;
+}
+
 export interface StallEscalation {
 	originKey: string;
 	threadRef: string;
@@ -153,6 +166,11 @@ export interface MailboxDeps {
 	isDraining?: () => boolean;
 	/** A child opened another session file than the one to resume; once per (origin, epoch), never blocks the turn. */
 	onSessionMismatch?: (info: SessionMismatchInfo) => void;
+	/**
+	 * A turn is being aborted for a tool repeat loop; at most once per turn, only when the abort still owns the turn
+	 * (a final that settled it first sends nothing). Called on the actor chain, so it must never await Slack.
+	 */
+	onStuckLoop?: (info: StuckLoopInfo) => void;
 }
 
 export interface SessionMismatchInfo {
@@ -189,6 +207,8 @@ interface ActiveTurn {
 	stallEscalated: boolean;
 	/** `onProviderLimit` fired for this turn: never twice. */
 	providerLimitSeen: boolean;
+	/** Tool repeat-loop counts of this turn (reset per turn). */
+	stuck: StuckDetector;
 }
 
 /**
@@ -489,6 +509,51 @@ export class OriginMailbox {
 		);
 	}
 
+	/**
+	 * Turn caught in a tool repeat loop: abort the child and settle the turn as failed (`stuck-loop: …`) through the
+	 * normal failure path. The child is kept — it is not wedged, and its session holds the conversation. A final that
+	 * settled the turn first wins; this then does nothing (no notice either).
+	 */
+	async #abortStuck(turn: ActiveTurn, toolName: string, count: number): Promise<void> {
+		const driver = this.#driver;
+		if (!driver || this.#turn !== turn) return;
+		const { originKey, log } = this.#deps;
+		log.warn("stuck_loop_cancel", { origin: originKey, opRef: turn.opRef, tool: toolName, count });
+		this.#deps.onStuckLoop?.({ originKey, threadRef: turn.threadRef, opRef: turn.opRef, toolName, count });
+		try {
+			await driver.abort();
+		} catch (error) {
+			log.warn("stuck_abort_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+		}
+		if (this.#turn !== turn || this.#driver !== driver) return;
+		await this.#onFinal(driver, {
+			opRef: turn.opRef,
+			status: "aborted",
+			text: "",
+			error: stuckCancelReason(toolName, count),
+		});
+	}
+
+	/**
+	 * Feeds a tool event to the turn's loop detector. Only `tool_execution_end` carries the result, so the claude
+	 * driver (it reports `tool_execution_start` only) never trips it — a known limit of that driver.
+	 */
+	#observeTool(turn: ActiveTurn, event: OmpEvent): void {
+		const hit = turn.stuck.observe(event);
+		if (hit === null) return;
+		const { originKey, log } = this.#deps;
+		if (hit.action === "cancel") {
+			this.#background("stuck_abort_settle_failed", () => this.#abortStuck(turn, hit.toolName, hit.count));
+			return;
+		}
+		log.info("stuck_loop_steer", { origin: originKey, opRef: turn.opRef, tool: hit.toolName, count: hit.count });
+		this.#background("stuck_steer_failed", async () => {
+			// Real omp starts a run when steered while idle: only steer the turn that is still running.
+			if (this.#turn !== turn || !this.#driver) return;
+			await this.#driver.steer(stuckSteerText(hit.toolName, hit.count));
+		});
+	}
+
 	/** Host tool calls of this origin's child running now. */
 	get hostToolsRunning(): number {
 		return this.#hostToolsRunning;
@@ -546,6 +611,9 @@ export class OriginMailbox {
 
 	#onDriverEvent(event: OmpEvent): void {
 		if (this.#onRetryEvent(event)) return;
+		if (this.#turn && (event.type === "tool_execution_start" || event.type === "tool_execution_end")) {
+			this.#observeTool(this.#turn, event);
+		}
 		if (event.type === "tool_execution_start") {
 			const tool = typeof event.toolName === "string" ? event.toolName : undefined;
 			this.#deps.log.info("tool_start", { origin: this.#deps.originKey, tool });
@@ -736,6 +804,7 @@ export class OriginMailbox {
 			stallClearedAt: 0,
 			stallEscalated: false,
 			providerLimitSeen: false,
+			stuck: createStuckDetector(),
 		};
 		this.#lastEventAt = this.#deps.clock.now();
 		this.#eventPersistedAt = this.#lastEventAt;
@@ -766,7 +835,7 @@ export class OriginMailbox {
 			const answers = context.split("\n").filter((line) => line.startsWith(THREAD_ANSWER_LINE));
 			blocks.push(withWarning(context, answers, "스레드 맥락의 봇 답"));
 		}
-		const channel = slackOriginChannel(originKey);
+		const channel = parseChatOrigin(originKey)?.conversationId;
 		if (channel !== undefined && this.#deps.recallEnabled?.() === true) {
 			const recall = buildRecallBlock({
 				text,
@@ -787,7 +856,7 @@ export class OriginMailbox {
 				blocks.push(withWarning(recall.block, answers, "이전 대화 회상의 봇 답"));
 			}
 		}
-		return blocks.length === 0 ? text : `${blocks.join("\n\n")}\n\n[현재 요청]\n${text}`;
+		return composeTurnPrompt(blocks, text);
 	}
 
 	/**

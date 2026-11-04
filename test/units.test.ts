@@ -8,6 +8,7 @@ const MAIN = join(REPO, "src", "main.ts");
 const UNITS = [
 	"ompbot-backup.service",
 	"ompbot-backup.timer",
+	"ompbot-dashboard.service",
 	"ompbot-gc.service",
 	"ompbot-gc.timer",
 	"ompbot.service",
@@ -66,6 +67,7 @@ describe("ompbot units render --dry-run", () => {
 			["ompbot.service", "daemon"],
 			["ompbot-backup.service", "backup"],
 			["ompbot-gc.service", "gc"],
+			["ompbot-dashboard.service", "dashboard"],
 		] as const) {
 			expect(units.get(name)).toContain(`\nExecStart=${process.execPath} ${join(REPO, "src", "main.ts")} ${command}\n`);
 		}

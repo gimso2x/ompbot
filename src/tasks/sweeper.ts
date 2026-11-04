@@ -1,8 +1,8 @@
+import type { ChannelPort as SlackTransport } from "../channel/port";
 import type { HerdrAgentStatusResult } from "../dispatch/omp";
 import type { FreezeState } from "../ops/freeze";
-import type { SlackTransport } from "../slack/transport";
 import type { TaskJudgement } from "./checker";
-import { summarizeJudgement } from "./checker";
+import { digest, summarizeJudgement } from "./checker";
 import type { TaskEvaluation } from "./evaluate";
 import type { TaskLedger, TaskRow } from "./ledger";
 import {
@@ -25,6 +25,18 @@ export const STALE_REMIND_MS = 30 * 60_000;
 export const STALE_NOTICE_MS = 2 * 60 * 60_000;
 /** Consecutive unreadable sweeps before the thread is told once. */
 export const READ_FAILURE_NOTICE_AFTER = 3;
+/** Unmet conditions listed in a prompt to the agent, and the length each line is cut to. */
+const UNMET_LIST_MAX = 8;
+const UNMET_LINE_MAX = 200;
+const NUDGE_HEAD =
+	"Outcome 판정이 아직 미도달입니다. 아래를 채우거나, 진행할 수 없으면 PROGRESS.md status를 blocked로 바꾸고 사유를 적으세요.";
+
+/** `- <problem>` lines for a prompt: the first eight, each cut at 200 characters, then `- …외 N개`. */
+function unmetLines(problems: readonly string[]): string[] {
+	const lines = problems.slice(0, UNMET_LIST_MAX).map((problem) => `- ${problem.slice(0, UNMET_LINE_MAX)}`);
+	if (problems.length > UNMET_LIST_MAX) lines.push(`- …외 ${problems.length - UNMET_LIST_MAX}개`);
+	return lines;
+}
 
 export interface TaskSweepDeps {
 	ledger: TaskLedger;
@@ -177,11 +189,11 @@ export class TaskSweeper {
 			return this.#result(row, status, judgement, actions);
 		}
 
-		await this.#staleness(row, now, actions);
+		await this.#staleness(row, now, actions, judgement);
 		return this.#result(row, status, judgement, actions);
 	}
 
-	async #staleness(row: TaskRow, now: number, actions: string[]): Promise<void> {
+	async #staleness(row: TaskRow, now: number, actions: string[], judgement: TaskJudgement): Promise<void> {
 		const { ledger } = this.#deps;
 		const fresh = ledger.require(row.taskId);
 		const base = Math.max(fresh.progressAt ?? 0, fresh.createdAt);
@@ -203,13 +215,33 @@ export class TaskSweeper {
 			this.#remindHeld.add(row.taskId);
 			this.#deps.log.info("task_remind_frozen", { task: row.taskId });
 		}
-		if (due && (status === "working" || status === "blocked")) {
+		// An agent that ended its turn short of the outcome hears why at once, once per distinct set of unmet conditions.
+		// It takes the place of the 30-minute reminder in that sweep: at most one prompt per sweep reaches the agent.
+		const unmetKey = `unmet:${digest(judgement.problems)}`;
+		const nudge =
+			!frozen &&
+			(status === "idle" || status === "done") &&
+			judgement.problems.length > 0 &&
+			!(unmetKey in fresh.notices);
+		if (nudge) {
+			const sent = await this.#deps.remind(row, [NUDGE_HEAD, ...unmetLines(judgement.problems)].join("\n"));
+			if (sent.ok) {
+				ledger.recordNotice(row.taskId, unmetKey);
+				ledger.markReminded(row.taskId, now);
+				actions.push("unmet nudge to agent");
+			} else {
+				this.#deps.log.warn("task_remind_failed", { task: row.taskId, error: sent.error ?? "unknown" });
+			}
+		} else if (due && (status === "working" || status === "blocked")) {
 			// A busy or waiting agent is not interrupted; the next sweep judges again, so the reminder follows idle.
 			this.#deps.log.info("task_remind_deferred", { task: row.taskId, agentStatus: status });
 			actions.push(`reminder deferred (${status})`);
 		} else if (due && status !== "gone") {
 			const minutes = Math.floor(age / 60_000);
-			const text = `PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. 지금 단계와 다음 행동을 PROGRESS.md의 updated·current·next에 반영하세요. 한 단계가 30분을 넘으면 30분마다 중간 갱신합니다.`;
+			const text = [
+				`PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. 지금 단계와 다음 행동을 PROGRESS.md의 updated·current·next에 반영하세요. 한 단계가 30분을 넘으면 30분마다 중간 갱신합니다.`,
+				...unmetLines(judgement.problems),
+			].join("\n");
 			const sent = await this.#deps.remind(row, text);
 			if (sent.ok) {
 				ledger.markReminded(row.taskId, now);

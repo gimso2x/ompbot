@@ -147,8 +147,11 @@ export interface TaskDocsMeta {
 	registeredAt: number;
 }
 
+/** Drops a leading `AC-<n>:` the caller already wrote, so the generated id is not shown twice. */
+export const stripAcPrefix = (text: string): string => text.replace(/^AC-\d+\s*[:.)]\s*/, "");
+
 export const acceptanceItems = (texts: readonly string[]): AcceptanceItem[] =>
-	texts.map((text, index) => ({ id: `AC-${index + 1}`, text: oneLine(text) }));
+	texts.map((text, index) => ({ id: `AC-${index + 1}`, text: stripAcPrefix(oneLine(text)) }));
 
 export function renderContext(meta: TaskDocsMeta, spec: NewTaskSpec, original: string): string {
 	return [

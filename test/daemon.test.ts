@@ -13,6 +13,7 @@ import { createLogger } from "../src/log";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { REDELIVERED_PREFIX } from "../src/slack/format";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -38,7 +39,7 @@ afterEach(async () => {
 function newDaemon(transport: WaitingTransport): Daemon {
 	const daemon = new Daemon({
 		config: home.config,
-		transport,
+		slack: new SlackChannel(transport),
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: BOOT_ID,
@@ -369,7 +370,7 @@ describe("stop() drains running turns before stopping the children", () => {
 	): Daemon {
 		const daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: (line) => options.lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,
@@ -537,7 +538,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 	function newRetryDaemon(transport: WaitingTransport, drivers: FakeOmpDriver[], wedged: boolean): Daemon {
 		const daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -679,7 +680,7 @@ describe("provider limit notice", () => {
 		const transport = new WaitingTransport();
 		const daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,

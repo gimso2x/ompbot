@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { OmpbotConfig } from "../src/config";
 import { createLogger } from "../src/log";
 import { clearSecretIndex, indexSecretValue, REDACTED, redact, secretIndexSize } from "../src/redact";
-import { indexRuntimeSecrets } from "../src/safety/secret-index";
+import { indexEnvSecrets, indexRuntimeSecrets } from "../src/safety/secret-index";
 
 // Assembled at runtime so secret scanners (gitleaks) do not flag the fixture; the value is unchanged.
 const TOKEN = ["Tgk4dJqLm7pQ", "xZ2wVn9sBfYeHc"].join("");
@@ -134,5 +134,29 @@ describe("indexRuntimeSecrets", () => {
 		// Missing token files degrade to pattern-only for those two; the env var was still indexed.
 		expect(indexed).toBe(1);
 		expect(redact(`v ${value}`)).toBe(`v ${REDACTED}`);
+	});
+
+	test("the dashboard path indexes env vars and guard files but never reads the Slack token files", () => {
+		const envValue = `plain-${TOKEN}`;
+		const guardValue = `guard-${TOKEN_REVERSED}`;
+		// Shares no 16-char window with the two values above.
+		const tokenValue = ["QqWwEeRrTtYyUuIi", "OoPpAaSsDdFfGgHh"].join("");
+		const guardFile = join(home, "guard.json");
+		writeFileSync(guardFile, JSON.stringify({ api_key: guardValue }));
+		const unreadable = tokenFile("bot", tokenValue);
+		chmodSync(unreadable, 0o000);
+
+		const indexed = indexEnvSecrets({
+			DEPLOY_TOKEN: envValue,
+			SLACK_BOT_TOKEN_FILE: unreadable,
+			SLACK_APP_TOKEN_FILE: join(home, "missing-app"),
+			OMPBOT_SECRET_GUARD_FILES: `${guardFile}:${join(home, "missing-guard")}`,
+		});
+
+		expect(indexed).toBe(2);
+		expect(redact(`env ${envValue}`)).toBe(`env ${REDACTED}`);
+		expect(redact(`guard ${guardValue}`)).toBe(`guard ${REDACTED}`);
+		chmodSync(unreadable, 0o600);
+		expect(redact(`file ${tokenValue}`)).toBe(`file ${tokenValue}`);
 	});
 });

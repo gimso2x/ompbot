@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import type { HistoryPage, SlackHandlers, SlackTransport } from "../slack/transport";
+import type { HistoryPage, SlackHandlers, SlackTransport } from "./transport";
 
 /**
  * Test-only transport (daemon uses it only when `OMPBOT_TEST_HOOKS=1` and `OMPBOT_TEST_TRANSPORT=<file>`): every Slack

@@ -11,13 +11,18 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OriginMailbox, type SessionMismatchInfo, type TurnFailureEscalation } from "../src/core/mailbox";
+import {
+	OriginMailbox,
+	type SessionMismatchInfo,
+	type StuckLoopInfo,
+	type TurnFailureEscalation,
+} from "../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor, slackDmOrigin } from "../src/core/origin";
 import { IDLE_STOP_MS, type InboundRecord, MONITOR_IDLE_STOP_MS } from "../src/core/types";
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
-import { OmpDriverError, type OmpEntries, type OmpOpenResult, type OmpState } from "../src/omp/driver";
+import { OmpDriverError, type OmpEntries, type OmpEvent, type OmpOpenResult, type OmpState } from "../src/omp/driver";
 import {
 	FakeOmpDriver,
 	type FakeOmpDriverOptions,
@@ -1247,5 +1252,115 @@ describe("mailbox: session resume check", () => {
 	test("a child that does not report its session file: no line, no notice, the turn runs as before", async () => {
 		savedSession();
 		expect(await quietTurn(() => undefined)).toEqual(["openSession", "prompt:안녕"]);
+	});
+});
+
+/** Can deliver an event at a moment the test picks, e.g. from inside a final listener. */
+class LoopDriver extends FakeOmpDriver {
+	readonly #listeners = new Set<(event: OmpEvent) => void>();
+
+	override onEvent(listener: (event: OmpEvent) => void): () => void {
+		this.#listeners.add(listener);
+		const off = super.onEvent(listener);
+		return () => {
+			this.#listeners.delete(listener);
+			off();
+		};
+	}
+
+	/** Test control: the child reports `event` now. */
+	emitEvent(event: OmpEvent): void {
+		for (const listener of this.#listeners) listener(event);
+	}
+}
+
+describe("mailbox: tool repeat loop (stuck-loop)", () => {
+	const LOOP_ORIGIN = "slack/dm/DLOOP";
+	let loops: StuckLoopInfo[];
+	let opened: LoopDriver[];
+
+	/** `bun test` failing the same way: the i-th identical start/end pair. */
+	const start = (i: number): OmpEvent => ({
+		type: "tool_execution_start",
+		toolCallId: `loop-${i}`,
+		toolName: "bash",
+		args: { command: "bun test" },
+	});
+	const end = (i: number): OmpEvent => ({
+		type: "tool_execution_end",
+		toolCallId: `loop-${i}`,
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "1 fail" }], details: { durationMs: i } },
+		isError: true,
+	});
+	const pairs = (n: number): OmpEvent[] => Array.from({ length: n }, (_, k) => [start(k + 1), end(k + 1)]).flat();
+
+	function loopMailbox(options: FakeOmpDriverOptions): OriginMailbox {
+		return new OriginMailbox({
+			originKey: LOOP_ORIGIN,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new LoopDriver({ ...options, sessionDir, store: sessionStore });
+				opened.push(driver);
+				return driver;
+			},
+			onStuckLoop: (info) => loops.push(info),
+		});
+	}
+
+	beforeEach(() => {
+		loops = [];
+		opened = [];
+	});
+
+	test("the same call six times: one steer at the 3rd, then abort and a stuck-loop failure at the 6th", async () => {
+		const mailbox = loopMailbox({ holdTurns: true, events: pairs(6) });
+		try {
+			const row = msg("테스트 고쳐", { originKey: LOOP_ORIGIN });
+			await mailbox.enqueue(row);
+			const driver = opened[0] as LoopDriver;
+			await untilFinal(mailbox, driver, () => {});
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toHaveLength(1);
+			expect(driver.calls).toContain("abort");
+			expect(loops).toEqual([
+				{
+					originKey: LOOP_ORIGIN,
+					threadRef: row.threadRef,
+					opRef: store.getInbound(row.platformMessageId)?.opRef ?? "missing",
+					toolName: "bash",
+					count: 6,
+				},
+			]);
+			expect(store.getInbound(row.platformMessageId)?.state).toBe("failed_notified");
+			const bodies = store.listDeliveries({ originKey: LOOP_ORIGIN }).map((d) => d.body);
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]).toStartWith("[turn failed] stuck-loop: ");
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("a normal final that lands before the loop abort settles the turn once, as answered", async () => {
+		const mailbox = loopMailbox({ events: [...pairs(5), start(6)] });
+		try {
+			const row = msg("테스트 고쳐", { originKey: LOOP_ORIGIN });
+			await mailbox.enqueue(row);
+			const driver = opened[0] as LoopDriver;
+			// The 6th end arrives right behind the final: the mailbox has queued the final's settlement first.
+			await untilFinal(mailbox, driver, () => {
+				driver.onFinal(() => driver.emitEvent(end(6)));
+			});
+			expect(driver.calls).not.toContain("abort");
+			expect(loops).toEqual([]);
+			expect(store.getInbound(row.platformMessageId)?.state).toBe("answered");
+			const bodies = store.listDeliveries({ originKey: LOOP_ORIGIN }).map((d) => d.body);
+			expect(bodies).toEqual(["ECHO 테스트 고쳐"]);
+		} finally {
+			await mailbox.close();
+		}
 	});
 });

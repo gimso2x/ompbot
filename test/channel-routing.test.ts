@@ -4,6 +4,7 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
+import { SlackChannel } from "../src/slack/channel";
 import type { FakeCall } from "../src/slack/fake-transport";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -42,7 +43,7 @@ async function boot(overrides: { escalationChannel?: string } = {}): Promise<voi
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: { ...home.config, ...overrides },
-		transport,
+		slack: new SlackChannel(transport),
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",

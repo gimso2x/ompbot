@@ -9,12 +9,13 @@ import { LogDirError, openLogSink } from "../ops/logfile";
 import { redact } from "../redact";
 import { floorsArgs, floorsSystemPrompt } from "../safety/prompt";
 import { indexRuntimeSecrets } from "../safety/secret-index";
+import { SlackChannel } from "../slack/channel";
 import { SocketModeTransport } from "../slack/socket-transport";
+import { FileFakeTransport } from "../slack/test-transport";
 import type { SlackTransport } from "../slack/transport";
 import { crashHook } from "./crash";
 import { Daemon } from "./daemon";
 import { acquireLock, type Lock, LockHeldError } from "./lock";
-import { FileFakeTransport } from "./test-transport";
 import { readVersion } from "./tools";
 
 /** `provider/model` in config.json becomes the two RpcClient options. */
@@ -151,7 +152,7 @@ export async function runDaemon(
 		clock,
 		bootId: lock.info.bootId,
 		ompVersion: await checkOmpVersion(config, log),
-		transport: pickTransport(config, env, log),
+		slack: new SlackChannel(pickTransport(config, env, log)),
 		crash: crashHook(env),
 		sweepMs: env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SWEEP_MS ? Number(env.OMPBOT_SWEEP_MS) : undefined,
 		driverFactory: (origin, sessionDir) =>

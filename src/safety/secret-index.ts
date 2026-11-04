@@ -80,6 +80,22 @@ export function indexRuntimeSecrets(
 		// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
 	}
 
+	known += indexEnvSecrets(env);
+	log.info("secret_index_loaded", { known });
+	return known;
+}
+
+/**
+ * The part of {@link indexRuntimeSecrets} that never touches the Slack token files: secret-named environment
+ * variables and the files listed in `OMPBOT_SECRET_GUARD_FILES`. The dashboard seeds its index with this alone, so its
+ * masking goes past the patterns without the dashboard reading the tokens. Returns how many values were indexed.
+ */
+export function indexEnvSecrets(env: Record<string, string | undefined>): number {
+	let known = 0;
+	const index = (candidate: string): void => {
+		if (indexSecretValue(candidate)) known += 1;
+	};
+
 	for (const [name, value] of Object.entries(env)) {
 		if (value === undefined || value === "" || !SECRET_ENV_NAME.test(name) || POINTER_ENV_NAME.test(name)) continue;
 		index(value);
@@ -88,7 +104,5 @@ export function indexRuntimeSecrets(
 	for (const path of (env.OMPBOT_SECRET_GUARD_FILES ?? "").split(":")) {
 		if (path !== "") indexFile(path, index);
 	}
-
-	log.info("secret_index_loaded", { known });
 	return known;
 }

@@ -17,6 +17,7 @@ import {
 	monitorOrigin,
 	withoutMarkerLines,
 } from "../monitors/ledger";
+import type { ApprovalDetail } from "../safety/approval";
 import { TaskLedger } from "../tasks/ledger";
 import {
 	assertInboundTransition,
@@ -147,6 +148,8 @@ export interface RecallCandidate {
 /**
  * Approval card ledger. `origin_key`/`origin_thread_ref` map a card back to the conversation that asked (NULL on rows
  * from before the mapping existed), `reply_ts`/`reply_text` hold the owner's thread reply that settled it as `replied`.
+ * `detail_json` holds the card's redacted, cut structured sections and `card_url`/`origin_url` the card and asking-thread
+ * permalinks, for the dashboard (all NULL on older rows, when absent or when the permalink lookup failed).
  */
 const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
 	approval_id TEXT PRIMARY KEY,
@@ -161,7 +164,10 @@ const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
 	origin_key TEXT,
 	origin_thread_ref TEXT,
 	reply_ts TEXT,
-	reply_text TEXT
+	reply_text TEXT,
+	detail_json TEXT,
+	card_url TEXT,
+	origin_url TEXT
 );`;
 
 const SCHEMA = `
@@ -473,10 +479,20 @@ export class Store {
 		/** The conversation that asked and the thread the request came from (absent for lane/legacy callers). */
 		originKey?: string | undefined;
 		originThreadRef?: string | undefined;
+		/** The card's structured sections as shown (already redacted and cut); only filled fields are stored. */
+		detail?: ApprovalDetail | undefined;
+		/** Permalinks of the card and of the asking thread (best effort; absent when the lookup failed). */
+		cardUrl?: string | undefined;
+		originUrl?: string | undefined;
 	}): void {
+		const detail: ApprovalDetail = {};
+		for (const key of ["action", "why", "impact", "rollback"] as const) {
+			const value = input.detail?.[key];
+			if (value !== undefined && value.trim() !== "") detail[key] = this.redact(value);
+		}
 		this.db
 			.query(
-				"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+				"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref, detail_json, card_url, origin_url) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				input.approvalId,
@@ -487,6 +503,9 @@ export class Store {
 				input.expiresAt,
 				input.originKey ?? null,
 				input.originThreadRef ?? null,
+				Object.keys(detail).length === 0 ? null : JSON.stringify(detail),
+				input.cardUrl ?? null,
+				input.originUrl ?? null,
 			);
 	}
 
@@ -1393,6 +1412,13 @@ export class Store {
 		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
 		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");
 		this.migrateApprovals();
+		// After the rebuild (which already creates them): a 'replied'-era table only lacks the dashboard columns.
+		const approvalColumns = this.db.query("PRAGMA table_info(approvals)").all() as Array<{ name: string }>;
+		for (const column of ["detail_json", "card_url", "origin_url"]) {
+			if (!approvalColumns.some((existing) => existing.name === column)) {
+				this.db.run(`ALTER TABLE approvals ADD COLUMN ${column} TEXT`);
+			}
+		}
 		// The approvals status index lives here, not in SCHEMA: the rebuild above drops whatever index the old
 		// table carried (a RENAME follows the table, the DROP kills it), so a pre-'replied' ledger would end this
 		// open without it. This runs after every open, so the sweep's status = 'pending' scan stays indexed.

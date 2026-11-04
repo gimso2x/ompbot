@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { Daemon } from "../src/daemon/daemon";
+import { Daemon, DRAIN_DEFERRED_COMMAND_TEXT } from "../src/daemon/daemon";
 import { callDaemon } from "../src/daemon/ipc";
 import {
 	RESTART_NOTICE_FILE,
@@ -13,6 +13,7 @@ import { renderStatusText } from "../src/daemon/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
 
@@ -45,7 +46,7 @@ async function boot(holdTurns: boolean): Promise<Daemon> {
 	transport = new WaitingTransport();
 	const started = new Daemon({
 		config: home.config,
-		transport,
+		slack: new SlackChannel(transport),
 		clock,
 		log: createLogger({
 			sink: (line) => {
@@ -223,6 +224,24 @@ describe("ompbot drain", () => {
 			expect(notices(RESTART_NOTICE_TEXT.back)).toEqual([]);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(false);
 		});
+	});
+
+	test("a slash command during a drain is recorded once and told it runs after the restart; status still answers", async () => {
+		daemon = await boot(false);
+		const slashRows = () =>
+			daemon.store
+				.listInbound()
+				.filter((row) => row.platformMessageId.startsWith(`slash:${DM}:`))
+				.map((row) => [row.textRef, row.state]);
+		daemon.setDraining(true);
+		const ack = await transport.emitSlash({ command: "/new-ompbot", user_id: OWNER, channel_id: DM });
+		expect(ack).toEqual({ response_type: "ephemeral", text: DRAIN_DEFERRED_COMMAND_TEXT });
+		expect(slashRows()).toEqual([["/new-ompbot", "pending"]]);
+		const status = await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: DM });
+		expect(status?.text).toBe(renderStatusText(daemon.status()));
+		expect(slashRows()).toHaveLength(1);
+		daemon.setDraining(false);
+		expect(await transport.emitSlash({ command: "/usage-ompbot", user_id: OWNER, channel_id: DM })).toBeUndefined();
 	});
 
 	test("a waiting approval counts as a running host tool and a pending approval", async () => {

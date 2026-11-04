@@ -100,6 +100,12 @@ export interface OmpbotConfig {
 	 * webhook triggers cannot be created. `bind` must be a loopback address; the default is 127.0.0.1.
 	 */
 	webhook?: { port: number; bind?: "127.0.0.1" | "::1" };
+	/**
+	 * Read-only status page of `ompbot dashboard` (a separate process; `--port`/`--bind` override). `bind` must be a
+	 * loopback address; the default is 127.0.0.1. Absent = the command needs `--port`. `herdrWebUrl` is herdr-web-ui's
+	 * address for the agent board's "herdr에서 답하기" links (absent = no link).
+	 */
+	dashboard?: { port: number; bind?: "127.0.0.1" | "::1"; herdrWebUrl?: string };
 }
 
 export interface SlackTokens {
@@ -209,8 +215,11 @@ export function readSlackTokens(config: OmpbotConfig): SlackTokens {
 	};
 }
 
-/** Loads and validates `<homeDir>/config.json`. Credential-file and workspace paths resolve against the config dir. */
-export function loadConfig(homeDir: string = defaultHomeDir()): OmpbotConfig {
+/**
+ * Loads and validates `<homeDir>/config.json`. Credential-file and workspace paths resolve against the config dir.
+ * `checkTokens: false` skips reading the token files — for processes that never talk to Slack (`ompbot dashboard`).
+ */
+export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkTokens?: boolean } = {}): OmpbotConfig {
 	const home = resolve(homeDir);
 	checkHome(home);
 
@@ -350,6 +359,27 @@ export function loadConfig(homeDir: string = defaultHomeDir()): OmpbotConfig {
 		for (const key of Object.keys(record)) if (key !== "port" && key !== "bind") invalid(configPath, `webhook.${key}`);
 	}
 
+	const dashboard = root.dashboard;
+	if (dashboard !== undefined) {
+		const record = asRecord(dashboard);
+		if (record === undefined) invalid(configPath, "dashboard");
+		if (!Number.isInteger(record.port) || (record.port as number) < 1 || (record.port as number) > 65535) {
+			invalid(configPath, "dashboard.port");
+		}
+		if (record.bind !== undefined && record.bind !== "127.0.0.1" && record.bind !== "::1") {
+			invalid(configPath, "dashboard.bind");
+		}
+		if (
+			record.herdrWebUrl !== undefined &&
+			(typeof record.herdrWebUrl !== "string" || !/^https?:\/\/\S+$/.test(record.herdrWebUrl))
+		) {
+			invalid(configPath, "dashboard.herdrWebUrl");
+		}
+		for (const key of Object.keys(record)) {
+			if (key !== "port" && key !== "bind" && key !== "herdrWebUrl") invalid(configPath, `dashboard.${key}`);
+		}
+	}
+
 	const config: OmpbotConfig = {
 		schemaVersion: 1,
 		homeDir: home,
@@ -386,6 +416,7 @@ export function loadConfig(homeDir: string = defaultHomeDir()): OmpbotConfig {
 	if (recallEnabled !== undefined) config.recallEnabled = recallEnabled;
 	if (watcherRoots !== undefined) config.watcherRoots = (watcherRoots as string[]).map((r) => resolve(r));
 	if (webhook !== undefined) config.webhook = webhook as { port: number; bind?: "127.0.0.1" | "::1" };
+	if (dashboard !== undefined) config.dashboard = dashboard as NonNullable<OmpbotConfig["dashboard"]>;
 	if (herdr !== undefined) config.herdr = herdr;
 	if (dispatchHosts !== undefined) {
 		config.dispatchHosts = dispatchHosts as Record<string, { ssh: string; workDir?: string; herdrBin?: string }>;
@@ -393,6 +424,6 @@ export function loadConfig(homeDir: string = defaultHomeDir()): OmpbotConfig {
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
 
-	readSlackTokens(config); // fail at startup on permissions/prefix; values are discarded here
+	if (options.checkTokens !== false) readSlackTokens(config); // fail at startup on permissions/prefix; values are discarded here
 	return config;
 }

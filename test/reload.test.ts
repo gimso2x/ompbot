@@ -6,6 +6,7 @@ import { planReload } from "../src/daemon/reload";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
 
@@ -71,7 +72,7 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		transport,
+		slack: new SlackChannel(transport),
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -119,7 +120,7 @@ test("reloading a config that turns herdr on answers restartRequired with herdr"
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		transport: new WaitingTransport(),
+		slack: new SlackChannel(new WaitingTransport()),
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -143,7 +144,7 @@ describe("boot last-good", () => {
 		daemon = new Daemon({
 			config: home.config,
 			bootConfigText,
-			transport: new WaitingTransport(),
+			slack: new SlackChannel(new WaitingTransport()),
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",

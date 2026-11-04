@@ -2,6 +2,7 @@
 // `ompbot inject` (todo 7) both call normalizeInbound, so owner gating and quoted-content fencing cannot diverge.
 import { randomBytes } from "node:crypto";
 import { injectionWarning, scanForInjection } from "../safety/injection";
+import { chatOriginKey, parseChatOrigin } from "./origin-key";
 import { parseCommand } from "./types";
 
 export interface NormalizeInput {
@@ -43,7 +44,7 @@ export function isOwner(userId: string | undefined, ownerUserId: string): boolea
 
 /** `slack/dm/<D…>` for the owner DM, `slack/ch/<C…|G…>` for a channel (one conversation per channel). */
 export function originKeyForChannel(channel: string, channelType = "im"): string {
-	return channelType === "im" ? `slack/dm/${channel}` : `slack/ch/${channel}`;
+	return chatOriginKey({ platform: "slack", kind: channelType === "im" ? "dm" : "ch", conversationId: channel });
 }
 
 /**
@@ -69,23 +70,13 @@ export function originKeyForMessage(
 
 /** Thread ref (`<channel>:<rootTs>`) a thread-session origin serves; undefined for every other origin kind. */
 export function threadRefOfOrigin(originKey: string): string | undefined {
-	const [, channel, rootTs] = /^slack\/ch\/([A-Z0-9]+)\/t\/([0-9.]+)$/.exec(originKey) ?? [];
-	return channel === undefined || rootTs === undefined ? undefined : threadRefOf(channel, rootTs);
+	const ref = parseChatOrigin(originKey);
+	return ref?.kind === "ch" && ref.threadId !== undefined ? threadRefOf(ref.conversationId, ref.threadId) : undefined;
 }
-
-const THREAD_ORIGIN = /^slack\/ch\/[A-Z0-9]+\/t\/[0-9.]+$/;
 
 /** True for thread-session origins (`slack/ch/<C>/t/<rootTs>`). */
 export function isThreadOrigin(originKey: string): boolean {
-	return THREAD_ORIGIN.test(originKey);
-}
-
-/**
- * Parent Slack channel of an origin (`slack/dm/<D>` → D, `slack/ch/<C>` → C, `slack/ch/<C>/t/<R>` → C);
- * undefined when the origin is not a Slack conversation (work lanes, monitors, …).
- */
-export function slackOriginChannel(originKey: string): string | undefined {
-	return /^slack\/(?:dm|ch)\/([A-Z0-9]+)(?:\/t\/[0-9.]+)?$/.exec(originKey)?.[1];
+	return threadRefOfOrigin(originKey) !== undefined;
 }
 
 export function threadRefOf(channel: string, threadTs: string): string {

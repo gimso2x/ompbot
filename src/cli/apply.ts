@@ -10,7 +10,7 @@ import {
 	DEFAULT_DRAIN_TIMEOUT_MIN,
 	findBun,
 	isExecutableFile,
-	REPORT_ORIGIN_PATTERN,
+	isReportOrigin,
 	REPORT_THREAD_PATTERN,
 	readLockStartedAt,
 	receiptPathFor,
@@ -67,7 +67,7 @@ export async function applyCommand(
 	}
 	const reportOrigin = values["report-origin"];
 	const reportThread = values["report-thread"];
-	if (reportOrigin !== undefined && !REPORT_ORIGIN_PATTERN.test(reportOrigin)) {
+	if (reportOrigin !== undefined && !isReportOrigin(reportOrigin)) {
 		return usageError("--report-origin must be slack/ch/<channel id> or slack/dm/<dm id>");
 	}
 	if (reportThread !== undefined && (reportOrigin === undefined || !REPORT_THREAD_PATTERN.test(reportThread))) {

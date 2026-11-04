@@ -1,0 +1,14 @@
+[Unit]
+Description=ompbot dashboard: read-only status page on a loopback port (config dashboard.port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=@PATH@
+ExecStart=@BUN@ @REPO_DIR@/src/main.ts dashboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

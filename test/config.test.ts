@@ -276,3 +276,36 @@ describe("herdr", () => {
 		expect(err.message).toContain(field);
 	});
 });
+
+describe("dashboard", () => {
+	test("port and loopback bind are accepted; bind defaults to unset", () => {
+		writeConfig(baseConfig({ dashboard: { port: 7331 } }));
+		expect(loadConfig(home).dashboard).toEqual({ port: 7331 });
+		writeConfig(baseConfig({ dashboard: { port: 7331, bind: "::1" } }));
+		expect(loadConfig(home).dashboard).toEqual({ port: 7331, bind: "::1" });
+		writeConfig(baseConfig({ dashboard: { port: 7331, herdrWebUrl: "https://herdr.example.test/" } }));
+		expect(loadConfig(home).dashboard).toEqual({ port: 7331, herdrWebUrl: "https://herdr.example.test/" });
+	});
+
+	test.each([
+		[{ port: 7331, bind: "0.0.0.0" }, "dashboard.bind"],
+		[{ port: 0 }, "dashboard.port"],
+		[{ port: 70000 }, "dashboard.port"],
+		[{ bind: "127.0.0.1" }, "dashboard.port"],
+		[{ port: 7331, token: "x" }, "dashboard.token"],
+		[{ port: 7331, herdrWebUrl: "javascript:alert(1)" }, "dashboard.herdrWebUrl"],
+		[{ port: 7331, herdrWebUrl: 7317 }, "dashboard.herdrWebUrl"],
+		["7331", "field=dashboard"],
+	])("AC-8: %j is a ConfigError naming %s", (dashboard, field) => {
+		writeConfig(baseConfig({ dashboard }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("checkTokens: false loads a config whose token files are missing", () => {
+		rmSync(join(home, "secrets"), { recursive: true, force: true });
+		expect(catchError(() => loadConfig(home)).code).toBe("secret_missing");
+		expect(loadConfig(home, { checkTokens: false }).ownerSlackUserId).toBe("UOWNER0");
+	});
+});

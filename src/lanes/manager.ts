@@ -1,12 +1,12 @@
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
+import type { ChannelPort } from "../channel/port";
 import { parseThreadRef } from "../core/normalize";
 import type { InboundRecord, MailboxClock } from "../core/types";
 import type { Logger } from "../log";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import { formatElapsed } from "../slack/format";
-import type { SlackTransport } from "../slack/transport";
 import type { Store } from "../store/db";
 import { classifyLaneCompletion, collectLaneDiff, type IntegrityInput, type IntegrityRefusal } from "./integrity";
 import { type LaneClaim, type LaneMeta, type LaneRow, laneOriginKey } from "./status";
@@ -55,7 +55,7 @@ function cwdOverlaps(a: string, b: string): boolean {
 
 export interface LaneManagerDeps {
 	store: Store;
-	transport: SlackTransport;
+	port: ChannelPort;
 	clock: MailboxClock;
 	log: Logger;
 	sessionsRoot: string;
@@ -112,7 +112,7 @@ export class LaneManager {
 
 	/** Creates the thread, the registry row and starts the lane's first turn. Throws `LaneInputError` for a refusal. */
 	async start(input: { title: string; cwd: string; brief?: string | undefined; channel: string }): Promise<LaneRow> {
-		const { store, transport, clock, log } = this.#deps;
+		const { store, port, clock, log } = this.#deps;
 		const frozen = this.#deps.frozen?.();
 		if (frozen !== undefined) {
 			log.warn("lane_refused_frozen", { channel: input.channel });
@@ -150,24 +150,23 @@ export class LaneManager {
 		this.#startingCwds.add(cwd);
 		let lane: LaneRow;
 		try {
-			const root = await transport.postMessage({ channel: input.channel, text: `🔄 ${title}` });
-			const status = await transport.postMessage({
-				channel: input.channel,
-				threadTs: root.ts,
-				text: `⏳ ${title} · ${formatElapsed(0)}`,
-			});
+			const root = await port.post({ conversationId: input.channel }, { text: `🔄 ${title}` });
+			const status = await port.post(
+				{ conversationId: input.channel, threadId: root.messageId },
+				{ text: `⏳ ${title} · ${formatElapsed(0)}` },
+			);
 			const name = this.#uniqueName(slugify(title));
 			const originKey = laneOriginKey(name);
 			const now = clock.now();
 			lane = store.insertLane({
 				name,
 				title,
-				threadRef: `${input.channel}:${root.ts}`,
+				threadRef: `${input.channel}:${root.messageId}`,
 				originKey,
 				cwd,
 				sessionDir: this.#deps.sessionDirFor(originKey),
 				meta: {
-					statusTs: status.ts,
+					statusTs: status.messageId,
 					startedAt: now,
 					lastProgressAt: now,
 					renderedRoot: `🔄 ${title}`,
@@ -440,7 +439,7 @@ export class LaneManager {
 	 * now shows it is returned for the caller to keep using.
 	 */
 	async #sync(lane: LaneRow, reason: "transition" | "milestone" | "tick"): Promise<LaneRow> {
-		const { store, transport, clock, log } = this.#deps;
+		const { store, port, clock, log } = this.#deps;
 		const name = lane.name;
 		const parsed = parseThreadRef(lane.threadRef);
 		if (parsed === undefined) return lane;
@@ -458,11 +457,14 @@ export class LaneManager {
 		const patch: Partial<LaneMeta> = {};
 		try {
 			if (lane.meta.renderedRoot !== rootText) {
-				await transport.updateMessage({ channel, ts: rootTs, text: rootText });
+				await port.edit({ platform: port.platform, conversationId: channel, messageId: rootTs }, { text: rootText });
 				patch.renderedRoot = rootText;
 			}
 			if (lane.meta.statusTs !== undefined && statusDue) {
-				await transport.updateMessage({ channel, ts: lane.meta.statusTs, text: statusText });
+				await port.edit(
+					{ platform: port.platform, conversationId: channel, messageId: lane.meta.statusTs },
+					{ text: statusText },
+				);
 				patch.renderedStatus = statusText;
 				patch.lastProgressAt = now;
 			}

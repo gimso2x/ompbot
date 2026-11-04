@@ -25,7 +25,7 @@ import {
 	STALL_NOTIFY_MS,
 	STALL_RELEASE_MS,
 } from "../src/core/types";
-import { Daemon } from "../src/daemon/daemon";
+import { Daemon, GATE_RESOLVE_CLOSED_SWEEPS } from "../src/daemon/daemon";
 import { runDoctor } from "../src/daemon/doctor";
 import { renderStatusText } from "../src/daemon/status";
 import type { ProcessRunner } from "../src/dispatch/omp";
@@ -38,6 +38,7 @@ import { collectGates, INBOUND_STARVATION_MS, TURNS_FAILING_WINDOW_MS } from "..
 import { gcSessions } from "../src/ops/gc";
 import { LOG_FILES, LOG_MAX_BYTES, LogDirError, openLogSink, rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { STALL_STATUS_TEXT } from "../src/slack/format";
 import type { SlackTransport } from "../src/slack/transport";
 import { ALERT_INCIDENT_REPEAT_MS, type Store } from "../src/store/db";
@@ -664,7 +665,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -852,7 +853,7 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		const failPrompts = options.failPrompts ?? 0;
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -970,11 +971,11 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		expect(transport.posts((text) => text.includes("게이트 backup_age 회복"))).toHaveLength(1);
 	});
 
-	/** Status of the backup_age gate's alert incident row read straight from the ledger (WAL-safe readonly open). */
-	function backupGateIncidentStatus(): string | undefined {
+	/** Status of a gate's alert incident row read straight from the ledger (WAL-safe readonly open). */
+	function gateIncidentStatus(gate: string): string | undefined {
 		const db = new Database(join(home.dir, "ompbot.db"), { readonly: true });
 		try {
-			const row = db.query("select status from alert_incidents where scope = ?").get("gate:backup_age") as {
+			const row = db.query("select status from alert_incidents where scope = ?").get(`gate:${gate}`) as {
 				status: string;
 			} | null;
 			return row?.status;
@@ -998,9 +999,9 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		await sweepOnce(); // close: recovery DM, closedSweeps=1
 		await transport.waitForPosts((text) => text.includes("게이트 backup_age 회복"));
 		await sweepOnce(); // closedSweeps=2
-		expect(backupGateIncidentStatus()).toBe("alerted");
+		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 		await sweepOnce(); // closedSweeps=3 -> incident resolved
-		expect(backupGateIncidentStatus()).toBe("resolved");
+		expect(gateIncidentStatus("backup_age")).toBe("resolved");
 
 		rmSync(join(home.dir, "backups", STAMP_FILE));
 		await sweepOnce();
@@ -1020,15 +1021,15 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		await sweepOnce(); // open again before the 3rd closed sweep
 		await sweepOnce();
 		expect(transport.posts((text) => text.includes("게이트 backup_age 열림"))).toHaveLength(1);
-		expect(backupGateIncidentStatus()).toBe("alerted");
+		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 
 		// A pending resolve must not survive an interruption: close again, then it needs a fresh run of 3 sweeps.
 		writeBackupStamp(home.dir);
 		await sweepOnce(); // closedSweeps=1 (recovery DM)
 		await sweepOnce(); // 2
-		expect(backupGateIncidentStatus()).toBe("alerted");
+		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 		await sweepOnce(); // 3
-		expect(backupGateIncidentStatus()).toBe("resolved");
+		expect(gateIncidentStatus("backup_age")).toBe("resolved");
 	});
 
 	test("a gate already closed at boot clears its leftover alerted incident, so the next open alerts", async () => {
@@ -1036,18 +1037,61 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		await daemon.sweep();
 		await transport.waitForPosts((text) => text.includes("게이트 backup_age 열림"));
 		await daemon.stop();
-		expect(backupGateIncidentStatus()).toBe("alerted");
+		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 
 		writeBackupStamp(home.dir); // closed by the time the new incarnation looks
 		await startDaemon({ gateSweepMs: 5_000 });
 		await daemon.sweep(); // first observation: closed -> stale row resolved
-		expect(backupGateIncidentStatus()).toBe("resolved");
+		expect(gateIncidentStatus("backup_age")).toBe("resolved");
 		expect(transport.posts((text) => text.includes("게이트 backup_age 회복"))).toHaveLength(0);
 
 		rmSync(join(home.dir, "backups", STAMP_FILE));
 		await sweepOnce();
 		await transport.waitForPosts((text) => text.includes("게이트 backup_age 열림"), 2);
 		expect(transport.posts((text) => text.includes("게이트 backup_age 열림"))).toHaveLength(2);
+	});
+
+	/** Fails three more owner turns (every prompt fails) and sweeps once, so turns_failing opens; waits for its DM. */
+	async function openTurnsFailing(round: number): Promise<void> {
+		for (let i = 0; i < 3; i++) {
+			await daemon.inject({ origin: ORIGIN, asOwner: true, text: `job ${round}-${i}` });
+		}
+		await transport.waitForPosts((text) => text.startsWith("[turn failed]"), 3 * round);
+		await sweepOnce();
+		await transport.waitForPosts((text) => text.includes("게이트 turns_failing 열림"), round);
+	}
+
+	test("a window gate's incident resolves silently after the closed sweeps, so a recurrence alerts again", async () => {
+		await startDaemon({ gateSweepMs: 5_000, failPrompts: 99 }); // every prompt fails with the stale-model sign
+		await openTurnsFailing(1);
+		expect(gateIncidentStatus("turns_failing")).toBe("alerted");
+
+		clock.advance(TURNS_FAILING_WINDOW_MS); // the evidence ages out: the next sweep sees the gate closed
+		for (let sweep = 1; sweep < GATE_RESOLVE_CLOSED_SWEEPS; sweep++) {
+			await sweepOnce();
+			expect(gateIncidentStatus("turns_failing")).toBe("alerted");
+		}
+		await sweepOnce();
+		expect(gateIncidentStatus("turns_failing")).toBe("resolved");
+		// Resolving is bookkeeping only: an aged-out window is not a fix, so no recovery DM.
+		expect(transport.posts((text) => text.includes("게이트 turns_failing 회복"))).toHaveLength(0);
+
+		await openTurnsFailing(2); // well inside 24h of the first alert: only the resolve lets it notify again
+		expect(transport.posts((text) => text.includes("게이트 turns_failing 열림"))).toHaveLength(2);
+		expect(gateIncidentStatus("turns_failing")).toBe("alerted");
+	});
+
+	test("a window gate already closed at boot resolves its leftover alerted incident without a recovery DM", async () => {
+		await startDaemon({ gateSweepMs: 5_000, failPrompts: 99 });
+		await openTurnsFailing(1);
+		await daemon.stop();
+		expect(gateIncidentStatus("turns_failing")).toBe("alerted");
+
+		clock.advance(TURNS_FAILING_WINDOW_MS); // aged out by the time the new incarnation looks
+		await startDaemon({ gateSweepMs: 5_000 });
+		await daemon.sweep(); // first observation: closed -> stale row resolved
+		expect(gateIncidentStatus("turns_failing")).toBe("resolved");
+		expect(transport.posts((text) => text.includes("게이트 turns_failing 회복"))).toHaveLength(0);
 	});
 
 	test("gateSweepMs=0 disables gate reporting entirely: an open gate never DMs, status still lists it", async () => {

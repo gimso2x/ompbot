@@ -16,8 +16,15 @@ import {
 	approvalActionId,
 	parseApprovalActionId,
 } from "../src/safety/approval";
-import { buildHostTools, checkUploadable, type HostToolDef } from "../src/safety/host-tools";
+import {
+	buildHostTools,
+	checkUploadable,
+	type HostToolDef,
+	UPLOAD_SCAN_CARRY_CHARS,
+	UPLOAD_SCAN_CHUNK_BYTES,
+} from "../src/safety/host-tools";
 import { buildFloorsPrompt, floorsArgs, floorsSystemPrompt } from "../src/safety/prompt";
+import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -214,7 +221,7 @@ describe("ApprovalBroker", () => {
 
 	const make = (extra: Partial<ApprovalBrokerOptions> = {}) =>
 		new ApprovalBroker({
-			transport,
+			port: new SlackChannel(transport),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -364,9 +371,9 @@ describe("host tools", () => {
 	function build(originKey = ORIGIN, extra: Partial<Parameters<typeof buildHostTools>[0]> = {}): HostToolDef[] {
 		return buildHostTools({
 			originKey,
-			transport,
+			port: new SlackChannel(transport),
 			broker: new ApprovalBroker({
-				transport,
+				port: new SlackChannel(transport),
 				ownerUserId: OWNER,
 				log: quietLog(),
 				timers,
@@ -498,6 +505,74 @@ describe("host tools", () => {
 		expect(() => checkUploadable(join(workspaceDir, "gh.txt"), deps)).toThrow(/token-like secret/);
 	});
 
+	test("checkUploadable scans files past 3MB: a token at the head or only at the tail is refused", () => {
+		const deps = { homeDir, workspaceDir, userHome };
+		const padding = "harmless line\n".repeat(Math.ceil((3 * 1024 * 1024 + 1) / 14));
+		writeFileSync(join(workspaceDir, "head.txt"), `token xoxb-TEST-0\n${padding}`);
+		expect(() => checkUploadable(join(workspaceDir, "head.txt"), deps)).toThrow(/token-like secret/);
+		writeFileSync(join(workspaceDir, "tail.txt"), `${padding}token xoxb-TEST-0\n`);
+		expect(() => checkUploadable(join(workspaceDir, "tail.txt"), deps)).toThrow(/token-like secret/);
+		writeFileSync(join(workspaceDir, "clean.txt"), padding);
+		expect(checkUploadable(join(workspaceDir, "clean.txt"), deps)).toBe(join(workspaceDir, "clean.txt"));
+	});
+
+	test("checkUploadable catches a token split across a scan chunk boundary, without false hits there", () => {
+		const deps = { homeDir, workspaceDir, userHome };
+		const file = join(workspaceDir, "split.txt");
+		for (const token of ["xoxb-TEST-0", `ghp_${"A".repeat(36)}`]) {
+			// The chunk boundary falls inside the token.
+			writeFileSync(file, `${"a ".repeat(UPLOAD_SCAN_CHUNK_BYTES / 2 - 1)} ${token}\n${"b ".repeat(1000)}`);
+			expect(() => checkUploadable(file, deps)).toThrow(/token-like secret/);
+		}
+		// `ask-…` is not an `sk-` key even when the carried-over tail starts at its `s`.
+		const head = "a".repeat(UPLOAD_SCAN_CHUNK_BYTES - UPLOAD_SCAN_CARRY_CHARS);
+		writeFileSync(file, `${head}sk-${"b".repeat(UPLOAD_SCAN_CARRY_CHARS - 3)}${"c ".repeat(1000)}`);
+		expect(checkUploadable(file, deps)).toBe(file);
+	});
+
+	describe("checkUploadable: short `sk-` runs in binary data are not keys", () => {
+		const padding = "\u0001".repeat(3 * 1024 * 1024 + 1);
+		const short = [`\u0000sk-a\u0000`, `\u0000sk-${"b".repeat(19)}\u0000`];
+
+		test("NUL-wrapped `sk-a` and `sk-` + 19 characters in a file over 3MB pass", () => {
+			const deps = { homeDir, workspaceDir, userHome };
+			const file = join(workspaceDir, "binary.bin");
+			writeFileSync(file, `${padding.slice(0, 1024)}${short.join("")}${padding}`);
+			expect(checkUploadable(file, deps)).toBe(file);
+		});
+
+		test("`sk-` + 20, `sk-ant-` + 20 and an `xoxb-` token past 3MB are refused", () => {
+			const deps = { homeDir, workspaceDir, userHome };
+			const file = join(workspaceDir, "binary.bin");
+			for (const token of [`sk-${"b".repeat(20)}`, `sk-ant-${"b".repeat(20)}`, "xoxb-TEST-0"]) {
+				writeFileSync(file, `${padding}\u0000${token}\u0000`);
+				expect(() => checkUploadable(file, deps)).toThrow(/token-like secret/);
+			}
+		});
+
+		test("chat masking is unchanged: the short runs are still redacted", () => {
+			expect(short.map(redact)).toEqual(["\u0000[REDACTED]\u0000", "\u0000[REDACTED]\u0000"]);
+		});
+	});
+
+	test("checkUploadable protects npm, kube, docker and gcloud credentials; other files in the home pass", () => {
+		const deps = { homeDir, workspaceDir, userHome };
+		const files = [
+			join(userHome, ".npmrc"),
+			join(userHome, ".kube", "config"),
+			join(userHome, ".docker", "config.json"),
+			join(userHome, ".config", "gcloud", "credentials.db"),
+		];
+		for (const file of files) {
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, "harmless\n");
+			expect(() => checkUploadable(file, deps)).toThrow(/protected directory/);
+		}
+		const plain = join(userHome, "notes.txt");
+		writeFileSync(plain, "harmless\n");
+		expect(checkUploadable(plain, deps)).toBe(plain);
+	});
+
 	test("upload tools need an owner DM origin", async () => {
 		tools = build("slack/channel/C1");
 		writeFileSync(join(workspaceDir, "a.txt"), "x");
@@ -507,7 +582,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval returns approved / denied / denied (timeout) from the buttons", async () => {
 		const broker = new ApprovalBroker({
-			transport,
+			port: new SlackChannel(transport),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -515,7 +590,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			transport,
+			port: new SlackChannel(transport),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -536,7 +611,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval forwards the optional sections; unfilled ones never appear", async () => {
 		const broker = new ApprovalBroker({
-			transport,
+			port: new SlackChannel(transport),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -544,7 +619,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			transport,
+			port: new SlackChannel(transport),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -592,7 +667,7 @@ describe("approval through the daemon (adapter owner gate, logs)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -640,7 +715,7 @@ describe("file upload thread routing (daemon)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: quietLog(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -691,7 +766,7 @@ describe("file upload thread routing (daemon)", () => {
 		const drivers: FakeOmpDriver[] = [];
 		daemon = new Daemon({
 			config: home.config,
-			transport,
+			slack: new SlackChannel(transport),
 			log: quietLog(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

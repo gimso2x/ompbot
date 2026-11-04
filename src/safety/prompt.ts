@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { chatPlatformOf } from "../core/origin-key";
 import { isPersonaOrigin } from "../monitors/tools";
 import { truncateUtf8 } from "../redact";
 
@@ -44,7 +45,7 @@ const formatSection = (herdr: boolean): string =>
 export function buildFloorsPrompt(secretsDir: string, originKey?: string, herdr = false): string {
 	// Owner-DM persona sessions get the monitor tools line; every Slack chat session gets the answer-format section.
 	const persona = originKey !== undefined && isPersonaOrigin(originKey);
-	const chat = originKey?.startsWith("slack/") === true;
+	const chat = originKey !== undefined && chatPlatformOf(originKey) !== undefined;
 	return [
 		"# ompbot 운영 안내 / ompbot operating floors",
 		"You are driven from the owner's Slack DM through ompbot (headless). The owner cannot answer interactive dialogs: never use the `ask` tool; ask in your normal reply instead. 슬랙 DM으로 구동되는 무인 세션이므로 `ask` 도구를 쓰지 말고, 질문은 일반 답변으로 하세요.",
@@ -63,7 +64,7 @@ export function buildFloorsPrompt(secretsDir: string, originKey?: string, herdr 
 		"- `ompbot_request_approval(summary, action?, why?, impact?, rollback?)`: 오너에게 승인/거부 버튼을 보내고 결과를 기다린다. 되돌릴 수 없는 작업이면 되돌릴 수 없는 이유(rollback)와 영향(impact)까지 채운다. Asks the owner with approve/deny buttons and waits; for irreversible actions fill at least `rollback` and `impact`.",
 		...(persona ? [MONITOR_LINE] : []),
 		"- 작업 디렉터리는 ompbot workspace다. 그 밖의 파일은 필요할 때만 건드린다. Your cwd is the ompbot workspace; touch files elsewhere only when needed.",
-		...(originKey?.startsWith("slack/") ? [THREAD_LOOKUP_LINE] : []),
+		...(chat ? [THREAD_LOOKUP_LINE] : []),
 		...(chat ? ["", formatSection(herdr)] : []),
 	].join("\n");
 }
@@ -87,7 +88,7 @@ export function floorsSystemPrompt(
 	herdr = false,
 ): string {
 	let persona = "";
-	if (originKey?.startsWith("slack/") && personaPath !== undefined) {
+	if (originKey !== undefined && chatPlatformOf(originKey) !== undefined && personaPath !== undefined) {
 		try {
 			const raw = readFileSync(personaPath, "utf8").trim();
 			if (raw !== "") {

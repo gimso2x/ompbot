@@ -152,26 +152,61 @@ interface TransitionSql {
 	at: number;
 }
 
-const toTask = (r: TaskSql): TaskRow => ({
-	taskId: r.task_id,
-	title: r.title,
-	risk: r.risk,
-	originKey: r.origin_key,
-	threadRef: r.thread_ref,
-	host: r.host,
-	repo: r.repo,
-	worktree: r.worktree,
-	branch: r.branch,
-	agent: r.agent,
-	status: r.status,
-	acceptance: JSON.parse(r.acceptance_json) as AcceptanceItem[],
-	createdAt: r.created_at,
-	updatedAt: r.updated_at,
-	progressAt: r.progress_at,
-	remindedAt: r.reminded_at,
-	notices: JSON.parse(r.notices_json) as Record<string, number>,
-	closedAt: r.closed_at,
-});
+/**
+ * A row's JSON columns, each on its own: an `acceptance_json` that does not parse to an array reads as `[]`, a
+ * `notices_json` that does not parse to a plain object as `{}`, and `broken` names the columns that did so. One
+ * damaged row never breaks a read of the others.
+ */
+export function parseTaskJson(
+	acceptanceJson: string,
+	noticesJson: string,
+): { acceptance: AcceptanceItem[]; notices: Record<string, number>; broken: string[] } {
+	const parse = (text: string): unknown => {
+		try {
+			return JSON.parse(text);
+		} catch {
+			return undefined;
+		}
+	};
+	const broken: string[] = [];
+	const acceptance = parse(acceptanceJson);
+	if (!Array.isArray(acceptance)) broken.push("acceptance_json");
+	const notices = parse(noticesJson);
+	const plain = typeof notices === "object" && notices !== null && !Array.isArray(notices);
+	if (!plain) broken.push("notices_json");
+	return {
+		acceptance: Array.isArray(acceptance) ? (acceptance as AcceptanceItem[]) : [],
+		notices: plain ? (notices as Record<string, number>) : {},
+		broken,
+	};
+}
+
+const toTask = (r: TaskSql): TaskRow => {
+	const { acceptance, notices } = parseTaskJson(r.acceptance_json, r.notices_json);
+	return {
+		taskId: r.task_id,
+		title: r.title,
+		risk: r.risk,
+		originKey: r.origin_key,
+		threadRef: r.thread_ref,
+		host: r.host,
+		repo: r.repo,
+		worktree: r.worktree,
+		branch: r.branch,
+		agent: r.agent,
+		status: r.status,
+		acceptance,
+		createdAt: r.created_at,
+		updatedAt: r.updated_at,
+		progressAt: r.progress_at,
+		remindedAt: r.reminded_at,
+		notices,
+		closedAt: r.closed_at,
+	};
+};
+
+/** `T-YYYYMMDD-` (11 characters), then the day's number as an integer: `-100` follows `-99`, not `-10`. */
+const TASK_ORDER = "substr(task_id, 1, 11), CAST(substr(task_id, 12) AS INTEGER), task_id";
 
 /** Durable registry of [TASK] work. Works on any database handle, so the CLI uses it without the full `Store`. */
 export class TaskLedger {
@@ -189,11 +224,12 @@ export class TaskLedger {
 		return this.#db.transaction(() => {
 			const now = this.#clock.now();
 			const day = kstDay(now);
-			const last = this.#db
-				.query("SELECT task_id FROM tasks WHERE task_id LIKE ? ORDER BY task_id DESC LIMIT 1")
-				.get(`T-${day}-%`) as { task_id: string } | null;
-			const seq = last === null ? 1 : Number(last.task_id.slice(`T-${day}-`.length)) + 1;
-			const taskId = formatTaskId(day, seq);
+			const prefix = `T-${day}-`;
+			// Numeric max: as text, `-99` sorts after `-100`, and the 101st id would collide.
+			const { last } = this.#db
+				.query("SELECT MAX(CAST(substr(task_id, ?) AS INTEGER)) AS last FROM tasks WHERE task_id LIKE ?")
+				.get(prefix.length + 1, `${prefix}%`) as { last: number | null };
+			const taskId = formatTaskId(day, (last ?? 0) + 1);
 			this.#db
 				.query(
 					`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
@@ -237,13 +273,15 @@ export class TaskLedger {
 	}
 
 	list(): TaskRow[] {
-		return (this.#db.query("SELECT * FROM tasks ORDER BY task_id").all() as TaskSql[]).map(toTask);
+		return (this.#db.query(`SELECT * FROM tasks ORDER BY ${TASK_ORDER}`).all() as TaskSql[]).map(toTask);
 	}
 
 	/** Tasks the sweep watches. */
 	listActive(): TaskRow[] {
 		return (
-			this.#db.query("SELECT * FROM tasks WHERE status IN ('working','blocked') ORDER BY task_id").all() as TaskSql[]
+			this.#db
+				.query(`SELECT * FROM tasks WHERE status IN ('working','blocked') ORDER BY ${TASK_ORDER}`)
+				.all() as TaskSql[]
 		).map(toTask);
 	}
 

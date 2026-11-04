@@ -1,10 +1,14 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import type { ChannelPort } from "../channel/port";
+import { ChannelRegistry } from "../channel/registry";
 import { loadConfig, type OmpbotConfig } from "../config";
 import type { DriverFactory, ProviderLimitInfo, TurnFailureEscalation } from "../core/mailbox";
-import { parseThreadRef, slackOriginChannel, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { parseThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
+import { parseChatOrigin } from "../core/origin-key";
+import { stuckStopText } from "../core/stuck";
 import { COMMAND_OP_REF, COMMAND_TEXT, type MailboxClock } from "../core/types";
 import { createDispatchAudit, installProcessAudit } from "../dispatch/audit";
 import { boardCardLink } from "../dispatch/board";
@@ -51,7 +55,7 @@ import { ApprovalBroker } from "../safety/approval";
 import { buildHostTools, type HostToolDef } from "../safety/host-tools";
 import { type CoreSink, type DeliverySource, SlackAdapter } from "../slack/adapter";
 import { type BackfillDeps, BackfillRunner, type ChannelTarget, channelCursorKey } from "../slack/backfill";
-import type { SlackTransport } from "../slack/transport";
+import type { SlackChannel } from "../slack/channel";
 import { type DeliveryRow, type InboundRow, LOG_COPY_SUFFIX, Store } from "../store/db";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
@@ -93,7 +97,7 @@ const MEDIA_SWEEP_INTERVAL_MS = 60 * 60_000;
 /** Gate sweep cadence of the self-diagnosis loop (0 disables it). */
 export const DEFAULT_GATE_SWEEP_MS = 5 * 60_000;
 /**
- * Consecutive closed sweeps after an alerted gate's recovery notice before its incident is resolved (15 minutes at
+ * Consecutive closed sweeps after an alerted gate closes before its incident is resolved (15 minutes at
  * the default sweep), so a recurrence after that alerts again. A shorter flap keeps the 24h suppression. Known gap:
  * restarting before the third closed sweep resolves the incident at boot instead, so a flap spanning a restart can
  * re-alert inside 24h — rare, and one extra notice.
@@ -120,9 +124,13 @@ export const PENDING_RETRY_MS = 60_000;
 /** Consecutive failed sweep retries before the owner is told once (24h repeat suppression via the incident machine). */
 export const PENDING_ALERT_AFTER = 3;
 
+/** Ephemeral answer to a slash command typed during a restart drain (recorded; the next process runs it). */
+export const DRAIN_DEFERRED_COMMAND_TEXT = "재시작 준비 중이라 재시작 뒤에 처리합니다. 다시 보내지 않아도 됩니다.";
+
 /**
  * Gates that close because their evidence window elapsed (`turns_failing` 1h, `monitors_failed` 24h), not because
- * the problem was fixed: the bot may still be broken, so their close is bookkeeping only — never a recovery DM.
+ * the problem was fixed: the bot may still be broken, so their close is bookkeeping only — never a recovery DM. The
+ * incident row is still resolved like any other gate's, so a recurrence alerts again.
  */
 const WINDOW_GATES = new Set(["turns_failing", "monitors_failed"]);
 
@@ -133,7 +141,11 @@ export interface DaemonOptions {
 	 * this text can become last-good at ready. Absent (tests) → read when `start()` begins.
 	 */
 	bootConfigText?: string | undefined;
-	transport: SlackTransport;
+	/**
+	 * The Slack side: its port carries every core-authored post (through the redacting registry), its `transport` the
+	 * adapter's inbound socket, backfill and delivery pump.
+	 */
+	slack: SlackChannel;
 	/** Builds the raw driver for (origin, sessionDir); the daemon namespaces its opRefs. */
 	driverFactory: DriverFactory;
 	log: Logger;
@@ -186,9 +198,6 @@ export interface InjectResult {
 
 /** Slack escapes only &, < and > in text; the adapter unescapes, so injected text is escaped to survive the round trip. */
 const escapeSlack = (text: string): string => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-/** Owner DM (`slack/dm/D…`) or a channel the bot was invited to (`slack/ch/C…`). */
-const SLACK_ORIGIN = /^slack\/(dm|ch)\/([A-Z0-9]+)$/;
 
 /** Sweep-retry state of one origin with stranded pending rows (see `#sweepPendingDispatch`). */
 interface PendingRetryState {
@@ -291,9 +300,14 @@ export class Daemon {
 	readonly #frozen: () => FreezeState | undefined;
 	#broker: ApprovalBroker | undefined;
 	#lanes: LaneManager | undefined;
+	/** Outbound Slack posts of the core (approval cards, lanes, tasks, uploads, inject markers), redacted on the way. */
+	readonly #slackPort: ChannelPort;
 
 	constructor(options: DaemonOptions) {
 		this.#options = options;
+		const channels = new ChannelRegistry();
+		channels.register(options.slack);
+		this.#slackPort = channels.get("slack");
 		this.#clock = options.clock ?? { now: () => Date.now() };
 		this.#log = options.log;
 		this.#frozen = createFreezeProbe(options.config.homeDir);
@@ -301,17 +315,18 @@ export class Daemon {
 
 	/** Host tools for the omp child of `originKey`: file upload, owner approval, and the lane tools of its kind. */
 	hostToolsFor(originKey: string): HostToolDef[] {
-		const { config, transport } = this.#options;
+		const { config } = this.#options;
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
-		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : slackOriginChannel(originKey);
+		const chatOrigin = parseChatOrigin(originKey);
+		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : chatOrigin?.conversationId;
 		const base = buildHostTools({
 			originKey,
-			transport,
+			port: this.#slackPort,
 			broker: this.#approval,
 			log: this.#log,
 			homeDir: config.homeDir,
 			workspaceDir: config.workspaceDir,
-			...(slackOriginChannel(originKey) !== undefined ? { ompExecutable: config.ompExecutable } : {}),
+			...(chatOrigin !== undefined ? { ompExecutable: config.ompExecutable } : {}),
 			...(channel === undefined ? {} : { channel }),
 			...(config.dispatchHosts === undefined ? {} : { dispatchHosts: config.dispatchHosts }),
 			...(config.herdrBoard === undefined ? {} : { herdrBoard: config.herdrBoard }),
@@ -325,7 +340,7 @@ export class Daemon {
 							threadRef: () =>
 								this.#router?.mailbox(originKey).state.threadRef ?? this.#store?.latestInboundThread(originKey),
 							rootText: (threadRef: string) => this.#store?.getInbound(threadRef)?.textRef,
-							transport,
+							port: this.#slackPort,
 							now: () => this.#clock.now(),
 						},
 					}),
@@ -372,7 +387,7 @@ export class Daemon {
 		const broker = this.#broker;
 		if (broker === undefined) return undefined;
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
-		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : slackOriginChannel(originKey);
+		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : parseChatOrigin(originKey)?.conversationId;
 		if (channel === undefined) return undefined;
 		return (request) => {
 			const ask = () =>
@@ -451,7 +466,7 @@ export class Daemon {
 		);
 		this.#store = store;
 		this.#broker = new ApprovalBroker({
-			transport: this.#options.transport,
+			port: this.#slackPort,
 			ownerUserId: config.ownerSlackUserId,
 			escalationChannel: config.escalationChannel,
 			log,
@@ -503,6 +518,11 @@ export class Daemon {
 			onEscalate: (info) => this.#escalateTurnFailures(info),
 			onProviderLimit: (info) => this.#notifyProviderLimit(info),
 			onSessionMismatch: (info) => this.#postThreadNotices([info.threadRef], formatSessionMismatchNotice(info)),
+			// A monitor's failed turn already retries with backoff through its own failure path: no thread post.
+			onStuckLoop: (info) => {
+				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
+				this.#postThreadNotices([info.threadRef], redact(stuckStopText(info.toolName, info.count)));
+			},
 			onStallEscalate: (info) => {
 				const target = this.#store;
 				if (target === undefined) return;
@@ -512,7 +532,7 @@ export class Daemon {
 		});
 		this.#lanes = new LaneManager({
 			store,
-			transport: this.#options.transport,
+			port: this.#slackPort,
 			clock: this.#clock,
 			log,
 			sessionsRoot,
@@ -597,7 +617,8 @@ export class Daemon {
 					text: arg === "" ? COMMAND_TEXT[command] : `${COMMAND_TEXT[command]} ${arg}`,
 					threadRef: threadRefOf(channel, TOP_LEVEL_TS),
 				});
-				return undefined;
+				// A drain holds the recorded command for the next process; say so, or the owner sees nothing and retypes it.
+				return this.#router?.draining === true ? DRAIN_DEFERRED_COMMAND_TEXT : undefined;
 			},
 			knowsThread: (threadRef) => store.getLaneByThread(threadRef) !== undefined || store.hasInboundThread(threadRef),
 			isThreadMuted: (threadRef) => store.isThreadMuted(threadRef),
@@ -652,7 +673,7 @@ export class Daemon {
 		// so creating the runner before the adapter exists is fine.
 		const backfill = new BackfillRunner(() => this.#backfillDeps());
 		this.#adapter = new SlackAdapter({
-			transport: this.#options.transport,
+			transport: this.#options.slack.transport,
 			core,
 			deliveries,
 			ownerUserId: config.ownerSlackUserId,
@@ -671,7 +692,7 @@ export class Daemon {
 		// A waiting click cannot outlive the process: expire every pending card and say so on them.
 		void this.#broker.expireStale(false).catch((error) => log.warn("approval_expire_failed", { error: String(error) }));
 
-		this.#options.transport.onReady = () => backfill.trigger();
+		this.#options.slack.transport.onReady = () => backfill.trigger();
 		backfill.trigger();
 
 		const herdrRun = this.#options.herdrRun;
@@ -719,7 +740,7 @@ export class Daemon {
 						onError: (error) => log.warn("task_board_link_failed", { task: row.taskId, error }),
 					});
 				},
-				transport: this.#options.transport,
+				transport: this.#slackPort,
 				ownerUserId: config.ownerSlackUserId,
 				now: () => this.#clock.now(),
 				log,
@@ -749,7 +770,7 @@ export class Daemon {
 		if (adapter === undefined) throw new Error("backfill before adapter start");
 		const channelCursorPrefix = channelCursorKey("");
 		return {
-			transport: this.#options.transport,
+			transport: this.#options.slack.transport,
 			ingest: (event) => adapter.ingestRecovered(event),
 			notifier: (channel, text) => adapter.postNotice(channel, text),
 			cursors: store,
@@ -769,9 +790,10 @@ export class Daemon {
 						return [channel, { channel, kind: channel.startsWith("D") ? "im" : "channel" }];
 					}),
 					...store.listSlackOrigins().flatMap((originKey): Array<[string, ChannelTarget]> => {
-						const channel = slackOriginChannel(originKey);
-						if (channel === undefined) return [];
-						return [[channel, { channel, kind: originKey.startsWith("slack/dm/") ? "im" : "channel" }]];
+						const ref = parseChatOrigin(originKey);
+						if (ref?.platform !== "slack") return [];
+						const channel = ref.conversationId;
+						return [[channel, { channel, kind: ref.kind === "dm" ? "im" : "channel" }]];
 					}),
 				]).values(),
 			],
@@ -953,7 +975,7 @@ export class Daemon {
 		if (heartbeat === undefined) return;
 		try {
 			const loopMs = heartbeat.beat(this.#clock.now(), {
-				socket: this.#options.transport.connectionState?.(),
+				socket: this.#options.slack.transport.connectionState?.(),
 				draining: this.#router?.draining === true,
 			});
 			if (loopMs > EVENT_LOOP_WARN_MS) this.#log.warn("event_loop_blocked", { loop_ms: loopMs });
@@ -1020,9 +1042,9 @@ export class Daemon {
 	 * cannot spam and a dead backup timer still reaches the only channel the owner watches. Two exceptions: the
 	 * window gates (`turns_failing`, `monitors_failed`) close silently, because an aged-out window is not a fix, and
 	 * `standing` incidents re-seed `alerted` after a restart, so a real recovery still reports across incarnations.
-	 * After a recovery notice the incident is resolved once the gate has stayed closed for
-	 * `GATE_RESOLVE_CLOSED_SWEEPS` sweeps, so a later recurrence alerts again; a gate first seen closed after a
-	 * restart resolves its leftover incident immediately.
+	 * After an alerted open closes (with the recovery notice, or silently for a window gate) the incident is resolved
+	 * once the gate has stayed closed for `GATE_RESOLVE_CLOSED_SWEEPS` sweeps, so a later recurrence alerts again; a
+	 * gate first seen closed after a restart, window gates included, resolves its leftover incident immediately.
 	 */
 	async #sweepGates(): Promise<void> {
 		const interval = this.#options.gateSweepMs ?? DEFAULT_GATE_SWEEP_MS;
@@ -1053,14 +1075,16 @@ export class Daemon {
 					this.#gateStates.set(gate.name, { state: "open", alerted, closedSweeps: 0, pendingResolve: false });
 				} else if (previous?.state === "open") {
 					// A close after a quiet open stays quiet; a close after an alerted open reports the recovery —
-					// except the window gates, whose close only means the evidence aged out.
-					const reportRecovery = previous.alerted && !WINDOW_GATES.has(gate.name);
-					if (reportRecovery) await adapter.postNotice(store.ownerChannel(), formatGateClosedNotice(gate));
+					// except the window gates, whose close only means the evidence aged out. Either way an alerted
+					// incident is resolved after the closed sweeps, so a window gate's row does not stay alerted.
+					if (previous.alerted && !WINDOW_GATES.has(gate.name)) {
+						await adapter.postNotice(store.ownerChannel(), formatGateClosedNotice(gate));
+					}
 					this.#gateStates.set(gate.name, {
 						state: "closed",
 						alerted: false,
 						closedSweeps: 1,
-						pendingResolve: reportRecovery,
+						pendingResolve: previous.alerted,
 					});
 				} else if (previous?.state === "closed") {
 					previous.closedSweeps += 1;
@@ -1069,8 +1093,9 @@ export class Daemon {
 						previous.pendingResolve = false;
 						this.#log.info("gate_incident_resolved", { gate: gate.name });
 					}
-				} else if (!WINDOW_GATES.has(gate.name)) {
+				} else {
 					// First observation after a restart is already closed: clear any leftover alerted row (no row = no-op).
+					// A window gate too: it only closes once its evidence window passed without a recurrence.
 					store.resolveAlertIncidents(`gate:${gate.name}`);
 					this.#log.info("gate_incident_resolved", { gate: gate.name, reason: "closed_at_boot" });
 					this.#gateStates.set(gate.name, { state: "closed", alerted: false, closedSweeps: 1, pendingResolve: false });
@@ -1129,7 +1154,8 @@ export class Daemon {
 		// Same latest-updated_at rule as the escalation/gate notices' ownerChannel(): a stale duplicate DM origin row
 		// must not make the answered count (and so the review cadence) follow a dead conversation.
 		const dmOrigin = store.ownerDmOrigin();
-		if (dmOrigin === undefined) return;
+		const channel = dmOrigin === undefined ? undefined : parseChatOrigin(dmOrigin)?.conversationId;
+		if (dmOrigin === undefined || channel === undefined) return;
 		const answered = store.countAnswered(dmOrigin);
 		const seen = this.#reviewedTurns.get(dmOrigin);
 		// First look at this DM since boot: its count is the baseline, so the cadence counts turns from here on.
@@ -1145,7 +1171,6 @@ export class Daemon {
 			return;
 		}
 		this.#reviewing = true;
-		const channel = dmOrigin.slice("slack/dm/".length);
 		const origin = store.getOrigin(dmOrigin);
 		void runSkillReview(
 			{
@@ -1334,19 +1359,20 @@ export class Daemon {
 		const adapter = this.#adapter;
 		if (!adapter) throw new Error("daemon not started");
 		if (request.asOwner !== true) throw new Error("inject requires --as-owner");
-		const match = SLACK_ORIGIN.exec(request.origin);
-		const channel = match?.[2];
-		if (channel === undefined)
+		// Owner DM (`slack/dm/D…`) or a channel the bot was invited to (`slack/ch/C…`); no thread origins.
+		const ref = parseChatOrigin(request.origin);
+		if (ref?.platform !== "slack" || ref.threadId !== undefined)
 			throw new Error(`inject origin must be slack/dm/<id> or slack/ch/<id>: ${request.origin}`);
-		const inChannel = match?.[1] === "ch";
+		const channel = ref.conversationId;
+		const inChannel = ref.kind === "ch";
 		// In a channel the bot only answers when addressed, exactly like a real owner message there.
-		const mention = inChannel && adapter.botUserId !== undefined ? `<@${adapter.botUserId}> ` : "";
+		const mention =
+			inChannel && adapter.botUserId !== undefined ? `${this.#slackPort.mentionUser(adapter.botUserId)} ` : "";
 		const nonce = randomBytes(6).toString("hex");
-		const root = await this.#options.transport.postMessage({
-			channel,
-			text: `🧪 inject ${nonce}`,
-			...(request.thread === undefined ? {} : { threadTs: request.thread }),
-		});
+		const marker = await this.#slackPort.post(
+			{ conversationId: channel, ...(request.thread === undefined ? {} : { threadId: request.thread }) },
+			{ text: `🧪 inject ${nonce}` },
+		);
 		const attachments = request.quoted === undefined ? undefined : [{ text: escapeSlack(request.quoted) }];
 		// A reply in an approval card's thread settles the card without an inbound row, so acceptance comes from the
 		// adapter's own verdict, not from the ledger.
@@ -1356,12 +1382,12 @@ export class Daemon {
 			channel_type: inChannel ? "channel" : "im",
 			user: this.#options.config.ownerSlackUserId,
 			text: `${mention}${escapeSlack(request.text)}`,
-			ts: root.ts,
+			ts: marker.messageId,
 			...(request.thread === undefined ? {} : { thread_ts: request.thread }),
 			attachments,
 		});
 		if (outcome === "dropped") throw new Error("inject_rejected: message was not accepted");
-		return { nonce, threadRef: threadRefOf(channel, request.thread ?? root.ts) };
+		return { nonce, threadRef: threadRefOf(channel, request.thread ?? marker.messageId) };
 	}
 
 	async #handleIpc(request: unknown): Promise<unknown> {

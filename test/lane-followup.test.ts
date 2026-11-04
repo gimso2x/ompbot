@@ -5,6 +5,7 @@ import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 
@@ -44,7 +45,7 @@ async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
 	const clock = { now: () => Date.now() };
 	const daemon = new Daemon({
 		config: home.config,
-		transport,
+		slack: new SlackChannel(transport),
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",

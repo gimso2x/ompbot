@@ -4,6 +4,7 @@ import { redact } from "../redact";
 import { openStore, type Store } from "../store/db";
 import { type DriverFactory, type MailboxDeps, OriginMailbox } from "./mailbox";
 import { isThreadOrigin } from "./normalize";
+import { chatOriginKey } from "./origin-key";
 import type { InboundRecord, MailboxClock, StatusProvider } from "./types";
 
 /**
@@ -11,7 +12,7 @@ import type { InboundRecord, MailboxClock, StatusProvider } from "./types";
  * the key, so `threadTs` is deliberately ignored. Keys are only built here, never parsed afterwards.
  */
 export function slackDmOrigin(message: { channelId: string; threadTs?: string }): string {
-	return `slack/dm/${message.channelId}`;
+	return chatOriginKey({ platform: "slack", kind: "dm", conversationId: message.channelId });
 }
 
 /** One session directory per origin epoch (`/new` starts a new one, so old epochs can be garbage collected). */
@@ -56,6 +57,8 @@ export interface OriginRouterDeps {
 	/** Owner notice for a provider usage limit seen in a turn's omp retry events; see `MailboxDeps`. */
 	onProviderLimit?: MailboxDeps["onProviderLimit"];
 	onSessionMismatch?: MailboxDeps["onSessionMismatch"];
+	/** Thread notice for a turn aborted on a tool repeat loop; see `MailboxDeps`. */
+	onStuckLoop?: MailboxDeps["onStuckLoop"];
 }
 
 /** Owns one `OriginMailbox` per origin key. */
