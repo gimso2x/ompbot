@@ -59,6 +59,10 @@ export class FileFakeTransport implements SlackTransport {
 		this.#log({ method: "updateMessage", ...args });
 	}
 
+	async deleteMessage(args: { channel: string; ts: string }): Promise<void> {
+		this.#log({ method: "deleteMessage", ...args });
+	}
+
 	async uploadFile(args: {
 		channel: string;
 		threadTs?: string | undefined;

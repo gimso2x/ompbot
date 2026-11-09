@@ -3,11 +3,15 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Server } from "bun";
 import { loadConfig, type OmpbotConfig } from "../config";
+import type { LiveView } from "../core/live-turn";
 import { callDaemon } from "../daemon/ipc";
 import { readVersion } from "../daemon/tools";
 import { BoardSource } from "../dashboard/board";
+import { readMonitorDetail } from "../dashboard/monitor-detail";
 import { startDashboardServer } from "../dashboard/server";
 import { buildSnapshot, createSnapshotCache, readBoardTasks } from "../dashboard/snapshot";
+import { readThreadConversation } from "../dashboard/thread-conversation";
+import { readTurnTrace } from "../dashboard/trace";
 import { DEFAULT_BOARD_API } from "../dispatch/board";
 import { realProcessRunner } from "../dispatch/omp";
 import { redact } from "../redact";
@@ -16,7 +20,11 @@ import { resolveTaskHost } from "../tasks/host";
 
 export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  read-only status page on a loopback port until SIGTERM: HTML at /, JSON at
-                                 /api/snapshot (also under a prefix like /task/); --port/--bind override config
+                                 /api/snapshot, a turn's waterfall at /api/turn/<id>/trace, a monitor's masked
+                                 instruction and runs at /api/monitor/detail?id=<id>, a conversation's
+                                 masked omp session at /api/thread/conversation?origin=<key>, what its running turn
+                                 is writing at /api/thread/live?origin=<key> (stream: /api/thread/live/events) (also
+                                 under a prefix like /task/); --port/--bind override config
                                  dashboard {port, bind?, herdrWebUrl?}; no port in either → exit 2. With config
                                  herdrBoard it also shows the herdr agent board (api/board, api/board/events,
                                  ?card=<key> detail with the pane's conversation and plan)
@@ -89,6 +97,19 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 			port,
 			hostname,
 			snapshot,
+			trace: (inboundId) => readTurnTrace(homeDir, inboundId, now()),
+			conversation: (origin, before) => readThreadConversation(homeDir, origin, before),
+			// The daemon's procedure file roots (MonitorScheduler in daemon.ts).
+			monitorDetail: (id) =>
+				readMonitorDetail(homeDir, { workspaceDir: config?.workspaceDir, scriptsRoot: join(homeDir, "scripts") }, id),
+			// 800 ms bound: a wedged daemon must not hold a read past the next tick (callDaemon defaults to 120 s).
+			live: async (origin) => {
+				const answer = await callDaemon(join(homeDir, "ompbot.sock"), { op: "live", origin }, 800);
+				if (typeof answer !== "object" || answer === null || !("ok" in answer) || answer.ok !== true) {
+					throw new Error("daemon live op failed");
+				}
+				return "live" in answer ? (answer.live as LiveView | null) : null;
+			},
 			onError: (error) =>
 				process.stderr.write(
 					`dashboard snapshot_failed: ${redact(error instanceof Error ? error.message : String(error))}\n`,

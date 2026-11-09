@@ -1,11 +1,22 @@
 import { Database } from "bun:sqlite";
 import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_SWEEP_MS, readSweepHeartbeat } from "../daemon/heartbeat";
 import { nextFireOf, toMonitor } from "../monitors/ledger";
 import { checkOmpRuntime } from "../omp/runtime-check";
 import { readStamp } from "./backup";
 import { readFreeze } from "./freeze";
+import { HERDR_HEALTH_STALE_MS, HERDR_UNREACHABLE_AFTER, readHerdrHealth } from "./herdr-health";
+import {
+	type DiskView,
+	diskHeadroom,
+	diskLow,
+	formatHeadroom,
+	type HostLoadReader,
+	hostPressure,
+	type StatfsReader,
+} from "./host-resources";
 import { OFFSITE_STAMP_FILE } from "./offsite";
 
 /** A stale backup is the first thing to catch; the hub uses the same 36h window for its file-age check. */
@@ -48,7 +59,12 @@ export const SOCKET_DOWN_MS = 10 * 60_000;
 /** An enabled monitor whose next fire is this far in the past means the monitor tick is not firing it. */
 export const MONITOR_OVERDUE_MS = 15 * 60_000;
 
-export type GateState = "open" | "closed";
+/**
+ * `unknown`: nothing to judge from (no heartbeat stamp, no ledger file — a home no daemon has run in). It is neither
+ * health nor a failure: `ompbot gates` counts it apart and fails on it only with `--strict`, and the daemon's own
+ * gate sweep keeps the previous state.
+ */
+export type GateState = "open" | "closed" | "unknown";
 
 export interface Gate {
 	name: string;
@@ -63,10 +79,31 @@ export interface GatesOptions {
 	ompExecutable?: string;
 	/** True when config.json has an `offsite` target; only then does the `offsite_age` gate exist. */
 	offsiteConfigured?: boolean;
+	/** Paths whose filesystems `disk_low` judges; default the bot home and `~/.omp/agent` (when it exists). */
+	diskPaths?: string[];
+	/** Test seam: filesystem stats per path (default `statfsSync`). */
+	statfs?: StatfsReader;
+	/** Test seam: load average, CPU count and /proc/meminfo for `host_pressure` (default this machine's). */
+	hostLoad?: Partial<HostLoadReader>;
 }
 
 function gate(name: string, open: boolean, detail: string): Gate {
 	return { name, state: open ? "open" : "closed", detail };
+}
+
+/** Gates judged from the ledger; all `unknown` while `ompbot.db` does not exist. */
+const LEDGER_GATES = [
+	"inbound_starved",
+	"origin_silent",
+	"deliveries_overdue",
+	"lanes_stuck",
+	"monitors_failed",
+	"monitors_stalled",
+	"turns_failing",
+] as const;
+
+function unknownGate(name: string, detail: string): Gate {
+	return { name, state: "unknown", detail };
 }
 
 function tableExists(db: Database, name: string): boolean {
@@ -128,10 +165,33 @@ function ompRuntimeGate(ompExecutable: string): Gate {
 	return gate(name, problem !== undefined, problem === undefined ? "ok" : `${problem.code} ${problem.detail}`);
 }
 
+/** Open when any judged filesystem is low; the detail names the tightest one (lowest free share). */
+function diskGate(paths: readonly string[], statfs: StatfsReader | undefined): Gate {
+	const views = paths
+		.map((path) => diskHeadroom(path, statfs))
+		.filter((view) => view.freeBytes !== null && view.totalBytes !== null);
+	if (views.length === 0) return gate("disk_low", false, "statfs=unavailable");
+	const share = (view: DiskView) => (view.totalBytes ? (view.freeBytes ?? 0) / view.totalBytes : 0);
+	const low = views.filter(diskLow);
+	const tightest = (low.length > 0 ? low : views).reduce((a, b) => (share(b) < share(a) ? b : a));
+	return gate("disk_low", low.length > 0, `path=${tightest.path} ${formatHeadroom(tightest)}`);
+}
+
+function hostPressureGate(read: Partial<HostLoadReader> | undefined): Gate {
+	const pressure = hostPressure(read);
+	const mem = pressure.memAvailableRatio === null ? "unknown" : String(Math.floor(pressure.memAvailableRatio * 100));
+	return gate(
+		"host_pressure",
+		pressure.open,
+		`load15=${pressure.load15.toFixed(2)} cpus=${pressure.cpus} mem_avail_pct=${mem}`,
+	);
+}
+
 /**
  * Read-only health projection over `<homeDir>`: opens the ledger read-only (never re-queues inflight deliveries,
  * unlike `openStore`) plus the backup stamp, and answers "does anything need a human?". Follows the upstream
- * `ops cycle` contract: any open gate means exit 1, so automation cannot mistake a sick bot for a healthy one.
+ * `ops cycle` contract: any open gate means exit 1, so automation cannot mistake a sick bot for a healthy one. A gate
+ * with nothing to judge from is `unknown`, not closed (`ompbot gates --strict` fails on those too).
  *
  * `failed_ambiguous` deliveries are intentionally NOT a gate: the state is sticky by design, already surfaced in
  * `ompbot status`, and has no CLI resolution path yet - gating on it would alert forever.
@@ -164,10 +224,10 @@ export function collectGates(options: GatesOptions): Gate[] {
 	}
 
 	// Filesystem-based like backup_age, so it reports even when the ledger is unreadable. No stamp at all means no
-	// daemon has ever swept here (fresh install) — the same "cannot judge" stance as db=missing, not health.
+	// daemon has ever swept here (fresh install): unknown, the same "cannot judge" stance as db=missing, not health.
 	const heartbeat = readSweepHeartbeat(homeDir);
 	if (heartbeat === undefined) {
-		gates.push(gate("sweep_stalled", false, "stamp=missing"));
+		gates.push(unknownGate("sweep_stalled", "stamp=missing"));
 	} else {
 		const beatAge = now - heartbeat.ts.getTime();
 		if (beatAge < -BACKUP_FUTURE_TOLERANCE_MS) {
@@ -179,7 +239,9 @@ export function collectGates(options: GatesOptions): Gate[] {
 		}
 	}
 
-	if (heartbeat?.socket?.state === "down") {
+	if (heartbeat === undefined) {
+		gates.push(unknownGate("slack_disconnected", "stamp=missing"));
+	} else if (heartbeat.socket?.state === "down") {
 		const downMs = now - heartbeat.socket.since.getTime();
 		gates.push(
 			gate(
@@ -189,7 +251,8 @@ export function collectGates(options: GatesOptions): Gate[] {
 			),
 		);
 	} else {
-		gates.push(gate("slack_disconnected", false, heartbeat?.socket === undefined ? "socket=unknown" : "socket=up"));
+		// A stamp without the socket field comes from a daemon older than this gate: closed, as before.
+		gates.push(gate("slack_disconnected", false, heartbeat.socket === undefined ? "socket=unknown" : "socket=up"));
 	}
 
 	// Open for as long as FROZEN exists, so a freeze the owner forgot keeps showing in `gates` and the gate alerts.
@@ -204,17 +267,29 @@ export function collectGates(options: GatesOptions): Gate[] {
 		),
 	);
 
+	// No stamp: herdr is off or the daemon predates the check, so there is nothing to judge and no gate.
+	const herdr = readHerdrHealth(homeDir);
+	if (herdr !== undefined) {
+		if (now - herdr.ts.getTime() > HERDR_HEALTH_STALE_MS) {
+			gates.push(gate("herdr_unreachable", false, "stamp=stale"));
+		} else if (herdr.fails >= HERDR_UNREACHABLE_AFTER) {
+			gates.push(gate("herdr_unreachable", true, `fails=${herdr.fails} since=${herdr.since}`));
+		} else {
+			gates.push(gate("herdr_unreachable", false, "ok"));
+		}
+	}
+
 	if (options.ompExecutable !== undefined) gates.push(ompRuntimeGate(options.ompExecutable));
+
+	// Host resources, like the stamps, report even when the ledger is unreadable: a full disk is often why it is.
+	const ompAgentDir = join(homedir(), ".omp", "agent");
+	const diskPaths = options.diskPaths ?? [homeDir, ...(existsSync(ompAgentDir) ? [ompAgentDir] : [])];
+	gates.push(diskGate(diskPaths, options.statfs));
+	gates.push(hostPressureGate(options.hostLoad));
 
 	const dbPath = join(homeDir, "ompbot.db");
 	if (!existsSync(dbPath)) {
-		gates.push(gate("inbound_starved", false, "db=missing"));
-		gates.push(gate("origin_silent", false, "db=missing"));
-		gates.push(gate("deliveries_overdue", false, "db=missing"));
-		gates.push(gate("lanes_stuck", false, "db=missing"));
-		gates.push(gate("monitors_failed", false, "db=missing"));
-		gates.push(gate("monitors_stalled", false, "db=missing"));
-		gates.push(gate("turns_failing", false, "db=missing"));
+		for (const name of LEDGER_GATES) gates.push(unknownGate(name, "db=missing"));
 		return gates;
 	}
 

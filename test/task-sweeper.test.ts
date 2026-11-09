@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
@@ -9,8 +9,9 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
+import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
 import type { TaskJudgement } from "../src/tasks/checker";
+import { resumeTask, type TaskDispatchDeps } from "../src/tasks/dispatch";
 import {
 	acceptanceItems,
 	docsDirOf,
@@ -22,8 +23,10 @@ import {
 } from "../src/tasks/docs";
 import type { TaskEvaluation } from "../src/tasks/evaluate";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
+import { formatAgentWaitingNotice, NUDGE_MAX } from "../src/tasks/notify";
 import {
 	READ_FAILURE_NOTICE_AFTER,
+	REVIEW_REALERT_MS,
 	STALE_NOTICE_MS,
 	STALE_REMIND_MS,
 	type TaskSweepDeps,
@@ -55,6 +58,7 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		evidence: {},
 		summary: [],
 		checks: [],
+		integrityWarnings: [],
 		reachKey: "k1",
 		acceptance: [],
 		steps: [],
@@ -96,17 +100,25 @@ interface Rig {
 	/** What the fake herdr answers for the task's agent (idle unless a test says otherwise). */
 	agent: { value: HerdrAgentStatusResult };
 	statusCalls: { count: number };
+	/** What the fake `herdr agent read` answers, and how often the sweeper asked. */
+	screen: { value: { ok: boolean; output?: string; error?: string } };
+	readCalls: { count: number };
 }
 
-function rig(over: Partial<Pick<TaskSweepDeps, "boardLink" | "log" | "frozen">> = {}): Rig {
+function rig(
+	over: Partial<
+		Pick<TaskSweepDeps, "boardLink" | "log" | "frozen" | "remind" | "autoLandPolicy" | "repoMatches" | "autoLand">
+	> = {},
+	task: Partial<Pick<TaskRow, "host" | "risk">> = {},
+): Rig {
 	const clock = { ms: T0 };
 	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => clock.ms } });
 	const row = ledger.register({
 		title: "로그 회전",
-		risk: "L2",
+		risk: task.risk ?? "L2",
 		originKey: "slack/ch/C1/t/100.1",
 		threadRef: "C1:100.1",
-		host: null,
+		host: task.host ?? null,
 		repo: "/r/repo",
 		acceptance: acceptanceItems(["하나", "둘"]),
 	});
@@ -117,6 +129,8 @@ function rig(over: Partial<Pick<TaskSweepDeps, "boardLink" | "log" | "frozen">> 
 	const evaluations = { count: 0 };
 	const agent: { value: HerdrAgentStatusResult } = { value: { ok: true, status: "idle" } };
 	const statusCalls = { count: 0 };
+	const screen: Rig["screen"] = { value: { ok: true, output: "› 승인할까요? [y/n]" } };
+	const readCalls = { count: 0 };
 	const deps: TaskSweepDeps = {
 		ledger,
 		evaluate: async () => {
@@ -131,6 +145,10 @@ function rig(over: Partial<Pick<TaskSweepDeps, "boardLink" | "log" | "frozen">> 
 		agentStatus: async () => {
 			statusCalls.count += 1;
 			return agent.value;
+		},
+		readAgent: async () => {
+			readCalls.count += 1;
+			return screen.value;
 		},
 		transport: new SlackChannel(transport),
 		ownerUserId: "UOWN",
@@ -150,6 +168,8 @@ function rig(over: Partial<Pick<TaskSweepDeps, "boardLink" | "log" | "frozen">> 
 		evaluations,
 		agent,
 		statusCalls,
+		screen,
+		readCalls,
 	};
 }
 
@@ -200,6 +220,50 @@ describe("TaskSweeper", () => {
 		r.next.value = { ok: true, judgement: { ...reachedJudgement(), reachKey: "k2" } };
 		await r.sweeper.check(r.ledger.require(r.row.taskId));
 		expect(posts(r)).toHaveLength(2);
+	});
+
+	test("Outcome card post: header 🔍 머지 대기 · <title>, criteria and branch fields, one primary 머지 button with the task id", async () => {
+		const r = rig({ boardLink: async () => "https://board.test/c/1" });
+		r.next.value = { ok: true, judgement: reachedJudgement() };
+		await r.sweeper.sweep();
+		const post = posts(r)[0];
+		const blocks = post && "blocks" in post ? post.blocks : undefined;
+		expect(blocks?.[0]).toEqual({
+			type: "header",
+			text: { type: "plain_text", text: "🔍 머지 대기 · 로그 회전", emoji: true },
+		});
+		expect(blocks).toContainEqual({
+			type: "section",
+			fields: [
+				{ type: "mrkdwn", text: "*수락기준*\n2/2" },
+				{ type: "mrkdwn", text: "*브랜치*\n`task/T-20261026-01`" },
+				{ type: "mrkdwn", text: "*워커*\nlocal/t-20261026-01 · T-20261026-01" },
+			],
+		});
+		expect(blocks).toContainEqual({
+			type: "actions",
+			elements: [
+				{
+					type: "button",
+					style: "primary",
+					text: { type: "plain_text", text: "머지" },
+					action_id: "ompbot:task:merge:T-20261026-01",
+					value: "T-20261026-01",
+				},
+			],
+		});
+		expect(blocks?.at(-1)).toEqual({
+			type: "context",
+			elements: [
+				{
+					type: "mrkdwn",
+					text: "머지 = close → ff merge → push → 정리 · 재시작은 따로 승인 · 작업 보드: https://board.test/c/1",
+				},
+			],
+		});
+		const body = JSON.stringify(blocks?.[1]);
+		expect(body).toContain("로그 파일이 10MB를 넘으면 회전합니다.");
+		expect(body).toContain("<@UOWN>");
 	});
 
 	test("Outcome card shows the worker's summary lines, not the criteria or the evidence list", async () => {
@@ -292,6 +356,27 @@ describe("TaskSweeper", () => {
 			["blocked", "working", "bot", "PROGRESS status: working"],
 			["working", "blocked", "bot", "다른 사유"],
 		]);
+	});
+
+	test("blocked again after a resume reports again, even with the same (or no) reason; one block reports once", async () => {
+		const r = rig();
+		for (const blockedReason of ["토큰 없음", ""]) {
+			const before = posts(r).length;
+			r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked", blockedReason }) };
+			await r.sweeper.sweep();
+			await r.sweeper.sweep();
+			expect(posts(r)).toHaveLength(before + 1);
+			// The owner answered, the agent resumed, then it hit the same wall again.
+			r.next.value = { ok: true, judgement: judgement() };
+			await r.sweeper.sweep();
+			expect(r.ledger.require(r.row.taskId).status).toBe("working");
+			r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked", blockedReason }) };
+			await r.sweeper.sweep();
+			await r.sweeper.sweep();
+			expect(posts(r)).toHaveLength(before + 2);
+			r.next.value = { ok: true, judgement: judgement() };
+			await r.sweeper.sweep();
+		}
 	});
 
 	test("blocked without a written reason is recorded as the PROGRESS status", async () => {
@@ -467,6 +552,7 @@ describe("TaskSweeper", () => {
 			},
 			remind: async () => ({ ok: true }),
 			agentStatus: async () => ({ ok: true, status: "idle" }),
+			readAgent: async () => ({ ok: true, output: "" }),
 			transport: new SlackChannel(r.transport),
 			ownerUserId: "UOWN",
 			now: () => r.clock.ms,
@@ -508,15 +594,148 @@ describe("TaskSweeper", () => {
 		expect(r.reminders).toHaveLength(1);
 	});
 
-	test("an agent waiting for input (blocked in herdr) gets no reminder either", async () => {
+	test("an agent waiting for input (blocked in herdr) gets no reminder either; the owner is told instead", async () => {
 		const r = rig();
 		r.agent.value = { ok: true, status: "blocked" };
 		r.clock.ms = T0 + STALE_REMIND_MS;
 		const [result] = await r.sweeper.sweep();
 		expect(r.reminders).toEqual([]);
 		expect(r.ledger.require(r.row.taskId).remindedAt).toBeNull();
-		expect(result?.actions).toEqual(["reminder deferred (blocked)"]);
-		expect(posts(r)).toHaveLength(0);
+		expect(result?.actions).toEqual(["agent waiting notice", "reminder deferred (blocked)"]);
+		expect(posts(r)).toHaveLength(1);
+	});
+
+	test("a herdr-blocked worker: one owner notice with the screen tail per wait; working or idle then blocked again tells once more", async () => {
+		const r = rig();
+		r.screen.value = { ok: true, output: "작업 중…\n\n› 이 파일을 지울까요? [y/n]\n" };
+		const waitNotices = () => posts(r).filter((post) => "text" in post && post.text.includes("워커 대기"));
+		r.agent.value = { ok: true, status: "blocked" };
+		r.clock.ms = T0 + 5 * MIN;
+		const [first] = await r.sweeper.sweep();
+		expect(first?.actions).toContain("agent waiting notice");
+		expect(waitNotices()).toHaveLength(1);
+		expect(waitNotices()[0]).toMatchObject({ channel: "C1", threadTs: "100.1" });
+		const text = (waitNotices()[0] as { text: string }).text;
+		expect(text.split("\n")[0]).toBe(
+			"⚠️ 워커 대기 · 로그 회전 — herdr 에이전트 `t-20261026-01`가 입력을 기다리거나 오류로 멈췄습니다. (local/t-20261026-01 · T-20261026-01) <@UOWN>",
+		);
+		expect(text).toContain("*화면 끝부분*:\n```\n작업 중…\n› 이 파일을 지울까요? [y/n]\n```");
+		expect(text).toContain("agent_blocked");
+
+		for (let i = 0; i < 2; i++) {
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+		}
+		expect(waitNotices()).toHaveLength(1);
+
+		for (const between of ["working", "idle"] as const) {
+			r.agent.value = { ok: true, status: between };
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+			r.agent.value = { ok: true, status: "blocked" };
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+		}
+		expect(waitNotices()).toHaveLength(3);
+	});
+
+	test("the wait notice goes out while frozen, says when the screen cannot be read, and masks secret shapes", async () => {
+		const r = rig({ frozen: () => ({ since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" }) });
+		r.agent.value = { ok: true, status: "blocked" };
+		r.screen.value = { ok: false, error: `agent read failed: ${"x".repeat(200)}` };
+		await r.sweeper.sweep();
+		expect(posts(r)).toHaveLength(1);
+		const text = (posts(r)[0] as { text: string }).text;
+		expect(text).toContain("워커 대기");
+		expect(text).toContain(`*화면*: 읽지 못함 (agent read failed: ${"x".repeat(120 - "agent read failed: ".length)})`);
+		expect(text).not.toContain("```");
+		expect(r.reminders).toEqual([]);
+
+		const row = r.ledger.require(r.row.taskId);
+		const masked = formatAgentWaitingNotice(
+			row,
+			{ ok: true, output: `토큰은 xoxb-TEST-0 입니다\n${"가".repeat(250)}\n펜스 \`\`\` 안` },
+			"UOWN",
+		);
+		expect(masked).not.toContain("xoxb-TEST-0");
+		expect(masked).toContain("토큰은 [REDACTED] 입니다");
+		expect(masked).toContain(`\n${"가".repeat(200)}\n`);
+		expect(masked).toContain("펜스 ʼʼʼ 안");
+		const tail = formatAgentWaitingNotice(
+			row,
+			{ ok: true, output: Array.from({ length: 20 }, (_, i) => `줄${i + 1}`).join("\n") },
+			"UOWN",
+		);
+		expect(tail).toContain("```\n줄9\n");
+		expect(tail).not.toContain("줄8\n");
+	});
+
+	test("an unanswerable herdr keeps the wait: blocked, failed lookup, blocked again posts nothing new", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "blocked" };
+		await r.sweeper.sweep();
+		r.agent.value = { ok: false, error: "agent list failed: server not running" };
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		r.agent.value = { ok: true, status: "blocked" };
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(posts(r).filter((post) => "text" in post && post.text.includes("워커 대기"))).toHaveLength(1);
+	});
+
+	test("one status question per working task per sweep; the screen is read only by the sweep that posts", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "blocked" };
+		for (let i = 1; i <= 3; i++) {
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+			expect(r.statusCalls.count).toBe(i);
+			expect(r.readCalls.count).toBe(1);
+		}
+		r.agent.value = { ok: true, status: "idle" };
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		r.agent.value = { ok: true, status: "blocked" };
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(r.statusCalls.count).toBe(5);
+		expect(r.readCalls.count).toBe(2);
+	});
+
+	test("an unconfirmed reminder or nudge counts as sent: warned once, not repeated on the next sweep", async () => {
+		const warnings: Array<{ event: string; fields?: Record<string, unknown> }> = [];
+		const sent: string[] = [];
+		const r = rig({
+			log: { info() {}, warn: (event, fields) => warnings.push({ event, fields }) },
+			remind: async (_row, text) => {
+				sent.push(text);
+				return { ok: false, unconfirmed: true, error: "agent prompt unconfirmed: agent_prompt_stalled" };
+			},
+		});
+		r.clock.ms = T0 + STALE_REMIND_MS;
+		const [first] = await r.sweeper.sweep();
+		expect(first?.actions).toEqual(["stale reminder to agent"]);
+		expect(r.ledger.require(r.row.taskId).remindedAt).toBe(r.clock.ms);
+		expect(warnings).toEqual([
+			{
+				event: "task_remind_unconfirmed",
+				fields: { task: r.row.taskId, error: "agent prompt unconfirmed: agent_prompt_stalled" },
+			},
+		]);
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(sent).toHaveLength(1);
+
+		r.next.value = { ok: true, judgement: judgement({ problems: ["AC-1: outcome.md에 절이 없습니다"] }) };
+		r.clock.ms += 5 * MIN;
+		const [nudged] = await r.sweeper.sweep();
+		expect(nudged?.actions).toEqual(["unmet nudge to agent"]);
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(sent).toHaveLength(2);
+		expect(warnings.filter((w) => w.event === "task_remind_failed")).toEqual([]);
 	});
 
 	test("a vanished agent: no reminder, one LOST notice with the resume call per progress base", async () => {
@@ -719,6 +938,132 @@ describe("TaskSweeper", () => {
 		expect((r.reminders[0] ?? "").split("\n").slice(1)).toEqual(lines.slice(1));
 	});
 
+	test("AC-4: ever-changing unmet conditions get exactly NUDGE_MAX nudges, then one owner notice; a resume counts anew", async () => {
+		const r = rig();
+		const herdr: string[][] = [];
+		const dispatch: TaskDispatchDeps = {
+			ledger: r.ledger,
+			originKey: "slack/ch/C1/t/100.1",
+			threadRef: () => "C1:100.1",
+			rootText: () => undefined,
+			port: new SlackChannel(r.transport),
+			now: () => r.clock.ms,
+			workspaceDir: "/ws",
+			run: async (cmd) => {
+				herdr.push(cmd);
+				const agents = [{ name: r.row.agent, agent_status: "idle" }];
+				return {
+					code: 0,
+					stdout: cmd.includes("list") ? JSON.stringify({ result: { agents } }) : "{}",
+					timedOut: false,
+				};
+			},
+			log: noop,
+		};
+		const sweepWith = async (n: number) => {
+			r.next.value = { ok: true, judgement: judgement({ problems: [`AC-1: 조건 ${n}`] }) };
+			r.clock.ms += MIN;
+			const [result] = await r.sweeper.sweep();
+			return result?.actions ?? [];
+		};
+		const limitNotices = () => posts(r).filter((p) => "text" in p && p.text.includes("nudge 상한"));
+
+		for (let n = 1; n <= NUDGE_MAX; n++) expect(await sweepWith(n)).toEqual(["unmet nudge to agent"]);
+		expect(r.reminders).toHaveLength(4);
+		expect(await sweepWith(5)).toEqual(["nudge limit notice"]);
+		expect(await sweepWith(6)).toEqual([]);
+		expect(await sweepWith(7)).toEqual([]);
+		expect(r.reminders).toHaveLength(4);
+		expect(limitNotices()).toHaveLength(1);
+		const notice = limitNotices()[0];
+		expect(notice && "text" in notice ? notice.text.split("\n") : []).toEqual([
+			`⚠️ nudge 상한 · 로그 회전 — 미충족 조건을 4번 알렸지만 Outcome에 닿지 않았습니다. (local/${r.row.agent} · ${r.row.taskId}) <@UOWN>`,
+			"*남은 조건*:",
+			"- AC-1: 조건 5",
+			"*답하는 법*: 이 스레드에 지시를 적으면 담당 에이전트에 넘겨 재개하고, 알림 횟수를 다시 셉니다.",
+		]);
+		expect(notice).toMatchObject({ channel: "C1", threadTs: "100.1" });
+
+		r.clock.ms += MIN;
+		expect(await resumeTask(dispatch, { id: r.row.taskId, task: "다시 해", host: undefined })).toContain(
+			"살아 있는 에이전트에 재개 프롬프트를 보냈습니다",
+		);
+		expect(herdr.some((cmd) => cmd.includes("prompt"))).toBe(true);
+		for (let n = 8; n < 8 + NUDGE_MAX; n++) expect(await sweepWith(n)).toEqual(["unmet nudge to agent"]);
+		expect(r.reminders).toHaveLength(8);
+		expect(await sweepWith(99)).toEqual(["nudge limit notice"]);
+		expect(limitNotices()).toHaveLength(2);
+	});
+
+	test("AC-4: the nudge-limit notice reaches the owner while frozen; the agent still hears nothing", async () => {
+		const state: { value: { since: string; reason: string; by: string } | undefined } = {
+			value: undefined,
+		};
+		const r = rig({ frozen: () => state.value });
+		const sweepWith = async (n: number) => {
+			r.next.value = { ok: true, judgement: judgement({ problems: [`AC-1: 조건 ${n}`] }) };
+			r.clock.ms += MIN;
+			return (await r.sweeper.sweep())[0]?.actions ?? [];
+		};
+		for (let n = 1; n <= NUDGE_MAX; n++) await sweepWith(n);
+		state.value = { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" };
+		expect(await sweepWith(5)).toEqual(["nudge limit notice"]);
+		expect(r.reminders).toHaveLength(NUDGE_MAX);
+	});
+
+	test("AC-5: a task left in review is brought up again at 24 and 48 hours, once each, without judging it", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: reachedJudgement() };
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("review");
+		const evaluated = r.evaluations.count;
+		const asked = r.statusCalls.count;
+		const waiting = () => posts(r).flatMap((p) => ("text" in p && p.text.includes("리뷰 대기") ? [p.text] : []));
+
+		r.clock.ms = T0 + REVIEW_REALERT_MS - MIN;
+		expect(await r.sweeper.sweep()).toMatchObject([{ status: "review", summary: "리뷰 대기 23시간", actions: [] }]);
+		r.clock.ms = T0 + REVIEW_REALERT_MS + 3 * MIN;
+		expect(await r.sweeper.sweep()).toEqual([
+			{ taskId: r.row.taskId, status: "review", read: true, summary: "리뷰 대기 24시간", actions: ["review re-alert"] },
+		]);
+		expect(waiting()).toEqual([
+			[
+				`🔍 리뷰 대기 24시간 · 로그 회전 — Outcome 도달 뒤 닫히지 않았습니다. (local/${r.row.agent} · ${r.row.taskId}) <@UOWN>`,
+				`*답하는 법*: "머지해"라고 답하거나 고칠 점을 적어 주세요. 그만두려면 \`tasks close ${r.row.taskId} --as cancelled\`.`,
+			].join("\n"),
+		]);
+		for (const hours of [25, 30, 47]) {
+			r.clock.ms = T0 + hours * 60 * MIN;
+			await r.sweeper.sweep();
+		}
+		expect(waiting()).toHaveLength(1);
+		r.clock.ms = T0 + 2 * REVIEW_REALERT_MS + MIN;
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(waiting()).toHaveLength(2);
+		expect(waiting()[1]).toStartWith("🔍 리뷰 대기 48시간 · 로그 회전");
+		expect([r.evaluations.count, r.statusCalls.count]).toEqual([evaluated, asked]);
+	});
+
+	test("AC-5: the review re-alert is posted while frozen, and a resumed task (working again) is not re-alerted", async () => {
+		const state = { value: { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" } };
+		const r = rig({ frozen: () => state.value });
+		r.next.value = { ok: true, judgement: reachedJudgement() };
+		await r.sweeper.sweep();
+		r.clock.ms = T0 + REVIEW_REALERT_MS;
+		const [result] = await r.sweeper.sweep();
+		expect(result?.actions).toEqual(["review re-alert"]);
+
+		const back = rig();
+		back.next.value = { ok: true, judgement: reachedJudgement() };
+		await back.sweeper.sweep();
+		back.ledger.transition(back.row.taskId, "working", "bot", "resume dispatch");
+		back.next.value = { ok: true, judgement: judgement({ problems: ["AC-1: 조건"] }) };
+		back.clock.ms = T0 + REVIEW_REALERT_MS + MIN;
+		await back.sweeper.sweep();
+		expect(posts(back).some((p) => "text" in p && p.text.includes("리뷰 대기"))).toBe(false);
+	});
+
 	test("syncReaction puts the single reaction of the closed status on the root", async () => {
 		const r = rig();
 		r.ledger.transition(r.row.taskId, "done", "human");
@@ -726,6 +1071,198 @@ describe("TaskSweeper", () => {
 		expect(added(r)).toEqual(["white_check_mark"]);
 		expect(await r.sweeper.syncReaction("T-19990101-01")).toBe(false);
 	});
+});
+
+describe("TaskSweeper: auto-land (taskAutoLand)", () => {
+	const POLICY = { repos: ["/r/repo"], maxRisk: "L2" as const };
+	const PASSED = [{ id: "AC-2", signal: 'command ["bun","test"]', ok: true, detail: "exit 0" }];
+	const textOf = (post: FakeCall | undefined): string => (post && "text" in post ? post.text : "");
+	const blocksOf = (post: FakeCall | undefined): unknown[] =>
+		post && "blocks" in post ? [...(post.blocks ?? [])] : [];
+	const hasMergeButton = (post: FakeCall | undefined): boolean =>
+		JSON.stringify(blocksOf(post)).includes('"action_id":"ompbot:task:merge:');
+	const header = (post: FakeCall | undefined): string => JSON.stringify(blocksOf(post)[0] ?? null);
+
+	/** A rig with the policy on, `repoMatches` answering `matched`, and `autoLand` answering `landed`. */
+	function autoRig(
+		opts: { matched?: boolean; landed?: (row: TaskRow) => Promise<boolean>; frozen?: boolean } = {},
+		task: Partial<Pick<TaskRow, "host" | "risk">> = {},
+	) {
+		const calls = { autoLand: 0, repoMatches: 0, postsAtAutoLand: [] as number[], repos: [] as string[][] };
+		const warnings: string[] = [];
+		const r: Rig = rig(
+			{
+				...(opts.frozen === true
+					? { frozen: () => ({ since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" }) }
+					: {}),
+				autoLandPolicy: () => POLICY,
+				repoMatches: async (_row, repos) => {
+					calls.repoMatches += 1;
+					calls.repos.push([...repos]);
+					return opts.matched ?? true;
+				},
+				autoLand: async (row) => {
+					calls.autoLand += 1;
+					calls.postsAtAutoLand.push(posts(r).length);
+					return opts.landed === undefined ? true : opts.landed(row);
+				},
+				log: { info() {}, warn: (event) => warnings.push(event) },
+			},
+			task,
+		);
+		return { r, calls, warnings };
+	}
+
+	test("AC-1: without taskAutoLand a task meeting every condition gets today's card and side effects, autoLand never called", async () => {
+		const reached = reachedJudgement({ checks: PASSED });
+		let autoLands = 0;
+		let matches = 0;
+		const off = rig({
+			autoLandPolicy: () => undefined,
+			repoMatches: async () => {
+				matches += 1;
+				return true;
+			},
+			autoLand: async () => {
+				autoLands += 1;
+				return true;
+			},
+		});
+		off.next.value = { ok: true, judgement: reached };
+		await off.sweeper.sweep();
+		// Today's sweeper: no auto-land dependencies at all.
+		const today = rig();
+		today.next.value = { ok: true, judgement: reached };
+		await today.sweeper.sweep();
+
+		expect(off.ledger.require(off.row.taskId).status).toBe("review");
+		expect(added(off)).toEqual(["mag"]);
+		expect(reactions(off)).toEqual(reactions(today));
+		expect(posts(off)).toHaveLength(1);
+		expect(posts(off)).toEqual(posts(today));
+		expect(hasMergeButton(posts(off)[0])).toBe(true);
+		expect(textOf(posts(off)[0])).not.toContain("자동 머지");
+		expect(autoLands).toBe(0);
+		expect(matches).toBe(0);
+		await off.sweeper.sweep();
+		expect(posts(off)).toHaveLength(1);
+		expect(autoLands).toBe(0);
+	});
+
+	test("AC-2: a local task meeting every condition: autoLand once, then one buttonless 🚚 card; the same reachKey again adds nothing", async () => {
+		const { r, calls } = autoRig();
+		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("review");
+		expect(added(r)).toEqual(["mag"]);
+		expect(calls.autoLand).toBe(1);
+		expect(calls.postsAtAutoLand).toEqual([0]); // autoLand goes first, the card after it
+		expect(calls.repos).toEqual([POLICY.repos]);
+		expect(posts(r)).toHaveLength(1);
+		const card = posts(r)[0];
+		expect(card).toMatchObject({ channel: "C1", threadTs: "100.1" });
+		expect(header(card)).toContain("🚚 자동 머지 · 로그 회전");
+		expect(blocksOf(card).some((b) => typeof b === "object" && b !== null && "type" in b && b.type === "actions")).toBe(
+			false,
+		);
+		expect(textOf(card)).not.toContain("<@UOWN>");
+		expect(textOf(card)).not.toContain("*질문*");
+		expect(textOf(card)).toContain("재실행 검사 1/1 통과");
+		expect(textOf(card)).toContain(`• ${SUMMARY[0]}`);
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(calls.autoLand).toBe(1);
+		expect(posts(r)).toHaveLength(1);
+	});
+
+	const failed = { id: "AC-2", signal: 'command ["bun","test"]', ok: false, detail: "exit 1" };
+	test.each<
+		[
+			string,
+			{ matched?: boolean; frozen?: boolean },
+			Partial<Pick<TaskRow, "host" | "risk">>,
+			Partial<TaskJudgement>,
+			string,
+		]
+	>([
+		["① a remote host key", {}, { host: "wsl" }, { checks: PASSED }, "원격"],
+		["② repoMatches false", { matched: false }, {}, { checks: PASSED }, "taskAutoLand.repos"],
+		["③ risk above maxRisk", {}, { risk: "L3" }, { checks: PASSED }, "L3"],
+		["④ no re-run check", {}, {}, { checks: [] }, "재실행 검사 없음"],
+		["⑤ one re-run check failed", {}, {}, { checks: [...PASSED, failed] }, "재실행 검사 실패"],
+		["⑥ an integrity warning", {}, {}, { checks: PASSED, integrityWarnings: ["무결성 guard: x"] }, "무결성"],
+		[
+			"⑦ a shared commit evidence warning",
+			{},
+			{},
+			{ checks: PASSED, evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat"] } },
+			"공유 커밋",
+		],
+		["(freeze) the bot is frozen", { frozen: true }, {}, { checks: PASSED }, "동결 중"],
+	])("AC-3 %s: no autoLand, one 머지 card with the '자동 머지 안 함' line", async (_name, opts, task, over, reason) => {
+		const { r, calls } = autoRig(opts, task);
+		r.next.value = { ok: true, judgement: reachedJudgement(over) };
+		await r.sweeper.sweep();
+		expect(calls.autoLand).toBe(0);
+		expect(posts(r)).toHaveLength(1);
+		const card = posts(r)[0];
+		expect(header(card)).toContain("🔍 머지 대기 · 로그 회전");
+		expect(hasMergeButton(card)).toBe(true);
+		const skip = textOf(card)
+			.split("\n")
+			.find((line) => line.startsWith("자동 머지 안 함: "));
+		expect(skip).toContain(reason);
+		expect(JSON.stringify(blocksOf(card))).toContain("자동 머지 안 함: ");
+		await r.sweeper.sweep();
+		expect(posts(r)).toHaveLength(1);
+		expect(calls.autoLand).toBe(0);
+	});
+
+	test("AC-7: a remote task (host set) never reaches repoMatches", async () => {
+		const { r, calls } = autoRig({}, { host: "wsl" });
+		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+		await r.sweeper.sweep();
+		expect(calls.repoMatches).toBe(0);
+		expect(calls.autoLand).toBe(0);
+		expect(posts(r)).toHaveLength(1);
+	});
+
+	test.each<[string, () => Promise<boolean>]>([
+		["returns false", async () => false],
+		[
+			"throws",
+			async () => {
+				throw new Error("marker post failed");
+			},
+		],
+	])(
+		"AC-4: autoLand %s: one 머지 card with the ⚠️ line, no 🚚 card; the other task goes on; a repeat sweep adds nothing",
+		async (_name, failure) => {
+			const { r, calls, warnings } = autoRig({
+				landed: async (row) => (row.taskId === r.row.taskId ? failure() : true),
+			});
+			const other = r.ledger.register({ ...r.row, host: null, acceptance: r.row.acceptance, threadRef: "C1:200.1" });
+			r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+			await r.sweeper.sweep();
+			expect(calls.autoLand).toBe(2);
+			const first = posts(r).filter((p) => "threadTs" in p && p.threadTs === "100.1");
+			expect(first).toHaveLength(1);
+			expect(header(first[0])).toContain("🔍 머지 대기");
+			expect(hasMergeButton(first[0])).toBe(true);
+			expect(textOf(first[0]).split("\n")[0]).toStartWith("⚠️ 자동 머지를 시작하지 못해");
+			expect(JSON.stringify(blocksOf(first[0]))).toContain("⚠️ 자동 머지를 시작하지 못해");
+			expect(posts(r).filter((p) => header(p).includes("🚚"))).toHaveLength(1); // the other task's
+			const second = posts(r).filter((p) => "threadTs" in p && p.threadTs === "200.1");
+			expect(second).toHaveLength(1);
+			expect(header(second[0])).toContain("🚚 자동 머지");
+			expect(r.ledger.require(r.row.taskId).status).toBe("review");
+			expect(r.ledger.require(other.taskId).status).toBe("review");
+			expect(warnings).toContain("task_autoland_failed");
+			await r.sweeper.sweep();
+			expect(calls.autoLand).toBe(2);
+			expect(posts(r)).toHaveLength(2);
+		},
+	);
 });
 
 describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
@@ -771,6 +1308,13 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 		rmSync(worktreeRoot, { recursive: true, force: true });
 	});
 
+	/** A git command that must succeed (the task worktree is a real one: the sweep reads its branch diff). */
+	function git(cwd: string, ...args: string[]): void {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args]);
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+	}
+
+	/** Registers a task whose worktree is what `startTask` leaves: a branch off main opened by the docs commit. */
 	function registerWithDocs(done: boolean): TaskRow {
 		const acceptance = acceptanceItems(["회전 테스트가 통과한다"]);
 		const row = daemon.store.tasks.register({
@@ -783,6 +1327,12 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 			acceptance,
 		});
 		herdrAgents.push(row.agent);
+		mkdirSync(row.repo);
+		git(row.repo, "init", "-q", "-b", "main");
+		git(row.repo, "config", "user.name", "t");
+		git(row.repo, "config", "user.email", "t@t");
+		git(row.repo, "commit", "-q", "--allow-empty", "-m", "init");
+		git(row.repo, "worktree", "add", "-q", "-b", row.branch, row.worktree);
 		const dir = docsDirOf(row.worktree, row.taskId);
 		mkdirSync(dir, { recursive: true });
 		const meta = {
@@ -812,6 +1362,8 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 			done ? `${renderOutcome(row.taskId)}## AC-1\n- test: bun test → 5 pass\n` : renderOutcome(row.taskId),
 		);
 		writeFileSync(join(dir, "context.md"), renderContext(meta, { ...spec, acceptance: ["x"] }, "원문"));
+		git(row.worktree, "add", "--", `docs/tasks/${row.taskId}`);
+		git(row.worktree, "commit", "-q", "-m", `docs(task): ${row.taskId} 4문서`);
 		return row;
 	}
 
@@ -935,6 +1487,24 @@ describe("daemon: herdr off (config without herdr)", () => {
 		await first.daemon.sweepTasks();
 		expect(first.herdrCalls.length).toBeGreaterThan(0);
 		expect(first.lines.filter((l) => l.includes("event=tasks_orphaned"))).toEqual([]);
+	});
+
+	test("herdr health: on, each check asks the local herdr server and writes the stamp; off writes nothing", async () => {
+		const off = await boot(home.config);
+		await off.daemon.checkHerdrHealth();
+		expect(off.herdrCalls).toEqual([]);
+		expect(existsSync(join(home.dir, "herdr-health"))).toBe(false);
+		await off.daemon.stop();
+
+		const on = await boot({ ...home.config, herdr: {} });
+		await on.daemon.checkHerdrHealth(); // the fake herdr prints no `status: running` line
+		await on.daemon.checkHerdrHealth();
+		expect(on.herdrCalls).toEqual([
+			["herdr", "status", "server"],
+			["herdr", "status", "server"],
+		]);
+		expect(readFileSync(join(home.dir, "herdr-health"), "utf8")).toMatch(/^ts=\S+ ok=0 fails=2 since=\S+ error=\S+\n$/);
+		expect(on.lines.filter((l) => l.includes("event=herdr_health_failed"))).toHaveLength(2);
 	});
 
 	test("chat host tools follow the switch: off has no taskSpec, on matches the full schema", async () => {

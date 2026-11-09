@@ -6,6 +6,7 @@ import type {
 	SlackBlockActionPayload,
 	SlackHandlers,
 	SlackMessageEvent,
+	SlackReactionEvent,
 	SlackReply,
 	SlackSlashPayload,
 	SlackTransport,
@@ -23,6 +24,7 @@ export type FakeCall =
 			ts: string;
 	  }
 	| { method: "updateMessage"; channel: string; ts: string; text: string; blocks?: readonly unknown[] | undefined }
+	| { method: "deleteMessage"; channel: string; ts: string }
 	| { method: "postEphemeral"; channel: string; user: string; text: string }
 	| { method: "getPermalink"; channel: string; ts: string }
 	| {
@@ -96,6 +98,11 @@ export class FakeSlackTransport implements SlackTransport {
 		this.maybeFail("updateMessage");
 	}
 
+	async deleteMessage(args: { channel: string; ts: string }): Promise<void> {
+		this.calls.push({ method: "deleteMessage", ...args });
+		this.maybeFail("deleteMessage");
+	}
+
 	async uploadFile(args: {
 		channel: string;
 		threadTs?: string | undefined;
@@ -139,7 +146,22 @@ export class FakeSlackTransport implements SlackTransport {
 		await writeFile(args.destPath, bytes);
 	}
 
-	async conversationsReplies(): Promise<HistoryPage> {
+	/** Canned threads for `conversationsReplies`: `threads[<channel>:<rootTs>]` is the oldest-first message list. */
+	readonly threads: Map<string, HistoryMessage[]> = new Map();
+	/** Every `conversationsReplies` call, in order. */
+	readonly replyCalls: Array<{ channel: string; ts: string; limit?: number | undefined }> = [];
+	/** When set, the next `conversationsReplies` call fails once with this error. */
+	failRepliesNext: Error | undefined;
+
+	async conversationsReplies(args?: { channel: string; ts: string; limit?: number | undefined }): Promise<HistoryPage> {
+		if (args !== undefined) this.replyCalls.push({ channel: args.channel, ts: args.ts, limit: args.limit });
+		if (this.failRepliesNext !== undefined) {
+			const error = this.failRepliesNext;
+			this.failRepliesNext = undefined;
+			throw error;
+		}
+		const thread = args === undefined ? undefined : this.threads.get(`${args.channel}:${args.ts}`);
+		if (thread !== undefined) return { messages: thread.slice(0, args?.limit).map((m) => ({ ...m })) };
 		return { messages: this.replies.map((reply) => ({ ...reply })) };
 	}
 
@@ -177,6 +199,10 @@ export class FakeSlackTransport implements SlackTransport {
 
 	async emitMessage(event: SlackMessageEvent): Promise<void> {
 		await this.handlers?.message(event);
+	}
+
+	async emitReaction(event: SlackReactionEvent): Promise<void> {
+		await this.handlers?.reaction(event);
 	}
 
 	async emitSlash(payload: SlackSlashPayload): Promise<SlashAck | undefined> {

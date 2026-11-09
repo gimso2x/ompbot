@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { classifyLaneCompletion, type IntegrityRefusal } from "../lanes/integrity";
 import {
 	type AcceptanceItem,
 	oneLine,
@@ -28,7 +29,21 @@ export interface CheckInput {
 	 * other conditions are met; absent → checks are not run and the judgement stands on the documents alone.
 	 */
 	runChecks?(checks: readonly TaskCheckRequest[]): Promise<TaskChecksRun>;
+	/**
+	 * The task branch's diff since its docs commit, for the lane integrity classifier (injected by the sweep only, like
+	 * `runChecks`). Called once all other conditions are met, before the checks; absent → the diff is not read.
+	 */
+	integrity?(): Promise<{ diff: string } | { error: string }>;
 }
+
+/** Integrity refusals that hold a task short of the outcome; the other categories only warn on the card. */
+const BLOCKING_INTEGRITY: ReadonlySet<IntegrityRefusal["category"]> = new Set([
+	"unfinished_work_marker",
+	"skipped_test",
+	"stub_implementation",
+]);
+const INTEGRITY_EXCERPT_MAX = 160;
+const INTEGRITY_ERROR_MAX = 120;
 
 /** One signal of one criterion's `[check: …]`, as registered. */
 export interface TaskCheckRequest {
@@ -89,6 +104,8 @@ export interface TaskJudgement {
 	summary: string[];
 	/** `[check: …]` results the sweep ran for this judgement; `[]` when the task has none or they were not run. */
 	checks: TaskCheck[];
+	/** `무결성 <category>: <excerpt>` lines that do not hold the outcome but go on the card; `[]` without a diff read. */
+	integrityWarnings: string[];
 	/** Fingerprint of everything the judgement stands on — the dedup key of the "reached" notice. */
 	reachKey: string;
 	/** The registered acceptance items with their spec.md checkbox, for display (not part of the judgement). */
@@ -182,6 +199,22 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 	if (blocked)
 		problems.push(`PROGRESS.md status가 blocked입니다${progress?.blockedReason ? `: ${progress.blockedReason}` : ""}`);
 
+	// The diff is read only for an otherwise complete task, before any check process runs.
+	const integrityWarnings: string[] = [];
+	if (problems.length === 0 && input.integrity !== undefined) {
+		const read = await input.integrity();
+		if ("error" in read) {
+			problems.push(`diff를 읽지 못해 무결성 검사를 미룹니다: ${read.error.slice(0, INTEGRITY_ERROR_MAX)}`);
+		} else {
+			const refusals = classifyLaneCompletion({ summary: (outcome?.summary ?? []).join("\n"), diff: read.diff });
+			for (const refusal of refusals) {
+				const line = `무결성 ${refusal.category}: ${refusal.excerpt.slice(0, INTEGRITY_EXCERPT_MAX)}`;
+				if (BLOCKING_INTEGRITY.has(refusal.category)) problems.push(line);
+				else integrityWarnings.push(line);
+			}
+		}
+	}
+
 	// The checks run last and only on an otherwise complete task: a run is a real process in the worktree.
 	const requests = taskChecksOf(input.snapshot);
 	let checkRun: { head: string; results: TaskCheck[] } | undefined;
@@ -220,13 +253,16 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		evidence,
 		summary: outcome?.summary ?? [],
 		checks: checkRun?.results ?? [],
-		// `head`/`checks` are absent (dropped by JSON) without a check run, so such a task keeps its former key.
+		integrityWarnings,
+		// `head`/`checks`/`integrityWarnings` are absent (dropped by JSON) without a check run or a warning, so such a
+		// task keeps its former key.
 		reachKey: digest({
 			spec: specDoc?.acceptance,
 			evidence,
 			updatedAt,
 			head: checkRun?.head,
 			checks: checkRun?.results,
+			integrityWarnings: integrityWarnings.length === 0 ? undefined : integrityWarnings,
 		}),
 		acceptance: input.snapshot.map((item) => ({
 			id: item.id,

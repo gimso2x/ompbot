@@ -3,15 +3,20 @@ import type { ApprovalBroker, ApprovalOrigin, ChoiceCardHandle, ChoiceEvent } fr
 
 /** More options than this: a numbered list and "번호로 답장" instead of buttons. */
 export const MAX_CHOICE_BUTTONS = 5;
+/** Slack allows at most 25 elements in one actions block; an `ask` question past it is answered by number. */
+export const MAX_CARD_BUTTONS = 25;
 /**
- * omp times a dialog out by itself at its `timeout`; the card's own deadline comes this much earlier so the owner-side
- * outcome (the recommended option) is what omp reads, not its withdrawal.
+ * omp times a dialog out by itself at its `timeout`; the card's own deadline comes this much earlier so a partly
+ * answered `ask` reaches omp with the owner's answers (omp's own timeout would overwrite them with its defaults).
  */
 const DEADLINE_LEAD_MS = 1_000;
 const REPLY_HINT = "버튼을 누르거나 이 스레드에 답장해 주세요";
 const YES = /^(예|네|응|ㅇㅇ|ㅇ|좋아|yes|y|ok|확인)$/i;
 
 const TIMEOUT_LINE = (fallback: string) => `⌛ 시간 초과: ${fallback}로 처리됨`;
+/** What omp does with an unanswered `ask` (`timedOutAskDialogResult`): each question's recommended option, else its first. */
+const ASK_FALLBACK = "추천(없으면 1번) 선택지";
+const ASK_TIMEOUT_LINE = `⌛ 시간 초과: ${ASK_FALLBACK}로 자동 선택`;
 const CANCELLED_LINE = "🚫 취소됨";
 
 /** Card deadline for a dialog: just before omp's own `timeout`, else the broker default. */
@@ -83,13 +88,14 @@ async function answerConfirm(
 		{
 			text: `❓ ${request.title}\n${request.message}\n${REPLY_HINT}`,
 			buttons: ["예", "아니오"],
-			fallback: "취소",
+			// omp reads a timed-out (or withdrawn) confirm as `false`: the owner sees that outcome, not a cancel.
+			fallback: "아니오",
 			timeoutMs: deadlineOf(request),
 		},
 		{ signal },
 	);
 	const result = await card.next();
-	if (result.kind === "timeout" || result.kind === "cancelled") return endUnanswered(card, result.kind, "취소");
+	if (result.kind === "timeout" || result.kind === "cancelled") return endUnanswered(card, result.kind, "아니오");
 	// Anything but a clear yes is a no (fail-closed).
 	const confirmed = result.kind === "choice" ? result.index === 0 : YES.test(result.text.trim());
 	const label = confirmed ? "예" : "아니오";
@@ -146,15 +152,17 @@ interface AskAnswer {
 	customInput?: string;
 }
 
-/** Buttons of the still-unanswered single-select questions of an `ask` card, with the question each one answers. */
-function askButtons(
-	questions: readonly OmpAskQuestion[],
-	answers: ReadonlyArray<AskAnswer | undefined>,
-): Array<{ label: string; question: number; option: number }> {
+/**
+ * Buttons of an `ask` card, with the question each one answers: drawn once per card, so a click's index means the
+ * same button for the card's whole life. Single-select questions with at most `MAX_CHOICE_BUTTONS` options get
+ * buttons while the card stays within `MAX_CARD_BUTTONS`; the rest are answered by number.
+ */
+function askButtons(questions: readonly OmpAskQuestion[]): Array<{ label: string; question: number; option: number }> {
 	const many = questions.length > 1;
 	const buttons: Array<{ label: string; question: number; option: number }> = [];
 	questions.forEach((question, q) => {
-		if (answers[q] !== undefined || question.multi === true || question.options.length > MAX_CHOICE_BUTTONS) return;
+		if (question.multi === true || question.options.length > MAX_CHOICE_BUTTONS) return;
+		if (buttons.length + question.options.length > MAX_CARD_BUTTONS) return;
 		question.options.forEach((option, o) => {
 			buttons.push({ label: many ? `${q + 1}. ${option.label}` : option.label, question: q, option: o });
 		});
@@ -169,8 +177,12 @@ function answerLine(answer: AskAnswer): string {
 	);
 }
 
-/** The `ask` card body: one block per question, answered ones show their answer. */
-function askText(questions: readonly OmpAskQuestion[], answers: ReadonlyArray<AskAnswer | undefined>): string {
+/** The `ask` card body: one block per question, answered ones show their answer. `buttoned`: questions with buttons. */
+function askText(
+	questions: readonly OmpAskQuestion[],
+	answers: ReadonlyArray<AskAnswer | undefined>,
+	buttoned: ReadonlySet<number>,
+): string {
 	const blocks = questions.map((question, q) => {
 		const head = `*${q + 1}. ${question.header === undefined ? "" : `[${question.header}] `}${question.question}*`;
 		const answer = answers[q];
@@ -181,9 +193,9 @@ function askText(questions: readonly OmpAskQuestion[], answers: ReadonlyArray<As
 		const how =
 			question.multi === true
 				? "번호를 쉼표로 답장해 주세요(예: 1,3)"
-				: question.options.length > MAX_CHOICE_BUTTONS
-					? "번호로 답장해 주세요"
-					: "버튼을 누르거나 번호로 답장해 주세요";
+				: buttoned.has(q)
+					? "버튼을 누르거나 번호로 답장해 주세요"
+					: "번호로 답장해 주세요";
 		return `${head}\n${numbered(labels, question.recommended)}\n${how}`;
 	});
 	return `❓ 질문 ${questions.length}개 — 답하지 않은 첫 질문부터 답장이 채워집니다\n${blocks.join("\n\n")}`;
@@ -215,15 +227,15 @@ async function answerAsk(
 ): Promise<OmpDialogResponse> {
 	const { questions } = request;
 	const answers: Array<AskAnswer | undefined> = questions.map(() => undefined);
-	const anyRecommended = questions.some((question) => question.recommended !== undefined);
-	const fallback = anyRecommended ? "추천 선택지" : "취소";
-	let buttons = askButtons(questions, answers);
+	const buttons = askButtons(questions);
+	const labels = buttons.map((button) => button.label);
+	const buttoned = new Set(buttons.map((button) => button.question));
 	const card = await broker.choose(
 		origin,
 		{
-			text: askText(questions, answers),
-			buttons: buttons.map((button) => button.label),
-			fallback,
+			text: askText(questions, answers, buttoned),
+			buttons: labels,
+			fallback: ASK_FALLBACK,
 			timeoutMs: deadlineOf(request),
 		},
 		{ signal },
@@ -242,29 +254,26 @@ async function answerAsk(
 		questions.map((_question, q) => `${q + 1}) ${answerLine(answers[q] ?? { selectedOptions: [] })}`).join(" · ");
 	for (;;) {
 		const result = await card.next();
-		if (result.kind === "cancelled") return endUnanswered(card, "cancelled", fallback);
+		if (result.kind === "cancelled") return endUnanswered(card, "cancelled", ASK_FALLBACK);
 		if (result.kind === "timeout") {
-			if (!anyRecommended && answers.every((answer) => answer === undefined)) {
-				return endUnanswered(card, "timeout", fallback);
-			}
+			const untouched = answers.every((answer) => answer === undefined);
+			// omp's own fallback, so the card says what omp picks.
 			questions.forEach((question, q) => {
 				if (answers[q] !== undefined) return;
-				const label = question.recommended === undefined ? undefined : question.options[question.recommended]?.label;
+				const label = question.options[question.recommended ?? 0]?.label;
 				answers[q] = { selectedOptions: label === undefined ? [] : [label] };
 			});
-			await card.close(`${TIMEOUT_LINE(fallback)} — ${summary()}`, summary());
-			return toResponse();
+			// Nothing answered: omp fills every question itself and marks the result `timedOut` for the model.
+			// Partly answered: the owner's answers go back as they are, the rest as omp would fill them.
+			await card.close(`${ASK_TIMEOUT_LINE} — ${summary()}`, untouched ? undefined : summary());
+			return untouched ? { cancelled: true, timedOut: true } : toResponse();
 		}
 		applyAskEvent(questions, answers, buttons, result);
 		if (answers.every((answer) => answer !== undefined)) {
 			await card.close(`✅ 답: ${summary()}`, summary());
 			return toResponse();
 		}
-		buttons = askButtons(questions, answers);
-		await card.update(
-			askText(questions, answers),
-			buttons.map((button) => button.label),
-		);
+		await card.update(askText(questions, answers, buttoned), labels);
 	}
 }
 
@@ -290,7 +299,8 @@ function applyAskEvent(
 
 /**
  * Puts one omp dialog to the owner as a choice card in `origin`'s conversation and returns the omp response.
- * select/confirm/input/editor/ask map as in doc/plans/slack-ask-progress.md (A2); a secret input is cancelled at once.
+ * select/confirm get buttons (a numbered list past `MAX_CHOICE_BUTTONS`), input/editor take a reply, ask gets one
+ * block per question; a secret input is cancelled at once, since a secret must never be typed into Slack.
  */
 export function answerDialogOnSlack(
 	broker: ApprovalBroker,

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ompbot TASK 흐름</title>
+<style>
+*{box-sizing:border-box;margin:0}[hidden],#simple[hidden]{display:none}html,body{height:100%;overflow:hidden;background:#08080F;color:#F4F3FA;font:11px/1.45 Pretendard,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;font-variant-numeric:tabular-nums}button,input,textarea,select{font:inherit;color:inherit}button,select,input,textarea,.pill,.src,.md,.pt{background:#181826}button,select,input,textarea,.pill,.src,.kd,#mini{border:1px solid #23243A}button,select,input,textarea{border-radius:6px;padding:4px 8px}button,.chip,.live{cursor:pointer}button.on{border-color:#8E76F1;color:#fff}
+.grp,.grp span,.card,.pt,.pt span,.src,#hub,.chip,#ring,#mini,#simple,#world,#world>*{position:absolute}#world,#world>*{left:0;top:0}header,main,footer,#warn,#panel,#drawer{position:fixed;left:0;right:0}.row,#tabs,#stats,.live,.hd,.r,#mini div,#simple,footer{display:flex;align-items:center;gap:8px}.row,.nm,.md,.rl,.bd,.pt span,.src,.chip,#recent div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pill,.kd,.md,.bd,.fix,.pt span,.chip,#stats div{font-size:10px}#memo,#stats div,.live,.kd,.bd,.pt span,#drawer label{color:#9A98AA}.pill,.md,.rl,#ring,#recent{color:#C9C7D6}
+.pill,.src,.md{border-radius:99px;padding:1px 8px}.live i,.pt,#hub,#ring{border-radius:50%}header,footer,#mini{background:#0C0B16}header{top:0;height:80px;border-bottom:1px solid #23243A;padding:8px 16px;display:flex;flex-direction:column;justify-content:space-between;z-index:5}.row{min-width:0}.sp{flex:1}.logo{color:#8E76F1;font-size:14px}#tabs{gap:4px}#ttl{font-size:18px;font-weight:600}#stats{gap:16px}#stats div{text-align:right}#stats b{display:block;font-size:22px;line-height:1;color:#F4F3FA;font-weight:600}.hd i{width:8px;height:8px;background:var(--c);border-radius:2px;flex:none}
+.live{gap:4px}.live i{width:8px;height:8px;background:#2F3146}.live.on i{background:#F5577F;box-shadow:0 0 12px #F5577F}main{top:80px;bottom:64px;overflow:hidden;touch-action:none;cursor:grab}#world{transform-origin:0 0}#gl,svg,canvas{pointer-events:none}svg path{fill:none;stroke:#2F3146;stroke-width:1.5}svg path.cy{stroke:#F2566F;stroke-dasharray:6 4}.grp{border:1px solid color-mix(in srgb,var(--c) 35%,transparent);background:color-mix(in srgb,var(--c) 4%,transparent);border-radius:10px}.grp span{left:12px;top:8px;color:var(--c)}
+.card{width:248px;background:#12121C;border:1px solid color-mix(in srgb,var(--c) 45%,transparent);border-radius:8px;--g:var(--c)}.in{overflow:hidden;height:100%;padding:8px 12px}.hd{cursor:move}.nm{font-size:calc(13px*var(--fs,1));font-weight:600;flex:1}.far .nm{white-space:normal;line-height:1.15}.kd{border-radius:3px;padding:0 4px}.r{justify-content:space-between;margin:6px 0 4px}.bd{border-radius:3px;padding:0 6px}.fix{padding:0 6px;margin-right:4px;border-color:#F2566F}.s-run,.s-running{animation:br 2.4s ease-in-out infinite;--g:#5A3CE6}
+.s-run .bd,.s-running .bd{background:#5A3CE6;color:#fff}@keyframes br{50%{border-color:#5A3CE6;box-shadow:0 0 24px #5A3CE64D}}.s-pass .bd{color:#6FE27F}.s-fail{--g:#F2566F}.s-fail .bd{background:#F2566F;color:#fff}.s-fail .rl{color:#F2566F}.s-fixed .bd,.s-fixed .rl{color:#AEA4F6}.s-blocked{opacity:.45}.card.sel{border-color:#8E76F1}.pt{width:8px;height:8px;border:1px solid var(--c)}.pt.i{left:-4px}.pt.o{right:-4px}.pt span{top:-4px;overflow:visible}.pt.i span{right:10px}.pt.o span{left:10px}.fl{animation:fl 1.1s ease-out}
+@keyframes fl{0%{box-shadow:0 0 24px var(--g,#F4F3FA);border-color:var(--g,#F4F3FA)}}.src{padding:6px 16px;font-size:13px}#hub{width:100px;height:100px;background:#F4F3FA;box-shadow:0 0 24px #F4F3FA4D}.chip{width:88px;background:#D4D0DE;color:#1B1A24;border-radius:3px;padding:2px 3px;border-left:3px solid var(--s);--g:var(--s)}.chip.off{opacity:.35}.chip.sel{outline:2px solid #8E76F1}#ring{width:140px;height:140px;border:6px solid #6FE27F;display:grid;place-content:center;text-align:center;box-shadow:0 0 24px #6FE27F4D;--g:#6FE27F}#ring b{font-size:22px;color:#F4F3FA}
+#ring.fl{animation:rg 1.1s ease-out}@keyframes rg{0%{box-shadow:0 0 72px #6FE27F}}#mini{left:12px;top:12px;border-radius:8px;padding:4px;z-index:3}#mini canvas{display:block;cursor:pointer}#mini div{gap:4px;margin-top:4px}#simple{top:12px;left:172px;right:12px;flex-wrap:wrap;z-index:3}#warn{top:80px;background:#F2566F;color:#fff;padding:4px 16px;z-index:6}footer{bottom:0;height:64px;border-top:1px solid #23243A;gap:16px;padding:0 16px}#recent{flex:1;min-width:0}#say{width:320px}#panel,#drawer{top:80px;bottom:64px;z-index:6;padding:16px;overflow:auto}#panel{background:#08080F}
+#drawer{left:auto;width:380px;background:#12121C;border-left:1px solid #23243A;z-index:7}#drawer nav{margin:8px 0}#drawer label{display:block;margin-bottom:8px}#drawer label input{display:block;width:100%;margin-top:4px}.db .row{margin-bottom:4px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #23243A;padding:4px 8px;text-align:left}textarea{width:100%;height:calc(100% - 40px);font-family:monospace;margin-top:8px}#err{color:#F2566F;white-space:normal}
+@media(max-width:767px){header{padding:6px 8px}.logo,#memo,#stats .x{display:none}.row{gap:4px}button{padding:4px 6px}#ttl{font-size:14px}#stats{gap:8px}footer{padding:0 8px;gap:8px}#say{width:40%}#drawer{top:auto;width:auto;left:0;height:70vh;border-left:0;border-top:1px solid #23243A}}@media(prefers-reduced-motion:reduce){.fl,.s-run,.s-running,#ring.fl{animation:none}}
+</style>
+</head>
+<body>
+<header>
+<div class="row"><b class="logo">◆</b><nav id="tabs"><button type="button" class="on" data-t="g">그래프</button><button type="button" data-t="n">노드</button><button type="button" data-t="r">실행</button><button type="button" data-t="j">기록</button></nav><i class="sp"></i><label class="live" id="lv"><input type="checkbox" id="live" hidden><i></i>LIVE</label><button type="button" id="run">▶실행</button><button type="button" id="stop">■</button><button type="button" id="loop" class="on">↻반복</button></div>
+<div class="row"><b id="ttl"></b><span class="pill" id="ver" hidden></span><span id="memo"></span><i class="sp"></i><div id="stats"></div></div>
+</header>
+<div id="warn" hidden></div>
+<main id="view"><div id="world"><div id="gl"></div><svg id="wires" aria-hidden="true"></svg><canvas id="glow"></canvas><div id="lay"></div></div><div id="simple" hidden></div><div id="mini"><canvas id="mc" width="140" height="70"></canvas><div><button type="button" id="zi">+</button><button type="button" id="zo">−</button><button type="button" id="fit">맞춤</button></div></div></main>
+<section id="panel" hidden></section>
+<aside id="drawer" hidden></aside>
+<footer><div id="recent"></div><input id="say" placeholder="그래프 수정을 말해 보세요"></footer>
+<script type="application/json" id="flow-default">{"title":"ompbot TASK 흐름","memo":"예시 흐름 · 실제 숫자 아님","sources":["오너 요청"],"groups":["계획","등록","구현","판정","랜딩"],"nodes":[{"id":"spec","name":"스펙 작성","group":"계획","kind":"AI","model":"anthropic/claude-opus-5-5 (쑥)","role":"doc/plans 스펙과 수락기준 작성","duration":1.2},{"id":"review","name":"떡 검토","group":"계획","kind":"AI","model":"google-antigravity/gemini-3.8-flash (떡)","role":"스펙 교차 검토","duration":0.8},{"id":"dispatch","name":"위임","group":"계획","kind":"AI","model":"anthropic/claude-opus-5-5 (쑥)","role":"스펙 커밋 후 ompbot_dispatch taskSpec","duration":0.4},{"id":"register","name":"taskSpec 검증","group":"등록","kind":"코드","role":"parseTaskSpecInput","duration":0.2},{"id":"worktree","name":"워크트리·4문서","group":"등록","kind":"코드","role":"task 브랜치와 docs(task) 커밋","duration":0.3},{"id":"agent","name":"워커 기동","group":"등록","kind":"코드","role":"herdr 에이전트 시작","duration":0.3},{"id":"build","name":"워커 구현","group":"구현","kind":"AI","model":"워커 모델","role":"워크트리에서 구현·테스트·커밋","duration":1.6},{"id":"progress","name":"PROGRESS 갱신","group":"구현","kind":"AI","model":"워커 모델","role":"PROGRESS.md·outcome.md 증거","duration":0.5},{"id":"ac","name":"수락기준 확인","group":"판정","kind":"코드","role":"5분 스윕 checkTask","duration":0.4},{"id":"integrity","name":"무결성 diff","group":"판정","kind":"코드","role":"diff 64KB 상한 안 검사","duration":0.3,"fail":1,"failReason":"diff too large"},{"id":"signals","name":"check 신호","group":"판정","kind":"코드","role":"[check:] 명령 재실행","duration":0.5},{"id":"outcome","name":"Outcome 카드","group":"판정","kind":"코드","role":"🔍 리뷰 대기 알림","inputs":["signals","integrity"],"duration":0.2},{"id":"ownerReview","name":"오너 리뷰","group":"랜딩","kind":"사람","role":"브랜치 확인","duration":1},{"id":"land","name":"close·머지·재시작","group":"랜딩","kind":"사람","role":"tasks close, ff 머지, 재반영","duration":0.6}],"edges":[{"from":"spec","to":"review"},{"from":"review","to":"dispatch"},{"from":"dispatch","to":"register"},{"from":"register","to":"worktree"},{"from":"worktree","to":"agent"},{"from":"agent","to":"build"},{"from":"build","to":"progress"},{"from":"progress","to":"ac"},{"from":"progress","to":"integrity"},{"from":"ac","to":"signals"},{"from":"signals","to":"outcome:signals"},{"from":"integrity","to":"outcome:integrity"},{"from":"outcome","to":"ownerReview"},{"from":"ownerReview","to":"land"}],"items":[{"id":"T-YYYYMMDD-01","status":"done"},{"id":"T-YYYYMMDD-02","status":"review"},{"id":"T-YYYYMMDD-03","status":"blocked"}]}</script>
+<script type="application/json" id="flow-data"></script>
+<script type="application/json" id="flow-status"></script>
+<script>
+const D=document,now=()=>performance.now(),M=Math,I=1/0,vr=()=>view.getBoundingClientRect(),$=s=>D.querySelector(s),h=s=>String(s??"").replace(/[&<>"]/g,c=>`&#${c.charCodeAt(0)};`),txt=i=>D.getElementById(i).textContent.trim();
+const COL=["#C38AF6","#F47EB9","#F1A476","#F8CD52","#948CEB","#6DF4D1"],CS={done:"#6FE27F",blocked:"#F2566F",working:"#5A3CE6",review:"#5A3CE6",cancelled:"#2F3146"};
+const SC={run:"#5A3CE6",running:"#5A3CE6",pass:"#6FE27F",fail:"#F2566F",fixed:"#AEA4F6"},L={wait:"대기",run:"실행 중",running:"실행 중",pass:"통과",fail:"실패",blocked:"막힘",fixed:"고침"};
+const base=txt("flow-data")||txt("flow-default"),RM=matchMedia("(prefers-reduced-motion: reduce)").matches,view=$("#view"),world=$("#world"),cv=$("#glow"),ctx=cv.getContext("2d");
+let G=JSON.parse(base),ST=JSON.parse(txt("flow-status")||"[]");
+try{const s=JSON.parse(localStorage.getItem("flow"));if(s&&s.b===base)G=s.g}catch{}
+let N={},EL={},HT={},P={},GB={},W=[],VO=[],T=3,WW=1,WH=1,dpr=1,V={k:1,x:0,y:0},fk=1,SM={},LOG=[],sel=null,task=null,ringN=0,prevT=-1,loop=1,stopped=0,simple=0,cur="g",dt="i",T0=now();
+const R={on:0,x:{},fix:{},prev:{},runs:[],fixes:0,t0:0,T:0};
+const save=()=>{try{localStorage.setItem("flow",JSON.stringify({b:base,g:G}))}catch{}};
+const bez=(a,c1,c2,b,t)=>{const u=1-t;return{x:u*u*u*a.x+3*u*u*t*c1.x+3*u*t*t*c2.x+t*t*t*b.x,y:u*u*u*a.y+3*u*u*t*c1.y+3*u*t*t*c2.y+t*t*t*b.y}};
+function wire(p0,p3){const d=M.max(40,M.abs(p3.x-p0.x)*.5),c1={x:p0.x+d,y:p0.y},c2={x:p3.x-d,y:p3.y},pts=[],cum=[];let len=0;
+for(let i=0;i<=48;i++){const p=bez(p0,c1,c2,p3,i/48);if(i)len+=M.hypot(p.x-pts.at(-2),p.y-pts.at(-1));pts.push(p.x,p.y);cum.push(len)}return{p0,c1,c2,p3,pts,cum,len}}
+function pointAt(g,s){if(s<=0)return{x:g.pts[0],y:g.pts[1]};if(s>=g.len)return{x:g.pts.at(-2),y:g.pts.at(-1)};let lo=0,hi=g.cum.length-1;
+while(hi-lo>1){const m=(lo+hi)>>1;if(g.cum[m]<s)lo=m;else hi=m}const f=(s-g.cum[lo])/(g.cum[hi]-g.cum[lo]||1);
+return{x:g.pts[lo*2]+(g.pts[hi*2]-g.pts[lo*2])*f,y:g.pts[lo*2+1]+(g.pts[hi*2+1]-g.pts[lo*2+1])*f}}
+function tracePart(ctx,g,s0,s1){const a=pointAt(g,s0);ctx.beginPath();ctx.moveTo(a.x,a.y);
+for(let i=0;i<g.cum.length;i++)if(g.cum[i]>s0&&g.cum[i]<s1)ctx.lineTo(g.pts[i*2],g.pts[i*2+1]);const b=pointAt(g,s1);ctx.lineTo(b.x,b.y)}
+const tm=a=>{const d=new Date(a);return`${d.getMonth()+1}/${d.getDate()} ${d.toTimeString().slice(0,8)}`};
+const ends=e=>[String(e.from).split(":"),String(e.to).split(":")];
+const warn=m=>{const w=$("#warn");w.hidden=!m;w.textContent=m};
+function log(st,node,msg){LOG.push({at:Date.now(),st,node,msg:msg||""});LOG=LOG.slice(-200)}
+function render(){
+G.edges||=[];G.items=(G.items||[]).map(i=>typeof i==="string"?{id:i}:i);N={};
+for(const n of G.nodes){n.inputs||=["in"];n.outputs||=["out"];n.group||="-";N[n.id]=n}
+GB={};[...new Set([...(G.groups||[]),...G.nodes.map(n=>n.group)])].filter(g=>N&&G.nodes.some(n=>n.group===g)).forEach((g,i)=>{GB[g]={c:COL[i%6],m:G.nodes.filter(n=>n.group===g)}});
+const port=(ps,c)=>ps.map((p,i)=>`<i class="pt ${c}" style="top:${30+i*14}px"><span>${h(p)}</span></i>`).join("");
+$("#lay").innerHTML=`${(G.sources||[]).map((s,i)=>`<div class="src" id="s${i}">${h(s)}</div>`).join("")}<div id="hub"></div>${G.nodes.map(n=>`<div class="card" data-id="${h(n.id)}" style="--c:${GB[n.group].c}"><div class="in"><div class="hd"><i></i><b class="nm">${h(n.name)}</b><span class="kd">${h(n.kind)}</span></div><div class="r"><span class="md">${h(n.model||"-")}</span><span><button class="fix" hidden>고치기</button><span class="bd"></span></span></div><div class="rl"></div></div>${port(n.inputs,"i")}${port(n.outputs,"o")}</div>`).join("")}${G.items.map((it,k)=>`<div class="chip${it.status==="cancelled"?" off":""}" id="c${k}" style="--s:${CS[it.status]||"#9A98AA"}" title="${h(it.id)} ${h(it.status)}">${h(it.id)}</div>`).join("")}<div id="ring"><span>${h(G.result||"완료")}</span><b id="rn"></b></div>`;
+EL={};for(const c of D.querySelectorAll(".card")){EL[c.dataset.id]=c;HT[c.dataset.id]=c.offsetHeight+12;c.style.height=`${HT[c.dataset.id]}px`}
+$("#gl").innerHTML=Object.keys(GB).map(g=>`<div class="grp" style="--c:${GB[g].c}"><span>${h(g)} ${GB[g].m.length}노드</span></div>`).join("");
+D.title=G.title||"";$("#ttl").textContent=D.title;$("#ver").hidden=!G.version;$("#ver").textContent=G.version||"";$("#memo").textContent=G.memo||"";
+}
+function place(){
+const ns=G.nodes,E=[],out={},inn={},st={},ord=[],dp={};for(const n of ns){out[n.id]=[];inn[n.id]=[]}
+for(const e of G.edges){const[[f,fp],[t,tp]]=ends(e);if(N[f]&&N[t]){const x={f,t,fp:fp||N[f].outputs[0],tp:tp||N[t].inputs[0]};E.push(x);out[f].push(x)}}
+const dfs=u=>{st[u]=1;for(const e of out[u])if(st[e.t]===1)e.cyc=1;else if(!st[e.t])dfs(e.t);st[u]=2;ord.push(u)};
+for(const n of ns)st[n.id]||dfs(n.id);const topo=ord.reverse();
+for(const u of topo){dp[u]??=0;for(const e of out[u])if(!e.cyc){dp[e.t]=M.max(dp[e.t]??0,dp[u]+1);inn[e.t].push(e)}}
+const av=g=>GB[g].m.reduce((s,n)=>s+dp[n.id],0)/GB[g].m.length,cols=Object.keys(GB).sort((a,b)=>av(a)-av(b));
+const hs=cols.map(g=>GB[g].m.reduce((s,n)=>s+HT[n.id]+16,32)),cy=M.max(...hs,160)/2+80;P={};
+cols.forEach((g,i)=>{let y=cy-hs[i]/2+(i%2?40:-40)+32;for(const n of[...GB[g].m].sort((a,b)=>dp[a.id]-dp[b.id])){P[n.id]=n.pos?{...n.pos}:{x:396+i*304,y};y+=HT[n.id]+16}});
+let mx=0,my=cy+90;const S=G.sources||[],sy=i=>cy-14+(i-(S.length-1)/2)*40,cx=380+cols.length*304+40,rows=M.ceil(G.items.length/3),CP=G.items.map((_,k)=>({x:cx+(k%3)*92,y:cy-rows*13+M.floor(k/3)*26})),rx=cx+336;
+const pos=(e,x,y)=>{if(e){e.style.left=`${x}px`;e.style.top=`${y}px`}};
+S.forEach((_,i)=>{pos($(`#s${i}`),24,sy(i))});pos($("#hub"),200,cy-50);pos($("#ring"),rx,cy-70);CP.forEach((p,k)=>{pos($(`#c${k}`),p.x,p.y);my=M.max(my,p.y+30)});
+Object.keys(GB).forEach((g,i)=>{const m=GB[g].m,x=M.min(...m.map(n=>P[n.id].x))-16,y=M.min(...m.map(n=>P[n.id].y))-32,w=M.max(...m.map(n=>P[n.id].x))+264-x,b=M.max(...m.map(n=>P[n.id].y+HT[n.id]))+16;Object.assign(GB[g],{x,y,w,h:b-y});pos($("#gl").children[i],x,y);Object.assign($("#gl").children[i].style,{width:`${w}px`,height:`${b-y}px`});mx=M.max(mx,x+w);my=M.max(my,b)});
+for(const n of ns)pos(EL[n.id],P[n.id].x,P[n.id].y);
+W=[];const add=(f,t,p0,p3,c,k=0,cyc=0,pi=0)=>W.push({f,t,g:wire(p0,p3),c,k,cyc,pi}),py=(id,ps,p)=>P[id].y+34+M.max(0,ps.indexOf(p))*14;
+const op=(id,p=N[id].outputs[0])=>({x:P[id].x+248,y:py(id,N[id].outputs,p)}),ip=(id,p=N[id].inputs[0])=>({x:P[id].x,y:py(id,N[id].inputs,p)});
+S.forEach((_,i)=>{add(`@s${i}`,"@H",{x:24+$(`#s${i}`).offsetWidth,y:sy(i)+14},{x:200,y:cy},"#C9C7D6")});
+for(const u of topo)if(!inn[u].length)add("@H",u,{x:300,y:cy},ip(u),"#C9C7D6");
+for(const e of E)add(e.f,e.t,op(e.f,e.fp),ip(e.t,e.tp),GB[N[e.f].group].c,0,e.cyc,N[e.t].inputs.indexOf(e.tp));
+for(const u of topo)if(!out[u].some(e=>!e.cyc)){if(CP.length)CP.forEach((p,k)=>{add(u,`@c${k}`,op(u),{x:p.x,y:p.y+10},GB[N[u].group].c,k)});else add(u,"@R",op(u),{x:rx,y:cy},"#6FE27F")}
+G.items.forEach((it,k)=>{if(it.status==="done")add(`@c${k}`,"@R",{x:CP[k].x+88,y:CP[k].y+10},{x:rx,y:cy},"#6FE27F")});
+VO=[...S.map((_,i)=>`@s${i}`),"@H",...topo,...G.items.map((_,k)=>`@c${k}`),"@R"];
+WW=M.max(mx,rx+140)+60;WH=my+60;Object.assign(world.style,{width:`${WW}px`,height:`${WH}px`});
+const sv=$("#wires");sv.setAttribute("width",WW);sv.setAttribute("height",WH);
+sv.innerHTML=W.map(({g:w,cyc})=>`<path d="M${w.p0.x} ${w.p0.y}C${w.c1.x} ${w.c1.y} ${w.c2.x} ${w.c2.y} ${w.p3.x} ${w.p3.y}"${cyc?' class="cy"':""}/>`).join("");
+const nd=M.min(2,devicePixelRatio||1,M.sqrt(8e6/WW/WH));if(cv.width!==M.round(WW*nd)||cv.height!==M.round(WH*nd)){dpr=nd;cv.width=M.round(WW*nd);cv.height=M.round(WH*nd);Object.assign(cv.style,{width:`${WW}px`,height:`${WH}px`})}
+const cyc=E.filter(e=>e.cyc);warn(cyc.length?`순환: ${cyc.map(e=>`${N[e.f].name} → ${N[e.t].name}`).join(", ")}`:"");
+sched();mini();
+}
+function sched(){
+const ins={};let mx=0;for(const w of W){w.s=I;w.a=I;if(!w.cyc){ins[w.t]||=[];ins[w.t].push(w)}}R.x={};
+for(const v of VO){let d,a=0,dead=0,bt=0;const n=N[v];
+for(const w of ins[v]||[])if(w.s===I){dead=1;bt=M.max(bt,w.dt)}else a=M.max(a,w.a);
+if(v.startsWith("@s"))d=+v.slice(2)*.14;
+else if(R.on&&dead){d=I;if(n)R.x[v]={b:bt}}
+else if(R.on&&n){const e0=a+(+n.duration||0),f=+n.fail>0,fx=R.fix[v];R.x[v]={s:a,e0,f,fx};d=!f?e0+.06:fx!=null?M.max(fx,e0)+.06:I;bt=e0}
+else d=a+.06;
+for(const w of W)if(w.f===v&&!w.cyc){if(d===I)w.dt=bt;else{w.s=d+w.k*.07;w.d=M.min(.95,M.max(.38,w.g.len/760));w.a=w.s+w.d;mx=M.max(mx,w.a)}}}
+T=mx+2.4;R.T=M.max(mx,...Object.values(R.x).map(x=>x.b??M.max(x.e0,x.fx??0)));
+}
+function rstate(id,t){const x=R.x[id];if(!x)return"wait";if(x.b!=null)return t>=x.b?"blocked":"wait";if(t<x.s)return"wait";if(t<x.e0)return"run";return x.f&&!(x.fx<=t)?"fail":"pass"}
+const nst=id=>R.on?R.prev[id]||"wait":SM[id]?.status||"wait";
+function count(){const c={pass:0,fail:0,blocked:0,fixed:0};for(const n of G.nodes){const s=nst(n.id);c[s]=(c[s]||0)+1}return c}
+function paint(){
+const c=count(),any=R.on||Object.keys(SM).length,v=k=>any?k:"-";
+for(const n of G.nodes){const s=nst(n.id),e=EL[n.id],x=!R.on&&SM[n.id];if(!e)continue;
+e.className=`card s-${s}${sel===n.id?" sel":""}`;e.querySelector(".bd").textContent=L[s]+(s==="fail"&&+n.fail?` ${n.fail}`:"");
+const m=s==="fail"?(x?x.msg:n.failReason):x?.msg,rl=e.querySelector(".rl");rl.textContent=m||n.role||"";rl.title=rl.textContent;e.querySelector(".fix").hidden=!(R.on&&s==="fail")}
+$("#stats").innerHTML=[["노드",G.nodes.length],["작업",G.items.length,"x"],["통과",v(c.pass)],["실패",v(c.fail)],["고침",v(R.on?R.fixes:c.fixed),"x"]].map(([l,n,m])=>`<div class="${m||""}"><b>${n}</b>${l}</div>`).join("");
+G.items.forEach((it,k)=>{$(`#c${k}`)?.classList.toggle("sel",it.id===task)});
+$("#recent").innerHTML=LOG.slice(-3).reverse().map(l=>`<div>${tm(l.at)} · <b style="color:${SC[l.st]||"#9A98AA"}">${h(L[l.st]||l.st)}</b> · → ${h(N[l.node]?.name||l.node)} · ${h(l.msg)}</div>`).join("");
+if(cur==="n"||cur==="r")tab(cur);
+}
+function pick(id){task=id;SM={};const mine=ST.filter(s=>(!s.task||s.task===id)&&N[s.node]);for(const s of mine)SM[s.node]=s;
+LOG=mine.map(s=>({at:Date.parse(s.at),st:s.status,node:s.node,msg:s.msg})).sort((a,b)=>a.at-b.at);paint()}
+const fl=e=>{if(e){e.classList.remove("fl");void e.offsetWidth;e.classList.add("fl")}};
+function arrive(w){const t=w.t;if(t==="@R"){ringN++;fl($("#ring"))}else if(t==="@H")fl($("#hub"));else if(t[0]==="@")fl($(`#${t.slice(1)}`));else if(EL[t]){fl(EL[t]);fl(EL[t].querySelectorAll(".pt.i")[M.max(0,w.pi)])}}
+function seg(w,a,b,lw,al){ctx.globalAlpha=al;ctx.lineWidth=lw;ctx.strokeStyle=w.c;tracePart(ctx,w.g,a,b);ctx.stroke()}
+function draw(t){ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,WW,WH);ctx.globalCompositeOperation="lighter";ctx.lineCap="round";if(stopped)return;
+for(const w of W){if(w.cyc||!(w.s<=(RM?1e9:t)))continue;const len=w.g.len,p=(t-w.s)/w.d;
+if(RM){seg(w,0,len,6,.11);seg(w,0,len,1.6,.45)}
+else if(p<1){const x=(p<.5?2*p*p:1-(2-2*p)**2/2)*len;seg(w,0,x,6,.22);seg(w,0,x,1.6,.9);for(let i=0;i<4;i++)seg(w,M.max(0,x-120+i*30),M.max(0,x-90+i*30),3,.15*(i+1));
+const o=pointAt(w.g,x),gr=ctx.createRadialGradient(o.x,o.y,0,o.x,o.y,10);gr.addColorStop(0,"#fff");gr.addColorStop(.4,w.c);gr.addColorStop(1,"#0000");ctx.globalAlpha=1;ctx.fillStyle=gr;ctx.beginPath();ctx.arc(o.x,o.y,10,0,7);ctx.fill()}
+else{const b=.16+.84*M.exp(-(t-w.a)/1.9);seg(w,0,len,6,.22*b);seg(w,0,len,1.6,.9*b)}}}
+function frame(now){requestAnimationFrame(frame);
+const e=(now-(R.on?R.t0:T0))/1000,t=stopped?-1:R.on?e:loop?e%T:M.min(e,T);
+if(t<prevT){ringN=0;for(const w of W){w.seen=null;w.hit=null}}
+for(const w of W){if(w.seen==null&&w.s<=t)w.seen=t;if(prevT<w.a&&w.a<=t){w.hit=t;arrive(w)}}prevT=t;
+if(R.on){let c=0;for(const n of G.nodes){const s=rstate(n.id,t);if(s!==R.prev[n.id]){R.prev[n.id]=s;c=1;if(s!=="wait")log(s,n.id,s==="fail"?n.failReason:s==="blocked"?"":n.role)}}
+const r=R.runs[0];if(r&&!r.end&&t>=R.T){r.end=1;Object.assign(r,count(),{fixed:R.fixes});c=1}if(c)paint()}
+const rn=`${RM||stopped?G.items.filter(i=>i.status==="done").length:ringN}/${G.items.length}`;if($("#rn").textContent!==rn)$("#rn").textContent=rn;draw(t)}
+function ap(){world.style.transform=`translate(${V.x}px,${V.y}px) scale(${V.k})`;world.classList.toggle("far",V.k<.62);world.style.setProperty("--fs",V.k<.62?M.min(1.6,.62/V.k):1);mini()}
+function fit(){const r=vr();fk=M.min(1.6,(r.width-24)/WW,(r.height-24)/WH);V={k:fk,x:(r.width-WW*fk)/2,y:(r.height-WH*fk)/2};ap()}
+function zoom(f,cx,cy){const k=M.max(M.min(.4,fk),M.min(1.6,V.k*f));V.x=cx-(cx-V.x)*k/V.k;V.y=cy-(cy-V.y)*k/V.k;V.k=k;ap()}
+function center(x,y){const r=vr();V.x=r.width/2-x*V.k;V.y=r.height/2-y*V.k;ap()}
+function mini(){const c=$("#mc").getContext("2d"),m=M.min(140/WW,70/WH),r=vr();c.clearRect(0,0,140,70);
+for(const g of Object.values(GB)){c.fillStyle=`${g.c}55`;c.fillRect(g.x*m,g.y*m,g.w*m,g.h*m)}c.strokeStyle="#8E76F1";c.strokeRect(-V.x/V.k*m,-V.y/V.k*m,r.width/V.k*m,r.height/V.k*m)}
+const rebuild=()=>{render();place();paint();save()};
+function run(){stopped=0;R.on=1;R.fix={};R.prev={};R.fixes=0;R.t0=now();prevT=-1;ringN=0;for(const w of W){w.seen=null;w.hit=null}sched();R.runs.unshift({no:R.runs.length+1,at:Date.now()});paint()}
+function tab(t){cur=t;for(const b of D.querySelectorAll("#tabs button"))b.classList.toggle("on",b.dataset.t===t);const p=$("#panel");p.hidden=t==="g";
+if(t==="n")p.innerHTML=`<table><tr><th>이름<th>구간<th>담당<th>모델<th>상태${G.nodes.map(n=>`<tr>${[n.name,n.group,n.kind,n.model,L[nst(n.id)]].map(x=>`<td>${h(x)}`).join("")}`).join("")}</table>`;
+if(t==="r")p.innerHTML=R.runs.map(r=>`<div>#${r.no} · ${tm(r.at)} · 통과 ${r.pass??"-"} · 실패 ${r.fail??"-"} · 막힘 ${r.blocked??"-"} · 고침 ${r.fixed??"-"}</div>`).join("")||"-";
+if(t==="j"){p.innerHTML='<div class="row"><button id="ap">적용</button><button id="ex">내보내기</button><button id="im">불러오기</button><span id="err"></span></div><textarea id="ta" spellcheck="false"></textarea>';
+const ta=$("#ta");ta.value=JSON.stringify(G,null,2);
+$("#ap").onclick=()=>{const v=ta.value,old=G;try{const g=JSON.parse(v);if(!Array.isArray(g.nodes))throw Error("nodes 배열이 없습니다");G=g;rebuild();fit();$("#err").textContent=""}
+catch(e){if(G!==old){G=old;rebuild()}const m=/position (\d+)/.exec(e.message);$("#err").textContent=`줄 ${m?v.slice(0,+m[1]).split("\n").length:(/line (\d+)/.exec(e.message)||[0,1])[1]} · ${e.message}`}};
+$("#ex").onclick=()=>{const a=D.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(G,null,2)],{type:"application/json"}));a.download="flow.json";a.click()};
+$("#im").onclick=()=>{const f=D.createElement("input");f.type="file";f.accept=".json";f.onchange=async()=>{ta.value=await f.files[0].text();$("#ap").click()};f.click()}}}
+function openD(id,t){sel=id;if(t)dt=t;const n=N[id],d=$("#drawer");if(!n){d.hidden=true;return}d.hidden=false;const other=e=>{const[[f],[to]]=ends(e);return f===id?["→",to]:["←",f]};
+d.innerHTML=`<div class="row"><b>${h(n.name)}</b><i class="sp"></i><button data-x>×</button></div><nav class="row">${[["i","정보"],["h","기록"],["l","연결"]].map(([k,l])=>`<button data-dt="${k}"${k===dt?' class="on"':""}>${l}</button>`).join("")}</nav><div class="db">${
+dt==="i"?[["model","모델"],["role","하는 일"],["inputs","입력 포트"],["outputs","출력 포트"],["duration","duration"],["fail","실패"],["failReason","실패 사유"]].map(([k,l])=>`<label>${l}<input data-k="${k}" value="${h(n[k])}"></label>`).join("")
+:dt==="h"?LOG.filter(l=>l.node===id).map(l=>`<div>${tm(l.at)} · ${h(L[l.st]||l.st)} · ${h(l.msg)}</div>`).join("")||"-"
+:`${G.edges.map((e,i)=>[e,i]).filter(([e])=>ends(e).some(([x])=>x===id)).map(([e,i])=>{const[a,o]=other(e);return`<div class="row"><button data-go="${h(o)}">${a} ${h(N[o]?.name||o)}</button><button data-del="${i}">삭제</button></div>`}).join("")}<div class="row"><select id="to">${G.nodes.filter(m=>m.id!==id).map(m=>`<option value="${h(m.id)}">${h(m.name)}`).join("")}</select><button data-add>연결 추가</button></div>`}</div>`;paint()}
+function cmd(v){const f=s=>G.nodes.find(n=>n.name===s.trim()||n.id===s.trim()),c=/^(.+?)\s*->\s*(.+?)(\s+연결)?$/.exec(v),p=/^(.+?)\s+뒤에\s+(.+?)\s+추가$/.exec(v),d=/^(.+?)\s+삭제$/.exec(v),a=f((c||p||d||[0,""])[1]),b=c&&f(c[2]);let ok=1;
+if(c&&a&&b)G.edges.push({from:a.id,to:b.id});
+else if(p&&a){let i=G.nodes.length+1;while(N[`n${i}`])i++;const id=`n${i}`;
+for(const e of G.edges)if(ends(e)[0][0]===a.id)e.from=id;G.nodes.splice(G.nodes.indexOf(a)+1,0,{id,name:p[2],group:a.group,kind:a.kind,model:a.model,role:""});G.edges.push({from:a.id,to:id})}
+else if(d&&a){const by=j=>G.edges.filter(e=>ends(e)[j][0]===a.id),q=by(1),o=by(0);G.nodes.splice(G.nodes.indexOf(a),1);G.edges=G.edges.filter(e=>!ends(e).some(([x])=>x===a.id));for(const i of q)for(const k of o)G.edges.push({from:i.from,to:k.to})}
+else ok=0;
+if(ok)rebuild();log(ok?"pass":"fail","",ok?v:`알아듣지 못한 명령: ${v}`);paint()}
+async function poll(){try{const r=await fetch("./status.json",{cache:"no-store"});if(!r.ok)throw Error(r.status);ST=await r.json();const old=SM;pick(task);
+for(const id in SM){const a=SM[id],b=old[id];if(!b||a.status!==b.status||a.msg!==b.msg){fl(EL[id]);LOG.push({at:Date.parse(a.at)||Date.now(),st:a.status,node:id,msg:a.msg})}}paint()}
+catch{warn("python3 -m http.server 로 열어 주세요");$("#live").checked=false;$("#live").onchange()}}
+let liveT=0;$("#live").onchange=()=>{clearInterval(liveT);const on=$("#live").checked;$("#lv").classList.toggle("on",on);if(on){poll();liveT=setInterval(poll,2000)}};
+$("#run").onclick=run;$("#stop").onclick=()=>{stopped=1;R.on=0;sched();paint()};
+$("#loop").onclick=()=>{loop=!loop;$("#loop").classList.toggle("on",!!loop);stopped=0;R.on=0;T0=now();sched();paint()};
+$("#tabs").onclick=e=>{const b=e.target.closest("button");if(b)tab(b.dataset.t)};
+const zc=f=>{const r=vr();zoom(f,r.width/2,r.height/2)};$("#zi").onclick=()=>zc(1.2);$("#zo").onclick=()=>zc(1/1.2);$("#fit").onclick=fit;
+$("#say").onkeydown=e=>{if(e.key==="Enter"&&e.target.value.trim()){cmd(e.target.value.trim());e.target.value=""}};
+$("#lay").addEventListener("click",e=>{const b=e.target.closest(".fix");if(!b)return;const id=b.closest(".card").dataset.id;R.fix[id]=(now()-R.t0)/1000;R.fixes++;sched();if(R.runs[0])R.runs[0].end=0;log("fixed",id,"고치기");paint()});
+const dr=$("#drawer");dr.onclick=e=>{const b=e.target.closest("button"),id=sel;if(!b)return;const s=b.dataset;
+if(s.x!=null){dr.hidden=true;sel=null;paint()}else if(s.dt)openD(id,s.dt);else if(s.go){const o=s.go;if(P[o])center(P[o].x+124,P[o].y+40);openD(o)}
+else if(s.del){G.edges.splice(+s.del,1);rebuild();openD(id)}else if(s.add!=null){const t=$("#to").value;G.edges.push({from:id,to:t});rebuild();openD(id)}};
+dr.oninput=e=>{const k=e.target.dataset.k,n=N[sel];if(!k||!n)return;const v=e.target.value;n[k]=/puts$/.test(k)?v.split(",").map(s=>s.trim()).filter(Boolean):/^(duration|fail)$/.test(k)?+v||0:v;rebuild()};
+function simp(){simple=!simple;const s=$("#simple");s.hidden=!simple;world.style.visibility=simple?"hidden":"";s.innerHTML=Object.entries(GB).map(([g,b])=>`<button class="pill" data-g="${h(g)}" style="color:${b.c};border-color:${b.c}">${h(g)} · ${b.m.length}노드</button>`).join("")}
+$("#simple").onclick=e=>{const g=GB[e.target.closest("button")?.dataset.g];if(g){simp();center(g.x+g.w/2,g.y+g.h/2)}};
+D.onkeydown=e=>{if(e.target.matches("input,textarea,select"))return;const k=e.key.toLowerCase();if(k==="f")fit();else if(k==="r")run();else if(k==="g")simp();else if(e.key==="Escape"){dr.hidden=true;sel=null;tab("g");paint()}};
+const pts=new Map(),mc=$("#mc"),on=(t,f,o)=>view.addEventListener(t,f,o);let act=null;
+on("pointerdown",e=>{if(e.target.closest("button,input,#mini,#simple"))return;pts.set(e.pointerId,{x:e.clientX,y:e.clientY});view.setPointerCapture(e.pointerId);
+if(pts.size===2){const[a,b]=[...pts.values()];act={pz:M.hypot(a.x-b.x,a.y-b.y),k:V.k};return}const c=e.target.closest(".card");
+act={sx:e.clientX,sy:e.clientY,vx:V.x,vy:V.y,id:c?.dataset.id,hd:!!e.target.closest(".hd"),ch:e.target.closest(".chip"),m:0,p:c&&{...P[c.dataset.id]}}});
+on("pointermove",e=>{if(!act||!pts.has(e.pointerId))return;pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+if(act.pz){if(pts.size<2)return;const[a,b]=[...pts.values()],r=vr();zoom(M.hypot(a.x-b.x,a.y-b.y)/act.pz*act.k/V.k,(a.x+b.x)/2-r.left,(a.y+b.y)/2-r.top);return}
+const dx=e.clientX-act.sx,dy=e.clientY-act.sy;if(M.hypot(dx,dy)>=4)act.m=1;if(!act.m)return;
+if(!act.id){V.x=act.vx+dx;V.y=act.vy+dy;ap()}else if(act.hd){N[act.id].pos={x:M.max(0,act.p.x+dx/V.k),y:M.max(0,act.p.y+dy/V.k)};place()}});
+const up=e=>{if(!pts.delete(e.pointerId)||!act)return;if(!act.pz&&!act.m){if(act.id)openD(act.id);else if(act.ch)pick(G.items[+act.ch.id.slice(1)].id)}if(act.m&&act.id)save();if(!pts.size)act=null};
+on("pointerup",up);on("pointercancel",up);
+on("wheel",e=>{e.preventDefault();const r=vr();zoom(M.exp(-e.deltaY*.0015),e.clientX-r.left,e.clientY-r.top)},{passive:false});
+on("dblclick",e=>{if(e.target.closest(".card,.chip,#mini,#simple,button"))return;const r=vr(),x=(e.clientX-r.left-V.x)/V.k,y=(e.clientY-r.top-V.y)/V.k;
+let i=G.nodes.length+1;while(N[`n${i}`])i++;const g=Object.keys(GB).reduce((m,k)=>M.abs(GB[k].x-x)<M.abs(GB[m].x-x)?k:m);G.nodes.push({id:`n${i}`,name:"새 노드",group:g,kind:"코드",model:"-",role:"",pos:{x,y}});rebuild();log("pass",`n${i}`,"노드 추가");paint()});
+const mm=e=>{const m=M.min(140/WW,70/WH),b=mc.getBoundingClientRect();center((e.clientX-b.left)/m,(e.clientY-b.top)/m)};
+mc.onpointerdown=e=>{mc.setPointerCapture(e.pointerId);mm(e)};mc.onpointermove=e=>{if(mc.hasPointerCapture(e.pointerId))mm(e)};
+addEventListener("resize",fit);
+render();place();const its=G.items,late=a=>a.reduce((m,i)=>!m||(i.at||"")>(m.at||"")?i:m,null);pick((late(its.filter(i=>/working|blocked|review/.test(i.status)))||late(its))?.id??null);fit();
+window.flow={G:()=>G,W:()=>W,R,V:()=>V,run,fit};requestAnimationFrame(frame);
+</script>
+</body>
+</html>

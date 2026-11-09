@@ -48,7 +48,7 @@ function makeAdapter(channel: string): {
 			seenMuteCommand: (platformMessageId) => handledMuteCommands.has(platformMessageId),
 			rememberMuteCommand: (platformMessageId) => handledMuteCommands.add(platformMessageId),
 		},
-		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined },
+		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined, defer: () => undefined },
 		ownerUserId: OWNER,
 		clock: { now: () => 1_000 },
 		log: createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact }),

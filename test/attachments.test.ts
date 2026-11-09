@@ -289,7 +289,7 @@ describe("attachment injection flag (adapter)", () => {
 			onCommand: () => "ok",
 			onAction() {},
 		};
-		const deliveries: DeliverySource = { claimDue: () => [], confirm() {}, fail() {} };
+		const deliveries: DeliverySource = { claimDue: () => [], confirm() {}, fail() {}, defer() {} };
 		const adapter = new SlackAdapter({
 			transport,
 			core,

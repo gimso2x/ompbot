@@ -55,8 +55,12 @@ export interface ApplyOptions {
 /** Everything `runApply` touches outside the home directory; tests replace the external effects with fakes. */
 export interface ApplyDeps {
 	homeDir: string;
+	/** systemd user unit running the daemon of `homeDir` (`ompbot`, `ompbot-<instance>`). */
+	unit: string;
 	/** Checkout holding `src/main.ts`; the daemon loads its code from here. */
 	repoDir: string;
+	/** Applies the same code to the other installs running from this checkout, after this one is up. */
+	peers?: () => Promise<PeerApply[]>;
 	/** PATH (with ~/.local/bin and ~/.bun/bin prepended) for every child process and for finding bun. */
 	pathEnv: string;
 	now: () => number;
@@ -71,6 +75,57 @@ export interface ApplyDeps {
 	lockStartedAt: () => number | undefined;
 	isExecutable: (path: string) => boolean;
 	log: (line: string) => void;
+}
+
+export interface PeerApply {
+	unit: string;
+	status: ApplyStatus;
+	exitCode: 0 | 1 | 3;
+	receiptPath: string;
+}
+
+export interface DaemonUnit {
+	unit: string;
+	homeDir: string;
+}
+
+/**
+ * Active user units whose ExecStart runs `<repoDir>/src/main.ts daemon`, with the home each one uses
+ * (`Environment=OMPBOT_HOME=`, else `defaultHome`). Second installs (`units render --instance`) share the checkout.
+ */
+export async function findDaemonUnits(
+	run: Runner,
+	pathEnv: string,
+	repoDir: string,
+	defaultHome: string,
+): Promise<DaemonUnit[]> {
+	const env = { PATH: pathEnv };
+	const listed = await run(
+		["systemctl", "--user", "list-units", "--type=service", "--state=active", "--no-legend", "--plain", "ompbot*"],
+		{ env },
+	);
+	const names = listed.code === 0 ? listed.stdout.split("\n").flatMap((line) => line.trim().split(/\s+/, 1)) : [];
+	const units = names.filter((name) => name.endsWith(".service"));
+	if (units.length === 0) return [];
+	const shown = await run(
+		["systemctl", "--user", "show", "-p", "Id", "-p", "Environment", "-p", "ExecStart", ...units],
+		{ env },
+	);
+	if (shown.code !== 0) return [];
+	const daemonArgv = `${join(repoDir, "src", "main.ts")} daemon `;
+	const found: DaemonUnit[] = [];
+	for (const block of shown.stdout.split(/\n\s*\n/)) {
+		const props = new Map<string, string>();
+		for (const line of block.split("\n")) {
+			const eq = line.indexOf("=");
+			if (eq > 0) props.set(line.slice(0, eq), line.slice(eq + 1));
+		}
+		const id = props.get("Id");
+		if (id === undefined || !(props.get("ExecStart") ?? "").includes(daemonArgv)) continue;
+		const home = /(?:^|\s)OMPBOT_HOME=(\S+)/.exec(props.get("Environment") ?? "")?.[1];
+		found.push({ unit: id.replace(/\.service$/, ""), homeDir: home ?? defaultHome });
+	}
+	return found;
 }
 
 export interface StepRecord {
@@ -202,7 +257,7 @@ export function parseUnixTimestamp(text: string): number | undefined {
  * Code is never reverted automatically; the receipt carries the previous HEAD and the revert command instead.
  */
 export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<ApplyOutcome> {
-	const { homeDir, repoDir } = deps;
+	const { homeDir, repoDir, unit } = deps;
 	const startedMs = deps.now();
 	const stamp = options.stamp ?? backupStamp(new Date(startedMs));
 	const receiptPath = receiptPathFor(homeDir, stamp);
@@ -302,13 +357,11 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 			else if (head.code !== 0 || main.code !== 0 || head.stdout.trim() !== main.stdout.trim()) {
 				skipReasons.push("HEAD differs from main");
 			}
-			const active = await deps.run(["systemctl", "--user", "is-active", SYSTEMD_UNIT], {
+			const active = await deps.run(["systemctl", "--user", "is-active", unit], {
 				env: { PATH: deps.pathEnv },
 			});
 			if (active.code !== 0) {
-				skipReasons.push(
-					`systemctl --user is-active ${SYSTEMD_UNIT} rc=${active.code} (daemon not active or no user bus)`,
-				);
+				skipReasons.push(`systemctl --user is-active ${unit} rc=${active.code} (daemon not active or no user bus)`);
 			}
 			const dirty = await git("status", "--porcelain", "--", "src");
 			if (dirty.code !== 0) skipReasons.push(`git status failed: ${dirty.stderr.trim()}`);
@@ -325,7 +378,7 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		if (bun === undefined) skipReasons.push(`bun not found on PATH (${deps.pathEnv})`);
 		if (skipReasons.length === 0 && options.mergedAt !== undefined) {
 			const show = await deps.run(
-				["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp", "--value", "--timestamp=unix", SYSTEMD_UNIT],
+				["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp", "--value", "--timestamp=unix", unit],
 				{ env: { PATH: deps.pathEnv } },
 			);
 			const enteredAt = show.code === 0 ? parseUnixTimestamp(show.stdout) : undefined;
@@ -337,7 +390,22 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		return { ok: true, detail: alreadyApplied ?? `main@${receipt.head} clean, bun=${bun}` };
 	});
 	if (skipReasons.length > 0) return finish("skipped", 3);
-	if (alreadyApplied !== undefined) return finish("already_applied", 0);
+
+	// Once this daemon runs the code, the other installs on the same checkout get it too. A peer that fails turns
+	// the whole apply into a failure (exit 1) so a caller does not mistake a half-applied checkout for done.
+	const finishWithPeers = async (status: "ok" | "already_applied"): Promise<ApplyOutcome> => {
+		const peers = deps.peers;
+		if (peers === undefined) return finish(status, 0);
+		let allOk = true;
+		await step("peers", async () => {
+			const results = await peers();
+			allOk = results.every((p) => p.exitCode === 0);
+			const detail = results.map((p) => `${p.unit}=${p.status}(${p.receiptPath})`).join(" ");
+			return { ok: allOk, detail: detail || "no other install on this checkout" };
+		});
+		return allOk ? finish(status, 0) : finish("failed", 1);
+	};
+	if (alreadyApplied !== undefined) return finishWithPeers("already_applied");
 
 	// 2. backup: ledger/bundle snapshot plus a config copy to roll back to.
 	const configPath = join(homeDir, "config.json");
@@ -370,7 +438,19 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 	});
 	if (!backedUp) return finish("failed", 1);
 
-	// 3. drain: a timeout cancels the drain itself, so nothing was changed and no restart follows.
+	// A path that ends without a verified new daemon leaves the old one draining: cancel it and record it.
+	const cancelDrain = async (): Promise<string> => {
+		try {
+			const response = await deps.callDaemon({ op: "drain_cancel" }, 10_000);
+			const ok = typeof response === "object" && response !== null && "ok" in response && response.ok === true;
+			return ok ? "drain cancelled" : `drain cancel refused: ${JSON.stringify(response)}`;
+		} catch (error) {
+			return `drain cancel failed: ${msg(error)}`;
+		}
+	};
+
+	// 3. drain: a timeout cancels the drain itself, so nothing was changed and no restart follows. An unreachable
+	// daemon may still have taken the drain (a lost answer): cancel it too, best effort, so no restart leaves it held.
 	const drained = await step("drain", async () => {
 		const result = await deps.drain(options.timeoutMin);
 		if (result.ok)
@@ -378,7 +458,8 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 				ok: true,
 				detail: `turns=${result.counts.turns} hostTools=${result.counts.hostTools} approvals=${result.counts.approvals}`,
 			};
-		if (result.reason === "unreachable") return { ok: false, detail: `daemon not reachable: ${result.error}` };
+		if (result.reason === "unreachable")
+			return { ok: false, detail: `daemon not reachable: ${result.error}; ${await cancelDrain()}` };
 		return { ok: false, detail: `${result.reason} after ${options.timeoutMin} min (drain cancelled)` };
 	});
 	if (!drained) return finish("failed", 1);
@@ -386,7 +467,7 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 	// 4+5. restart and wait for a daemon that started after the restart request.
 	const restartAndWait = async (): Promise<StepResult & { restartAt: number }> => {
 		const restartAt = deps.now();
-		const restart = await deps.run(["systemctl", "--user", "restart", SYSTEMD_UNIT], { env: { PATH: deps.pathEnv } });
+		const restart = await deps.run(["systemctl", "--user", "restart", unit], { env: { PATH: deps.pathEnv } });
 		if (restart.code !== 0)
 			return { ok: false, detail: `systemctl restart rc=${restart.code}: ${restart.stderr.trim()}`, restartAt };
 		return { ok: true, detail: "restart requested", restartAt };
@@ -420,17 +501,6 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		return r;
 	});
 	const ready = restarted && (await step("ready", () => waitReady(restartAt)));
-
-	// A restart path that ends without a verified new daemon leaves the old one draining: cancel it and record it.
-	const cancelDrain = async (): Promise<string> => {
-		try {
-			const response = await deps.callDaemon({ op: "drain_cancel" }, 10_000);
-			const ok = typeof response === "object" && response !== null && "ok" in response && response.ok === true;
-			return ok ? "drain cancelled" : `drain cancel refused: ${JSON.stringify(response)}`;
-		} catch (error) {
-			return `drain cancel failed: ${msg(error)}`;
-		}
-	};
 
 	// 7. rollback on failure: last known-good config back, one more restart; the code stays and is described in the receipt.
 	if (!ready) {
@@ -474,7 +544,7 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		const ok = recordLastGoodConfig(homeDir);
 		return { ok: true, detail: ok ? `${configPath}${LAST_GOOD_SUFFIX}` : "no config.json or copy failed" };
 	});
-	return finish("ok", 0);
+	return finishWithPeers("ok");
 }
 
 /** Reads the daemon lock `startedAt` (ms); undefined when absent or malformed. */

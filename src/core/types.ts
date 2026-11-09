@@ -17,9 +17,13 @@ export type CommandKind =
 	| "resume"
 	| "queue"
 	| "followup"
-	| "usage";
+	| "usage"
+	| "distill";
 
-/** Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). */
+/**
+ * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` is typed as
+ * `!distill` only: its slash name is not in the Slack app manifests.
+ */
 export const COMMAND_TEXT: Record<CommandKind, string> = {
 	new: "/new-ompbot",
 	status: "/status-ompbot",
@@ -30,6 +34,7 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
 	queue: "/queue-ompbot",
 	followup: "/followup-ompbot",
 	usage: "/usage-ompbot",
+	distill: "/distill-ompbot",
 };
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */

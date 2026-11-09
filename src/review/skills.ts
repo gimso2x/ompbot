@@ -6,11 +6,22 @@ import type { Logger } from "../log";
 import type { OmpFinal, OmpSessionDriver } from "../omp/driver";
 import { redact } from "../redact";
 
+export interface SkillCheck {
+	/** A case where the skill should — or should not — fire, stated so a later session can replay it. */
+	situation: string;
+	/** What correct behaviour looks like when that situation comes up. */
+	expect: string;
+}
+
 export interface SkillProposal {
 	action: "create" | "patch";
 	name: string;
 	description: string;
 	content: string;
+	/** Adoption gate: what actually worked in this conversation (short quote or tight summary). */
+	evidence: string;
+	/** Adoption gate: paired fire / do-not-fire checks (MIN_CHECKS..MAX_CHECKS) recorded into the installed skill. */
+	checks: SkillCheck[];
 }
 
 export interface SkillReviewDeps {
@@ -34,6 +45,11 @@ export const MAX_PROPOSALS = 3;
 export const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MAX_DESCRIPTION = 1024;
 const MAX_CONTENT = 100_000;
+/** Adoption-gate limits: evidence must be present and checks must cover both a fire and a do-not-fire case. */
+export const MAX_EVIDENCE = 2_000;
+export const MIN_CHECKS = 2;
+export const MAX_CHECKS = 4;
+export const MAX_CHECK_TEXT = 500;
 /** Revisions of one skill live at `<skills>/<name>/revisions/<install-time>.md`. */
 export const SKILL_REVISIONS_DIR = "revisions";
 /** Every line terminator a frontmatter reader may honour (CRLF first so it collapses to one space). */
@@ -56,8 +72,12 @@ export function buildSkillReviewPrompt(digest: string): string {
 		"좋은 스킬은 클래스 단위 워크플로 하나입니다(예: 'release-checklist'). 한 세션짜리 좁은 스킬은 만들지 마세요.",
 		"교훈은 '규칙 + 이유 한 절'로 쓰세요.",
 		"",
+		"채택 게이트 — 모든 제안에 아래 두 필드가 있어야 하고, 없는 제안은 폐기됩니다:",
+		"- evidence: 이 대화에서 그 절차가 실제로 통했음을 보여 주는 근거(짧은 인용이나 요지). 한 번도 통하지 않은 절차는 제안하지 마세요.",
+		"- checks: 이 스킬이 발동해야 할 상황과 발동하면 안 되는 상황을 각각 적어도 하나씩(2~4개).",
+		"",
 		"답은 JSON 배열로만 쓰세요. 제안이 없으면 정확히 NO_PROPOSAL 한 단어.",
-		'각 항목: {"action":"create"|"patch","name":"kebab-case","description":"무엇을 하는 스킬인지 + 언제 쓰는지","content":"SKILL.md 본문(markdown, frontmatter 없이, 실행 절차와 주의)"}',
+		'각 항목: {"action":"create"|"patch","name":"kebab-case","description":"무엇을 하는 스킬인지 + 언제 쓰는지","content":"SKILL.md 본문(markdown, frontmatter 없이, 실행 절차와 주의)","evidence":"이 대화에서 통한 근거","checks":[{"situation":"발동 또는 비발동 상황","expect":"그때의 기대 결과"}]}',
 		`최대 ${MAX_PROPOSALS}개.`,
 		"",
 		"[대화]",
@@ -126,11 +146,35 @@ function validProposals(list: unknown[]): SkillProposal[] {
 		if (!NAME_PATTERN.test(name) || seen.has(name)) continue;
 		if (description === "" || description.length > MAX_DESCRIPTION) continue;
 		if (content === "" || content.length > MAX_CONTENT) continue;
+		// Adoption gate: a proposal the conversation never actually vindicated, or whose fire/do-not-fire checks are
+		// missing or malformed, never reaches an approval card (Regression Tax / SkillOpt adoption rule).
+		const evidence = typeof item.evidence === "string" ? item.evidence.trim() : "";
+		if (evidence === "" || evidence.length > MAX_EVIDENCE) continue;
+		const rawChecks = Array.isArray(item.checks) ? item.checks : [];
+		if (rawChecks.length < MIN_CHECKS || rawChecks.length > MAX_CHECKS) continue;
+		const checks: SkillCheck[] = [];
+		let checksOk = true;
+		for (const rawCheck of rawChecks) {
+			if (typeof rawCheck !== "object" || rawCheck === null) {
+				checksOk = false;
+				break;
+			}
+			const check = rawCheck as Record<string, unknown>;
+			const situation = typeof check.situation === "string" ? check.situation.trim() : "";
+			const expect = typeof check.expect === "string" ? check.expect.trim() : "";
+			if (situation === "" || expect === "" || situation.length > MAX_CHECK_TEXT || expect.length > MAX_CHECK_TEXT) {
+				checksOk = false;
+				break;
+			}
+			checks.push({ situation, expect });
+		}
+		if (!checksOk) continue;
 		// A proposal must not smuggle a known secret into the skills directory (name ends up in file names too).
 		if (redact(name) !== name) continue;
-		if (redact(`${description}\n${content}`) !== `${description}\n${content}`) continue;
+		const gateText = `${description}\n${content}\n${evidence}\n${JSON.stringify(checks)}`;
+		if (redact(gateText) !== gateText) continue;
 		seen.add(name);
-		proposals.push({ action, name, description, content });
+		proposals.push({ action, name, description, content, evidence, checks });
 	}
 	return proposals.slice(0, MAX_PROPOSALS);
 }
@@ -162,11 +206,28 @@ function yamlScalar(value: string): string {
 	return YAML_PLAIN_SAFE.test(oneLine) && !YAML_RESERVED.test(oneLine) ? oneLine : JSON.stringify(oneLine);
 }
 
+/**
+ * The adoption-check section appended to an installed SKILL.md: the paired fire/do-not-fire checks from the proposal
+ * plus the model-portability rule. An empty string when the body already carries the heading (never duplicated).
+ */
+function renderAdoptionChecks(proposal: SkillProposal): string {
+	if (proposal.content.includes("## 채택 검증")) return "";
+	const lines = ["", "## 채택 검증", ""];
+	lines.push(
+		`설치 뒤 아래 짝을 실제 대화에서 한 번씩 돌려 확인한다. 어긋나면 \`ompbot skills rollback ${proposal.name}\`.`,
+	);
+	lines.push("");
+	for (const check of proposal.checks) lines.push(`- ${check.situation} → ${check.expect}`);
+	lines.push("- 이 스킬을 만든 모델과 다른 경로(예: GLM 크론 모니터)에서 쓸 때는 그 모델에서 다시 확인한 뒤 쓴다.");
+	lines.push("");
+	return lines.join("\n");
+}
+
 /** Renders the SKILL.md that gets installed (frontmatter + body); unsafe name/description are double-quoted. */
 export function renderSkillFile(proposal: SkillProposal): string {
 	const name = yamlScalar(proposal.name);
 	const description = yamlScalar(proposal.description);
-	return `---\nname: ${name}\ndescription: ${description}\n---\n\n${proposal.content}\n`;
+	return `---\nname: ${name}\ndescription: ${description}\n---\n\n${proposal.content}\n${renderAdoptionChecks(proposal)}`;
 }
 
 /**
@@ -175,7 +236,7 @@ export function renderSkillFile(proposal: SkillProposal): string {
  */
 export async function runSkillReview(
 	deps: SkillReviewDeps,
-	options: { sessionDir: string; timeoutMs?: number } = { sessionDir: "" },
+	options: { sessionDir: string; timeoutMs?: number; announceEmpty?: boolean } = { sessionDir: "" },
 ): Promise<{ proposals: number; installed: number }> {
 	const driver = deps.makeDriver(SKILL_REVIEW_ORIGIN, options.sessionDir);
 	const timeoutMs = options.timeoutMs ?? 5 * 60_000;
@@ -210,11 +271,18 @@ export async function runSkillReview(
 	const proposals = extractProposals(final.text);
 	if (proposals.length === 0) {
 		deps.log.info("skill_review_no_proposal");
+		// An explicit `!distill` ends in silence otherwise: the owner waits for a card that never comes.
+		if (options.announceEmpty === true)
+			await deps.notify("📝 스킬 리뷰를 끝냈습니다. 이 대화에서 제안할 만한 절차가 없었어요(승인 카드 없음).");
 		return { proposals: 0, installed: 0 };
 	}
 
 	const paths = deps.savePending(proposals);
-	const lines = proposals.map((p) => `- ${p.name} (${p.action}): ${p.description}`);
+	const lines = proposals.map((p) => {
+		const evidence =
+			p.evidence.length <= 120 ? p.evidence : `${p.evidence.slice(0, 119).replace(/[\ud800-\udbff]$/, "")}…`;
+		return `- ${p.name} (${p.action === "patch" ? "patch · 기존 스킬 덮어씀" : p.action}): ${p.description}\n  근거: ${evidence} · 검증 ${p.checks.length}짝(설치 본문 '채택 검증' 절에 기록)`;
+	});
 	const verdict = await deps.requestApproval(
 		`📝 스킬 제안 ${proposals.length}건 — 승인하면 ${proposals.map((p) => p.name).join(", ")}를 설치합니다.\n${lines.join("\n")}`,
 	);
@@ -224,24 +292,22 @@ export async function runSkillReview(
 		);
 		return { proposals: proposals.length, installed: 0 };
 	}
-	let installed = 0;
+	const installed: string[] = [];
 	for (const proposal of proposals) {
 		try {
 			await deps.install(proposal);
-			installed += 1;
+			installed.push(proposal.name);
 		} catch (error) {
 			deps.log.warn("skill_install_failed", { name: proposal.name, error: String(error) });
 		}
 	}
+	const failed = proposals.length - installed.length;
 	await deps.notify(
-		`📝 스킬 ${installed}개 설치: ${proposals
-			.slice(0, installed)
-			.map((p) => p.name)
-			.join(
-				", ",
-			)} — 다음 세션부터 스킬 목록에 나타납니다.\n나빠지면 \`ompbot skills rollback <이름>\`로 직전 개정으로 되돌릴 수 있습니다.`,
+		`📝 스킬 ${installed.length}개 설치: ${installed.join(", ")} — 다음 세션부터 스킬 목록에 나타납니다.${
+			failed === 0 ? "" : `\n${failed}개는 설치하지 못했습니다(ompbot.log skill_install_failed).`
+		}\n나빠지면 \`ompbot skills rollback <이름>\`로 직전 개정으로 되돌릴 수 있습니다.`,
 	);
-	return { proposals: proposals.length, installed };
+	return { proposals: proposals.length, installed: installed.length };
 }
 
 /** One digest entry: a user/assistant session message trimmed to `perMessage` (undefined for any other line). */
@@ -397,6 +463,23 @@ export function backupSkillRevision(dir: string, now: number): string | undefine
 	copyFileSync(current, path);
 	chmodSync(path, 0o600);
 	return path;
+}
+
+/**
+ * Installs one approved proposal into `dir` (`<skills>/<name>`) exactly as the approval card named it: a `create`
+ * never replaces an existing SKILL.md (an owner-written skill included) and a `patch` needs one to replace. The
+ * previous SKILL.md becomes a revision first, so an approved patch stays reversible. Returns the saved revision
+ * path (`undefined` on a first install); throws when the action does not match what is on disk.
+ */
+export function installSkill(dir: string, proposal: SkillProposal, now: number): string | undefined {
+	const exists = existsSync(join(dir, "SKILL.md"));
+	if (proposal.action === "create" && exists)
+		throw new Error(`create refused: ${proposal.name} already has a SKILL.md (only a patch may replace it)`);
+	if (proposal.action === "patch" && !exists) throw new Error(`patch refused: ${proposal.name} is not installed`);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const revision = backupSkillRevision(dir, now);
+	writeFileSync(join(dir, "SKILL.md"), renderSkillFile(proposal), { mode: 0o600 });
+	return revision;
 }
 
 /** Revision files of a skill, newest first (timestamp names sort chronologically); empty when there are none. */

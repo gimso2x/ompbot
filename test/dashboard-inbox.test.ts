@@ -64,6 +64,7 @@ const task = (taskId: string, extra: Partial<TaskInfo>): TaskInfo => ({
 const SNAPSHOT: DashboardSnapshot = {
 	generatedAt: "2026-11-04T10:00:00+09:00",
 	daemon: { ok: false, error: "no daemon" },
+	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	turns: {
 		ok: true,
 		items: [
@@ -82,6 +83,34 @@ const SNAPSHOT: DashboardSnapshot = {
 				blocksRestart: false,
 				topLevel: false,
 				slash: false,
+			},
+		],
+		threads: [
+			{
+				originKey: "slack/dm/U1",
+				threadRef: "D1:1.0",
+				kind: "message",
+				title: "인박스 셸 손봐 줘",
+				column: "working",
+				latest: {
+					inboundId: 7,
+					state: "dispatched",
+					createdAt: "2026-11-04T09:50:00+09:00",
+					preview: "인박스 셸 손봐 줘",
+					ageMs: 600_000,
+					silentMs: 30_000,
+					stalled: false,
+					waitReason: null,
+				},
+				turnCount: 1,
+				openCount: 1,
+				runCount: 1,
+				pendingCount: 0,
+				stalledCount: 0,
+				updatedAt: "2026-11-04T09:59:30+09:00",
+				recent: [
+					{ inboundId: 7, state: "dispatched", createdAt: "2026-11-04T09:50:00+09:00", preview: "인박스 셸 손봐 줘" },
+				],
 			},
 		],
 	},
@@ -172,6 +201,7 @@ const SNAPSHOT: DashboardSnapshot = {
 	},
 	gates: { ok: true, items: [] },
 	backup: { ok: true, offsite: null },
+	jobs: { ok: true, items: [] },
 };
 
 /** The rendered markup only: the inline script ships the renderers' source, templates included. */
@@ -239,7 +269,7 @@ describe("dashboard inbox", () => {
 		const nav = /<nav class="sidenav"[^>]*>([\s\S]*?)<\/nav>/.exec(html)?.[1] ?? "";
 		for (const [view, label, count] of [
 			["inbox", "인박스", 3],
-			["turns", "진행 중 턴", 1],
+			["turns", "턴", 1],
 			["lanes", "레인", 0],
 			["approvals", "승인 대기", 1],
 			["monitors", "모니터", 0],

@@ -2,7 +2,7 @@ import { type DriverFactory, openOriginSession, sessionToResume } from "../core/
 import { isTurnPromptFor, promptTextOf } from "../core/types";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
-import { turnAnswer } from "../omp/answers";
+import { closingAnswer, turnAnswerParts } from "../omp/answers";
 import { entryText, type OmpEntry, type OmpSessionDriver } from "../omp/driver";
 import type { InboundRow, Store } from "../store/db";
 
@@ -22,11 +22,11 @@ export interface RecoveryResult {
 }
 
 /**
- * Answer of a finished turn after the prompt's user entry, or undefined when the turn did not finish (its last message
- * is not an assistant stop). Same rule as the live mailbox: every stop-ended answer of the turn, or only the last text
- * for a monitor origin.
+ * Answer parts of a finished turn after the prompt's user entry, or undefined when the turn did not finish (its last
+ * message is not an assistant stop) or has no answer text. Same rule as the live mailbox: every stop-ended answer of
+ * the turn, or only the last text for a monitor origin.
  */
-function finalAnswer(entries: readonly OmpEntry[], promptText: string, lastOnly: boolean): string | undefined {
+function finalAnswerParts(entries: readonly OmpEntry[], promptText: string, lastOnly: boolean): string[] | undefined {
 	const promptAt = entries.findIndex(
 		(entry) =>
 			entry.type === "message" && entry.message?.role === "user" && isTurnPromptFor(entryText(entry), promptText),
@@ -37,9 +37,10 @@ function finalAnswer(entries: readonly OmpEntry[], promptText: string, lastOnly:
 	if (last?.message?.role !== "assistant" || last.message.stopReason !== "stop") return undefined;
 	if (lastOnly) {
 		const text = entryText(last);
-		return text === "" ? undefined : text;
+		return text === "" ? undefined : [text];
 	}
-	return turnAnswer(turn);
+	const parts = turnAnswerParts(turn);
+	return parts.length === 0 ? undefined : parts;
 }
 
 /**
@@ -84,27 +85,34 @@ export async function recoverDispatched(deps: RecoveryDeps): Promise<RecoveryRes
 				const lead = group[0];
 				if (!lead) continue;
 				const opRef = lead.opRef ?? `row:${lead.platformMessageId}`;
-				let text: string | undefined;
+				let parts: string[] | undefined;
 				const cursor = (deps.cursorOf ?? ((row) => row.entryCursor))(lead);
+				const monitor = originKey.startsWith(MONITOR_ORIGIN_PREFIX);
 				if (driver && cursor) {
 					try {
-						text = finalAnswer(
-							(await driver.entriesSince(cursor)).entries,
-							promptTextOf(lead.textRef),
-							originKey.startsWith(MONITOR_ORIGIN_PREFIX),
-						);
+						parts = finalAnswerParts((await driver.entriesSince(cursor)).entries, promptTextOf(lead.textRef), monitor);
 					} catch (error) {
 						log.warn("recovery_cursor_failed", { origin: originKey, id: lead.platformMessageId, error: String(error) });
 					}
 				} else if (openError !== undefined) {
 					log.warn("recovery_open_failed", { origin: originKey, error: String(openError) });
 				}
-				if (text === undefined) {
+				if (parts === undefined) {
 					store.recordTurnFailure({ originKey, opRef, threadRef: lead.threadRef, notice: INTERRUPTED_NOTICE });
 					result.interrupted += 1;
 					log.info("recovery_interrupted", { origin: originKey, id: lead.platformMessageId, opRef });
 				} else {
-					store.recordAnswer({ originKey, opRef, threadRef: lead.threadRef, parts: [text] });
+					// Like the live turn end: what the dead process already sent as interim deliveries is not sent again.
+					const answer = monitor
+						? { body: parts.join("\n\n"), whole: parts.join("\n\n") }
+						: closingAnswer(parts, store.interimBodies(originKey, opRef));
+					store.recordAnswer({
+						originKey,
+						opRef,
+						threadRef: lead.threadRef,
+						parts: [answer.body],
+						answer: answer.whole,
+					});
 					result.answered += 1;
 					log.info("recovery_answered", { origin: originKey, id: lead.platformMessageId, opRef });
 				}

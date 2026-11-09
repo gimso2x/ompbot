@@ -174,7 +174,10 @@ describe("inject", () => {
 			text: "summarize <this> & that",
 			quoted,
 		});
-		expect(transport.posts((text) => text === `🧪 inject ${nonce}`)).toHaveLength(1);
+		// The marker shows the owner what was injected: the first line, Slack-escaped.
+		expect(transport.posts((text) => text === `🧪 inject ${nonce}\n> summarize &lt;this&gt; &amp; that`)).toHaveLength(
+			1,
+		);
 		const text = daemon.store.getInbound(threadRef)?.textRef ?? "";
 		const fence = /<<<quoted-([0-9a-f]{16})>>>/.exec(text)?.[1];
 		expect(fence).toBeDefined();
@@ -237,6 +240,123 @@ describe("sweep heartbeat", () => {
 		expect(beat?.ts.getTime()).toBeGreaterThan(0);
 		expect(beat?.loopMs).toBeGreaterThanOrEqual(0);
 		expect(daemon.status().openGates.map((gate) => gate.name)).toEqual(["backup_age"]); // sweep_stalled closed
+	});
+
+	test("a sweep step that throws does not reject the sweep: sweep_failed is logged and the heartbeat is not rewritten", async () => {
+		const lines: string[] = [];
+		const daemon = new Daemon({
+			config: home.config,
+			slack: new SlackChannel(new WaitingTransport()),
+			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: BOOT_ID,
+			sweepMs: 3_600_000, // sweeps are driven by the test
+			gateSweepMs: 0,
+			taskSweepMs: 0,
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		daemons.push(daemon);
+		await daemon.start();
+		const before = readSweepHeartbeat(home.dir);
+		expect(before).toBeDefined(); // the boot beat
+
+		daemon.store.close(); // every ledger step outside the per-step guards now throws
+		await expect(daemon.sweep()).resolves.toBeUndefined();
+		expect(lines.filter((line) => line.includes("level=error") && line.includes("event=sweep_failed"))).toHaveLength(1);
+		// A failed sweep is not a finished one: the stamp keeps aging, so a sweep that keeps failing opens sweep_stalled.
+		expect(readSweepHeartbeat(home.dir)).toEqual(before);
+	});
+
+	/** Resolves with the sweep, or rejects once `ms` passes — the bound, not a sleep the result depends on. */
+	function sweepWithin(daemon: Daemon, ms: number): Promise<void> {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => reject(new Error(`sweep did not finish within ${ms}ms`)), ms);
+		daemon
+			.sweep()
+			.then(resolve, reject)
+			.finally(() => clearTimeout(timer));
+		return promise;
+	}
+
+	test("a lane verdict that never settles does not hold the sweep: gates and the heartbeat still run", async () => {
+		const now = { t: Date.now() };
+		const verify = Promise.withResolvers<{ ok: false; reasons: string[] }>();
+		let verifyCalls = 0;
+		const daemon = new Daemon({
+			config: home.config,
+			slack: new SlackChannel(new WaitingTransport()),
+			log: createLogger({ sink: () => undefined, clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: BOOT_ID,
+			clock: { now: () => now.t },
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+			verifyClaim: () => {
+				verifyCalls += 1;
+				return verify.promise;
+			},
+		});
+		daemons.push(daemon);
+		await daemon.start();
+		daemon.store.insertLane({
+			name: "stuck",
+			title: "stuck lane",
+			threadRef: "C1:1.0",
+			originKey: "ompbot/work/stuck",
+			cwd: home.dir,
+			sessionDir: join(home.dir, "sessions", "stuck"),
+			meta: {
+				startedAt: 0,
+				lastProgressAt: 0,
+				steerSeq: 0,
+				claim: { repo: home.dir, commit: "HEAD", summary: "s", claimedAt: 0 },
+			},
+		});
+		daemon.store.transitionLane("stuck", "done-claimed", { event: "claim" }, {});
+		now.t += 60_000;
+		await sweepWithin(daemon, 2_000);
+		expect(verifyCalls).toBe(1);
+		expect(readSweepHeartbeat(home.dir)?.ts.getTime()).toBe(now.t);
+		// The verdict is still pending: a second sweep beats again without starting another tick.
+		now.t += 60_000;
+		await sweepWithin(daemon, 2_000);
+		expect(verifyCalls).toBe(1);
+		expect(readSweepHeartbeat(home.dir)?.ts.getTime()).toBe(now.t);
+		verify.resolve({ ok: false, reasons: ["released"] });
+	});
+
+	test("a mailbox whose idle stop never finishes does not hold the sweep", async () => {
+		const now = { t: Date.now() };
+		const release = Promise.withResolvers<void>();
+		let stops = 0;
+		class StuckStopDriver extends FakeOmpDriver {
+			override async stop(): Promise<void> {
+				stops += 1;
+				await release.promise;
+				await super.stop();
+			}
+		}
+		const transport = new WaitingTransport();
+		const daemon = new Daemon({
+			config: { ...home.config, idleTimeoutMinutes: 1 },
+			slack: new SlackChannel(transport),
+			log: createLogger({ sink: () => undefined, clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: BOOT_ID,
+			clock: { now: () => now.t },
+			driverFactory: (_origin, sessionDir) => new StuckStopDriver({ sessionDir, store: sessions }),
+		});
+		daemons.push(daemon);
+		await daemon.start();
+		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "warm" });
+		await transport.waitForPosts(echoes("warm"));
+		now.t += 120_000;
+		try {
+			await sweepWithin(daemon, 2_000);
+			expect(stops).toBe(1);
+			expect(readSweepHeartbeat(home.dir)?.ts.getTime()).toBe(now.t);
+		} finally {
+			release.resolve();
+		}
 	});
 });
 
@@ -507,9 +627,9 @@ class FakeClock {
 }
 
 /** Background dispatches log their outcome; the log sink is the deterministic "the drain ran" signal. */
-async function untilLog(lines: string[], needle: string): Promise<void> {
+async function untilLog(lines: string[], needle: string, count = 1): Promise<void> {
 	const deadline = Date.now() + 5_000;
-	while (!lines.some((line) => line.includes(needle))) {
+	while (lines.filter((line) => line.includes(needle)).length < count) {
 		if (Date.now() > deadline) throw new Error(`log line never appeared: ${needle}`);
 		await new Promise<void>((resolve) => setTimeout(resolve, 5));
 	}
@@ -575,11 +695,12 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 
 		// Two failed sweep retries stay quiet; the third alerts the owner once, in the owner DM.
 		const sign = String(new OmpDriverError("rpc_error", "abort wedged"));
+		// The retry runs in the background of the sweep: wait for each one's outcome before the next sweep.
 		for (let i = 0; i < PENDING_ALERT_AFTER - 1; i++) {
 			clock.advance(61_000);
 			await daemon.sweep();
+			await untilLog(lines, "event=pending_retry_failed", i + 1);
 		}
-		expect(lines.some((line) => line.includes("event=pending_retry_failed"))).toBe(true);
 		expect(transport.posts((text) => text.includes("보내지 못하고"))).toHaveLength(0);
 		const alerted = transport.waitForPosts((text) => text.includes("보내지 못하고"));
 		clock.advance(61_000);

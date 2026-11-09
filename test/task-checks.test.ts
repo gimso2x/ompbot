@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
@@ -12,6 +12,7 @@ import { acceptanceItems, docsDirOf, parseSpec, renderProgress, renderSpec } fro
 import { evaluateTask, type TaskCheckCache } from "../src/tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
+import { formatReachedNotice } from "../src/tasks/notify";
 import { TaskSweeper } from "../src/tasks/sweeper";
 
 const T0 = Date.parse("2026-11-04T01:00:00Z");
@@ -28,7 +29,7 @@ interface Task {
 }
 
 /** A registered task whose three documents are complete: every AC checked with `test:` evidence. */
-function task(acceptance: string[]): Task {
+function task(acceptance: string[], repo = "/r/repo"): Task {
 	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => T0 } });
 	const row = ledger.register({
 		title: "check",
@@ -36,7 +37,7 @@ function task(acceptance: string[]): Task {
 		originKey: "slack/ch/C1/t/100.1",
 		threadRef: "C1:100.1",
 		host: null,
-		repo: "/r/repo",
+		repo,
 		acceptance: acceptanceItems(acceptance),
 	});
 	const meta = {
@@ -77,6 +78,7 @@ interface FakeHost {
 	ops: TaskHostOps;
 	runs: { argv: string[]; worktree: string; timeoutMs: number }[];
 	heads: { count: number };
+	diffs: { count: number };
 }
 
 function fakeHost(
@@ -84,10 +86,13 @@ function fakeHost(
 	over: {
 		run?: (argv: string[]) => { code: number | null; output: string; timedOut?: boolean };
 		head?: () => { sha: string; clean: boolean };
+		/** The task branch's diff since its docs commit (default: empty); a string error is a failed read. */
+		diff?: { ok: true; value: string } | { ok: false; error: string };
 	} = {},
 ): FakeHost {
 	const runs: FakeHost["runs"] = [];
 	const heads = { count: 0 };
+	const diffs = { count: 0 };
 	const unused = () => {
 		throw new Error("not used");
 	};
@@ -108,18 +113,23 @@ function fakeHost(
 			heads.count += 1;
 			return over.head?.() ?? { sha: HEAD_A, clean: true };
 		},
+		branchDiff: async () => {
+			diffs.count += 1;
+			return over.diff ?? { ok: true, value: "" };
+		},
 	};
-	return { ops, runs, heads };
+	return { ops, runs, heads, diffs };
 }
 
 /** A sweeper over the real `evaluateTask` and `host`; the agent is idle, Slack is a fake. */
-function sweeperFor(t: Task, host: FakeHost): { sweeper: TaskSweeper; transport: FakeSlackTransport } {
+function sweeperFor(t: Task, host: Pick<FakeHost, "ops">): { sweeper: TaskSweeper; transport: FakeSlackTransport } {
 	const transport = new FakeSlackTransport();
 	const sweeper = new TaskSweeper({
 		ledger: t.ledger,
 		evaluate: (row, checks) => evaluateTask(row, host.ops, checks),
 		remind: async () => ({ ok: true }),
 		agentStatus: async () => ({ ok: true, status: "idle" }),
+		readAgent: async () => ({ ok: true, output: "" }),
 		transport: new SlackChannel(transport),
 		ownerUserId: "UOWN",
 		now: () => T0,
@@ -366,5 +376,271 @@ describe("host runCheck / headOf", () => {
 		await expect(
 			createTaskHostOps({ run: answers("", { code: 128, stdout: "fatal: not a git repository" }) }).headOf("/r/wt"),
 		).rejects.toThrow("git rev-parse failed");
+	});
+});
+
+interface GitTask extends Task {
+	ops: TaskHostOps;
+	/** The temp directory holding the repository and its task worktree. */
+	root: string;
+	/** Writes (or with `null` deletes) one file in the worktree and commits it on the task branch. */
+	commit(path: string, content: string | null, message: string): void;
+}
+
+const gitAt =
+	(cwd: string) =>
+	(...args: string[]): string => {
+		const result = Bun.spawnSync(["git", "-C", cwd, ...args]);
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+
+/**
+ * A real task worktree in a temp repository: `main` holds `mainFiles`, the task branch opens with the docs commit
+ * (complete documents: every AC checked with `test:` evidence), as `startTask` leaves it.
+ */
+async function gitTask(mainFiles: Record<string, string> = {}, docsMessage?: string): Promise<GitTask> {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "ompbot-integrity-")));
+	const repo = join(root, "repo");
+	mkdirSync(repo);
+	const git = gitAt(repo);
+	git("init", "-q", "-b", "main");
+	git("config", "user.name", "t");
+	git("config", "user.email", "t@t");
+	const seed = { "README.md": "# repo\n", ...mainFiles };
+	for (const [path, content] of Object.entries(seed)) {
+		mkdirSync(dirname(join(repo, path)), { recursive: true });
+		writeFileSync(join(repo, path), content);
+	}
+	git("add", "--", ...Object.keys(seed));
+	git("commit", "-q", "-m", "init");
+	const t = task(["하나"], repo);
+	const ops = createTaskHostOps({});
+	const { worktree, branch, taskId } = t.row;
+	expect(await ops.createWorktree({ repo, worktree, branch })).toEqual({ ok: true, value: null });
+	for (const [path, content] of Object.entries(t.files)) {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, content);
+	}
+	const wt = gitAt(worktree);
+	if (docsMessage === undefined) expect((await ops.commitDocs({ worktree, taskId })).ok).toBe(true);
+	else {
+		wt("add", "--", `docs/tasks/${taskId}`);
+		wt("commit", "-q", "-m", docsMessage);
+	}
+	const commit = (path: string, content: string | null, message: string) => {
+		if (content === null) wt("rm", "-q", "--", path);
+		else {
+			mkdirSync(dirname(join(worktree, path)), { recursive: true });
+			writeFileSync(join(worktree, path), content);
+			wt("add", "--", path);
+		}
+		wt("commit", "-q", "-m", message);
+	};
+	return { ...t, ops, root, commit };
+}
+
+describe("diff integrity of the task branch", () => {
+	test("AC-1: an it.skip( added to a .test.ts holds the sweep short of the outcome; the commit removing it reaches", async () => {
+		const g = await gitTask();
+		try {
+			g.commit("test/rotate.test.ts", 'it.skip("rotates", () => {});\n', "test: rotate (skipped)");
+			const { sweeper, transport } = sweeperFor(g, g);
+			const held = await sweeper.check(g.row);
+			expect(held.status).toBe("working");
+			expect(held.judgement?.reached).toBe(false);
+			expect(held.judgement?.problems).toContainEqual(
+				expect.stringMatching(/^무결성 skipped_test: test\/rotate\.test\.ts: it\.skip\(/),
+			);
+			expect(posted(transport).some((text) => text.includes("Outcome 도달"))).toBe(false);
+
+			g.commit("test/rotate.test.ts", 'it("rotates", () => {});\n', "test: rotate");
+			const reached = await sweeper.check(g.ledger.require(g.row.taskId));
+			expect(reached.judgement).toMatchObject({ reached: true, problems: [] });
+			expect(reached.status).toBe("review");
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+
+	test("AC-2: TODO markers and stub bodies hold the outcome too, one problem line per refusal", async () => {
+		const t = task(["하나"]);
+		const diff = [
+			"diff --git a/src/rotate.ts b/src/rotate.ts",
+			"--- a/src/rotate.ts",
+			"+++ b/src/rotate.ts",
+			"@@ -1,0 +1,2 @@",
+			"+const size = 10; // TODO pick the real limit",
+			'+export function rotate(): never { throw new Error("not implemented"); }',
+		].join("\n");
+		const judged = await evaluateTask(t.row, fakeHost(t.files, { diff: { ok: true, value: diff } }).ops, cache());
+		expect(judged.ok && judged.judgement).toMatchObject({
+			reached: false,
+			integrityWarnings: [],
+			problems: [
+				"무결성 unfinished_work_marker: src/rotate.ts: const size = 10; // TODO pick the real limit",
+				'무결성 stub_implementation: src/rotate.ts: export function rotate(): never { throw new Error("not implemented"); }',
+			],
+		});
+	});
+
+	test("AC-2: guard deletions and unproven claims do not hold the outcome; the card shows them under 무결성 경고", async () => {
+		const t = task(["하나"]);
+		const dir = docsDirOf(t.row.worktree, t.row.taskId);
+		const files = {
+			...t.files,
+			[`${dir}/outcome.md`]: (t.files[`${dir}/outcome.md`] as string).replace(
+				"바뀌었습니다.",
+				"회전을 고쳤고 모두 통과했습니다.",
+			),
+		};
+		const diff = [
+			"--- a/src/rotate.ts",
+			"+++ b/src/rotate.ts",
+			"@@ -3 +2,0 @@",
+			'-\tif (size < 0) throw new Error("refuse negative size");',
+		].join("\n");
+		const { sweeper, transport } = sweeperFor(t, fakeHost(files, { diff: { ok: true, value: diff } }));
+		const result = await sweeper.check(t.row);
+		expect(result.status).toBe("review");
+		const warnings = [
+			'무결성 guard_deletion_without_adversarial_regression: src/rotate.ts: if (size < 0) throw new Error("refuse negative size");',
+			"무결성 unproven_claim_word: summary: 회전을 고쳤고 모두 통과했습니다.",
+		];
+		expect(result.judgement).toMatchObject({ reached: true, problems: [], integrityWarnings: warnings });
+		const card = posted(transport).find((text) => text.includes("Outcome 도달")) ?? "";
+		const lines = card.split("\n");
+		const head = lines.indexOf("*⚠️ 무결성 경고*");
+		// Right after the summary line, one bullet per warning.
+		expect(lines[head - 1]).toBe("• 회전을 고쳤고 모두 통과했습니다.");
+		expect(lines.slice(head + 1, head + 3)).toEqual(warnings.map((line) => `• ${line}`));
+	});
+
+	test("AC-2: a clean diff leaves the judgement and the card exactly as without the integrity read", async () => {
+		const t = task(["하나"]);
+		const dir = docsDirOf(t.row.worktree, t.row.taskId);
+		const clean = [
+			"--- /dev/null",
+			"+++ b/src/rotate.ts",
+			"@@ -0,0 +1 @@",
+			"+export const rotate = (size: number): number => size;",
+		].join("\n");
+		const host = fakeHost(t.files, { diff: { ok: true, value: clean } });
+		const withDiff = await evaluateTask(t.row, host.ops, cache());
+		expect(host.diffs.count).toBe(1);
+		const without = await checkTask({
+			snapshot: t.row.acceptance,
+			spec: t.files[`${dir}/spec.md`],
+			progress: t.files[`${dir}/PROGRESS.md`],
+			outcome: t.files[`${dir}/outcome.md`],
+			commitCheck: async () => "ok",
+		});
+		expect(withDiff.ok && withDiff.judgement).toEqual(without);
+		const { sweeper, transport } = sweeperFor(t, host);
+		await sweeper.check(t.row);
+		const card = posted(transport).find((text) => text.includes("Outcome 도달")) ?? "";
+		expect(card).toBe(formatReachedNotice(t.row, without, "UOWN").replace("{{mention:UOWN}}", "<@UOWN>"));
+		expect(card).not.toContain("무결성");
+	});
+
+	test("AC-3: the diff starts at the docs commit — a TODO main committed before it is not judged", async () => {
+		const g = await gitTask({ "src/old.ts": "export const old = 1; // TODO from main\n" });
+		try {
+			g.commit("src/rotate.ts", "export const rotate = (size: number): number => size;\n", "feat: rotate");
+			const diff = await g.ops.branchDiff({ worktree: g.row.worktree, branch: g.row.branch, taskId: g.row.taskId });
+			expect(diff.ok).toBe(true);
+			const text = diff.ok ? diff.value : "";
+			expect(text).toContain("+export const rotate");
+			expect(text).not.toContain("TODO from main");
+			expect(text).not.toContain("docs/tasks/");
+			const judged = await evaluateTask(g.row, g.ops, cache());
+			expect(judged.ok && judged.judgement).toMatchObject({ reached: true, problems: [] });
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+
+	test("the integrity diff leaves out the worker's own task documents updated after the docs commit", async () => {
+		const g = await gitTask({});
+		try {
+			g.commit("src/rotate.ts", "export const rotate = (size: number): number => size;\n", "feat: rotate");
+			g.commit(`docs/tasks/${g.row.taskId}/PROGRESS.md`, "status: done\n", "docs(task): progress");
+			const diff = await g.ops.branchDiff({ worktree: g.row.worktree, branch: g.row.branch, taskId: g.row.taskId });
+			const text = diff.ok ? diff.value : "";
+			expect(text).toContain("+export const rotate");
+			expect(text).not.toContain("docs/tasks/");
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+
+	test("AC-3: a diff past the default 64 K cap but under the diff cap is read whole; past the diff cap it is refused", async () => {
+		const g = await gitTask();
+		try {
+			g.commit("src/big.ts", `export const big = "${"x".repeat(70_000)}";\n`, "feat: big");
+			const input = { worktree: g.row.worktree, branch: g.row.branch, taskId: g.row.taskId };
+			const under = await g.ops.branchDiff(input);
+			expect(under.ok).toBe(true);
+			// Read whole through the real process runner, not cut at the default 64 K collector cap.
+			expect(under.ok && under.value.length).toBeGreaterThan(70_000);
+
+			g.commit("src/huge.ts", `export const huge = "${"y".repeat(520_000)}";\n`, "feat: huge");
+			const over = await g.ops.branchDiff(input);
+			expect(over).toEqual({ ok: false, error: "diff too large" });
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+
+	test("AC-3: no docs commit or a failing git defers the integrity check and holds the outcome", async () => {
+		const g = await gitTask({}, "docs: task documents");
+		try {
+			const input = { worktree: g.row.worktree, branch: g.row.branch, taskId: g.row.taskId };
+			expect(await g.ops.branchDiff(input)).toEqual({ ok: false, error: "no_base" });
+			const noBase = await evaluateTask(g.row, g.ops, cache());
+			expect(noBase.ok && noBase.judgement).toMatchObject({
+				reached: false,
+				problems: ["diff를 읽지 못해 무결성 검사를 미룹니다: no_base"],
+			});
+
+			// git answers the base, then fails the diff itself.
+			const failing = createTaskHostOps({
+				run: async (cmd) =>
+					cmd.includes("log")
+						? { code: 0, stdout: `${"d".repeat(40)}\n`, timedOut: false }
+						: { code: 128, stdout: "fatal: bad revision", timedOut: false },
+			});
+			expect(await failing.branchDiff(input)).toEqual({ ok: false, error: "git diff failed: fatal: bad revision" });
+			const failed = await evaluateTask(g.row, failing, cache());
+			expect(failed.ok && failed.judgement).toMatchObject({
+				reached: false,
+				problems: ["diff를 읽지 못해 무결성 검사를 미룹니다: git diff failed: fatal: bad revision"],
+			});
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+
+	test("AC-3: evaluateTask without the sweep's checks (CLI, dashboard) never reads the diff", async () => {
+		const g = await gitTask();
+		try {
+			g.commit("test/rotate.test.ts", 'it.skip("rotates", () => {});\n', "test: rotate (skipped)");
+			let reads = 0;
+			const counted: TaskHostOps = {
+				...g.ops,
+				branchDiff: (input) => {
+					reads += 1;
+					return g.ops.branchDiff(input);
+				},
+			};
+			const judged = await evaluateTask(g.row, counted);
+			expect(judged.ok && judged.judgement).toMatchObject({ reached: true, integrityWarnings: [] });
+			expect(reads).toBe(0);
+			const swept = await evaluateTask(g.row, counted, cache());
+			expect(swept.ok && swept.judgement.reached).toBe(false);
+			expect(reads).toBe(1);
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
 	});
 });

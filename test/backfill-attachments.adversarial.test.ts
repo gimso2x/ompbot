@@ -26,6 +26,7 @@ import { downloadAttachmentFile, hostAllowed, sniffImageMime } from "../src/slac
 import {
 	type BackfillDeps,
 	BackfillRunner,
+	type BackfillSummary,
 	type ChannelTarget,
 	type CursorStore,
 	channelCursorKey,
@@ -531,6 +532,77 @@ describe("backfill: threads, quarantine, isolation, runner", () => {
 		expect((await run(false))?.scanned).toBe(0); // still being polled, not quarantined until restart
 	});
 
+	test("[DEFECT] threads of an unreadable channel follow the channel's strikes instead of failing one by one", async () => {
+		const ROOT = t(1_792_700_000);
+		const deps = rig({
+			channels: [
+				{ channel: "C1", kind: "channel" },
+				{ channel: "C2", kind: "channel" },
+			],
+			histories: { C1: [], C2: [] },
+			threads: [
+				{ channel: "C1", rootTs: ROOT },
+				{ channel: "C1", rootTs: t(1_792_700_100) },
+				{ channel: "C2", rootTs: ROOT },
+			],
+			thread: [
+				{ ts: ROOT, text: "root", user: "UOWNER" },
+				{ ts: t(1_792_799_990), text: "reply", user: "UOWNER", thread_ts: ROOT },
+			],
+		});
+		let archived = true;
+		const replyReads: string[] = [];
+		const base = deps.transport;
+		deps.transport = {
+			conversationsHistory: async (args: { channel: string }) => {
+				if (archived && args.channel === "C1") {
+					throw new SlackCallError("definitive", "slack_platform_error:is_archived");
+				}
+				return base.conversationsHistory(args as never);
+			},
+			conversationsReplies: async (args: { channel: string; ts: string }) => {
+				replyReads.push(args.channel);
+				return base.conversationsReplies(args as never);
+			},
+		} as unknown as SlackTransport;
+		const state = freshState();
+		const threadOf = (summary: BackfillSummary, channel: string) =>
+			summary.targets.filter((target) => target.key.startsWith(`thr:${channel}:`));
+
+		const first = await runBackfillPass(deps, state);
+		expect(replyReads).toEqual(["C2"]); // the healthy channel's thread is still read
+		expect(threadOf(first, "C1").map((target) => [target.truncated, target.skipped])).toEqual([
+			[true, false],
+			[true, false],
+		]);
+		expect(deps.logLines.filter((line) => /backfill_read_failed target=thr:/.test(line))).toEqual([]);
+
+		await runBackfillPass(deps, state);
+		const quarantined = await runBackfillPass(deps, state);
+		expect(threadOf(quarantined, "C1").every((target) => target.skipped && !target.truncated)).toBe(true);
+		expect(replyReads.filter((channel) => channel === "C1")).toEqual([]);
+
+		archived = false; // re-invited / unarchived: the channel read clears the strikes and its threads come back
+		state.quarantine.clear(); // quarantine lasts until restart; a restart starts with an empty map
+		await runBackfillPass(deps, state);
+		expect(replyReads.filter((channel) => channel === "C1")).toHaveLength(2);
+	});
+
+	test("[DEFECT] a thread whose root was deleted is quarantined after three strikes, not retried every pass", async () => {
+		const deps = rig({ channels: [], threads: [{ channel: "C1", rootTs: t(1_792_700_000) }] });
+		let replyReads = 0;
+		deps.transport = {
+			conversationsReplies: async () => {
+				replyReads += 1;
+				throw new SlackCallError("definitive", "slack_platform_error:thread_not_found");
+			},
+		} as unknown as SlackTransport;
+		const state = freshState();
+		for (let pass = 0; pass < 5; pass++) await runBackfillPass(deps, state);
+		expect(replyReads).toBe(3);
+		expect(deps.logLines.filter((line) => /event=backfill_quarantined target=thr:C1:/.test(line))).toHaveLength(1);
+	});
+
 	test("[DEFECT] a failing notifier on one channel must not abort the pass for the remaining targets", async () => {
 		const deps = rig({
 			channels: [
@@ -631,6 +703,7 @@ async function buildAdapter(opts: { mediaRoot?: string | null } = {}) {
 		confirm: (id) => void store.confirmDelivery(id),
 		fail: (id, error, outcome) =>
 			void (outcome === "definitive" ? store.failDelivery(id, error) : store.markAmbiguous(id, error)),
+		defer: (id, error, retry) => void store.deferDelivery(id, error, retry),
 	};
 	const logs: string[] = [];
 	const mediaRoot = opts.mediaRoot === null ? undefined : (opts.mediaRoot ?? join(dir, "media"));

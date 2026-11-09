@@ -9,7 +9,14 @@ import { resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from ".
 import { parseTaskSpecInput } from "../tasks/docs";
 import { auditContext } from "./audit";
 import { type BoardLinkResolver, boardCardLink, type HerdrBoardConfig } from "./board";
-import { herdrPromptExisting, herdrReadAgent, herdrRemoteStart, OWNER_NAME_PATTERN, runOmpPrint } from "./omp";
+import {
+	herdrAgentExists,
+	herdrPromptExisting,
+	herdrReadAgent,
+	herdrRemoteStart,
+	OWNER_NAME_PATTERN,
+	runOmpPrint,
+} from "./omp";
 
 export interface DispatchToolDeps {
 	originKey: string;
@@ -124,6 +131,14 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 	return herdrOn ? tool : { ...tool, description: SIMPLE_ONLY_DESCRIPTION, parameters: SIMPLE_ONLY_PARAMETERS };
 
 	/**
+	 * The one gate every work-sending branch passes: the handoff risk scan of its brief (no brief → nothing to scan).
+	 * Only a high_risk brief asks the owner; a peer bot having written in the thread asks nothing more (owner, 11-09).
+	 */
+	function gateWork(text: string | undefined, signal: AbortSignal): Promise<{ suffix: string; approved: boolean }> {
+		return text === undefined || text === "" ? Promise.resolve(CLEAR_GATE) : gateHandoff(text, signal);
+	}
+
+	/**
 	 * Handoff risk scan of a brief about to go to a herdr worker or an `omp -p` run. clear/advisory pass (advisory adds
 	 * a result line); high_risk passes only on an `approved` owner card, anything else throws before a worker is touched.
 	 */
@@ -193,7 +208,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			const input = parseTaskSpecInput(params.taskSpec);
 			const briefed = task !== undefined && task !== "";
 			if (input.kind === "resume") {
-				const gate = briefed ? await gateHandoff(task, signal) : CLEAR_GATE;
+				const gate = await gateWork(briefed ? task : undefined, signal);
 				return redact(await resumeTask(taskDeps, { id: input.id, task, host })) + gate.suffix;
 			}
 			// Exclusions and acceptance are forbidding/checking sentences by design; they are not scanned.
@@ -205,7 +220,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				...spec.scope,
 				...(spec.background === undefined ? [] : [spec.background]),
 			];
-			const gate = briefed ? await gateHandoff(brief.join("\n"), signal) : CLEAR_GATE;
+			const gate = await gateWork(briefed ? brief.join("\n") : undefined, signal);
 			const raised = gate.approved && ["L0", "L1", "L2"].includes(spec.risk) ? { ...spec, risk: "L3" as const } : spec;
 			return redact(await startTask(taskDeps, { spec: raised, task, host: host ?? null })) + gate.suffix;
 		}
@@ -232,7 +247,21 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				const summary = taskDeps === undefined ? undefined : await taskSummaryLine(taskDeps, name, host);
 				return `▸ ${host}/${name} 최근 출력:\n${redact(read.output ?? "")}${summary === undefined ? "" : `\n${summary}`}`;
 			}
-			const gate = await gateHandoff(task, signal);
+			const gate = await gateWork(task, signal);
+			// A name the host already runs gets the task as a follow-up, like the local herdr branch.
+			const existing = await herdrAgentExists(name, sshOptions);
+			if (!existing.ok) return `시작 실패: ${existing.error}`;
+			if (existing.exists) {
+				const follow = await herdrPromptExisting(name, task, sshOptions);
+				const check = `진행 확인: ompbot_dispatch {host:"${host}", name:"${name}"}`;
+				if (follow.unconfirmed === true) {
+					deps.log.warn("dispatch_remote_prompt_unconfirmed", { host, agent: name, error: follow.error });
+					return `전달은 했지만 작업 시작이 확인되지 않았습니다(${follow.error?.replace("agent prompt unconfirmed: ", "")}). ${check}${gate.suffix}`;
+				}
+				if (!follow.ok) return `전달 실패: ${follow.error ?? "unknown"}`;
+				deps.log.info("dispatch_remote_prompted", { host, agent: name });
+				return `후속 지시를 ${host}/${name}에 전달했습니다. ${check}${gate.suffix}`;
+			}
 			const start = await herdrRemoteStart({ sshTarget: hostEntry.ssh, name, task, cwd, options: sshOptions });
 			if (!start.ok) return `시작 실패: ${start.error}`;
 			deps.log.info("dispatch_remote_started", { host, agent: name, cwd });
@@ -255,15 +284,20 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				const summary = taskDeps === undefined ? undefined : await taskSummaryLine(taskDeps, name, null);
 				return `▸ ${name} 최근 출력:\n${redact(read.output ?? "")}${summary === undefined ? "" : `\n${summary}`}`;
 			}
-			const gate = await gateHandoff(task, signal);
+			const gate = await gateWork(task, signal);
 			const follow = await herdrPromptExisting(name, task, herdrOptions);
+			const check = `진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}`;
+			if (follow.unconfirmed === true) {
+				deps.log.warn("dispatch_prompt_unconfirmed", { agent: name, error: follow.error });
+				return `전달은 했지만 작업 시작이 확인되지 않았습니다(${follow.error?.replace("agent prompt unconfirmed: ", "")}). ${check}${gate.suffix}`;
+			}
 			if (!follow.ok) return `전달 실패: ${follow.error ?? "unknown"}`;
 			deps.log.info("dispatch_prompted", { agent: name });
-			return `후속 지시를 ${name}에 전달했습니다. 진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}${gate.suffix}`;
+			return `후속 지시를 ${name}에 전달했습니다. ${check}${gate.suffix}`;
 		}
 
 		if (task === undefined || task === "") throw new Error("task is required");
-		const gate = await gateHandoff(task, signal);
+		const gate = await gateWork(task, signal);
 		deps.log.info("dispatch_simple", { origin: deps.originKey });
 		const result = await runOmpPrint({
 			task,

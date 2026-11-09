@@ -40,9 +40,11 @@ export type DrainWaitResult =
 export async function waitForDrain(options: DrainWaitOptions): Promise<DrainWaitResult> {
 	const now = options.now ?? Date.now;
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+	let accepted = false;
 	try {
 		const deadline = now() + options.timeoutMin * 60_000;
 		let state = await options.call("drain");
+		accepted = true;
 		options.onStarted?.(state);
 		for (;;) {
 			if (!state.draining) return { ok: false, reason: "cancelled_elsewhere", counts: state };
@@ -55,7 +57,17 @@ export async function waitForDrain(options: DrainWaitOptions): Promise<DrainWait
 			state = await options.call("drain_status");
 		}
 	} catch (error) {
-		return { ok: false, reason: "unreachable", error: error instanceof Error ? error.message : String(error) };
+		const message = error instanceof Error ? error.message : String(error);
+		// The daemon has no drain expiry: a drain it accepted must not outlive this wait, or new turns stay held.
+		if (!accepted) return { ok: false, reason: "unreachable", error: message };
+		let cancel: string;
+		try {
+			await options.call("drain_cancel");
+			cancel = "drain cancelled";
+		} catch (cancelError) {
+			cancel = `drain cancel failed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`;
+		}
+		return { ok: false, reason: "unreachable", error: `${message}; ${cancel}` };
 	}
 }
 

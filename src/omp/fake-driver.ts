@@ -64,6 +64,12 @@ export interface FakeOmpDriverOptions {
 	 * reminder -> toolUse -> toolResult -> stop answer. `onFinal.text` is the last assistant text, like real omp.
 	 */
 	script?: (prompt: string, steers: readonly string[]) => readonly FakeTurnMessage[];
+	/**
+	 * Like real omp, emit `{ type: "message_end", message }` for every `script` message while the turn runs: the
+	 * messages are appended and emitted right after the turn's start events, before a held turn waits for `release()`
+	 * (the script then sees no steers). `untilScripted()` resolves once they all went out.
+	 */
+	messageEvents?: boolean;
 }
 
 /** One message of a scripted turn (`FakeOmpDriverOptions.script`). */
@@ -72,6 +78,8 @@ export interface FakeTurnMessage {
 	text: string;
 	/** Assistant messages only: `"stop"` ends the turn's answer, `"toolUse"` precedes a tool call. */
 	stopReason?: "stop" | "toolUse";
+	/** Assistant messages only: names of the tools it calls, as omp `{ type: "toolCall", name }` content blocks. */
+	toolCalls?: readonly string[];
 }
 
 export const FAKE_MODELS = ["fake/alpha", "fake/beta"] as const;
@@ -83,6 +91,8 @@ interface ActiveTurn {
 	steers: string[];
 	release: () => void;
 	abort: () => void;
+	/** Resolved once a `messageEvents` turn emitted its scripted messages. */
+	scripted: PromiseWithResolvers<void>;
 }
 
 /**
@@ -159,6 +169,7 @@ export class FakeOmpDriver implements OmpSessionDriver {
 			steers: [],
 			release: () => gate.resolve("release"),
 			abort: () => gate.resolve("abort"),
+			scripted: Promise.withResolvers<void>(),
 		};
 		this.#turn = turn;
 		void (async () => {
@@ -181,6 +192,13 @@ export class FakeOmpDriver implements OmpSessionDriver {
 					...(call.args === undefined ? {} : { args: call.args }),
 				});
 			}
+			let last: string | undefined;
+			if (this.#options.script && this.#options.messageEvents) {
+				// Same macrotask hop as the tool calls: the mailbox records the turn after `prompt()` resolves.
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				last = this.#playScript(this.#options.script(text, turn.steers));
+				turn.scripted.resolve();
+			}
 			const outcome = this.#options.holdTurns ? await gate.promise : "release";
 			if (this.#turn !== turn) return;
 			this.#turn = undefined;
@@ -190,17 +208,7 @@ export class FakeOmpDriver implements OmpSessionDriver {
 				return;
 			}
 			if (this.#options.script) {
-				let last = "";
-				for (const step of this.#options.script(text, turn.steers)) {
-					const content = [{ type: "text", text: step.text }];
-					this.#append({
-						type: "message",
-						message: step.stopReason
-							? { role: step.role, content, stopReason: step.stopReason }
-							: { role: step.role, content },
-					});
-					if (step.role === "assistant" && step.text !== "") last = step.text;
-				}
+				last ??= this.#playScript(this.#options.script(text, turn.steers));
 				this.#emitFinal({ opRef, status: "completed", text: last });
 				return;
 			}
@@ -231,9 +239,34 @@ export class FakeOmpDriver implements OmpSessionDriver {
 		this.#turn?.abort();
 	}
 
+	/** Appends the scripted messages (emitting `message_end` with `messageEvents`); returns the last assistant text. */
+	#playScript(steps: readonly FakeTurnMessage[]): string {
+		let last = "";
+		for (const step of steps) {
+			const content = [
+				{ type: "text", text: step.text },
+				...(step.toolCalls ?? []).map((name, i) => ({ type: "toolCall", id: `call-${i}`, name, arguments: {} })),
+			];
+			const message = step.stopReason
+				? { role: step.role, content, stopReason: step.stopReason }
+				: { role: step.role, content };
+			this.#append({ type: "message", message });
+			if (this.#options.messageEvents) this.#emit({ type: "message_end", message });
+			if (step.role === "assistant" && step.text !== "") last = step.text;
+		}
+		return last;
+	}
+
 	/** Test control: finish a held turn normally. */
 	release(): void {
 		this.#turn?.release();
+	}
+
+	/** Test control: resolves once the running `messageEvents` turn emitted all its scripted messages. */
+	untilScripted(): Promise<void> {
+		const turn = this.#turn;
+		if (!turn) return Promise.reject(new OmpDriverError("rpc_error", "no running turn"));
+		return turn.scripted.promise;
 	}
 
 	async newSession(): Promise<{ cancelled: boolean }> {

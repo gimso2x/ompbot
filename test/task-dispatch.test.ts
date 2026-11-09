@@ -76,6 +76,9 @@ function fakeHost(): FakeHost {
 		async headOf() {
 			throw new Error("dispatch never runs checks");
 		},
+		async branchDiff() {
+			throw new Error("dispatch never reads the branch diff");
+		},
 	};
 	return host;
 }
@@ -88,6 +91,8 @@ interface Harness {
 	herdr: string[][];
 	agents: Set<string>;
 	failAgentStart: { value: boolean };
+	/** Follow-up prompts (`--wait`) end in herdr's `agent_prompt_stalled`: delivered, start unseen. */
+	promptStalled: { value: boolean };
 	approvals: Array<{ summary: string; detail: ApprovalDetail }>;
 }
 
@@ -98,6 +103,8 @@ function harness(
 		board?: HerdrBoardConfig;
 		/** What the owner's approval card answers; absent → the tool has no approver. */
 		approval?: ApprovalResult;
+		/** Free space the start sees under the repo's parent; absent → the real filesystem (`/r` does not exist). */
+		disk?: { freeBytes: number; totalBytes: number; asked: string[] };
 	} = {},
 ): Harness {
 	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => NOW } });
@@ -107,6 +114,7 @@ function harness(
 	const herdr: string[][] = [];
 	const agents = new Set<string>();
 	const failAgentStart = { value: false };
+	const promptStalled = { value: false };
 	const run: ProcessRunner = async (cmd) => {
 		// Over ssh every remote word is single-quoted (or a bare `~`); record the words the remote shell would see.
 		const sshAt = cmd[0] === "ssh" ? cmd.indexOf("--") : -1;
@@ -123,6 +131,10 @@ function harness(
 					result: { workspace: { workspace_id: "W1" }, tab: { tab_id: "T1" }, root_pane: { pane_id: "P1" } },
 				}),
 			);
+		}
+		if (args[1] === "agent" && args[2] === "prompt" && args.includes("--wait") && promptStalled.value) {
+			const stderr = JSON.stringify({ error: { code: "agent_prompt_stalled", message: "no start seen" } });
+			return { code: 1, stdout: "", stderr, timedOut: false };
 		}
 		if (args[1] === "agent" && args[2] === "start") {
 			if (failAgentStart.value) return { code: 1, stdout: "boom", timedOut: false };
@@ -158,10 +170,19 @@ function harness(
 						port: new SlackChannel(transport),
 						now: () => NOW,
 						hostOps: () => host,
+						...(options.disk === undefined
+							? {}
+							: {
+									diskHeadroom: (path: string) => {
+										const disk = options.disk as NonNullable<typeof options.disk>;
+										disk.asked.push(path);
+										return { path, freeBytes: disk.freeBytes, totalBytes: disk.totalBytes };
+									},
+								}),
 					},
 				}),
 	});
-	return { tool, ledger, transport, host, herdr, agents, failAgentStart, approvals };
+	return { tool, ledger, transport, host, herdr, agents, failAgentStart, promptStalled, approvals };
 }
 
 const call = (h: Harness, params: Record<string, unknown>) =>
@@ -259,6 +280,34 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		} finally {
 			server.stop(true);
 		}
+	});
+
+	test("AC-7: a local start on a low disk is refused before anything is registered, created or started", async () => {
+		const GIB = 1024 ** 3;
+		const disk = { freeBytes: 4 * GIB, totalBytes: 100 * GIB, asked: [] as string[] };
+		const h = harness({ disk });
+		const out = await call(h, { taskSpec: GOOD_SPEC, task: "회전을 구현해" });
+		expect(out).toBe("시작 거부: 디스크 여유 부족 (/r free_gib=4.0, 기준 5GiB·10%)");
+		expect(disk.asked).toEqual(["/r"]);
+		expect(h.ledger.list()).toEqual([]);
+		expect([h.host.calls, [...h.host.files.keys()], h.herdr]).toEqual([[], [], []]);
+		expect(h.transport.calls).toEqual([]);
+
+		// 8 GiB of 50 is 16%: neither under 5 GiB nor under 10%, so the start goes on.
+		const roomy = harness({ disk: { freeBytes: 8 * GIB, totalBytes: 50 * GIB, asked: [] } });
+		expect(await call(roomy, { taskSpec: GOOD_SPEC, task: "회전을 구현해" })).toContain(
+			"T-20261026-01 등록·시작했습니다",
+		);
+	});
+
+	test("AC-7: a remote host start never looks at the local disk", async () => {
+		const disk = { freeBytes: 1024, totalBytes: 100 * 1024 ** 3, asked: [] as string[] };
+		const h = harness({ disk });
+		expect(await call(h, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" })).toContain(
+			"T-20261026-01 등록·시작했습니다",
+		);
+		expect(disk.asked).toEqual([]);
+		expect(h.ledger.require("T-20261026-01").host).toBe("wsl");
 	});
 
 	test("host=wsl starts the agent through ssh herdr and records the host", async () => {
@@ -366,6 +415,27 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		const reactions = h.transport.calls.filter((c) => c.method === "addReaction" || c.method === "removeReaction");
 		expect(reactions.at(-1)).toMatchObject({ method: "addReaction", name: "hourglass_flowing_sand" });
 		expect(reactions.some((c) => c.method === "removeReaction" && c.name === "mag")).toBe(true);
+	});
+
+	test("an unconfirmed resume prompt still resumes, saying the start was not seen", async () => {
+		const h = await started();
+		h.ledger.transition("T-20261026-01", "review", "bot");
+		h.promptStalled.value = true;
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" }, task: "리뷰 반영해" });
+		expect(out).toContain("살아 있는 에이전트에 재개 프롬프트를 보냈습니다(시작 확인 안 됨) (review → working)");
+		expect(h.ledger.require("T-20261026-01").status).toBe("working");
+	});
+
+	test("an unconfirmed follow-up (local or remote) says it was delivered without a seen start", async () => {
+		const h = harness();
+		h.promptStalled.value = true;
+		expect(await call(h, { mode: "herdr", name: "plain", task: "후속" })).toBe(
+			'전달은 했지만 작업 시작이 확인되지 않았습니다(agent_prompt_stalled). 진행 확인: ompbot_dispatch {mode:"herdr", name:"plain"}',
+		);
+		h.agents.add("remote1");
+		expect(await call(h, { host: "wsl", name: "remote1", task: "후속" })).toBe(
+			'전달은 했지만 작업 시작이 확인되지 않았습니다(agent_prompt_stalled). 진행 확인: ompbot_dispatch {host:"wsl", name:"remote1"}',
+		);
 	});
 
 	test("a missing agent is started again in the same worktree", async () => {

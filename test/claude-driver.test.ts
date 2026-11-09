@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { turnAnswer } from "../src/omp/answers";
+import { turnAnswerParts } from "../src/omp/answers";
 import { type ClaudeApprovalHook, ClaudeOmpDriver } from "../src/omp/claude-driver";
 import { OmpDriverError, type OmpFinal } from "../src/omp/driver";
 
@@ -175,7 +175,7 @@ test("fresh session: prompt, final, entries and answers", async () => {
 	const all = await driver.entriesSince();
 	expect(all.entries.map((e) => e.message?.role)).toEqual(["user", "assistant"]);
 	expect(all.entries[1]?.message?.stopReason).toBe("stop");
-	expect(turnAnswer(all.entries)).toBe("FAKE-REPLY");
+	expect(turnAnswerParts(all.entries)).toEqual(["FAKE-REPLY"]);
 	const leaf = await driver.leafId();
 	expect(leaf).toBe(all.leafId);
 	expect((await driver.entriesSince(leaf ?? undefined)).entries).toEqual([]);
@@ -316,6 +316,24 @@ test("dangerous bash escalates to the approval hook", async () => {
 	expect(final.text).toBe("TOOL-DONE");
 	expect(seen).toEqual([{ toolName: "Bash", command: "git push --force origin main" }]);
 	expect(permissionDecision(harness.readLog())).toMatchObject({ behavior: "allow" });
+	await driver.stop();
+});
+
+test("a throwing approval hook still answers the CLI with a deny", async () => {
+	const harness = makeHarness({
+		approval: async () => {
+			throw new Error("slack 429");
+		},
+	});
+	const driver = harness.driver;
+	await driver.start();
+	await driver.openSession();
+	const done = nextFinal(driver);
+	await driver.prompt("@tool git push --force origin main");
+	const final = await done;
+	expect(final.text).toBe("TOOL-DENIED");
+	expect(permissionResponses(harness.readLog())).toHaveLength(1);
+	expect(permissionDecision(harness.readLog())).toMatchObject({ behavior: "deny" });
 	await driver.stop();
 });
 

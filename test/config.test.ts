@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, loadConfig, readSlackTokens } from "../src/config";
+import { LIVE_FIELDS } from "../src/daemon/reload";
 
 let home: string;
 
@@ -186,6 +187,27 @@ describe("loadConfig", () => {
 		["mentionFreeChannels", baseConfig({ mentionFreeChannels: ["C0123456789", ""] })],
 		["recallEnabled", baseConfig({ recallEnabled: "false" })],
 		["recallEnabled", baseConfig({ recallEnabled: 0 })],
+		["peerBots", baseConfig({ peerBots: { userId: "UPEER00001", name: "떡" } })],
+		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "upeer00001", name: "떡" }] })],
+		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "UPEER", name: "떡" }] })],
+		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "UOWNER0", name: "떡" }] })],
+		["peerBots.0.name", baseConfig({ peerBots: [{ userId: "UPEER00001", name: "" }] })],
+		["peerBots.0.name", baseConfig({ peerBots: [{ userId: "UPEER00001", name: "x".repeat(33) }] })],
+		[
+			"peerBots.1.token",
+			baseConfig({
+				peerBots: [
+					{ userId: "UPEER00001", name: "a" },
+					{ userId: "UPEER00002", name: "b", token: "x" },
+				],
+			}),
+		],
+		["requireMention", baseConfig({ requireMention: "true" })],
+		["peerHopLimit", baseConfig({ peerHopLimit: 3 })],
+		["peerHopLimit.turns", baseConfig({ peerHopLimit: { turns: 0, windowMinutes: 30 } })],
+		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 1.5 } })],
+		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3 } })],
+		["peerHopLimit.extra", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 30, extra: 1 } })],
 	])("invalid field %s is reported by name", (field, cfg) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
@@ -211,6 +233,25 @@ describe("loadConfig", () => {
 		expect(loadConfig(home).recallEnabled).toBe(false);
 		writeConfig(baseConfig({ recallEnabled: true }));
 		expect(loadConfig(home).recallEnabled).toBe(true);
+	});
+
+	test("peerBots, requireMention and peerHopLimit are optional and read as written", () => {
+		const loaded = loadConfig(home);
+		expect(loaded.peerBots).toBeUndefined();
+		expect(loaded.requireMention).toBeUndefined();
+		expect(loaded.peerHopLimit).toBeUndefined();
+		writeConfig(
+			baseConfig({
+				peerBots: [{ userId: "U0TESTPEER1", name: "떡" }],
+				requireMention: true,
+				peerHopLimit: { turns: 2, windowMinutes: 10 },
+			}),
+		);
+		expect(loadConfig(home)).toMatchObject({
+			peerBots: [{ userId: "U0TESTPEER1", name: "떡" }],
+			requireMention: true,
+			peerHopLimit: { turns: 2, windowMinutes: 10 },
+		});
 	});
 
 	test("mentionFreeChannels is optional and accepts only channel ids", () => {
@@ -274,6 +315,42 @@ describe("herdr", () => {
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
+	});
+});
+
+describe("taskAutoLand", () => {
+	const withHerdr = (taskAutoLand: unknown) => baseConfig({ herdr: {}, taskAutoLand });
+
+	test("AC-5: is optional; repos are kept with their trailing slash dropped, maxRisk when given", () => {
+		writeConfig(baseConfig({ herdr: {} }));
+		expect(loadConfig(home).taskAutoLand).toBeUndefined();
+		writeConfig(withHerdr({ repos: ["/home/owner/work/ompbot/", "/home/owner/work/home-bot"] }));
+		expect(loadConfig(home).taskAutoLand).toEqual({
+			repos: ["/home/owner/work/ompbot", "/home/owner/work/home-bot"],
+		});
+		writeConfig(withHerdr({ repos: ["/srv/repo//"], maxRisk: "L1" }));
+		expect(loadConfig(home).taskAutoLand).toEqual({ repos: ["/srv/repo"], maxRisk: "L1" });
+	});
+
+	test.each([
+		["empty repos", withHerdr({ repos: [] }), "(field=taskAutoLand.repos)"],
+		["repos not an array", withHerdr({ repos: "/srv/repo" }), "(field=taskAutoLand.repos)"],
+		["a relative repo", withHerdr({ repos: ["/srv/a", "work/ompbot"] }), "(field=taskAutoLand.repos.1)"],
+		["a non-string repo", withHerdr({ repos: [7] }), "(field=taskAutoLand.repos.0)"],
+		["maxRisk outside L0~L4", withHerdr({ repos: ["/srv/a"], maxRisk: "L5" }), "(field=taskAutoLand.maxRisk)"],
+		["a lower-case maxRisk", withHerdr({ repos: ["/srv/a"], maxRisk: "l2" }), "(field=taskAutoLand.maxRisk)"],
+		["an undefined key", withHerdr({ repos: ["/srv/a"], hosts: ["wsl"] }), "(field=taskAutoLand.hosts)"],
+		["a non-object", withHerdr(["/srv/a"]), "(field=taskAutoLand)"],
+		["taskAutoLand without herdr", baseConfig({ taskAutoLand: { repos: ["/srv/a"] } }), "(field=herdr)"],
+	])("AC-5: %s is rejected", (_name, cfg, field) => {
+		writeConfig(cfg);
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("AC-5: taskAutoLand is a live field (ompbot reload applies it without a restart)", () => {
+		expect(LIVE_FIELDS).toContain("taskAutoLand");
 	});
 });
 

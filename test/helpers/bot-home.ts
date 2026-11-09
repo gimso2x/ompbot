@@ -61,6 +61,15 @@ export function makeHome(
 	};
 }
 
+/** Whether a message's blocks still carry buttons: an approval card keeps its other blocks after the decision. */
+export function hasButtons(blocks: readonly unknown[] | undefined): boolean {
+	return (
+		blocks?.some(
+			(block) => typeof block === "object" && block !== null && "type" in block && block.type === "actions",
+		) ?? false
+	);
+}
+
 /** FakeSlackTransport whose `waitForPosts` resolves on the post that satisfies it (no polling, bounded timeout). */
 export class WaitingTransport extends FakeSlackTransport {
 	readonly #waiters = new Set<() => void>();

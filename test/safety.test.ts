@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
+import { monitorOrigin } from "../src/monitors/ledger";
 import { buildChildEnv } from "../src/omp/env";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
@@ -23,10 +24,10 @@ import {
 	UPLOAD_SCAN_CARRY_CHARS,
 	UPLOAD_SCAN_CHUNK_BYTES,
 } from "../src/safety/host-tools";
-import { buildFloorsPrompt, floorsArgs, floorsSystemPrompt } from "../src/safety/prompt";
+import { buildFloorsPrompt, floorsArgs, floorsSystemPrompt, WAIT_INTERIM_LINE } from "../src/safety/prompt";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const CHANNEL = "D1";
 const ORIGIN = `slack/dm/${CHANNEL}`;
@@ -44,11 +45,11 @@ class ButtonTransport extends FakeSlackTransport {
 		blocks?: readonly unknown[] | undefined;
 	}): Promise<void> {
 		await super.updateMessage(args);
-		if (args.blocks && args.blocks.length > 0) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
+		if (args.blocks !== undefined && hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
 		else this.#armed.resolve();
 	}
 
-	/** Settles after the final (blocks removed) update of a request. */
+	/** Settles after the final (buttons removed) update of a request. */
 	concluded(): Promise<void> {
 		return this.#armed.promise;
 	}
@@ -83,6 +84,9 @@ function memoryApprovalStore(): ApprovalStore {
 			expiresAt: number;
 			originKey: string | null;
 			replyTs: string | null;
+			summary: string;
+			originThreadRef: string | null;
+			mirrorRef: string | null;
 		}
 	>();
 	return {
@@ -94,9 +98,18 @@ function memoryApprovalStore(): ApprovalStore {
 				expiresAt: input.expiresAt,
 				originKey: input.originKey ?? null,
 				replyTs: null,
+				summary: input.summary,
+				originThreadRef: input.originThreadRef ?? null,
+				mirrorRef: null,
 			});
 		},
 		getApproval: (id) => rows.get(id),
+		setApprovalMirrorRef: (id, mirrorRef) => {
+			const row = rows.get(id);
+			if (row?.status !== "pending") return false;
+			row.mirrorRef = mirrorRef;
+			return true;
+		},
 		replyApproval: (id, replyTs, _text, now) => {
 			const row = rows.get(id);
 			if (row === undefined || row.status !== "pending" || row.expiresAt <= now) return false;
@@ -111,12 +124,19 @@ function memoryApprovalStore(): ApprovalStore {
 			return true;
 		},
 		expirePendingApprovals: (now, due = true) => {
-			const expired: Array<{ approvalId: string; channel: string; messageTs: string }> = [];
+			const expired: ReturnType<ApprovalStore["expirePendingApprovals"]> = [];
 			for (const [id, row] of rows) {
 				if (row.status !== "pending") continue;
 				if (due && row.expiresAt > now) continue;
 				row.status = "expired";
-				expired.push({ approvalId: id, channel: row.channel, messageTs: row.messageTs });
+				expired.push({
+					approvalId: id,
+					channel: row.channel,
+					messageTs: row.messageTs,
+					summary: row.summary,
+					originThreadRef: row.originThreadRef,
+					mirrorRef: row.mirrorRef,
+				});
 			}
 			return expired;
 		},
@@ -166,6 +186,16 @@ describe("floors prompt answer format", () => {
 		}
 	});
 
+	test("chat sessions are told a note next to `wait` reaches the owner right away; monitor sessions are not", () => {
+		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1"]) {
+			expect(buildFloorsPrompt("/s", originKey)).toContain(WAIT_INTERIM_LINE);
+		}
+		for (const originKey of ["monitor/3", monitorOrigin("mabc12345")]) {
+			expect(buildFloorsPrompt("/s", originKey)).not.toContain(WAIT_INTERIM_LINE);
+			expect(floorsSystemPrompt("/s", originKey)).not.toContain(WAIT_INTERIM_LINE);
+		}
+	});
+
 	test("herdr off: no chat prompt mentions herdr; herdr on: byte-identical to base 1ad1bbc", () => {
 		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "herdr-on-base.json"), "utf8")) as {
 			prompts: Record<string, string>;
@@ -184,6 +214,28 @@ describe("floors prompt answer format", () => {
 				base.prompts[originKey] as string,
 			);
 		}
+	});
+
+	test("`ask` is allowed only for chat and lane sessions whose dialogs the owner answers; forbidden elsewhere", () => {
+		const ALLOWED = "may use the `ask` tool";
+		const FORBIDDEN = "never use the `ask` tool";
+		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1", "ompbot/work/lane1"]) {
+			const prompt = buildFloorsPrompt("/s", originKey, false, true);
+			expect(prompt).toContain(ALLOWED);
+			expect(prompt).toContain("추천 선택지(없으면 첫 선택지)가 자동 선택");
+			expect(prompt).not.toContain(FORBIDDEN);
+			// The daemon's omp child of the same origin, with an answerer (run.ts passes `answerDialogsFor(origin)`).
+			expect(floorsArgs("/s", originKey, undefined, undefined, false, true)[1]).toContain(ALLOWED);
+		}
+		for (const originKey of ["monitor/3", "review/skills", undefined]) {
+			const prompt = buildFloorsPrompt("/s", originKey, false, true);
+			expect(prompt).toContain(FORBIDDEN);
+			expect(prompt).not.toContain(ALLOWED);
+		}
+		// The claude driver (run.ts: `floorsSystemPrompt` without an answerer) gets the ban even for a chat origin.
+		const claude = floorsSystemPrompt("/s", "slack/dm/D1", undefined, () => undefined, true);
+		expect(claude).toContain(FORBIDDEN);
+		expect(claude).not.toContain(ALLOWED);
 	});
 
 	test("the send-file guidance names the conversation thread and the mermaid/SVG/HTML push for every origin", () => {
@@ -245,8 +297,61 @@ describe("ApprovalBroker", () => {
 		expect(await result).toBe("approved");
 		// The decision removes the buttons.
 		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		expect(last).toMatchObject({ ts, blocks: [] });
+		expect(last).toMatchObject({ ts });
+		expect(last?.method === "updateMessage" && last.blocks !== undefined && !hasButtons(last.blocks)).toBe(true);
 		expect(broker.pendingCount).toBe(0);
+	});
+
+	test("the card: header, summary, sections as fields and the buttons; after approval header and fields stay with a result line", async () => {
+		const result = broker.ask(CHANNEL, "배포를 진행할까요?", {
+			detail: { action: "git push origin main", why: "릴리스", impact: "운영 반영" },
+		});
+		const { ts, blocks } = await transport.shown.promise;
+		const header = { type: "header", text: { type: "plain_text", text: "🔐 승인 요청", emoji: true } };
+		const summary = { type: "section", text: { type: "mrkdwn", text: "배포를 진행할까요?" } };
+		const fields = {
+			type: "section",
+			fields: [
+				{ type: "mrkdwn", text: "*할 일*\ngit push origin main" },
+				{ type: "mrkdwn", text: "*이유*\n릴리스" },
+				{ type: "mrkdwn", text: "*영향*\n운영 반영" },
+			],
+		};
+		expect(blocks).toEqual([
+			header,
+			summary,
+			fields,
+			{
+				type: "actions",
+				elements: [
+					expect.objectContaining({
+						text: { type: "plain_text", text: "승인" },
+						action_id: approvalActionId("approve", CHANNEL, ts),
+					}),
+					expect.objectContaining({
+						text: { type: "plain_text", text: "거부" },
+						action_id: approvalActionId("deny", CHANNEL, ts),
+					}),
+				],
+			},
+			{ type: "context", elements: [{ type: "mrkdwn", text: expect.stringContaining("거부로 처리됩니다") }] },
+		]);
+		// The notification text is the full card as before; the summary section above carries no `• 라벨:` lines.
+		const cardText =
+			"🔐 승인 요청\n배포를 진행할까요?\n• 할 일: git push origin main\n• 이유: 릴리스\n• 영향: 운영 반영";
+		expect(transport.calls.find((c) => c.method === "updateMessage")).toMatchObject({ ts, text: cardText });
+
+		broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: OWNER });
+		expect(await result).toBe("approved");
+		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
+		const text = last?.method === "updateMessage" ? last.text : "";
+		expect(text.startsWith(`${cardText}\n`)).toBe(true);
+		const resultLine = text.slice(cardText.length + 1);
+		expect(resultLine).toMatch(/^✅ 승인됨 · \d{2}:\d{2}$/);
+		expect(last).toMatchObject({
+			ts,
+			blocks: [header, summary, fields, { type: "context", elements: [{ type: "mrkdwn", text: resultLine }] }],
+		});
 	});
 
 	test("deny resolves as denied", async () => {
@@ -283,7 +388,8 @@ describe("ApprovalBroker", () => {
 
 		expect(await result).toBe("timeout");
 		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		expect(last).toMatchObject({ blocks: [] });
+		expect(last?.method === "updateMessage" && last.blocks !== undefined && !hasButtons(last.blocks)).toBe(true);
+		expect(last?.method === "updateMessage" ? last.text : "").toMatch(/\n⌛ 시간 초과: 거부로 처리됨 · \d{2}:\d{2}$/);
 		expect(timers.callbacks.size).toBe(0);
 	});
 
@@ -349,6 +455,48 @@ describe("ApprovalBroker", () => {
 		);
 		timers.fireAll();
 		await result;
+	});
+
+	test("a gh publish command without `external` still gets the 🌐 title and a leading exposure section", async () => {
+		const result = broker.request(CHANNEL, "업스트림에 버그 이슈 등록", undefined, {
+			action: "gh issue create --repo can1357/oh-my-pi --title 'x' --body-file /tmp/b.md",
+		});
+		await transport.shown.promise;
+		const post = transport.calls.find((c) => c.method === "postMessage");
+		expect(post?.text).toBe(
+			[
+				"🌐 외부 공개 승인 요청",
+				"업스트림에 버그 이슈 등록",
+				"• 🌐 외부 공개: GitHub에 게시합니다. 공개 저장소면 누구나 봅니다(감지: gh issue create)",
+				"• 할 일: gh issue create --repo can1357/oh-my-pi --title 'x' --body-file /tmp/b.md",
+			].join("\n"),
+		);
+		expect(post?.blocks?.[0]).toMatchObject({ type: "header", text: { text: "🌐 외부 공개 승인 요청" } });
+		timers.fireAll();
+		await result;
+	});
+
+	test("an explicit `external` wins over detection; read-only gh and local git stay a plain card", async () => {
+		const explicit = broker.request(CHANNEL, "메일 발송", undefined, {
+			external: "외부 메일 a@example.com",
+			action: "gh pr comment 1 --body hi",
+		});
+		await transport.shown.promise;
+		expect(transport.calls.find((c) => c.method === "postMessage")?.text).toContain(
+			"• 🌐 외부 공개: 외부 메일 a@example.com\n",
+		);
+		timers.fireAll();
+		await explicit;
+		for (const action of ["gh issue view 18559", "gh api repos/a/b/issues", "git push --force origin main"]) {
+			transport = new ButtonTransport();
+			broker = make();
+			const plain = broker.request(CHANNEL, "확인", undefined, { action });
+			await transport.shown.promise;
+			const text = transport.calls.find((c) => c.method === "postMessage")?.text;
+			expect(text?.startsWith("🔐 승인 요청\n"), action).toBe(true);
+			timers.fireAll();
+			await plain;
+		}
 	});
 });
 

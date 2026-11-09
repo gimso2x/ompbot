@@ -737,16 +737,22 @@ describe("collectGates adversarial", () => {
 		db.run("CREATE TABLE deliveries (state TEXT, next_at INTEGER)");
 		db.run("INSERT INTO inbound VALUES ('x', 'dispatched', ?)", [old]);
 		db.close();
-		const byName = Object.fromEntries(collectGates({ homeDir: home, now }).map((g) => [g.name, g.state]));
+		// Host resources injected calm, so only the ledger decides the states below.
+		const calm = { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => undefined };
+		const byName = Object.fromEntries(
+			collectGates({ homeDir: home, now, diskPaths: [], hostLoad: calm }).map((g) => [g.name, g.state]),
+		);
 		expect(byName).toEqual({
 			backup_age: "closed",
-			sweep_stalled: "closed", // no heartbeat stamp: nothing to judge
+			sweep_stalled: "unknown", // no heartbeat stamp: nothing to judge
 			inbound_starved: "open",
 			origin_silent: "closed", // a pre-migration inbound table has no origin_key/created_at columns
 			deliveries_overdue: "closed",
 			lanes_stuck: "closed",
-			slack_disconnected: "closed", // no heartbeat stamp: socket state unknown
+			slack_disconnected: "unknown", // no heartbeat stamp: nothing to judge
 			frozen: "closed",
+			disk_low: "closed", // diskPaths: [] reads statfs=unavailable
+			host_pressure: "closed",
 			monitors_failed: "closed",
 			monitors_stalled: "closed", // no heartbeat stamp: cannot tell a drain from a stall
 			turns_failing: "closed", // a pre-migration deliveries table has no body/created_at columns
@@ -819,17 +825,27 @@ describe("collectGates adversarial", () => {
 		const stale = await cli(["gates"], home);
 		expect(stale.code).toBe(1);
 		const lines = stale.out.trimEnd().split("\n");
-		expect(lines).toHaveLength(12);
-		expect(lines[lines.length - 1]).toMatch(/^gates_done open=1 total=11 opened=backup_age\(hours=3[78]\.\d\)$/);
+		expect(lines).toHaveLength(14);
+		// No heartbeat stamp in this home: the two heartbeat gates are unknown and named on the last line too.
+		expect(lines[lines.length - 1]).toMatch(
+			/^gates_done open=1 unknown=2 total=13 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,slack_disconnected$/,
+		);
 		const json = await cli(["gates", "--json"], home);
 		expect(json.code).toBe(1);
-		const parsed = JSON.parse(json.out) as { open: number; gates: Array<{ name: string; state: string }> };
+		const parsed = JSON.parse(json.out) as {
+			open: number;
+			unknown: number;
+			gates: Array<{ name: string; state: string }>;
+		};
 		expect(parsed.open).toBe(1);
+		expect(parsed.unknown).toBe(2);
 		expect(parsed.gates.map((g) => g.name)).toEqual([
 			"backup_age",
 			"sweep_stalled",
 			"slack_disconnected",
 			"frozen",
+			"disk_low",
+			"host_pressure",
 			"inbound_starved",
 			"origin_silent",
 			"deliveries_overdue",
@@ -842,7 +858,9 @@ describe("collectGates adversarial", () => {
 		writeStampAt(home, new Date(now));
 		const healthy = await cli(["gates"], home);
 		expect(healthy.code).toBe(0);
-		expect(healthy.out.trimEnd().split("\n").pop()).toBe("gates_done open=0 total=11");
+		expect(healthy.out.trimEnd().split("\n").pop()).toBe(
+			"gates_done open=0 unknown=2 total=13 unknown_gates=sweep_stalled,slack_disconnected",
+		);
 	});
 });
 

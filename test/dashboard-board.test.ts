@@ -177,7 +177,8 @@ function boardWhen(source: BoardSource, check: () => boolean, what: string): Pro
 const SNAPSHOT: DashboardSnapshot = {
 	generatedAt: "2026-11-04T09:00:00+09:00",
 	daemon: { ok: false, error: "no daemon" },
-	turns: { ok: true, items: [] },
+	turns: { ok: true, items: [], threads: [] },
+	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	tasks: {
 		ok: true,
 		items: [
@@ -203,6 +204,7 @@ const SNAPSHOT: DashboardSnapshot = {
 	alerts: { ok: true, items: [] },
 	gates: { ok: true, items: [] },
 	backup: { ok: true, offsite: null },
+	jobs: { ok: true, items: [] },
 };
 
 let upstream: FakeHerdrWeb | undefined;

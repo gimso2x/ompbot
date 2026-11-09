@@ -8,16 +8,17 @@ import type { ReloadResult } from "../daemon/reload";
 import { runDaemon } from "../daemon/run";
 import { readStatusFromDb, renderStatusText, type StatusReport } from "../daemon/status";
 import { readVersion } from "../daemon/tools";
-import { type ProcessRunner, realProcessRunner } from "../dispatch/omp";
+import { herdrSshArgv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 import { readConfigText } from "../ops/apply";
 import { BackupError, type BackupResult, DEFAULT_KEEP, runBackup } from "../ops/backup";
 import { clearFreeze, readFreeze, writeFreeze } from "../ops/freeze";
-import { collectGates } from "../ops/gates";
+import { collectGates, type GatesOptions } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
 import { OffsiteError, type OffsiteResult, runOffsite } from "../ops/offsite";
 import { APPLY_USAGE, applyCommand } from "./apply";
 import { DASHBOARD_USAGE, dashboardCommand } from "./dashboard";
 import { DRAIN_USAGE, drainCommand } from "./drain";
+import { FEEDBACK_USAGE, feedbackCommand } from "./feedback";
 import { INIT_USAGE, initCommand } from "./init";
 import { MONITORS_USAGE, monitorsCommand } from "./monitors";
 import { RESTORE_USAGE, restoreCommand } from "./restore";
@@ -31,8 +32,9 @@ const DISPATCH_HOST_CHECK_MS = 10_000;
 const USAGE = `usage: ompbot <command>
 ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single instance)
   status [--json]                ledger counts, origins, omp version
-  doctor                         check home, secrets, omp, bun, Slack auth, backup bundle; then herdr --version (herdr on) and ssh reach per dispatchHosts
-                                 entry (a failing host is a warning line and does not change the exit code)
+  doctor                         check home, secrets, omp, omp runtime, bun, Slack auth, backup bundle; then herdr --version and the herdr omp
+                                 integration (herdr on), and ssh reach plus the herdr omp integration per dispatchHosts entry (integration
+                                 and host lines are warnings and do not change the exit code)
   gc [--dry-run]                 delete previous-epoch session dirs, idle thread origins and deleted-monitor origins older than sessionRetentionDays (default 30)
   backup [--keep N] [--max-bundle-bytes N]    consistent ompbot.db snapshot (VACUUM INTO), quick_check, retention (default 14) + stamp
                                  + sessions/config.json/workspace/scripts bundle (tar.gz, sha256 in the stamp) when they exist; the
@@ -46,14 +48,16 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  working); a due 'at' monitor waits and fires once after unfreeze; the 'frozen' gate stays
                                  open until unfreeze
   unfreeze                       remove <home>/FROZEN
-  gates [--json]                 read-only health projection; exit 1 if any open. gates: backup_age, offsite_age (only with
-                                 config offsite), sweep_stalled, slack_disconnected, frozen,
-                                 omp_runtime, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
+  gates [--json] [--strict]      read-only health projection; each gate is open, closed or unknown (nothing to judge: no
+                                 heartbeat stamp or no ompbot.db yet); exit 1 if any open, with --strict also if any unknown.
+                                 gates: backup_age, offsite_age (only with config offsite), sweep_stalled, slack_disconnected,
+                                 frozen, herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
+                                 disk_low, host_pressure, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
                                  monitors_failed, monitors_stalled, turns_failing, ledger_unreadable
   inject --origin <slack/dm/ID|slack/ch/ID> --as-owner --text <t> [--quoted <q>] [--thread <ts>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${FEEDBACK_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -92,28 +96,60 @@ function loadConfigIfPresent(homeDir: string): OmpbotConfig | undefined {
 	return existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir) : undefined;
 }
 
-/** Reach check per `dispatchHosts` entry, run together: one `ok`/`fail <ssh's first stderr line>` line each, in config order. */
+const firstLine = (text: string | undefined): string => text?.trim().split("\n")[0]?.trim() ?? "";
+
+/**
+ * Reach check per `dispatchHosts` entry, run together: one `ok`/`fail <ssh's first stderr line>` line each, in config
+ * order, each followed by that host's herdr omp integration line.
+ */
 async function checkDispatchHosts(config: OmpbotConfig, run: ProcessRunner): Promise<string[]> {
-	return await Promise.all(
+	const perHost = await Promise.all(
 		Object.entries(config.dispatchHosts ?? {}).map(async ([name, host]) => {
-			const result = await run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host.ssh, "true"], {
-				timeoutMs: DISPATCH_HOST_CHECK_MS,
-			});
-			if (result.code === 0 && !result.timedOut) return `ok dispatch host ${name}: ssh ${host.ssh}`;
-			const firstLine = (text: string | undefined) => text?.trim().split("\n")[0]?.trim() ?? "";
+			const [result, integration] = await Promise.all([
+				run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host.ssh, "true"], {
+					timeoutMs: DISPATCH_HOST_CHECK_MS,
+				}),
+				checkHerdrIntegration(herdrSshArgv(host.ssh, host.herdrBin ?? "herdr", ["integration", "status"]), run),
+			]);
+			const integrationLine = `${integration.ok ? "ok" : "fail"} herdr omp integration on ${name}: ${integration.detail}`;
+			if (result.code === 0 && !result.timedOut) return [`ok dispatch host ${name}: ssh ${host.ssh}`, integrationLine];
 			const reason = result.timedOut
 				? "timed out"
 				: firstLine(result.stderr) || firstLine(result.stdout) || `exit ${result.code}`;
-			return `fail dispatch host ${name}: ${reason} (warning only)`;
+			return [`fail dispatch host ${name}: ${reason} (warning only)`, integrationLine];
 		}),
 	);
+	return perHost.flat();
+}
+
+/**
+ * `herdr integration status` (one `<agent>: <state> (…)` line per agent): the `omp:` line must say `current`, or the
+ * agent_status herdr reports for omp workers (blocked, idle…) never changes. A miss is a warning: the detail ends in
+ * the install command and `(warning only)`.
+ */
+async function checkHerdrIntegration(cmd: string[], run: ProcessRunner): Promise<{ ok: boolean; detail: string }> {
+	const result = await run(cmd, { timeoutMs: DISPATCH_HOST_CHECK_MS });
+	const fix = "— herdr integration install omp (warning only)";
+	if (result.code !== 0 || result.timedOut) {
+		const reason = result.timedOut
+			? "timed out"
+			: firstLine(result.stderr) || firstLine(result.stdout) || `exit ${result.code}`;
+		return { ok: false, detail: `integration status failed: ${reason} ${fix}` };
+	}
+	const omp = result.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => line.startsWith("omp:"));
+	if (omp === undefined) return { ok: false, detail: `no omp line ${fix}` };
+	// The extension path in the trailing parentheses is noise on a doctor line.
+	const summary = omp.replace(/\s*\([/~][^)]*\)\s*$/, "");
+	return /^omp:\s*current\b/.test(omp) ? { ok: true, detail: summary } : { ok: false, detail: `${summary} ${fix}` };
 }
 
 /** Local herdr (config `herdr` on): `<bin> --version` must answer; the line carries its first output line or why not. */
 async function checkLocalHerdr(herdr: { bin?: string }, run: ProcessRunner): Promise<{ ok: boolean; line: string }> {
 	const bin = herdr.bin ?? "herdr";
 	const result = await run([bin, "--version"], { timeoutMs: DISPATCH_HOST_CHECK_MS });
-	const firstLine = (text: string | undefined) => text?.trim().split("\n")[0]?.trim() ?? "";
 	if (result.code === 0 && !result.timedOut)
 		return { ok: true, line: `ok herdr: ${bin} ${firstLine(result.stdout)}`.trim() };
 	const reason = result.timedOut
@@ -123,9 +159,11 @@ async function checkLocalHerdr(herdr: { bin?: string }, run: ProcessRunner): Pro
 }
 
 /**
- * `ompbot doctor`: the doctor checks, then (herdr on) the local herdr version, then one reach line per dispatch host. A host may be switched off on purpose
- * (a laptop), so its line is a warning and never changes the exit code; an unreadable config was reported above.
- * A local herdr that does not answer while `herdr` is on is a failure (exit 1): dispatch and the [TASK] sweep need it.
+ * `ompbot doctor`: the doctor checks, then (herdr on) the local herdr version and its omp integration, then per dispatch
+ * host one reach line and one omp integration line. A host may be switched off on purpose (a laptop), so its lines are
+ * warnings and never change the exit code; an unreadable config was reported above. A local herdr that does not answer
+ * while `herdr` is on is a failure (exit 1): dispatch and the [TASK] sweep need it. A missing omp integration is a
+ * warning everywhere: herdr still runs the agents, only their waiting state goes unseen.
  */
 export async function doctorCommand(
 	homeDir: string,
@@ -146,6 +184,8 @@ export async function doctorCommand(
 		const herdr = await checkLocalHerdr(config.herdr, run);
 		write(herdr.line);
 		if (!herdr.ok && exit === 0) exit = 1;
+		const integration = await checkHerdrIntegration([config.herdr.bin ?? "herdr", "integration", "status"], run);
+		write(`${integration.ok ? "ok" : "fail"} herdr omp integration: ${integration.detail}`);
 	}
 	for (const line of await checkDispatchHosts(config, run)) write(line);
 	return exit;
@@ -239,22 +279,39 @@ async function backupCommand(args: string[], homeDir: string): Promise<number> {
 	return config?.offsite === undefined ? 0 : offsiteRun(config, homeDir, false);
 }
 
-function gatesCommand(args: string[], homeDir: string): number {
-	const { values } = parseArgs({ args, options: { json: { type: "boolean" } } });
+/** Test seam of `ompbot gates`: the clock and the host readers `collectGates` would otherwise take from this machine. */
+export type GatesCommandDeps = Pick<GatesOptions, "statfs" | "hostLoad"> & { now?: () => number };
+
+/** `ompbot gates`: exit 1 when a gate is open, or with `--strict` also when one cannot be judged (`unknown`). */
+export function gatesCommand(args: string[], homeDir: string, deps: GatesCommandDeps = {}): number {
+	const { values } = parseArgs({ args, options: { json: { type: "boolean" }, strict: { type: "boolean" } } });
 	// A db-only home (no config.json) has no omp to check; the omp_runtime gate is then omitted.
 	const config = loadConfigIfPresent(homeDir);
 	const omp = config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
-	const gates = collectGates({ homeDir, now: Date.now(), offsiteConfigured: config?.offsite !== undefined, ...omp });
+	const gates = collectGates({
+		homeDir,
+		now: (deps.now ?? Date.now)(),
+		offsiteConfigured: config?.offsite !== undefined,
+		...omp,
+		...(deps.statfs === undefined ? {} : { statfs: deps.statfs }),
+		...(deps.hostLoad === undefined ? {} : { hostLoad: deps.hostLoad }),
+	});
 	const open = gates.filter((gate) => gate.state === "open");
+	const unknown = gates.filter((gate) => gate.state === "unknown");
 	if (values.json === true) {
-		process.stdout.write(`${JSON.stringify({ open: open.length, gates })}\n`);
+		process.stdout.write(`${JSON.stringify({ open: open.length, unknown: unknown.length, gates })}\n`);
 	} else {
 		for (const gate of gates) process.stdout.write(`gate=${gate.name} state=${gate.state} detail=${gate.detail}\n`);
-		// Alerting tools show only the last line, so it names the open gates.
-		const names = open.map((gate) => `${gate.name}(${gate.detail})`).join(",");
-		process.stdout.write(`gates_done open=${open.length} total=${gates.length}${names ? ` opened=${names}` : ""}\n`);
+		// Alerting tools show only the last line, so it names the open and the unjudgeable gates.
+		const opened = open.map((gate) => `${gate.name}(${gate.detail})`).join(",");
+		const unjudged = unknown.map((gate) => gate.name).join(",");
+		process.stdout.write(
+			`gates_done open=${open.length} unknown=${unknown.length} total=${gates.length}${opened ? ` opened=${opened}` : ""}${
+				unjudged ? ` unknown_gates=${unjudged}` : ""
+			}\n`,
+		);
 	}
-	return open.length > 0 ? 1 : 0;
+	return open.length > 0 || (values.strict === true && unknown.length > 0) ? 1 : 0;
 }
 
 async function statusCommand(args: string[], homeDir: string): Promise<number> {
@@ -417,6 +474,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return skillsCommand(rest, env);
 			case "dashboard":
 				return await dashboardCommand(rest, homeDir);
+			case "feedback":
+				return feedbackCommand(rest, homeDir);
 			default:
 				process.stderr.write(USAGE);
 				return command === undefined || command === "--help" || command === "help" ? 0 : 2;

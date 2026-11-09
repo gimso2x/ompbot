@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type OmpbotConfig, readSlackTokens } from "../config";
 import { createLogger, type Logger } from "../log";
@@ -17,6 +17,7 @@ import { crashHook } from "./crash";
 import { Daemon } from "./daemon";
 import { acquireLock, type Lock, LockHeldError } from "./lock";
 import { readVersion } from "./tools";
+import { startWatchdog, watchdogStallMs } from "./watchdog";
 
 /** `provider/model` in config.json becomes the two RpcClient options. */
 function splitModel(model: string | undefined): { provider?: string; model?: string } {
@@ -55,6 +56,20 @@ async function checkOmpVersion(config: OmpbotConfig, log: Logger): Promise<strin
 }
 
 /**
+ * Test-only fatal error once the daemon runs: `OMPBOT_TEST_FATAL=rejection|exception`, read only when
+ * `OMPBOT_TEST_HOOKS=1` (like `OMPBOT_TEST_CRASH_AT`), so the `daemon_fatal` record can be proven on a real process.
+ */
+function testFatal(env: Record<string, string | undefined>): void {
+	const kind = env.OMPBOT_TEST_HOOKS === "1" ? env.OMPBOT_TEST_FATAL : undefined;
+	if (kind === "rejection") setTimeout(() => void Promise.reject(new Error("test_fatal")), 0);
+	if (kind === "exception") {
+		setTimeout(() => {
+			throw new Error("test_fatal");
+		}, 0);
+	}
+}
+
+/**
  * `ompbot daemon`: holds the single-instance lock, runs until SIGTERM/SIGINT, then stops gracefully.
  * Resolves with the process exit code.
  */
@@ -65,8 +80,9 @@ export async function runDaemon(
 	bootConfigText?: string,
 ): Promise<number> {
 	let logFile: (line: string) => void;
+	let logPath: string;
 	try {
-		logFile = openLogSink(config.homeDir).sink;
+		({ sink: logFile, path: logPath } = openLogSink(config.homeDir));
 	} catch (error) {
 		if (error instanceof LogDirError) {
 			process.stderr.write(`ompbot daemon: refusing to start: ${error.message}\n`);
@@ -106,12 +122,48 @@ export async function runDaemon(
 		}),
 		{ clock },
 	);
+	// Why the process ended, in ompbot.log too (not only Bun's journal output). Both lines are written synchronously:
+	// the process is gone right after them.
+	const lastWords = createLogger({
+		clock,
+		redact,
+		sink: (line) => {
+			try {
+				logFile(line);
+			} catch {
+				// stderr below still reaches the journal
+			}
+			try {
+				writeSync(2, `${line}\n`);
+			} catch {
+				// nothing left to report to
+			}
+		},
+	});
+	const fatal = (kind: string, error: unknown) => {
+		lastWords.error("daemon_fatal", {
+			kind,
+			error: String(error).slice(0, 500),
+			stack: error instanceof Error ? error.stack?.split("\n").slice(0, 5).join("\n") : undefined,
+		});
+		// The code Bun itself exits with on an uncaught error or an unhandled rejection.
+		process.exit(1);
+	};
+	process.on("uncaughtException", (error) => fatal("uncaughtException", error));
+	process.on("unhandledRejection", (reason) => fatal("unhandledRejection", reason));
+	process.on("exit", (code) => lastWords.info("daemon_exit", { code }));
 
 	const model = splitModel(config.model);
 	// claude children take a bare model id; a `model` naming another provider is an omp-only setting.
 	const claudeModel = model.provider === undefined || model.provider === "claude" ? model.model : undefined;
 	const secretsDir = join(config.homeDir, "secrets");
-	const personaPath = join(config.homeDir, "workspace", "persona.md");
+	const personaFiles = {
+		persona: join(config.homeDir, "workspace", "persona.md"),
+		soul: join(config.homeDir, "workspace", "soul.md"),
+		owner: join(config.homeDir, "workspace", "owner.md"),
+	};
+	const onPersonaError = (error: unknown, path: string) =>
+		log.warn("persona_unreadable", { path, error: String(error) });
 	// Seed the known-secret value index before anything can answer: masking sits below the agent.
 	indexRuntimeSecrets(config, env, log);
 	const exited = Promise.withResolvers<number>();
@@ -167,8 +219,8 @@ export async function runDaemon(
 						systemPrompt: floorsSystemPrompt(
 							secretsDir,
 							origin,
-							personaPath,
-							(error) => log.warn("persona_unreadable", { path: personaPath, error: String(error) }),
+							personaFiles,
+							onPersonaError,
 							config.herdr !== undefined,
 						),
 						approval: daemon.requestApprovalFor(origin),
@@ -180,12 +232,15 @@ export async function runDaemon(
 						...model,
 						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 						env: { OMP_WIKI_NOTE_DISABLE: "1" },
+						// `ask` is allowed only where the owner can answer it: the same answerer the driver gets below.
 						extraArgs: floorsArgs(
 							secretsDir,
 							origin,
-							personaPath,
-							(error) => log.warn("persona_unreadable", { path: personaPath, error: String(error) }),
+							personaFiles,
+							onPersonaError,
 							config.herdr !== undefined,
+							daemon.answerDialogsFor(origin) !== undefined,
+							daemon.peerTouched(origin),
 						),
 						hostTools: daemon.hostToolsFor(origin),
 						answerDialog: daemon.answerDialogsFor(origin),
@@ -201,9 +256,13 @@ export async function runDaemon(
 		lock.release();
 		return 1;
 	}
+	// From here a main thread stuck for minutes ends the process (SIGKILL) and systemd starts a fresh one.
+	const watchdog = startWatchdog({ stallMs: watchdogStallMs(env), logPath });
 	const stopAlive = startServiceAlive({ log, clock, snapshot: () => daemon.aliveFields() });
+	testFatal(env);
 	const code = await exited.promise;
 	stopAlive();
+	watchdog.stop();
 	log.stop();
 	lock.release();
 	return code;

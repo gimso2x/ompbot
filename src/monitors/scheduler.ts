@@ -59,8 +59,6 @@ export interface TickSummary {
 /** Reason prefix of events a frozen tick records instead of firing. */
 const FROZEN_SKIP = "frozen";
 
-export { isWakeGateOff } from "./script";
-
 /**
  * The procedure files of one fire, read from disk now (an edit between fires applies to the next one): one block per
  * file, a `읽기 실패` line for a file that cannot be read (the fire goes on), and a truncation marker once the files

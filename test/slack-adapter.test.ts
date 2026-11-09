@@ -13,10 +13,21 @@ import {
 	type SlackAdapterOptions,
 } from "../src/slack/adapter";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
-import { CHUNK_LIMIT, chunkText, REDELIVERED_PREFIX, STALL_STATUS_TEXT, toMrkdwn } from "../src/slack/format";
+import {
+	CHUNK_LIMIT,
+	chunkText,
+	MARKDOWN_CHUNK_LIMIT,
+	type MarkdownPart,
+	REDELIVERED_PREFIX,
+	renderMarkdownParts,
+	renderParts,
+	STALL_STATUS_TEXT,
+	toMrkdwn,
+} from "../src/slack/format";
 import { mapWebApiError } from "../src/slack/socket-transport";
 import { SlackCallError, SlackRateLimitedError } from "../src/slack/transport";
-import { openStore, type Store } from "../src/store/db";
+import { INTERIM_INFIX, openStore, type Store } from "../src/store/db";
+import { FRESHNESS_MS } from "../src/store/transitions";
 
 const OWNER = "UOWNER";
 const TS = "1800000000.000100";
@@ -69,6 +80,7 @@ function storeDeliveries(): DeliverySource {
 		confirm: (id) => void store.confirmDelivery(id),
 		fail: (id, error, outcome) =>
 			void (outcome === "definitive" ? store.failDelivery(id, error) : store.markAmbiguous(id, error)),
+		defer: (id, error, retry) => void store.deferDelivery(id, error, retry),
 	};
 }
 
@@ -81,7 +93,7 @@ async function build(
 		transport,
 		core: makeCore(),
 		deliveries,
-		ownerUserId: OWNER,
+		ownerUserId: extra.ownerUserId ?? OWNER,
 		clock,
 		log: createLogger({ sink: (l) => logs.push(l), clock, redact }),
 	});
@@ -319,9 +331,10 @@ describe("channels", () => {
 });
 
 describe("deliveries", () => {
-	test("a 4000+ char answer is split into messages of <= 3900 chars in the thread, then confirmed", async () => {
+	test("an answer whose table outgrows one markdown message takes the plain path: messages of <= 3900 chars in the thread", async () => {
 		await transport.emitMessage(dm());
-		answer([`${"가나다라마바사 ".repeat(700)}끝`]);
+		const rows = Array.from({ length: 800 }, (_, i) => `| 가나다라 ${i} | 마바사 |`).join("\n");
+		answer([`<@U0123ABCD> 표\n\n| 이름 | 값 |\n| --- | --- |\n${rows}\n\n끝`]);
 		expect(await adapter.pumpDeliveries()).toBe(1);
 		const answerPosts = transport.calls.filter((c) => c.method === "postMessage").slice(1);
 		expect(answerPosts.length).toBeGreaterThanOrEqual(2);
@@ -329,11 +342,12 @@ describe("deliveries", () => {
 			if (p.method !== "postMessage") throw new Error("unreachable");
 			expect(p.text.length).toBeLessThanOrEqual(CHUNK_LIMIT);
 			expect(p.threadTs).toBe(TS);
+			expect(p.blocks).toBeUndefined();
 		}
 		expect(store.listDeliveries()[0]?.state).toBe("confirmed");
 	});
 
-	test("a top-level (monitor) answer in parts: part 1 is top level, parts 2+ reply under part 1's ts", async () => {
+	test("a top-level (monitor) answer in parts: part 1 is top level, parts 2+ reply under part 1's ts, no footer", async () => {
 		store.ensureOrigin("slack/ch/C1", join(dir, "sessions"));
 		store.recordInbound({ originKey: "slack/ch/C1", platformMessageId: "C1:1", textRef: "x", threadRef: "C1:-" });
 		store.markDispatched("C1:1", { opRef: "top", entryCursor: null });
@@ -341,11 +355,17 @@ describe("deliveries", () => {
 			originKey: "slack/ch/C1",
 			opRef: "top",
 			threadRef: "C1:-",
-			parts: [`${"가나다라마바사 ".repeat(1000)}끝`],
+			parts: [`${"가나다라마바사 ".repeat(2000)}끝`],
 		});
 		expect(await adapter.pumpDeliveries()).toBe(1);
 		const posts = transport.calls.filter((c) => c.method === "postMessage");
-		expect(posts.length).toBeGreaterThanOrEqual(3);
+		expect(posts.length).toBeGreaterThanOrEqual(2);
+		// No running status in a monitor's thread: no elapsed/tool footer either.
+		for (const p of posts) {
+			if (p.method !== "postMessage") throw new Error("unreachable");
+			expect(p.blocks).toHaveLength(1);
+			expect(p.blocks?.[0]).toMatchObject({ type: "markdown" });
+		}
 		const [first, ...rest] = posts;
 		if (first?.method !== "postMessage") throw new Error("unreachable");
 		expect(first.threadTs).toBeUndefined();
@@ -362,7 +382,18 @@ describe("deliveries", () => {
 		expect(toMrkdwn("`<@U0123ABCD>`")).toBe("`<@U0123ABCD>`");
 	});
 
-	test("finishing removes 👀, adds ✅ and turns the status into ✅ using chat.update", async () => {
+	test("labelled channel and user mentions stay live Slack tokens", () => {
+		expect(toMrkdwn("<#C0123|general> 채널의 <@U0123|name> 확인")).toBe("<#C0123|general> 채널의 <@U0123|name> 확인");
+		expect(toMrkdwn("<#c0123|general>")).toBe("&lt;#c0123|general&gt;");
+	});
+
+	test("an unclosed last fence is code: its body is not converted", () => {
+		const text = "설명 **굵게**\n```ts\nif (a < b && c) {\n- not a bullet\n**x**\n";
+		expect(toMrkdwn(text)).toBe("설명 *굵게*\n```ts\nif (a < b && c) {\n- not a bullet\n**x**\n");
+		expect(toMrkdwn("```\na < b && c")).toBe("```\na < b && c");
+	});
+
+	test("finishing removes 👀, adds ✅ and deletes the status message instead of relabelling it", async () => {
 		await transport.emitMessage(dm());
 		answer(["답"]);
 		await adapter.pumpDeliveries();
@@ -371,9 +402,8 @@ describe("deliveries", () => {
 		]);
 		expect(transport.calls.filter((c) => c.method === "addReaction").pop()).toMatchObject({ name: "white_check_mark" });
 		const statusTs = transport.calls.find((c) => c.method === "postMessage")?.ts;
-		expect(transport.calls.filter((c) => c.method === "updateMessage")).toMatchObject([
-			{ ts: statusTs, text: "✅ 완료 · 00:00" },
-		]);
+		expect(transport.calls.filter((c) => c.method === "deleteMessage")).toMatchObject([{ ts: statusTs }]);
+		expect(transport.count("updateMessage")).toBe(0);
 		expect(transport.count("postMessage")).toBe(2);
 	});
 
@@ -388,8 +418,8 @@ describe("deliveries", () => {
 		expect(transport.calls.filter((c) => c.method === "addReaction").map((c) => ("name" in c ? c.name : ""))).toEqual([
 			"eyes",
 		]);
-		// The status message in the thread still closes as before.
-		expect(transport.calls.filter((c) => c.method === "updateMessage")).toMatchObject([{ text: "✅ 완료 · 00:00" }]);
+		// The status message in the thread still goes away like any other.
+		expect(transport.count("deleteMessage")).toBe(1);
 
 		const other = "1800000000.000900";
 		await transport.emitMessage(dm({ ts: other }));
@@ -427,7 +457,7 @@ describe("deliveries", () => {
 			redelivered: true,
 		};
 		const confirmed: number[] = [];
-		await build({ claimDue: () => [item], confirm: (id) => void confirmed.push(id), fail: () => {} });
+		await build({ claimDue: () => [item], confirm: (id) => void confirmed.push(id), fail: () => {}, defer: () => {} });
 		await adapter.pumpDeliveries();
 		expect(transport.calls.find((c) => c.method === "postMessage")).toMatchObject({
 			text: `${REDELIVERED_PREFIX}\n본문`,
@@ -459,7 +489,12 @@ describe("deliveries", () => {
 		});
 		await adapter.pumpDeliveries();
 		expect(transport.calls.filter((c) => c.method === "addReaction").pop()).toMatchObject({ name: "warning" });
-		expect(transport.calls.filter((c) => c.method === "updateMessage")[0]).toMatchObject({ text: "⚠️ 실패 · 00:00" });
+		expect(transport.count("deleteMessage")).toBe(1);
+		const last = transport.calls.filter((c) => c.method === "postMessage").pop();
+		expect(last?.method === "postMessage" ? last.blocks?.at(-1) : undefined).toEqual({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "⚠️ 00:00" }],
+		});
 	});
 
 	test("while chat.postMessage is rate limited nothing is claimed; it resumes after Retry-After", async () => {
@@ -479,6 +514,70 @@ describe("deliveries", () => {
 		expect(transport.count("postMessage")).toBe(callsAfter429 + 1);
 	});
 
+	/** An answered op on its own DM thread, recorded without the inbound event (no status message is posted). */
+	function seedAnswer(opRef: string, body: string): void {
+		const id = `D1:1800000000.${opRef.padStart(6, "0")}`;
+		store.ensureOrigin("slack/dm/D1", join(dir, "sessions"));
+		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: id, textRef: "q", threadRef: id });
+		store.markDispatched(id, { opRef, entryCursor: null });
+		store.recordAnswer({ originKey: "slack/dm/D1", opRef, threadRef: id, parts: [body] });
+	}
+
+	const postedTexts = (): string[] => transport.calls.flatMap((c) => (c.method === "postMessage" ? [c.text] : []));
+
+	test("a 429 and the Blocked rest of its batch keep their attempts and go out once the block lifts", async () => {
+		seedAnswer("1", "첫째");
+		seedAnswer("2", "둘째");
+		// Six blocked rounds: more than MAX_DEFINITIVE_FAILURES, so a counted failure would have expired both rows.
+		for (let round = 0; round < 6; round++) {
+			transport.failNext.postMessage = [new SlackRateLimitedError(30_000)];
+			expect(await adapter.pumpDeliveries()).toBe(0);
+			expect(store.listDeliveries().map((r) => [r.state, r.attempts, r.nextAt])).toEqual([
+				["pending", 0, now + 30_000],
+				["pending", 0, now + 30_000],
+			]);
+			now += 30_000;
+		}
+		// Only the first row of each batch reached Slack; the rest never tried while the method was blocked.
+		expect(postedTexts()).toEqual(Array(6).fill("첫째"));
+		expect(await adapter.pumpDeliveries()).toBe(2);
+		expect(postedTexts().slice(6)).toEqual(["첫째", "둘째"]);
+		expect(store.listDeliveries().map((r) => r.state)).toEqual(["confirmed", "confirmed"]);
+	});
+
+	test("a rate-limited delivery still expires once it is 24h old", async () => {
+		seedAnswer("1", "늦은 답");
+		transport.failNext.postMessage = [new SlackRateLimitedError(30_000)];
+		await adapter.pumpDeliveries();
+		expect(store.listDeliveries()[0]).toMatchObject({ state: "pending", attempts: 0 });
+		now += FRESHNESS_MS;
+		expect(await adapter.pumpDeliveries()).toBe(0);
+		expect(store.listDeliveries()[0]?.state).toBe("expired");
+		expect(postedTexts()).toEqual(["늦은 답"]);
+	});
+
+	test("a 429 on part 2 of 3 resumes at part 2 after the block: part 1 is not posted again", async () => {
+		const body = `${"가나다라마바사 ".repeat(3000)}끝`;
+		const parts = (renderMarkdownParts(body, false) ?? []).map((part) => part.text);
+		expect(parts).toHaveLength(3);
+		seedAnswer("1", body);
+		const original = transport.postMessage.bind(transport);
+		let calls = 0;
+		transport.postMessage = async (args) => {
+			calls += 1;
+			if (calls === 2) throw new SlackRateLimitedError(30_000);
+			return original(args);
+		};
+		expect(await adapter.pumpDeliveries()).toBe(0);
+		expect(store.listDeliveries()[0]).toMatchObject({ state: "pending", attempts: 0, nextAt: now + 30_000 });
+		expect(postedTexts()).toEqual(parts.slice(0, 1));
+
+		now += 30_000;
+		expect(await adapter.pumpDeliveries()).toBe(1);
+		expect(postedTexts()).toEqual(parts);
+		expect(store.listDeliveries()[0]?.state).toBe("confirmed");
+	});
+
 	test("a 429 on postNotice blocks the delivery pump: both share the chat.postMessage key", async () => {
 		await transport.emitMessage(dm());
 		answer(["본문"]);
@@ -490,6 +589,559 @@ describe("deliveries", () => {
 
 		now += 60_000; // past both Retry-After and the delivery backoff
 		expect(await adapter.pumpDeliveries()).toBe(1);
+	});
+});
+
+type Post = Extract<(typeof transport.calls)[number], { method: "postMessage" }>;
+const posts = (): Post[] => transport.calls.filter((c): c is Post => c.method === "postMessage");
+
+describe("markdown answers", () => {
+	test("an answer without mention tokens goes out as one markdown block; text is the mrkdwn fallback within 3,000 chars", async () => {
+		const body = `# 제목\n\n| 도구 | 상태 |\n| --- | --- |\n| omp | 실행 |\n\n**굵게** ${"가나다라마바사 ".repeat(600)}끝`;
+		expect(body.length).toBeGreaterThan(3_900);
+		const item: DeliveryItem = {
+			deliveryId: 1,
+			originKey: "slack/dm/D1",
+			threadRef: `D1:${TS}`,
+			body,
+			redelivered: false,
+		};
+		const confirmed: number[] = [];
+		await build({ claimDue: () => [item], confirm: (id) => void confirmed.push(id), fail: () => {}, defer: () => {} });
+		await adapter.pumpDeliveries();
+		expect(posts()).toHaveLength(1);
+		const [post] = posts();
+		expect(post?.blocks?.[0]).toEqual({ type: "markdown", text: body });
+		expect(post?.text).toBe(toMrkdwn(body).slice(0, 3_000));
+		expect(post?.text.length).toBeLessThanOrEqual(3_000);
+		expect(confirmed).toEqual([1]);
+	});
+
+	test("a confirmed answer deletes the thread's status message and carries ✅ mm:ss · 도구 N회 as its last block", async () => {
+		await transport.emitMessage(dm());
+		const statusTs = posts()[0]?.ts;
+		await adapter.setProgress(`D1:${TS}`, { tools: 6, recentTools: [], steers: 0, retries: 0 });
+		now += 42_000;
+		answer(["답"]);
+		await adapter.pumpDeliveries();
+		expect(transport.calls.filter((c) => c.method === "deleteMessage")).toEqual([
+			{ method: "deleteMessage", channel: "D1", ts: statusTs ?? "" },
+		]);
+		const updates = transport.calls.flatMap((c) => (c.method === "updateMessage" ? [c.text] : []));
+		expect(updates.filter((t) => t.startsWith("✅"))).toEqual([]);
+		expect(posts().at(-1)?.blocks?.at(-1)).toEqual({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "✅ 00:42 · 도구 6회" }],
+		});
+	});
+
+	test("an interim delivery keeps the ⏳ status running; the turn-end delivery then finishes it as before", async () => {
+		await build({
+			...storeDeliveries(),
+			claimDue: () => store.claimDue().map((row) => ({ ...row, keepStatus: row.opRef.includes(INTERIM_INFIX) })),
+		});
+		await transport.emitMessage(dm());
+		const statusTs = posts()[0]?.ts ?? "";
+		store.markDispatched(`D1:${TS}`, { opRef: "op1", entryCursor: null });
+		store.recordInterim({
+			originKey: "slack/dm/D1",
+			opRef: "op1",
+			threadRef: `D1:${TS}`,
+			index: 0,
+			body: "먼저 끝난 답",
+		});
+		now += 20_000;
+		expect(await adapter.pumpDeliveries()).toBe(1);
+		// No footer, no status delete or ✅ label: the turn still runs.
+		expect(posts().at(-1)?.blocks).toEqual([{ type: "markdown", text: "먼저 끝난 답" }]);
+		expect(transport.count("deleteMessage")).toBe(0);
+		const statusUpdates = () =>
+			transport.calls.flatMap((c) => (c.method === "updateMessage" && c.ts === statusTs ? [c.text] : []));
+		expect(statusUpdates().filter((t) => t.startsWith("✅"))).toEqual([]);
+		// A later progress report still reaches the status message.
+		await adapter.setProgress(`D1:${TS}`, { tools: 4, recentTools: [], steers: 0, retries: 0 });
+		expect(statusUpdates()).toHaveLength(1);
+		expect(statusUpdates()[0]).toStartWith("⏳");
+		expect(statusUpdates()[0]).toContain("4");
+
+		now += 22_000;
+		store.recordAnswer({ originKey: "slack/dm/D1", opRef: "op1", threadRef: `D1:${TS}`, parts: ["마지막 답"] });
+		expect(await adapter.pumpDeliveries()).toBe(1);
+		expect(transport.calls.filter((c) => c.method === "deleteMessage")).toEqual([
+			{ method: "deleteMessage", channel: "D1", ts: statusTs },
+		]);
+		expect(posts().at(-1)?.blocks?.at(-1)).toEqual({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "✅ 00:42 · 도구 4회" }],
+		});
+	});
+
+	test("a command's reply gets no footer: the command thread never showed a ⏳ message", async () => {
+		await transport.emitMessage(dm({ text: "!new" }));
+		expect(posts()).toHaveLength(0);
+		answer(["🆕 새 대화를 시작했습니다."]);
+		await adapter.pumpDeliveries();
+		expect(posts()[0]?.blocks).toEqual([{ type: "markdown", text: "🆕 새 대화를 시작했습니다." }]);
+		expect(transport.count("deleteMessage")).toBe(0);
+	});
+
+	const item = (deliveryId: number, body: string, redelivered = false): DeliveryItem => ({
+		deliveryId,
+		originKey: "slack/dm/D1",
+		threadRef: `D1:${TS}`,
+		body,
+		redelivered,
+	});
+
+	/** A queue the pump drains; confirms and failures are recorded in order. */
+	async function buildQueue(queue: DeliveryItem[]) {
+		const confirmed: number[] = [];
+		const failed: Array<[number, string]> = [];
+		await build({
+			claimDue: () => queue.splice(0),
+			confirm: (id) => void confirmed.push(id),
+			fail: (id, _error, outcome) => void failed.push([id, outcome]),
+			defer: () => {},
+		});
+		return { confirmed, failed };
+	}
+
+	/** A queue the pump drains, with the owner `U0OWNER` and the peer bot `U0PEER` (떡). */
+	async function buildMentionQueue(queue: DeliveryItem[]): Promise<number[]> {
+		const confirmed: number[] = [];
+		await build(
+			{ claimDue: () => queue.splice(0), confirm: (id) => void confirmed.push(id), fail: () => {}, defer: () => {} },
+			{ ownerUserId: "U0OWNER", peerBots: [{ userId: "U0PEER", name: "떡" }] },
+		);
+		return confirmed;
+	}
+	const typeOf = (block: unknown): unknown =>
+		typeof block === "object" && block !== null && "type" in block ? block.type : undefined;
+	const markdownTexts = (post: Post | undefined): string[] =>
+		(post?.blocks ?? []).flatMap((block) =>
+			typeOf(block) === "markdown" && typeof block === "object" && block !== null && "text" in block
+				? [String(block.text)]
+				: [],
+		);
+	const bell = (text: string) => ({ type: "context", elements: [{ type: "mrkdwn", text }] });
+
+	test("an answer mentioning the owner and a peer goes markdown: readable names in the block, live tokens in one 🔔 line, text keeps them", async () => {
+		const body = "<@U0OWNER> 확인 부탁: **결정** 필요\n\n<@U0PEER> 도 봐 줘. 다시 <@U0OWNER>";
+		const confirmed = await buildMentionQueue([item(1, body)]);
+		await adapter.pumpDeliveries();
+		const [post] = posts();
+		expect(post?.blocks).toEqual([
+			{ type: "markdown", text: "@오너 확인 부탁: **결정** 필요\n\n@떡 도 봐 줘. 다시 @오너" },
+			bell("🔔 <@U0OWNER> <@U0PEER>"),
+		]);
+		expect(post?.text).toContain("<@U0OWNER>");
+		expect(post?.text).toContain("<@U0PEER>");
+		expect(confirmed).toEqual([1]);
+	});
+
+	test("an answer over 11,000 chars with mentions only at its end: the 🔔 line sits right after the first part's markdown", async () => {
+		const body = `${"가나다라마바사 ".repeat(2000)}끝\n\n<@U0PEER> <@U0OWNER> 마무리`;
+		await buildMentionQueue([item(1, body)]);
+		await adapter.pumpDeliveries();
+		const [first, ...rest] = posts();
+		expect(rest.length).toBeGreaterThanOrEqual(1);
+		expect(first?.blocks?.[0]).toMatchObject({ type: "markdown" });
+		expect(first?.blocks?.[1]).toEqual(bell("🔔 <@U0PEER> <@U0OWNER>"));
+		for (const post of [first, ...rest]) for (const md of markdownTexts(post)) expect(md).not.toContain("<@");
+		expect(markdownTexts(rest.at(-1)).join("")).toContain("@떡 @오너 마무리");
+		// A peer bot reads only `text`: the message holding the mention keeps its whole fallback, tokens included.
+		expect(rest.at(-1)?.text).toContain("<@U0PEER> <@U0OWNER> 마무리");
+		expect(first?.text.length).toBeLessThanOrEqual(3_000);
+		expect(rest.flatMap((p) => p.blocks ?? []).some((b) => typeOf(b) === "context")).toBe(false);
+	});
+
+	test("mentions inside a code block or inline code stay verbatim and stay out of the 🔔 line; other tokens get readable names", async () => {
+		const body =
+			"예시:\n```\n<@U0CODE> <!here>\n```\n그리고 `<@U0SPAN>` 표시, <@U0OWNER> <#C0GEN|general> <#C0BARE> <@U0OTHER> <!here>";
+		const coded = "예시:\n```c\n#include <stdio.h>\n<#include> <@deco\n```\n그리고 `<@deco` 와 `<#include>` 표시";
+		await buildMentionQueue([item(1, body), item(2, coded)]);
+		await adapter.pumpDeliveries();
+		const [first, second] = posts();
+		expect(first?.blocks).toEqual([
+			{
+				type: "markdown",
+				text: "예시:\n```\n<@U0CODE> <!here>\n```\n그리고 `<@U0SPAN>` 표시, @오너 #general #채널 @사용자 @here",
+			},
+			bell("🔔 <@U0OWNER> <#C0GEN|general> <#C0BARE> <@U0OTHER> <!here>"),
+		]);
+		expect(second?.blocks).toEqual([{ type: "markdown", text: coded }]);
+	});
+
+	test("a monitor delivery's ⏰ first line becomes a header block; the same body from a chat origin gets none", async () => {
+		const body = "⏰ 아침 브리핑\n본문 **굵게**";
+		await buildQueue([{ ...item(1, body), originKey: "monitor/7" }, item(2, body)]);
+		await adapter.pumpDeliveries();
+		const [monitor, chat] = posts();
+		expect(monitor?.blocks).toEqual([
+			{ type: "header", text: { type: "plain_text", text: "⏰ 아침 브리핑", emoji: true } },
+			{ type: "markdown", text: "본문 **굵게**" },
+		]);
+		expect(monitor?.text).toBe(toMrkdwn(body));
+		expect(chat?.blocks).toEqual([{ type: "markdown", text: body }]);
+	});
+
+	test("a mention in a monitor title reads as a name in the header and opens the 🔔 line", async () => {
+		await buildMentionQueue([{ ...item(1, "⏰ *브리핑* <@U0OWNER>\n본문 <@U0PEER>"), originKey: "monitor/7" }]);
+		await adapter.pumpDeliveries();
+		expect(posts()[0]?.blocks).toEqual([
+			{ type: "header", text: { type: "plain_text", text: "⏰ 브리핑 @오너", emoji: true } },
+			{ type: "markdown", text: "본문 @떡" },
+			bell("🔔 <@U0OWNER> <@U0PEER>"),
+		]);
+	});
+
+	test("a markdown block refused on the first message: the answer starts over plain, later answers stay plain, logged once", async () => {
+		const queue = [item(1, "**첫 답**")];
+		const { confirmed } = await buildQueue(queue);
+		transport.failNext.postMessage = [new SlackCallError("definitive", "slack_platform_error:invalid_blocks")];
+		await adapter.pumpDeliveries();
+		expect(posts().map((p) => p.blocks === undefined)).toEqual([false, true]);
+		expect(posts()[1]?.text).toBe(renderParts("**첫 답**", false)[0]);
+		expect(confirmed).toEqual([1]);
+		queue.push(item(2, "**둘째 답**"));
+		await adapter.pumpDeliveries();
+		expect(posts()).toHaveLength(3);
+		expect(posts()[2]?.blocks).toBeUndefined();
+		expect(confirmed).toEqual([1, 2]);
+		expect(logs.filter((l) => l.includes("event=markdown_blocks_disabled"))).toHaveLength(1);
+	});
+
+	test("a markdown block refused on the second message: no path switch, nothing resent, the delivery fails", async () => {
+		const body = `${"가나다라마바사 ".repeat(2000)}끝`;
+		expect(renderMarkdownParts(body, false)).toHaveLength(2);
+		const { confirmed, failed } = await buildQueue([item(1, body)]);
+		const original = transport.postMessage.bind(transport);
+		let calls = 0;
+		transport.postMessage = async (args) => {
+			calls += 1;
+			if (calls === 2) throw new SlackCallError("definitive", "slack_platform_error:invalid_blocks");
+			return original(args);
+		};
+		await adapter.pumpDeliveries();
+		expect(calls).toBe(2);
+		expect(confirmed).toEqual([]);
+		expect(failed).toEqual([[1, "ambiguous"]]);
+		expect(logs.some((l) => l.includes("event=markdown_blocks_rejected_midway"))).toBe(true);
+		expect(logs.some((l) => l.includes("event=markdown_blocks_disabled"))).toBe(false);
+	});
+
+	test("a redelivered markdown answer opens with the duplicate-possible context block; the markdown has no prefix", async () => {
+		await buildQueue([item(1, "**본문**", true)]);
+		await adapter.pumpDeliveries();
+		expect(posts()[0]?.blocks).toEqual([
+			{ type: "context", elements: [{ type: "mrkdwn", text: REDELIVERED_PREFIX }] },
+			{ type: "markdown", text: "**본문**" },
+		]);
+		expect(posts()[0]?.text).toBe(`${REDELIVERED_PREFIX}\n*본문*`);
+	});
+
+	test("steered and cancelled threads keep their status relabelled; only the answer's thread deletes its status", async () => {
+		const queue: DeliveryItem[] = [];
+		await buildQueue(queue);
+		const steered = "1800000000.000700";
+		const dropped = "1800000000.000800";
+		await transport.emitMessage(dm());
+		await transport.emitMessage(dm({ ts: steered }));
+		await transport.emitMessage(dm({ ts: dropped }));
+		const [lead, steer, drop] = posts().map((p) => p.ts);
+		queue.push({
+			...item(1, "답"),
+			finishThreadRefs: [`D1:${steered}`, `D1:${dropped}`],
+			cancelThreadRefs: [`D1:${dropped}`],
+		});
+		await adapter.pumpDeliveries();
+		expect(transport.calls.flatMap((c) => (c.method === "deleteMessage" ? [c.ts] : []))).toEqual([lead ?? ""]);
+		expect(transport.calls.flatMap((c) => (c.method === "updateMessage" ? [[c.ts, c.text]] : []))).toEqual([
+			[steer ?? "", "✅ 완료 · 00:00"],
+			[drop ?? "", "🚫 취소됨 · 00:00"],
+		]);
+	});
+});
+
+describe("card answers", () => {
+	const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({
+		type,
+		props,
+		children,
+	});
+	const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });
+	const fence = (json: string): string => `\`\`\`card\n${json}\n\`\`\``;
+	const barChart = (title: string) =>
+		el("Chart", {
+			title,
+			chart: { type: "bar", categories: ["월", "화", "수"], series: [{ name: "턴", values: [10, 20, 12] }] },
+		});
+	const table = el("Table", {
+		headers: ["도구", "횟수"],
+		rows: [
+			["bash", "10"],
+			["read", "7"],
+			["edit", 3],
+		],
+	});
+	/** Fields 2칸 + bar 차트 + Table 3행. */
+	const FULL = spec({
+		c: el("Card", { title: "주간 요약" }, ["f", "g", "t"]),
+		f: el("Fields", {}, ["a", "b"]),
+		a: el("Field", { label: "턴", value: "42" }),
+		b: el("Field", { label: "실패", value: 1 }),
+		g: barChart("일별 턴"),
+		t: table,
+	});
+	const CHART_ONLY = spec({ c: el("Card", { title: "추이" }, ["g"]), g: barChart("일별 턴") });
+	const TABLE_ONLY = spec({ c: el("Card", { title: "표" }, ["t"]), t: table });
+	const INVALID = () => new SlackCallError("definitive", "slack_platform_error:invalid_blocks");
+
+	const item = (deliveryId: number, body: string, redelivered = false): DeliveryItem => ({
+		deliveryId,
+		originKey: "slack/dm/D1",
+		threadRef: `D1:${TS}`,
+		body,
+		redelivered,
+	});
+	async function buildQueue(queue: DeliveryItem[], extra: Partial<SlackAdapterOptions> = {}) {
+		const confirmed: number[] = [];
+		const failed: Array<[number, string]> = [];
+		await build(
+			{
+				claimDue: () => queue.splice(0),
+				confirm: (id) => void confirmed.push(id),
+				fail: (id, _error, outcome) => void failed.push([id, outcome]),
+				defer: () => {},
+			},
+			extra,
+		);
+		return { confirmed, failed };
+	}
+	/** An answered op on its own DM thread in the store, so a deferred delivery keeps its `sentParts`. */
+	function seedAnswer(opRef: string, body: string): void {
+		const id = `D1:1800000000.${opRef.padStart(6, "0")}`;
+		store.ensureOrigin("slack/dm/D1", join(dir, "sessions"));
+		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: id, textRef: "q", threadRef: id });
+		store.markDispatched(id, { opRef, entryCursor: null });
+		store.recordAnswer({ originKey: "slack/dm/D1", opRef, threadRef: id, parts: [body] });
+	}
+	/** Throws `errors[n]` on the n-th postMessage instead of posting; refused payloads are kept in order. */
+	function failPosts(errors: Record<number, Error>): Array<{ text: string; blocks?: readonly unknown[] }> {
+		const refused: Array<{ text: string; blocks?: readonly unknown[] }> = [];
+		const original = transport.postMessage.bind(transport);
+		let calls = 0;
+		transport.postMessage = async (args) => {
+			calls += 1;
+			const err = errors[calls];
+			if (err !== undefined) {
+				refused.push(args);
+				throw err;
+			}
+			return original(args);
+		};
+		return refused;
+	}
+	const typeOf = (block: unknown): unknown =>
+		typeof block === "object" && block !== null && "type" in block ? block.type : undefined;
+	const typesOf = (blocks: readonly unknown[] | undefined): unknown[] => (blocks ?? []).map(typeOf);
+	const hasFields = (blocks: readonly unknown[] | undefined): boolean =>
+		(blocks ?? []).some((b) => typeOf(b) === "section" && typeof b === "object" && b !== null && "fields" in b);
+	/** The mrkdwn text of each `section` block that has one. */
+	const sectionTexts = (blocks: readonly unknown[] | undefined): string[] =>
+		(blocks ?? []).flatMap((b) => {
+			if (typeOf(b) !== "section" || typeof b !== "object" || b === null || !("text" in b)) return [];
+			const text = b.text;
+			return typeof text === "object" && text !== null && "text" in text ? [String(text.text)] : [];
+		});
+
+	test("one card fence (Fields + bar chart + 3-row Table) goes out as [text, card, text]; the card is native blocks with a fallback text", async () => {
+		const body = `앞 글 **요약**\n\n${fence(FULL)}\n\n뒷 글 결론`;
+		const { confirmed } = await buildQueue([item(1, body)]);
+		await adapter.pumpDeliveries();
+		expect(posts()).toHaveLength(3);
+		const [before, card, after] = posts();
+		expect(before?.blocks).toEqual([{ type: "markdown", text: "앞 글 **요약**" }]);
+		expect(hasFields(card?.blocks)).toBe(true);
+		expect(typesOf(card?.blocks)).toContain("data_visualization");
+		expect(typesOf(card?.blocks).some((t) => t === "table" || t === "data_table")).toBe(true);
+		expect(card?.text.trim()).not.toBe("");
+		expect(after?.blocks).toEqual([{ type: "markdown", text: "뒷 글 결론" }]);
+		expect(confirmed).toEqual([1]);
+	});
+
+	test("a chart card refused mid-answer: resent at once with an ASCII chart, the next part follows, charts stay ASCII and markdown stays on for later answers", async () => {
+		const queue = [item(1, `앞 글\n\n${fence(CHART_ONLY)}\n\n뒷 글`)];
+		const { confirmed, failed } = await buildQueue(queue);
+		const refused = failPosts({ 2: INVALID() });
+		await adapter.pumpDeliveries();
+		expect(typesOf(refused[0]?.blocks)).toContain("data_visualization");
+		expect(posts()).toHaveLength(3);
+		const card = posts()[1];
+		expect(typesOf(card?.blocks)).not.toContain("data_visualization");
+		expect(sectionTexts(card?.blocks).some((t) => t.startsWith("```") && t.includes("일별 턴"))).toBe(true);
+		expect(posts()[2]?.blocks).toEqual([{ type: "markdown", text: "뒷 글" }]);
+		expect(confirmed).toEqual([1]);
+		expect(failed).toEqual([]);
+		expect(logs.filter((l) => l.includes("event=card_blocks_rejected"))).toHaveLength(1);
+		expect(logs.filter((l) => l.includes("event=card_chart_blocks_disabled"))).toHaveLength(1);
+		expect(logs.some((l) => l.includes("event=markdown_blocks_disabled"))).toBe(false);
+
+		// The next answer: its text is still a markdown block, its chart card is ASCII on the first try.
+		queue.push(item(2, `다음 답\n\n${fence(CHART_ONLY)}`));
+		await adapter.pumpDeliveries();
+		expect(refused).toHaveLength(1);
+		const [text, chart] = posts().slice(3);
+		expect(text?.blocks).toEqual([{ type: "markdown", text: "다음 답" }]);
+		expect(typesOf(chart?.blocks)).not.toContain("data_visualization");
+		expect(sectionTexts(chart?.blocks).some((t) => t.includes("일별 턴"))).toBe(true);
+		expect(confirmed).toEqual([1, 2]);
+	});
+
+	test("a table-only card refused: resent once as the fence's code block without blocks; markdown stays on", async () => {
+		const { confirmed } = await buildQueue([item(1, `${fence(TABLE_ONLY)}\n\n뒷 글`)]);
+		const refused = failPosts({ 1: INVALID() });
+		await adapter.pumpDeliveries();
+		expect(refused).toHaveLength(1);
+		expect(posts()).toHaveLength(2);
+		expect(posts()[0]?.blocks).toBeUndefined();
+		expect(posts()[0]?.text).toContain(`\`\`\`card\n${TABLE_ONLY}\n\`\`\``);
+		expect(posts()[1]?.blocks).toEqual([{ type: "markdown", text: "뒷 글" }]);
+		expect(confirmed).toEqual([1]);
+		expect(logs.some((l) => l.includes("event=markdown_blocks_disabled"))).toBe(false);
+		expect(logs.some((l) => l.includes("event=card_chart_blocks_disabled"))).toBe(false);
+	});
+
+	test("an answer opening with a card whose text part is refused: that part goes once without blocks, the card is not resent, markdown turns off", async () => {
+		const body = `${fence(TABLE_ONLY)}\n\n뒷 글 **결론**`;
+		const queue = [item(1, body)];
+		const { confirmed, failed } = await buildQueue(queue);
+		const refused = failPosts({ 2: INVALID() });
+		await adapter.pumpDeliveries();
+		expect(refused).toHaveLength(1);
+		expect(refused[0]?.blocks).toEqual([{ type: "markdown", text: "뒷 글 **결론**" }]);
+		expect(posts()).toHaveLength(2);
+		expect(typesOf(posts()[0]?.blocks).some((t) => t === "table" || t === "data_table")).toBe(true);
+		expect(posts()[1]?.blocks).toBeUndefined();
+		expect(posts()[1]?.text).toBe(renderMarkdownParts(body, false, undefined, { cards: true })?.[1]?.text);
+		expect(confirmed).toEqual([1]);
+		expect(failed).toEqual([]);
+		expect(logs.filter((l) => l.includes("event=markdown_blocks_disabled"))).toHaveLength(1);
+		expect(logs.some((l) => l.includes("event=markdown_blocks_rejected_midway"))).toBe(false);
+
+		queue.push(item(2, "**둘째 답**"));
+		await adapter.pumpDeliveries();
+		expect(posts()).toHaveLength(3);
+		expect(posts()[2]?.blocks).toBeUndefined();
+		expect(confirmed).toEqual([1, 2]);
+	});
+
+	test("a refused chart card, then a 429 on the next part: the resumed delivery posts the same messages in the same order", async () => {
+		const body = `앞 글\n\n${fence(CHART_ONLY)}\n\n뒷 글`;
+		seedAnswer("1", body);
+		const refused = failPosts({ 2: INVALID(), 4: new SlackRateLimitedError(30_000) });
+		expect(await adapter.pumpDeliveries()).toBe(0);
+		expect(store.listDeliveries()[0]).toMatchObject({ state: "pending", sentParts: 2 });
+		now += 30_000;
+		expect(await adapter.pumpDeliveries()).toBe(1);
+		expect(refused).toHaveLength(2);
+		expect(posts()).toHaveLength(3);
+		expect(posts()[0]?.blocks).toEqual([{ type: "markdown", text: "앞 글" }]);
+		expect(typesOf(posts()[1]?.blocks)).not.toContain("data_visualization");
+		expect(posts()[2]?.blocks).toEqual([{ type: "markdown", text: "뒷 글" }]);
+		expect(store.listDeliveries()[0]?.state).toBe("confirmed");
+	});
+
+	test("invalid cards (root Text, unknown component, bad JSON, Button, two tables) stay as code in the text part and log card_spec_invalid", async () => {
+		const cases = [
+			spec({ t: el("Text", { content: "x" }) }, "t"),
+			spec({ c: el("Card", {}, ["x"]), x: el("Gauge", { value: 3 }) }),
+			'{"root":"c","elements":{',
+			spec({ c: el("Card", {}, ["a"]), a: el("Actions", {}, ["b"]), b: el("Button", { id: "x", label: "y" }) }),
+			spec({ c: el("Card", {}, ["t1", "t2"]), t1: table, t2: table }),
+		];
+		const { confirmed } = await buildQueue(cases.map((json, i) => item(i + 1, `앞 글\n\n${fence(json)}\n\n뒷 글`)));
+		await adapter.pumpDeliveries();
+		expect(posts()).toHaveLength(cases.length);
+		cases.forEach((json, i) => {
+			const body = `앞 글\n\n${fence(json)}\n\n뒷 글`;
+			expect(posts()[i]?.blocks).toEqual([{ type: "markdown", text: body }]);
+		});
+		const invalid = logs.filter((l) => l.includes("event=card_spec_invalid"));
+		expect(invalid).toHaveLength(cases.length);
+		for (const [i, line] of invalid.entries()) {
+			expect(line).toContain(`id=${i + 1}`);
+			expect(line).toMatch(/issues=".*card 1: .+"/);
+		}
+		expect(confirmed).toEqual([1, 2, 3, 4, 5]);
+	});
+
+	test("a 429 right before the card part: the resumed delivery starts at the card part", async () => {
+		const body = `앞 글\n\n${fence(FULL)}\n\n뒷 글`;
+		seedAnswer("1", body);
+		failPosts({ 2: new SlackRateLimitedError(30_000) });
+		expect(await adapter.pumpDeliveries()).toBe(0);
+		expect(store.listDeliveries()[0]).toMatchObject({ state: "pending", sentParts: 1 });
+		expect(posts()).toHaveLength(1);
+		now += 30_000;
+		expect(await adapter.pumpDeliveries()).toBe(1);
+		expect(posts()).toHaveLength(3);
+		expect(posts()[0]?.blocks).toEqual([{ type: "markdown", text: "앞 글" }]);
+		expect(typesOf(posts()[1]?.blocks)).toContain("data_visualization");
+		expect(posts()[2]?.blocks).toEqual([{ type: "markdown", text: "뒷 글" }]);
+	});
+
+	test("an answer without a valid card goes out exactly as the cards-off markdown parts", async () => {
+		const bodies = [
+			"**답**\n\n| a | b |\n| --- | --- |\n| 1 | 2 |",
+			`예시:\n\`\`\`md\n${fence(FULL)}\n\`\`\`\n끝`,
+			`앞 글\n\n\`\`\`card\n${FULL}\n`,
+		];
+		await buildQueue(bodies.map((body, i) => item(i + 1, body)));
+		await adapter.pumpDeliveries();
+		expect(posts().map((p) => ({ text: p.text, blocks: p.blocks }))).toEqual(
+			bodies.flatMap((body) => renderMarkdownParts(body, false) ?? []).map((p) => ({ text: p.text, blocks: p.blocks })),
+		);
+		expect(logs.some((l) => l.includes("event=card_spec_invalid"))).toBe(false);
+	});
+});
+
+describe("system notices", () => {
+	test("a two-line notice is a header + section card with the same text; a one-line notice has no blocks", async () => {
+		const text = "⚠️ 응답 지연\n세션 `a` 가 *2분* 넘게 조용합니다.\n다음 줄";
+		await adapter.postNotice("D1", text, TS);
+		await adapter.postNotice("D1", "공지 한 줄");
+		const [card, line] = posts();
+		expect(card).toMatchObject({ channel: "D1", threadTs: TS, text });
+		expect(card?.blocks).toEqual([
+			{ type: "header", text: { type: "plain_text", text: "⚠️ 응답 지연", emoji: true } },
+			{ type: "section", text: { type: "mrkdwn", text: "세션 `a` 가 *2분* 넘게 조용합니다.\n다음 줄" } },
+		]);
+		expect(line?.text).toBe("공지 한 줄");
+		expect(line?.blocks).toBeUndefined();
+	});
+
+	test("Slack refusing the card blocks: the notice goes out once more without blocks, logged", async () => {
+		transport.failNext.postMessage = [new SlackCallError("definitive", "slack_platform_error:invalid_blocks")];
+		await adapter.postNotice("D1", "제목\n본문");
+		// The fake records the refused call too: the card attempt, then one resend without blocks.
+		expect(posts().map((p) => [p.text, p.blocks === undefined])).toEqual([
+			["제목\n본문", false],
+			["제목\n본문", true],
+		]);
+		expect(logs.filter((l) => l.includes("event=notice_blocks_rejected"))).toHaveLength(1);
+		expect(logs.some((l) => l.includes("event=backfill_notice_failed"))).toBe(false);
+	});
+
+	test("the header is plain text: mrkdwn emphasis, code and mention syntax are stripped from the first line", async () => {
+		await adapter.postNotice("D1", "*⚠️ 게이트* `x` <@U1>\n본문");
+		const header = posts()[0]?.blocks?.[0];
+		expect(header).toMatchObject({ type: "header", text: { type: "plain_text" } });
+		const title = JSON.stringify(header);
+		expect(title).not.toContain("*");
+		expect(title).not.toContain("`");
+		expect(title).not.toContain("<@");
+		expect(header).toEqual({ type: "header", text: { type: "plain_text", text: "⚠️ 게이트 x @사용자", emoji: true } });
 	});
 });
 
@@ -535,18 +1187,37 @@ describe("status message", () => {
 		expect(transport.count("updateMessage")).toBe(2);
 	});
 
-	test("a final update blocked by a 429 is retried by tick, not lost", async () => {
+	test("a status delete blocked by a 429 is retried by tick as a delete, not turned into an update", async () => {
 		await transport.emitMessage(dm());
 		answer(["답"]);
-		transport.failNext.updateMessage = [new SlackRateLimitedError(5_000)];
+		transport.failNext.deleteMessage = [new SlackRateLimitedError(5_000)];
 		await adapter.pumpDeliveries();
 		expect(store.listDeliveries()[0]?.state).toBe("confirmed");
-		expect(transport.count("updateMessage")).toBe(1);
-		now += 5_000;
+		expect(transport.count("deleteMessage")).toBe(1);
+		now += 4_999;
 		await adapter.tick();
-		const updates = transport.calls.filter((c) => c.method === "updateMessage");
-		expect(updates).toHaveLength(2);
-		expect(updates[1]).toMatchObject({ text: "✅ 완료 · 00:05" });
+		expect(transport.count("deleteMessage")).toBe(1);
+		now += 1;
+		await adapter.tick();
+		expect(transport.count("deleteMessage")).toBe(2);
+		expect(transport.count("updateMessage")).toBe(0);
+		await adapter.tick();
+		expect(transport.count("deleteMessage")).toBe(2);
+	});
+
+	test("a refused status delete relabels the status with the final label in the same call", async () => {
+		await transport.emitMessage(dm());
+		const statusTs = posts()[0]?.ts;
+		answer(["답"]);
+		transport.failNext.deleteMessage = [new SlackCallError("definitive", "slack_platform_error:cant_delete_message")];
+		await adapter.pumpDeliveries();
+		expect(transport.calls.filter((c) => c.method === "updateMessage")).toEqual([
+			{ method: "updateMessage", channel: "D1", ts: statusTs ?? "", text: "✅ 완료 · 00:00" },
+		]);
+		expect(logs.some((l) => l.includes("event=status_delete_failed"))).toBe(true);
+		await adapter.tick();
+		expect(transport.count("deleteMessage")).toBe(1);
+		expect(transport.count("updateMessage")).toBe(1);
 	});
 
 	test("setProgress inside the cadence posts nothing; the next cadence update shows it", async () => {
@@ -690,6 +1361,48 @@ describe("format", () => {
 			`${"line of code\n".repeat(600)}`.replace(/\n$/, ""),
 		);
 		expect(chunkText("가".repeat(9000)).every((c) => c.length <= CHUNK_LIMIT)).toBe(true);
+	});
+
+	const markdownOf = (part: MarkdownPart): string =>
+		part.blocks.flatMap((b) => (b.type === "markdown" ? [b.text] : [])).join("");
+
+	test("markdown parts: up to 11,000 chars is one message; longer answers split with balanced fences", () => {
+		const mid = `${"가나다라마바사 ".repeat(600)}끝`;
+		expect(mid.length).toBeGreaterThan(CHUNK_LIMIT);
+		expect(renderMarkdownParts(mid, false)).toHaveLength(1);
+		const code = `설명\n\n\`\`\`ts\n${"const x = 1;\n".repeat(1200)}\`\`\`\n끝`;
+		expect(code.length).toBeGreaterThan(MARKDOWN_CHUNK_LIMIT);
+		const parts = renderMarkdownParts(code, false) ?? [];
+		expect(parts.length).toBeGreaterThanOrEqual(2);
+		for (const part of parts) {
+			const md = markdownOf(part);
+			expect(md.length).toBeLessThanOrEqual(MARKDOWN_CHUNK_LIMIT);
+			expect((md.match(/```/g) ?? []).length % 2).toBe(0);
+		}
+		expect(
+			parts
+				.map(markdownOf)
+				.join("\n")
+				.replace(/```(ts)?\n?/g, "")
+				.replace(/\n+/g, "\n"),
+		).toBe(code.replace(/```(ts)?\n?/g, "").replace(/\n+/g, "\n"));
+	});
+
+	test("a GFM table across a markdown chunk boundary lands whole in one part; no part opens mid-table", () => {
+		const rows = Array.from({ length: 600 }, (_, i) => `| 항목 ${String(i).padStart(3, "0")} | 값 |`);
+		const table = ["| 이름 | 값 |", "| --- | --- |", ...rows].join("\n");
+		const body = `${"서론 문장입니다. ".repeat(300)}\n\n${table}\n\n${"결론 ".repeat(300)}`;
+		expect(body.length).toBeGreaterThan(MARKDOWN_CHUNK_LIMIT);
+		const parts = (renderMarkdownParts(body, false) ?? []).map(markdownOf);
+		expect(parts.length).toBeGreaterThanOrEqual(2);
+		expect(parts.filter((md) => md.includes(table))).toHaveLength(1);
+		for (const md of parts) {
+			const [first, second] = md.split("\n");
+			if (first?.startsWith("|")) expect(second).toBe("| --- | --- |");
+		}
+		// A table that cannot fit one message leaves the whole answer to the plain path.
+		const huge = ["| 이름 | 값 |", "| --- | --- |", ...Array.from({ length: 900 }, (_, i) => `| 항목 ${i} | 값 |`)];
+		expect(renderMarkdownParts(huge.join("\n"), false)).toBeUndefined();
 	});
 });
 

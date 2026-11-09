@@ -60,6 +60,8 @@ export interface BackupOptions {
 	now?: Date;
 	/** Combined size ceiling of the bundle sources (tests inject this). Default 512MB. */
 	maxBundleBytes?: number;
+	/** The tar binary (tests inject this). Default `tar` on PATH. */
+	tarBin?: string;
 }
 
 export interface BackupResult {
@@ -150,6 +152,17 @@ interface PendingBundle {
 	target: string;
 }
 
+/** GNU tar's only warning that still leaves a complete archive: a file (a live session log) grew while it was read. */
+const FILE_CHANGED_WARNING = /^tar: .+: file changed as we read it$/;
+
+/** `tar -c` exit 0, or exit 1 whose every stderr line is the file-changed warning; anything else is a failure. */
+function tarCreateSucceeded(exitCode: number | null, stderr: string): boolean {
+	if (exitCode === 0) return true;
+	if (exitCode !== 1) return false;
+	const lines = stderr.split("\n").filter((line) => line.trim() !== "");
+	return lines.length > 0 && lines.every((line) => FILE_CHANGED_WARNING.test(line));
+}
+
 /**
  * Tars the bundle sources (`sessions/`, `config.json`, `workspace/`, `scripts/`) of `<homeDir>` into a temp file and verifies the archive
  * lists every source. `undefined` when the home has no sources at all (a ledger-only home has nothing to bundle).
@@ -160,6 +173,7 @@ function createPendingBundle(
 	backupsDir: string,
 	stamp: string,
 	maxBytes: number,
+	tarBin: string,
 ): PendingBundle | undefined {
 	const sources = BUNDLE_SOURCES.filter((name) => existsSync(join(homeDir, name)));
 	if (sources.length === 0) return undefined;
@@ -175,11 +189,11 @@ function createPendingBundle(
 		const target = join(backupsDir, `ompbot-bundle-${stamp}.tar.gz`);
 		if (existsSync(target)) throw new BackupError("target_exists", target);
 		tmp = `${target}.tmp-${crypto.randomUUID()}`;
-		const create = Bun.spawnSync(["tar", "-czf", tmp, "-C", homeDir, ...sources]);
-		if (create.exitCode !== 0) {
+		const create = Bun.spawnSync([tarBin, "-czf", tmp, "-C", homeDir, ...sources]);
+		if (!tarCreateSucceeded(create.exitCode, create.stderr.toString())) {
 			throw new BackupError("bundle_failed", create.stderr.toString().trim().slice(0, 200));
 		}
-		const list = Bun.spawnSync(["tar", "-tzf", tmp]);
+		const list = Bun.spawnSync([tarBin, "-tzf", tmp]);
 		if (list.exitCode !== 0) {
 			throw new BackupError("bundle_failed", list.stderr.toString().trim().slice(0, 200));
 		}
@@ -252,7 +266,13 @@ export function runBackup(options: BackupOptions): BackupResult {
 		}
 		if (check !== "ok") throw new BackupError("integrity_check_failed", `quick_check=${check}`);
 
-		bundle = createPendingBundle(homeDir, backupsDir, stamp, options.maxBundleBytes ?? DEFAULT_MAX_BUNDLE_BYTES);
+		bundle = createPendingBundle(
+			homeDir,
+			backupsDir,
+			stamp,
+			options.maxBundleBytes ?? DEFAULT_MAX_BUNDLE_BYTES,
+			options.tarBin ?? "tar",
+		);
 		renameSync(tmp, target);
 		if (bundle !== undefined) renameSync(bundle.tmp, bundle.target);
 		fsyncDir(backupsDir);

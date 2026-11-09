@@ -58,6 +58,51 @@ describe("SlackChannel over FakeSlackTransport", () => {
 		expect(transport.calls[1]).toMatchObject({ method: "updateMessage", blocks: [] });
 	});
 
+	test("a card is header → section(body ?? text) → fields → actions → context; `buttons: []` drops only the actions", async () => {
+		const transport = new FakeSlackTransport();
+		const channel = new SlackChannel(transport);
+		const header = { type: "header", text: { type: "plain_text", text: "🔐 승인 요청", emoji: true } };
+		const fields = { type: "section", fields: [{ type: "mrkdwn", text: "*할 일*\n배포" }] };
+		const note = { type: "context", elements: [{ type: "mrkdwn", text: "⏳ 13:30까지" }] };
+		const card = {
+			title: "🔐 승인 요청",
+			body: "요약",
+			fields: [{ label: "할 일", value: "배포" }],
+			buttonsNote: "⏳ 13:30까지",
+		};
+		const ref = await channel.post(
+			{ conversationId: "C1" },
+			{ text: "알림 문구", ...card, buttons: [{ actionId: "ompbot:test:yes", label: "예" }] },
+		);
+		expect(transport.calls[0]).toMatchObject({
+			method: "postMessage",
+			text: "알림 문구",
+			blocks: [
+				header,
+				{ type: "section", text: { type: "mrkdwn", text: "요약" } },
+				fields,
+				{
+					type: "actions",
+					elements: [{ type: "button", text: { type: "plain_text", text: "예" }, action_id: "ompbot:test:yes" }],
+				},
+				note,
+			],
+		});
+		await channel.edit(ref, { text: "알림 문구", ...card, buttons: [] });
+		expect(transport.calls[1]).toMatchObject({
+			blocks: [header, { type: "section", text: { type: "mrkdwn", text: "요약" } }, fields, note],
+		});
+		// Without `body` the section shows `text`; a field longer than Slack's 2,000 characters is cut.
+		await channel.edit(ref, { text: "본문", fields: [{ label: "긴 칸", value: "가".repeat(3000) }] });
+		const last = transport.calls[2];
+		expect(last).toMatchObject({
+			blocks: [
+				{ type: "section", text: { type: "mrkdwn", text: "본문" } },
+				{ type: "section", fields: [{ type: "mrkdwn", text: `*긴 칸*\n${"가".repeat(2000 - "*긴 칸*\n".length)}` }] },
+			],
+		});
+	});
+
 	test("uploadFile keeps the thread, title and comment", async () => {
 		const transport = new FakeSlackTransport();
 		const { fileId } = await new SlackChannel(transport).uploadFile(

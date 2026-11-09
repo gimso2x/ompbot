@@ -98,7 +98,9 @@ function isBotMessage(message: HistoryMessage, botUserId: string): boolean {
 /** Slack refuses read calls sent as JSON bodies; @slack/web-api form-encodes for us (the 2026-09-17 incident). */
 function isUnreadableChannelError(error: unknown): boolean {
 	if (!(error instanceof SlackCallError) || error.kind !== "definitive") return false;
-	return /slack_platform_error:(channel_not_found|not_in_channel|missing_scope|is_archived|invalid_auth)/.test(
+	// thread_not_found: the thread's root was deleted. Like a left channel it never comes back, so the thread target
+	// takes the same strikes and quarantine instead of a warning on every pass until it leaves the 7-day window.
+	return /slack_platform_error:(channel_not_found|not_in_channel|missing_scope|is_archived|invalid_auth|thread_not_found)/.test(
 		error.message,
 	);
 }
@@ -413,6 +415,15 @@ export async function runBackfillPass(
 		const key = threadCursorKey(thread.channel, thread.rootTs);
 		if ((quarantine.get(key) ?? 0) >= QUARANTINE_ATTEMPTS) {
 			targets.push({ key, scanned: 0, recovered: 0, truncated: false, skipped: true });
+			continue;
+		}
+		// The channel read already failed as unreadable (left, archived, deleted): its threads would fail the same way,
+		// one warning each. Follow the channel's strikes instead — retried while it is striking, skipped once it is
+		// quarantined, read again as soon as a channel read succeeds (which clears the strikes).
+		const channelStrikes = quarantine.get(channelCursorKey(thread.channel)) ?? 0;
+		if (channelStrikes > 0) {
+			const skipped = channelStrikes >= QUARANTINE_ATTEMPTS;
+			targets.push({ key, scanned: 0, recovered: 0, truncated: !skipped, skipped });
 			continue;
 		}
 		targets.push(

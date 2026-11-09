@@ -11,6 +11,7 @@ import {
 	type SlackHandlers,
 	type SlackMessageEvent,
 	SlackRateLimitedError,
+	type SlackReactionEvent,
 	type SlackSlashPayload,
 	type SlackTransport,
 } from "./transport";
@@ -159,9 +160,12 @@ export class SocketModeTransport implements SlackTransport {
 			},
 			handlers: {
 				eventsApi: async (payload) => {
-					// Slack shapes events_api payloads by our app's event subscriptions; only `message` is subscribed.
-					const body = payload as { event?: SlackMessageEvent };
-					if (body.event?.type === "message") await handlers.message(body.event);
+					// Slack shapes events_api payloads by our app's event subscriptions: `message` and the two reaction events.
+					const event = (payload as { event?: SlackMessageEvent | SlackReactionEvent }).event;
+					if (event?.type === "message") await handlers.message(event);
+					else if (event?.type === "reaction_added" || event?.type === "reaction_removed") {
+						await handlers.reaction(event);
+					}
 				},
 				// Slash and interactive payloads are Slack-defined; the adapter validates the fields it reads.
 				slashCommand: (payload) => handlers.slash(payload as SlackSlashPayload),
@@ -217,6 +221,10 @@ export class SocketModeTransport implements SlackTransport {
 	}): Promise<void> {
 		const { blocks, ...rest } = args;
 		await guarded(() => this.web.chat.update({ ...rest, ...(blocks ? { blocks: [...blocks] as never } : {}) }));
+	}
+
+	async deleteMessage(args: { channel: string; ts: string }): Promise<void> {
+		await guarded(() => this.web.chat.delete(args));
 	}
 
 	async uploadFile(args: {

@@ -11,6 +11,7 @@ const SNAPSHOT_KEYS = [
 	"generatedAt",
 	"daemon",
 	"turns",
+	"feedback",
 	"tasks",
 	"lanes",
 	"herdr",
@@ -19,6 +20,7 @@ const SNAPSHOT_KEYS = [
 	"alerts",
 	"gates",
 	"backup",
+	"jobs",
 ];
 
 let home: TestHome;

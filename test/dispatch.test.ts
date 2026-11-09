@@ -143,6 +143,14 @@ describe("simple mode risk gate", () => {
 		expect(runs).toHaveLength(1);
 		expect(approvals).toEqual([]);
 	});
+
+	test("omp -p has nobody to answer a dialog: its floors forbid `ask` even for a chat origin", async () => {
+		const { built, runs } = simpleTool();
+		await built.execute({ task: "빌드 상태 요약" }, { signal });
+		const appendix = runs[0]?.[runs[0].indexOf("--append-system-prompt") + 1] ?? "";
+		expect(appendix).toContain("never use the `ask` tool");
+		expect(appendix).not.toContain("may use the `ask` tool");
+	});
 });
 
 describe("remote dispatch (host qualifier)", () => {
@@ -312,6 +320,108 @@ describe("herdr dispatch", () => {
 			options: { run: runner([{ match: () => true, respond: () => ({ code: 1, stdout: "", timedOut: false }) }]) },
 		});
 		expect(result.ok).toBe(false);
+	});
+});
+
+describe("herdr local start cleanup", () => {
+	/** A local start whose argv is recorded; `fail` names the step that exits 1. */
+	async function startWith(fail: "start" | "prompt") {
+		const calls: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			calls.push(cmd);
+			if (cmd[1] === "workspace" && cmd[2] === "create") {
+				const created = { workspace: { workspace_id: "W7" }, tab: { tab_id: "T7" }, root_pane: { pane_id: "P7" } };
+				return { code: 0, stdout: JSON.stringify({ result: created }), timedOut: false };
+			}
+			if (cmd[1] === "agent" && cmd[2] === fail) return { code: 1, stdout: "", stderr: "boom", timedOut: false };
+			return { code: 0, stdout: "{}", timedOut: false };
+		};
+		const result = await herdrStartAgent({ name: "t-1", task: "지시", cwd: "/ws", options: { run } });
+		return { result, calls, closes: calls.filter((cmd) => cmd[1] === "workspace" && cmd[2] === "close") };
+	}
+
+	test("workspace create passes --no-focus; a failed agent start closes that workspace exactly once", async () => {
+		const { result, calls, closes } = await startWith("start");
+		expect(calls[0]).toEqual(["herdr", "workspace", "create", "--cwd", "/ws", "--label", "ompbot · t-1", "--no-focus"]);
+		expect(result).toEqual({ ok: false, error: "agent start failed: boom" });
+		expect(closes).toEqual([["herdr", "workspace", "close", "W7"]]);
+		expect(calls.some((cmd) => cmd[2] === "prompt")).toBe(false);
+	});
+
+	test("a failed first prompt leaves the started agent and its workspace alone", async () => {
+		const { result, closes } = await startWith("prompt");
+		expect(result).toEqual({ ok: false, error: "agent prompt failed: boom" });
+		expect(closes).toEqual([]);
+	});
+});
+
+describe("herdr follow-up delivery check", () => {
+	const fail = (code: string): RunProcessResult => ({
+		code: 1,
+		stdout: "",
+		stderr: JSON.stringify({ error: { code, message: code } }),
+		timedOut: false,
+	});
+	async function follow(...answers: RunProcessResult[]) {
+		const calls: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			calls.push(cmd);
+			return answers[calls.length - 1] ?? { code: 0, stdout: "", timedOut: false };
+		};
+		return { result: await herdrPromptExisting("t-1", "재개", { run }), calls };
+	}
+
+	test("waits for working or blocked for 15 s; a seen start is ok", async () => {
+		const { result, calls } = await follow({ code: 0, stdout: "", timedOut: false });
+		expect(calls).toEqual([
+			[
+				"herdr",
+				"agent",
+				"prompt",
+				"t-1",
+				"재개",
+				"--wait",
+				"--until",
+				"working",
+				"--until",
+				"blocked",
+				"--timeout",
+				"15000",
+			],
+		]);
+		expect(result).toEqual({ ok: true });
+	});
+
+	test("a stall or herdr's own timeout is unconfirmed; agent_blocked stays a plain failure", async () => {
+		expect((await follow(fail("agent_prompt_stalled"))).result).toEqual({
+			ok: false,
+			unconfirmed: true,
+			error: "agent prompt unconfirmed: agent_prompt_stalled",
+		});
+		expect((await follow(fail("timeout"))).result).toEqual({
+			ok: false,
+			unconfirmed: true,
+			error: "agent prompt unconfirmed: timeout",
+		});
+		const blocked = await follow(fail("agent_blocked"));
+		expect(blocked.result).toEqual({ ok: false, error: "agent prompt failed: agent_blocked: agent_blocked" });
+		expect(blocked.calls).toHaveLength(1);
+	});
+
+	test("a herdr that does not know --wait gets the plain prompt exactly once more", async () => {
+		const usage: RunProcessResult = {
+			code: 2,
+			stdout: "",
+			stderr: "error: unexpected argument '--wait' found\n\nUsage: herdr agent prompt <NAME> <TEXT>\n",
+			timedOut: false,
+		};
+		const retried = await follow(usage, { code: 0, stdout: "", timedOut: false });
+		expect(retried.calls).toHaveLength(2);
+		expect(retried.calls[1]).toEqual(["herdr", "agent", "prompt", "t-1", "재개"]);
+		expect(retried.result).toEqual({ ok: true });
+		const stillFailing = await follow(usage, fail("agent_not_found"));
+		expect(stillFailing.calls).toHaveLength(2);
+		expect(stillFailing.result).toEqual({ ok: false, error: "agent prompt failed: agent_not_found: agent_not_found" });
 	});
 });
 
@@ -547,5 +657,23 @@ describe("herdr optional (config herdr)", () => {
 		const { built, calls } = dispatchTool({ herdr: {} });
 		await built.execute({ mode: "herdr", name: "x" }, { signal });
 		expect(calls[0]?.[0]).toBe("herdr");
+	});
+
+	test("a task to a name the remote host already runs is a follow-up prompt, not a second start", async () => {
+		const calls: string[][] = [];
+		const { built } = dispatchTool({
+			herdr: {},
+			dispatchHosts: { wsl: { ssh: "wsl" } },
+			run: async (cmd) => {
+				calls.push(cmd);
+				return { code: 0, stdout: JSON.stringify({ result: { agents: [{ name: "worker-1" }] } }), timedOut: false };
+			},
+		});
+		const text = String(await built.execute({ host: "wsl", name: "worker-1", task: "다음 단계 진행" }, { signal }));
+		expect(text).toContain("후속 지시");
+		const words = calls.map((cmd) => cmd.join(" "));
+		expect(words.some((line) => line.includes("'agent' 'prompt' 'worker-1' '다음 단계 진행'"))).toBe(true);
+		// None of herdrRemoteStart's steps after its name check ran.
+		expect(words.some((line) => /'(workspace|tab)'|'agent' 'start'/.test(line))).toBe(false);
 	});
 });

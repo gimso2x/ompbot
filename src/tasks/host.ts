@@ -1,14 +1,24 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { dispatchEnv, type ProcessRunner, realProcessRunner, remoteShellQuote } from "../dispatch/omp";
+import {
+	DEFAULT_STDOUT_CAP,
+	dispatchEnv,
+	type ProcessRunner,
+	realProcessRunner,
+	remoteShellQuote,
+} from "../dispatch/omp";
 import type { CommitCheck } from "./checker";
 import { TASK_PATH_PATTERN } from "./docs";
 
 export type HostResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
-/** Process-runner stdout cap (`realProcessRunner`): a document at or past it may be cut, so it counts as unreadable. */
-const RUNNER_STDOUT_CAP = 64_000;
+/**
+ * Task-branch diffs are collected whole (still `--unified=0`, still without `docs/tasks`): the integrity classifier
+ * is local string work with no model context, and a real task branch (T-20261109-04) measured ~150 KB. Past this a
+ * task keeps the commit-unit review hand-off instead of an ever-larger read.
+ */
+const DIFF_STDOUT_CAP = 512_000;
 const GIT_TIMEOUT_MS = 60_000;
 const IO_TIMEOUT_MS = 20_000;
 const HEX_HASH = /^[0-9a-f]{7,40}$/;
@@ -37,6 +47,12 @@ export interface TaskHostOps {
 	 * cannot be asked or git fails unexpectedly (never answers "no" for "unknown").
 	 */
 	commitOnTaskBranch(input: { worktree: string; branch: string; taskId: string; hash: string }): Promise<CommitCheck>;
+	/**
+	 * `git diff <base>..<branch> --unified=0` from the branch's docs commit (the base `commitOnTaskBranch` measures
+	 * from). `no_base` without a docs commit, `diff too large` at its own (raised) stdout cap, any git or host failure
+	 * as its error — never an empty diff for "unknown".
+	 */
+	branchDiff(input: { worktree: string; branch: string; taskId: string }): Promise<HostResult<string>>;
 	/** Commits `docs/tasks/<taskId>` on the worktree's branch as `docs(task): <taskId> 4문서`; the value is the hash. */
 	commitDocs(input: { worktree: string; taskId: string }): Promise<HostResult<string>>;
 	/**
@@ -84,15 +100,44 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 	const env = dispatchEnv(options.inheritedEnv ?? process.env);
 
 	/** One command on the host, stderr folded into stdout so a git error reaches the report. */
-	const exec = (argv: string[], timeoutMs: number) =>
+	const exec = (argv: string[], timeoutMs: number, stdoutCap?: number) =>
 		sshTarget === undefined
-			? run(["sh", "-c", 'exec "$@" 2>&1', "sh", ...argv], { timeoutMs, env })
-			: run(sshCommand(sshTarget, [...argv, "2>&1"]), { timeoutMs });
+			? run(["sh", "-c", 'exec "$@" 2>&1', "sh", ...argv], { timeoutMs, env, stdoutCap })
+			: run(sshCommand(sshTarget, [...argv, "2>&1"]), { timeoutMs, stdoutCap });
 	const unreachable = (result: { code: number | null; timedOut: boolean }): boolean =>
 		result.timedOut || result.code === null || (sshTarget !== undefined && result.code === SSH_FAILURE);
 	/** ssh writes its own connection errors to stderr; the remote command's output is on stdout. */
 	const unreachableReason = (result: { stdout: string; stderr?: string }): string =>
 		(result.stderr?.trim() || result.stdout.trim()).slice(0, 120);
+	/** The task branch's base: the oldest commit carrying its docs-commit message; `undefined` when it has none. */
+	const docsBase = async (
+		worktree: string,
+		taskId: string,
+		branch: string,
+	): Promise<HostResult<string | undefined>> => {
+		const grep = `--grep=${docsCommitMessage(taskId)}`;
+		const log = await exec(
+			[
+				"git",
+				"-C",
+				worktree,
+				"log",
+				"--format=%H",
+				"--fixed-strings",
+				sshTarget === undefined ? grep : `'${grep}'`,
+				branch,
+			],
+			GIT_TIMEOUT_MS,
+		);
+		if (unreachable(log)) return { ok: false, error: "host unreachable" };
+		if (log.code !== 0) return { ok: false, error: `git log failed: ${log.stdout.trim().slice(0, 160)}` };
+		const base = log.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => FULL_HASH.test(line))
+			.at(-1);
+		return { ok: true, value: base };
+	};
 
 	return {
 		async pathExists(path) {
@@ -152,7 +197,7 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 			const result = await run(sshCommand(sshTarget, ["cat", path]), { timeoutMs: IO_TIMEOUT_MS });
 			if (unreachable(result)) return { ok: false, error: `host unreachable: ${unreachableReason(result)}` };
 			if (result.code !== 0) return { ok: true, value: undefined };
-			if (result.stdout.length >= RUNNER_STDOUT_CAP) return { ok: false, error: `${path} is too large to read` };
+			if (result.stdout.length >= DEFAULT_STDOUT_CAP) return { ok: false, error: `${path} is too large to read` };
 			return { ok: true, value: result.stdout };
 		},
 
@@ -177,27 +222,48 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 
 			if ((await git("cat-file", "-e", `${hash}^{commit}`)).code !== 0) return "missing";
 			// The docs commit opens the task branch; the oldest one carrying its message is the base.
-			const message = docsCommitMessage(taskId);
-			const grep = `--grep=${message}`;
-			const log = await git(
-				"log",
-				"--format=%H",
-				"--fixed-strings",
-				sshTarget === undefined ? grep : `'${grep}'`,
-				branch,
-			);
-			if (log.code !== 0) throw failed("log", log);
-			const base = log.stdout
-				.split("\n")
-				.map((line) => line.trim())
-				.filter((line) => FULL_HASH.test(line))
-				.at(-1);
+			const found = await docsBase(worktree, taskId, branch);
+			if (!found.ok) throw new Error(`cannot check commit ${hash}: ${found.error}`);
+			const base = found.value;
 			if (base === undefined) return "no_base";
 			const parsed = await git("rev-parse", `${hash}^{commit}`);
 			const full = parsed.stdout.trim();
 			if (parsed.code !== 0 || !FULL_HASH.test(full)) throw failed("rev-parse", parsed);
 			if (full === base) return "not_on_branch";
 			return (await ancestor(base, full)) && (await ancestor(full, branch)) ? "ok" : "not_on_branch";
+		},
+
+		async branchDiff({ worktree, branch, taskId }) {
+			assertPath(worktree);
+			assertBranch(branch);
+			if (!TASK_ID.test(taskId)) throw new Error(`unsafe task id: ${taskId}`);
+			const base = await docsBase(worktree, taskId, branch);
+			if (!base.ok) return base;
+			if (base.value === undefined) return { ok: false, error: "no_base" };
+			const diff = await exec(
+				[
+					"git",
+					"-C",
+					worktree,
+					"-c",
+					"core.quotepath=false",
+					"diff",
+					`${base.value}..${branch}`,
+					"--no-color",
+					"--unified=0",
+					// The worker's own status documents are not judged and only eat into the runner's stdout cap.
+					// `:!` rather than `:(exclude)`: the argv crosses a remote shell unquoted over ssh.
+					"--",
+					".",
+					":!docs/tasks",
+				],
+				GIT_TIMEOUT_MS,
+				DIFF_STDOUT_CAP,
+			);
+			if (unreachable(diff)) return { ok: false, error: `host unreachable: ${unreachableReason(diff)}` };
+			if (diff.code !== 0) return { ok: false, error: `git diff failed: ${diff.stdout.trim().slice(0, 160)}` };
+			if (diff.stdout.length >= DIFF_STDOUT_CAP) return { ok: false, error: "diff too large" };
+			return { ok: true, value: diff.stdout };
 		},
 
 		async commitDocs({ worktree, taskId }) {

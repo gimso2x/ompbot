@@ -15,8 +15,12 @@ export const LIVE_FIELDS = [
 	"skillReviewTurns",
 	"dispatchHosts",
 	"herdrBoard",
+	"taskAutoLand",
 	"restartNotice",
 	"recallEnabled",
+	"peerBots",
+	"requireMention",
+	"peerHopLimit",
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /** Bound when the daemon starts (tokens, socket, omp children, scheduler). */

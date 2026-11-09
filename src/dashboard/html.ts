@@ -13,8 +13,20 @@ import {
 } from "../ops/gates";
 import type { BoardCard, BoardPanel } from "./board";
 import { renderMarkdown } from "./markdown";
-import type { DashboardSnapshot, TaskInfo, TurnKind, TurnWaitReason } from "./snapshot";
+import type { MonitorDetailRun, MonitorProcedure } from "./monitor-detail";
+import type {
+	DashboardSnapshot,
+	JobHealth,
+	JobInfo,
+	JobState,
+	MonitorInfo,
+	TaskInfo,
+	TurnKind,
+	TurnWaitReason,
+} from "./snapshot";
 import { STYLE } from "./style";
+import { TRACE_CLIENT } from "./trace-client";
+import { renderTrace } from "./trace-view";
 
 /** The gate thresholds the screens put into words; shipped to the page as JSON next to the renderers. */
 const GATE_LIMITS = {
@@ -42,6 +54,39 @@ const TURN_LABELS: { kind: Record<TurnKind, string>; wait: Record<TurnWaitReason
 		queued: "전달 대기",
 	},
 };
+
+/**
+ * A background job's badge word and tone: its `health`, with `ok` told apart by `state` (running or done). Shipped to
+ * the page like `TURN_LABELS`.
+ */
+const JOB_LABELS: Record<Exclude<JobHealth, "ok"> | Exclude<JobState, "failed">, [string, string]> = {
+	running: ["진행 중", "is-info"],
+	done: ["완료", "is-success"],
+	failed: ["실패", "is-danger"],
+	dead: ["멈춤(프로세스 없음)", "is-danger"],
+	stale: ["갱신 끊김", "is-warning"],
+	invalid: ["파일 오류", "is-warning"],
+};
+
+/** A monitor event stage's word and dot tone (list and panel). Shipped to the page like `TURN_LABELS`. */
+const MONITOR_STAGES: Record<string, [string, string]> = {
+	delivered: ["전달", "is-ok"],
+	no_report: ["조용히 끝남", "is-quiet"],
+	failed: ["실패", "is-fail"],
+	failed_no_retry: ["실패", "is-fail"],
+	admitted: ["대기", "is-run"],
+	dispatched: ["진행 중", "is-run"],
+	authored: ["작성됨", "is-run"],
+	skipped: ["건너뜀", "is-skip"],
+};
+
+/** A monitor run's slot-to-settle time: `52초`, `5분 52초`, `6시간 15분`. Shipped to the page. */
+function monitorTook(ms: number): string {
+	const seconds = Math.floor(Math.max(0, ms) / 1000);
+	if (seconds < 60) return `${seconds}초`;
+	const minutes = Math.floor(seconds / 60);
+	return minutes < 60 ? `${minutes}분 ${seconds % 60}초` : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
+}
 
 /**
  * A health gate in words: the owner-facing name, its numbers taken from the gate constants, and the one thing to do
@@ -120,11 +165,14 @@ export interface DashboardUi {
 	selected?: string;
 	/** Theme preference: system (default), light or dark. */
 	theme?: string;
+	/** `?layout=list` of the turns view: its threads as one table instead of the three columns. */
+	layout?: string;
 }
 
 /**
  * The redrawn part of the page for one snapshot: the top bar, the side navigation and the chosen view. Self-contained
- * on purpose — no imports, and the only module-level helpers are `gateText`/`alertText`/`GATE_LIMITS`/`TURN_LABELS`,
+ * on purpose — no imports, and the only module-level helpers are `gateText`/`alertText`/`GATE_LIMITS`/`TURN_LABELS`/
+ * `JOB_LABELS`/`MONITOR_STAGES`/`monitorTook`,
  * which the page ships next to it: the page ships this very function's source as its inline script, so the server's
  * first render and every client redraw are the same code. Every free string goes through `esc`.
  *
@@ -134,6 +182,20 @@ export interface DashboardUi {
  * look (blocked, stalled, open gate, frozen, waiting on the owner) · is-danger failed/down/gone · grey idle/waiting.
  * Every status pill pairs an icon shape with its word so status is never conveyed by colour alone.
  */
+/**
+ * A thread's open turns in words: inbound rows steered into one omp run are that run's merged messages, not a queue.
+ * Empty for no open turn.
+ */
+export function openTurnsText(thread: { openCount: number; runCount: number; pendingCount: number }): string {
+	const sent = thread.openCount - thread.pendingCount;
+	const parts = [
+		...(thread.runCount === 0 ? [] : [`실행 ${thread.runCount}`]),
+		...(sent > thread.runCount ? [`합쳐진 메시지 ${sent}`] : []),
+		...(thread.pendingCount === 0 ? [] : [`대기 ${thread.pendingCount}`]),
+	];
+	return parts.join(" · ");
+}
+
 export function renderDashboardMain(
 	s: DashboardSnapshot,
 	board?: BoardPanel,
@@ -219,6 +281,13 @@ export function renderDashboardMain(
 		gone: ["사라짐", "is-danger"],
 		failed: ["실패", "is-danger"],
 		failed_no_retry: ["실패", "is-danger"],
+		answered: ["답함", "is-success"],
+		failed_notified: ["실패", "is-danger"],
+		discarded: ["버림", ""],
+		no_report: ["조용히 끝남", ""],
+		skipped: ["건너뜀", ""],
+		admitted: ["대기", ""],
+		authored: ["작성됨", "is-info"],
 	};
 	const badge = (text: string, tone: string): string =>
 		`<span class="status-pill ${tone}">${statusIcon(tone)}<span class="badge ${tone}">${esc(text)}</span></span>`;
@@ -233,7 +302,7 @@ export function renderDashboardMain(
 
 	const VIEWS: Array<[string, string]> = [
 		["inbox", "인박스"],
-		["turns", "진행 중 턴"],
+		["turns", "턴"],
 		["lanes", "레인"],
 		["approvals", "승인 대기"],
 		["monitors", "모니터"],
@@ -569,40 +638,44 @@ export function renderDashboardMain(
 	const sectionView = (): string => {
 		if (view === "turns") {
 			const turns = s.turns;
-			if (!turns.ok) return `${head("진행 중인 턴", undefined)}${banners.join("")}${failed(turns.error)}`;
-			const rows = turns.items
-				.filter((turn) => hit(turn.preview, turn.originKey, turn.threadRef))
-				.map((turn) =>
-					row(
-						String(turn.inboundId),
-						[
-							state(turn.state),
-							badge(TURN_LABELS.kind[turn.kind], ""),
-							...(turn.waitReason === null
-								? []
-								: [
-										badge(
-											TURN_LABELS.wait[turn.waitReason],
-											turn.waitReason === "restart" || turn.waitReason === "frozen" ? "is-warning" : "",
-										),
-									]),
-							...(turn.blocksRestart ? [badge("재시작이 기다리는 턴", "is-warning")] : []),
-							...(turn.stalled ? [badge("정체", "is-warning")] : []),
-						],
-						esc(turn.preview ?? turn.originKey),
-						[
-							turn.preview === null ? "" : esc(turn.originKey),
-							`경과 ${dur(turn.ageMs)} · 마지막 이벤트 뒤 ${dur(turn.silentMs)}`,
-							turn.topLevel
-								? turn.originKey.startsWith("slack/dm/")
-									? "DM"
-									: "채널 메인"
-								: turn.threadRef
-									? `스레드 ${esc(turn.threadRef)}`
-									: "",
-						],
-					),
-				);
+			// Background jobs (`<home>/jobs/*.json`) under the turns: they outlive the turn that started them.
+			const jobs = s.jobs;
+			const jobRow = (job: JobInfo): string => {
+				const [word, tone] = JOB_LABELS[job.health === "ok" ? (job.state ?? "running") : job.health];
+				const counts =
+					job.done === undefined || job.total === undefined
+						? ""
+						: `${
+								job.percent === undefined
+									? ""
+									: `<span class="meter" role="img" aria-label="진행 ${job.percent}%"><i style="width:${job.percent}%"></i></span> `
+							}${esc(
+								`${job.done}/${job.total}${job.unit ? ` ${job.unit}` : ""}${job.percent === undefined ? "" : ` (${job.percent}%)`}`,
+							)}`;
+				return row(`job:${job.name}`, [badge(word, tone)], esc(job.title), [
+					counts,
+					`${job.startedAt ? `시작 ${at(job.startedAt)} · ` : ""}마지막 갱신 뒤 ${dur(job.ageMs)}`,
+					job.thread ? `스레드 ${esc(job.thread)}` : "",
+					esc(job.detail ?? ""),
+				]);
+			};
+			const shownJobs = jobs.ok ? jobs.items.filter((job) => hit(job.title, job.name, job.detail, job.thread)) : [];
+			// Running or troubled jobs sit above the board where they are seen; cleanly finished ones fold at the bottom.
+			const finished = (job: JobInfo): boolean => job.state === "done" && job.health === "ok";
+			const liveJobs = shownJobs.filter((job) => !finished(job));
+			const doneJobs = shownJobs.filter(finished);
+			const jobTop = !jobs.ok
+				? `<div class="view-head" id="jobs"><h2 class="h2">백그라운드 작업</h2></div>${failed(jobs.error)}`
+				: liveJobs.length === 0
+					? ""
+					: `<div class="view-head" id="jobs"><h2 class="h2">백그라운드 작업</h2><span class="count-chip">${liveJobs.length}</span></div><div class="rows">${liveJobs.map(jobRow).join("")}</div>`;
+			// `id="closed"` keeps the fold open across the 15-second redraw, like the inbox's 최근 닫힘.
+			const jobDone =
+				doneJobs.length === 0
+					? ""
+					: `<details class="closed" id="closed"><summary>끝난 백그라운드 작업 <span class="count-chip">${doneJobs.length}</span></summary><div class="rows">${doneJobs.map(jobRow).join("")}</div></details>`;
+			const runningJobs = jobs.ok ? jobs.items.filter((job) => job.state === "running").length : 0;
+			if (!turns.ok) return `${head("턴", undefined)}${banners.join("")}${failed(turns.error)}${jobTop}${jobDone}`;
 			const draining = d.ok && (d.drain !== undefined || d.heartbeat?.draining === true);
 			const holding = turns.items.filter((turn) => turn.blocksRestart);
 			const oldest = holding.reduce((max, turn) => Math.max(max, turn.ageMs), 0);
@@ -613,14 +686,160 @@ export function renderDashboardMain(
 							: `진행 중인 턴 ${holding.length}개가 끝나면 재시작합니다 (가장 오래된 턴 경과 ${dur(oldest)}).`
 					} 그동안 들어온 요청은 재시작 뒤 처리됩니다.</span></p>`
 				: "";
-			return listOf(
-				"진행 중인 턴",
-				rows,
-				turns.items.length,
-				"진행 중인 턴이 없어요",
-				"슬랙 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.",
-				drainLine,
+			// One card per conversation (Slack thread = omp session), laid out like the inbox.
+			const openThreads = turns.threads.filter((thread) => thread.column === "working").length;
+			// Every number in the head says what it counts: open threads match the 진행 중 column, jobs link to their block.
+			const title = head(
+				"턴",
+				undefined,
+				`<span class="view-sum">진행 중 스레드 <b>${openThreads}</b>${
+					runningJobs > 0 ? ` · <a href="#jobs">백그라운드 작업 <b>${runningJobs}</b></a>` : ""
+				}</span>`,
 			);
+			// No thread but live jobs: the jobs stand in for the empty board.
+			if (turns.threads.length === 0) {
+				return liveJobs.length > 0
+					? `${title}${banners.join("")}${drainLine}${jobTop}${jobDone}`
+					: `${title}${banners.join("")}${drainLine}${jobTop}<div class="empty-box"><p class="note">최근 24시간 턴이 없어요</p><p class="note-sub">슬랙 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.</p></div>${jobDone}`;
+			}
+			type ThreadCol = "attention" | "working" | "done";
+			const THREAD_RANK: Record<ThreadCol, number> = { attention: 0, working: 1, done: 2 };
+			const threads = turns.threads.filter((thread) =>
+				hit(thread.title, thread.latest.preview, thread.originKey, thread.threadRef),
+			);
+			const restartHeld = new Set(holding.map((turn) => turn.originKey));
+			const placeOf = (key: string): string => {
+				if (key.startsWith("slack/dm/")) return "DM";
+				const channel = /^slack\/ch\/([^/]+)(\/t\/[^/]+)?$/.exec(key);
+				if (channel !== null) return channel[2] === undefined ? `${channel[1]} 채널 메인` : (channel[1] ?? "");
+				return key.startsWith("monitor/") ? "" : key;
+			};
+			const threadLink = (key: string): string =>
+				`href="?view=turns&amp;item=${esc(encodeURIComponent(key))}" data-item="${esc(key)}"`;
+			const verdicts = s.feedback.ok ? s.feedback.verdicts : {};
+			/** The owner's 👍/👎 on the turn of `inboundId`; nothing without a verdict. */
+			const feedbackBadge = (inboundId: number): string => {
+				const verdict = verdicts[String(inboundId)];
+				return verdict === undefined
+					? ""
+					: `<span class="badge" data-feedback="${verdict}" title="오너 피드백">${verdict === "up" ? "👍" : "👎"}</span>`;
+			};
+			const threadBadges = (thread: (typeof threads)[number]): string =>
+				[
+					state(thread.latest.state),
+					feedbackBadge(thread.latest.inboundId),
+					...(thread.stalledCount > 0 ? [badge("정체", "is-warning")] : []),
+					...(restartHeld.has(thread.originKey) ? [badge("재시작이 기다리는 턴", "is-warning")] : []),
+				].join("");
+			const byRecent = (a: (typeof threads)[number], b: (typeof threads)[number]): number =>
+				THREAD_RANK[a.column] - THREAD_RANK[b.column] || msOf(b.updatedAt) - msOf(a.updatedAt);
+			const threadCard = (thread: (typeof threads)[number]): string => {
+				const key = thread.originKey;
+				const place = placeOf(key);
+				const latest = thread.latest;
+				const sum = [
+					latest.preview !== null && latest.preview !== thread.title ? `<span>${esc(latest.preview)}</span>` : "",
+					latest.waitReason === null
+						? ""
+						: `<span class="card-wait">${esc(TURN_LABELS.wait[latest.waitReason])}</span>`,
+				]
+					.filter((part) => part !== "")
+					.join(" · ");
+				// One open turn is already the state badge; more rows say whether they are one run or a queue.
+				const meta = [`턴 ${thread.turnCount}`, ...(thread.openCount > 1 ? [openTurnsText(thread)] : [])];
+				return `<a class="card${isSel(key) ? " is-selected" : ""}" data-state="${esc(`${thread.column}:${latest.state}`)}" ${threadLink(key)} data-row="${esc(key)}"${
+					isSel(key) ? ' aria-current="true"' : ""
+				}><p class="card-eyebrow"><span>${esc(TURN_LABELS.kind[thread.kind])}</span>${
+					place === "" ? "" : ` · <span>${esc(place)}</span>`
+				}</p><p class="card-title">${esc(thread.title)}</p>${sum === "" ? "" : `<p class="card-sum">${sum}</p>`}<div class="card-foot"><span class="badges">${threadBadges(
+					thread,
+				)}</span><span class="card-time">${ago(msOf(thread.updatedAt))}</span><span class="card-meta">${meta
+					.map((part) => `<span>${esc(part)}</span>`)
+					.join("")}</span></div></a>`;
+			};
+			const lead = `${banners.join("")}${drainLine}${threads.length === 0 ? nothing : ""}`;
+			if (ui.layout === "list") {
+				const TURN_SORTS: Array<[string, string]> = [
+					["state", "상태"],
+					["title", "제목"],
+					["kind", "종류"],
+					["turns", "턴 수"],
+					["age", "경과"],
+					["updated", "갱신"],
+				];
+				const key = TURN_SORTS.some(([id]) => id === ui.sort) ? (ui.sort as string) : "state";
+				const flip = ui.desc === true ? -1 : 1;
+				const value = (thread: (typeof threads)[number]): string | number =>
+					key === "title"
+						? thread.title
+						: key === "kind"
+							? TURN_LABELS.kind[thread.kind]
+							: key === "turns"
+								? thread.turnCount
+								: key === "age"
+									? thread.latest.ageMs
+									: key === "updated"
+										? clock - msOf(thread.updatedAt)
+										: THREAD_RANK[thread.column];
+				const sorted = threads.slice().sort((a, b) => {
+					const x = value(a);
+					const y = value(b);
+					const order =
+						typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), "ko");
+					return order === 0 ? byRecent(a, b) : order * flip;
+				});
+				const heads = TURN_SORTS.map(([id, label]) => {
+					const active = id === key;
+					const sort = active ? (flip === 1 ? "ascending" : "descending") : "none";
+					return `<th scope="col" aria-sort="${sort}"><button type="button" data-sort="${id}">${esc(label)}${
+						active ? `<span aria-hidden="true"> ${flip === 1 ? "↑" : "↓"}</span>` : ""
+					}</button></th>`;
+				}).join("");
+				const body = sorted
+					.map(
+						(thread) =>
+							`<tr data-row="${esc(thread.originKey)}" data-state="${esc(`${thread.column}:${thread.latest.state}`)}"${
+								isSel(thread.originKey) ? ' class="is-selected"' : ""
+							}><td><span class="badges">${threadBadges(thread)}</span></td><td class="list-title"><a ${threadLink(
+								thread.originKey,
+							)}${isSel(thread.originKey) ? ' aria-current="true"' : ""}>${esc(thread.title)}</a></td><td>${esc(
+								TURN_LABELS.kind[thread.kind],
+							)}</td><td class="num">${thread.turnCount}</td><td class="num">${dur(thread.latest.ageMs)}</td><td class="num">${ago(
+								msOf(thread.updatedAt),
+							)}</td></tr>`,
+					)
+					.join("");
+				return `${title}${lead}${jobTop}${
+					sorted.length === 0
+						? ""
+						: `<table class="list"><thead><tr>${heads}</tr></thead><tbody>${body}</tbody></table>`
+				}${jobDone}`;
+			}
+			const TURN_COLS: Array<[ThreadCol, string, string, string]> = [
+				["attention", "확인 필요", "확인할 스레드가 없어요", "멈췄거나 실패로 끝난 스레드가 생기면 여기에 모입니다."],
+				[
+					"working",
+					"진행 중",
+					"진행 중인 턴이 없어요",
+					"슬랙 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.",
+				],
+				["done", "완료", "끝난 스레드가 없어요", "턴이 끝난 스레드는 마지막 활동 뒤 24시간 동안 여기에 남습니다."],
+			];
+			const chips = TURN_COLS.map(
+				([id, label]) =>
+					`<a class="chip" href="#col-${id}">${esc(label)} <b>${threads.filter((thread) => thread.column === id).length}</b></a>`,
+			).join("");
+			const columns = TURN_COLS.map(([id, label, none, hint]) => {
+				const cards = threads.filter((thread) => thread.column === id).sort(byRecent);
+				const body =
+					cards.length === 0
+						? `<div class="col-empty-wrap"><p class="col-empty">${esc(none)}</p><p class="col-empty-sub">${esc(hint)}</p></div>`
+						: cards.map(threadCard).join("");
+				return `<section class="col" id="col-${id}" aria-label="${esc(label)}"><h2 class="col-head"><span>${esc(
+					label,
+				)}</span><span class="count-chip">${cards.length}</span></h2>${body}</section>`;
+			}).join("");
+			return `${title}${lead}${jobTop}<nav class="col-chips" aria-label="열로 이동">${chips}</nav><div class="inbox">${columns}</div>${jobDone}`;
 		}
 		if (view === "lanes") {
 			const lanes = s.lanes;
@@ -674,22 +893,87 @@ export function renderDashboardMain(
 		if (view === "monitors") {
 			const monitors = s.monitors;
 			if (!monitors.ok) return `${head("모니터", undefined)}${banners.join("")}${failed(monitors.error)}`;
-			const rows = monitors.items
-				.filter((monitor) => hit(monitor.name, monitor.kind))
-				.map((monitor) =>
-					row(
-						monitor.name,
-						[
-							...(monitor.lastStage ? [state(monitor.lastStage)] : []),
-							...(monitor.openIncidents > 0 ? [badge(`사건 ${monitor.openIncidents}`, "is-danger")] : []),
-						],
-						esc(monitor.name),
-						[
-							`${esc(monitor.kind)} · 다음 ${at(monitor.nextFireAt)}`,
-							monitor.lastAt ? `마지막 ${at(monitor.lastAt)}` : "",
-						],
-					),
-				);
+			// Groups by the KST day of the next fire against the snapshot's own day.
+			const generated = Date.parse(s.generatedAt);
+			const today = s.generatedAt.slice(0, 10);
+			const tomorrow = new Date(generated + 9 * 3_600_000 + 86_400_000).toISOString().slice(0, 10);
+			const dayOf = (monitor: MonitorInfo): string => {
+				const day = monitor.nextFireAt?.slice(0, 10);
+				return day === undefined ? "none" : day === today ? "today" : day === tomorrow ? "tomorrow" : "later";
+			};
+			const GROUPS: Array<[string, string]> = [
+				["today", `오늘 ${today.slice(5)}`],
+				["tomorrow", `내일 ${tomorrow.slice(5)}`],
+				["later", "그 뒤"],
+				["none", "예정 없음"],
+			];
+			const stageOf = (stage: string): [string, string] => MONITOR_STAGES[stage] ?? [stage || "?", ""];
+			/** One of the 7 run dots, never by colour alone: its time and result are its label. */
+			const dot = (event: MonitorInfo["recent"][number] | undefined): string => {
+				if (event === undefined) {
+					return '<span class="mon-dot is-empty" role="img" title="기록 없음" aria-label="기록 없음"></span>';
+				}
+				const [word, tone] = stageOf(event.stage);
+				const label = `${at(event.at)} ${esc(word)}${event.manual ? " · 수동" : ""}`;
+				return `<span class="mon-dot ${tone}${event.manual ? " is-manual" : ""}" role="img" title="${label}" aria-label="${label}"></span>`;
+			};
+			const lastLines = (monitor: MonitorInfo): string[] => {
+				const run = monitor.lastRun;
+				if (run === null) return ["정기 실행 아직 없음"];
+				const took =
+					run.durationMs === null
+						? `진행 중 · 시작 후 ${dur(generated - Date.parse(run.slotAt))}`
+						: `${esc(stageOf(run.stage)[0])} ${at(run.at)} · ${
+								run.attempts > 0
+									? `재시도 ${run.attempts}회 · 지연 포함 ${monitorTook(run.durationMs)}`
+									: monitorTook(run.durationMs)
+							}`;
+				return [`${took}${run.manual ? " · 수동" : ""}`, ...(monitor.scheduledRun ? [] : ["정기 실행 아직 없음"])];
+			};
+			const monitorRow = (monitor: MonitorInfo): string => {
+				const id = monitor.id;
+				const selected = isSel(id) || isSel(monitor.name);
+				const chips = [
+					`→ ${monitor.destination}`,
+					...(monitor.copyTo === null ? [] : [`+ 사본 ${monitor.copyTo}`]),
+					monitor.model === null ? "기본 모델" : monitor.model.slice(monitor.model.lastIndexOf("/") + 1),
+					...monitor.files.map((file) => `${file.kind === "procedure" ? "절차" : "스크립트"} ${file.name}`),
+				]
+					.map((text) => `<span class="mon-chip">${esc(text)}</span>`)
+					.join("");
+				// Oldest on the left, empty slots before the first event.
+				const dots = [
+					...Array.from({ length: Math.max(0, 7 - monitor.recent.length) }, () => dot(undefined)),
+					...monitor.recent.map(dot),
+				].join("");
+				return `<a class="row mon-row${selected ? " is-selected" : ""}" href="?view=monitors&amp;item=${esc(
+					encodeURIComponent(id),
+				)}" data-item="${esc(id)}" data-row="${esc(id)}" data-state="${esc(monitor.lastStage ?? "")}"${
+					selected ? ' aria-current="true"' : ""
+				}><div class="mon-when"><span class="mon-time">${
+					monitor.nextFireAt === null ? "-" : esc(monitor.nextFireAt.slice(11, 16))
+				}</span><span class="mon-sched">${esc(monitor.schedule)}</span></div><div class="row-main"><p class="row-title">${esc(
+					monitor.name,
+				)}</p><p class="row-sub">${esc(monitor.summary)}</p><p class="mon-chips">${chips}</p>${
+					monitor.openIncidents > 0
+						? `<div class="badges">${badge(`사건 ${monitor.openIncidents}`, "is-danger")}</div>`
+						: ""
+				}</div><div class="mon-side"><span class="mon-dots">${dots}</span>${lastLines(monitor)
+					.map((line) => `<span class="mon-last">${line}</span>`)
+					.join("")}</div></a>`;
+			};
+			const shown = monitors.items.filter((monitor) =>
+				hit(monitor.name, monitor.summary, monitor.destination, monitor.schedule),
+			);
+			const rows = GROUPS.flatMap(([key, label]) => {
+				const group = shown.filter((monitor) => dayOf(monitor) === key);
+				return group.length === 0
+					? []
+					: [
+							`<h3 class="mon-group">${esc(label)} <span class="count-chip">${group.length}</span></h3>`,
+							...group.map(monitorRow),
+						];
+			});
 			return listOf(
 				"모니터",
 				rows,
@@ -957,7 +1241,13 @@ export function renderDashboardMain(
 	const openAlerts = s.alerts.ok ? s.alerts.items.filter((alert) => alert.gateState === "open").length : 0;
 	const NAV: Record<string, [number, boolean]> = {
 		inbox: [entries.length, !s.tasks.ok || entries.some((entry) => entry.col === "attention")],
-		turns: [count(s.turns), warnOf(s.turns, s.turns.ok && s.turns.items.some((turn) => turn.stalled))],
+		// Threads in the 진행 중 column, the same number the column shows; a thread in 확인 필요 or a troubled job
+		// lights the warning. Running jobs are counted in the view's head, not here.
+		turns: [
+			s.turns.ok ? s.turns.threads.filter((thread) => thread.column === "working").length : 0,
+			warnOf(s.turns, s.turns.ok && s.turns.threads.some((thread) => thread.column === "attention")) ||
+				warnOf(s.jobs, s.jobs.ok && s.jobs.items.some((job) => job.health !== "ok")),
+		],
 		lanes: [count(s.lanes), !s.lanes.ok],
 		approvals: [count(s.approvals), warnOf(s.approvals, count(s.approvals) > 0)],
 		monitors: [
@@ -974,14 +1264,17 @@ export function renderDashboardMain(
 			current ? ' aria-current="page"' : ""
 		}><span>${esc(label)}</span><span class="nav-count${warn ? " is-warn" : ""}">${n}</span>${navIcon(id)}</a>`;
 	}).join("");
-	const layout = view === "list" ? "list" : "board";
+	const layout = view === "list" || (view === "turns" && ui.layout === "list") ? "list" : "board";
+	// The turns view switches between its own board and table; everywhere else Board/List is the inbox's.
+	const [boardHref, listHref] =
+		view === "turns" ? ["?view=turns", "?view=turns&amp;layout=list"] : ["./", "?view=list"];
 	const themeBtn = (mode: string, text: string): string =>
 		`<button type="button" class="seg-item" data-theme-set="${mode}" aria-pressed="${theme === mode}">${text}</button>`;
 	const topbar = `<header class="topbar"><nav class="crumbs" aria-label="위치"><span>ompbot</span><span aria-hidden="true">/</span><span aria-current="page">${esc(
 		viewLabel,
-	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div><div class="top-tools"><div class="seg" role="group" aria-label="보기 방식"><a class="seg-item" href="./" data-layout="board"${
+	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div><div class="top-tools"><div class="seg" role="group" aria-label="보기 방식"><a class="seg-item" href="${boardHref}" data-layout="board"${
 		layout === "board" ? ' aria-current="true"' : ""
-	}>Board</a><a class="seg-item" href="?view=list" data-layout="list"${layout === "list" ? ' aria-current="true"' : ""}>List</a></div><div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
+	}>Board</a><a class="seg-item" href="${listHref}" data-layout="list"${layout === "list" ? ' aria-current="true"' : ""}>List</a></div><div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
 	const content = view === "inbox" ? inboxView() : view === "list" ? listView() : sectionView();
 	return `${topbar}<nav class="sidenav" aria-label="보기">${nav}</nav><main class="view" id="view" aria-label="${esc(
 		viewLabel,
@@ -1164,9 +1457,10 @@ export function renderDetailHead(
 
 /**
  * The detail panel of a row of the other views (`?view=<view>&item=<id>`): every field the snapshot has for it, no
- * more. An id not in the snapshot gets the "지금 목록에 없는 항목" notice. Self-contained (shipped to the page).
+ * more. An id not in the snapshot gets the "지금 목록에 없는 항목" notice. A monitor's panel ends in `monitorBody`
+ * ({@link renderMonitorDetail}), a loading line until then. Self-contained (shipped to the page).
  */
-export function renderItemDetail(s: DashboardSnapshot, view: string, id: string): string {
+export function renderItemDetail(s: DashboardSnapshot, view: string, id: string, monitorBody?: string): string {
 	const esc = (value: unknown): string =>
 		String(value ?? "")
 			.replace(/&/g, "&amp;")
@@ -1182,7 +1476,7 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string)
 		return minutes < 60 ? `${minutes}분` : `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
 	};
 	const LABELS: Record<string, string> = {
-		turns: "진행 중 턴",
+		turns: "턴",
 		lanes: "레인",
 		approvals: "승인 대기",
 		monitors: "모니터",
@@ -1192,22 +1486,68 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string)
 		`<p class="eyebrow">${esc(LABELS[view] ?? view)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 			title,
 		)}</h2><dl class="facts">${rows.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${value}</dd>`).join("")}</dl>`;
-	if (view === "turns" && s.turns.ok) {
-		const turn = s.turns.items.find((item) => String(item.inboundId) === id);
-		if (turn) {
-			return show(turn.originKey, [
-				["상태", esc(turn.state)],
-				["종류", esc(TURN_LABELS.kind[turn.kind])],
-				["대기 이유", turn.waitReason === null ? "-" : esc(TURN_LABELS.wait[turn.waitReason])],
-				["요청", turn.preview === null ? "-" : esc(turn.preview)],
-				["받은 경로", turn.slash ? "슬래시 명령" : "메시지"],
-				...(turn.blocksRestart ? [["재시작", "이 턴이 끝나야 재시작해요"] as [string, string]] : []),
-				["시작", at(turn.createdAt)],
-				["경과", dur(turn.ageMs)],
-				["마지막 이벤트 뒤", dur(turn.silentMs)],
-				["스레드", esc(turn.threadRef ?? "-")],
-				["입수 번호", esc(turn.inboundId)],
+	if (view === "turns" && s.jobs.ok) {
+		const job = s.jobs.items.find((item) => `job:${item.name}` === id);
+		if (job) {
+			const [word] = JOB_LABELS[job.health === "ok" ? (job.state ?? "running") : job.health];
+			return show(job.title, [
+				["상태", `${esc(word)} · ${esc(job.state ?? "-")}`],
+				[
+					"진행",
+					job.done === undefined || job.total === undefined
+						? "-"
+						: esc(
+								`${job.done}/${job.total}${job.unit ? ` ${job.unit}` : ""}${job.percent === undefined ? "" : ` (${job.percent}%)`}`,
+							),
+				],
+				["시작", at(job.startedAt)],
+				["마지막 갱신", at(job.updatedAt)],
+				["마지막 갱신 뒤", dur(job.ageMs)],
+				["pid", job.pid === undefined ? "-" : `<code>${esc(job.pid)}</code>`],
+				["스레드", esc(job.thread ?? "-")],
+				["로그", job.log === undefined ? "-" : `<code>${esc(job.log)}</code>`],
+				["설명", esc(job.detail ?? "-")],
+				["파일", `<code>jobs/${esc(job.name)}.json</code>`],
 			]);
+		}
+	}
+	if (view === "turns" && s.turns.ok) {
+		// A conversation by its origin key; an inbound id (the old one-turn address) finds the conversation it is in.
+		const thread = /^\d+$/.test(id)
+			? s.turns.threads.find((item) => item.recent.some((turn) => String(turn.inboundId) === id))
+			: s.turns.threads.find((item) => item.originKey === id);
+		if (thread) {
+			const latest = thread.latest;
+			const verdicts = s.feedback.ok ? s.feedback.verdicts : {};
+			const feedbackBadge = (inboundId: number): string => {
+				const verdict = verdicts[String(inboundId)];
+				return verdict === undefined
+					? ""
+					: `<span class="badge" data-feedback="${verdict}" title="오너 피드백">${verdict === "up" ? "👍" : "👎"}</span>`;
+			};
+			const recent = thread.recent
+				.map(
+					(turn) =>
+						`<li><button type="button" class="turn-recent-item" data-trace-turn="${esc(turn.inboundId)}"><span class="mono">${at(
+							turn.createdAt,
+						)}</span><span class="badge">${esc(turn.state)}</span>${feedbackBadge(turn.inboundId)}<span class="turn-recent-text">${esc(
+							turn.preview ?? "-",
+						)}</span></button></li>`,
+				)
+				.join("");
+			return `${show(thread.title, [
+				["상태", esc(latest.state)],
+				["종류", esc(TURN_LABELS.kind[thread.kind])],
+				["대기 이유", latest.waitReason === null ? "-" : esc(TURN_LABELS.wait[latest.waitReason])],
+				["요청", latest.preview === null ? "-" : esc(latest.preview)],
+				["시작", at(latest.createdAt)],
+				["경과", dur(latest.ageMs)],
+				["마지막 이벤트 뒤", dur(latest.silentMs)],
+				["스레드", esc(thread.threadRef ?? "-")],
+				["입수 번호", esc(latest.inboundId)],
+				["턴", esc(`${thread.turnCount}${thread.openCount > 0 ? ` · ${openTurnsText(thread)}` : ""}`)],
+				["대화", `<code>${esc(thread.originKey)}</code>`],
+			])}<h3 class="h2">최근 턴</h3><ol class="turn-recent" aria-label="최근 턴 (누르면 트레이스)">${recent}</ol>`;
 		}
 	}
 	if (view === "lanes" && s.lanes.ok) {
@@ -1265,15 +1605,29 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string)
 		}
 	}
 	if (view === "monitors" && s.monitors.ok) {
-		const monitor = s.monitors.items.find((item) => item.name === id);
+		// By id; a link from before ids (`item=<name>`) opens the same panel.
+		const monitor = s.monitors.items.find((item) => item.id === id || item.name === id);
 		if (monitor) {
-			return show(monitor.name, [
-				["종류", esc(monitor.kind)],
+			const sends = [
+				monitor.destination,
+				...(monitor.copyTo === null ? [] : [`사본 ${monitor.copyTo}`]),
+				monitor.deliver === "verbatim" ? "원문 그대로" : "턴으로 답",
+			];
+			// Snapshot facts now; the rest once the page has read `api/monitor/detail`.
+			return `${show(monitor.name, [
+				["일정", `${esc(monitor.schedule)}${monitor.cron === null ? "" : ` <code>${esc(monitor.cron)}</code>`}`],
 				["다음 실행", at(monitor.nextFireAt)],
-				["마지막 단계", esc(monitor.lastStage ?? "-")],
-				["마지막 실행", at(monitor.lastAt)],
-				["열린 사건", esc(monitor.openIncidents)],
-			]);
+				["겹침 정책", monitor.overlap === "skip" ? "건너뜀" : "줄 세움"],
+				["보내는 곳", esc(sends.join(" · "))],
+				[
+					"모델",
+					esc(`${monitor.model ?? "기본 모델"}${monitor.thinking === null ? "" : ` · thinking ${monitor.thinking}`}`),
+				],
+				["상태", monitor.openIncidents > 0 ? `열린 사건 ${monitor.openIncidents}` : "열린 사건 없음"],
+			])}<div class="mon-detail">${
+				monitorBody ??
+				'<div class="skeleton" role="status"><p class="note-sub">하는 일과 최근 실행을 불러오는 중…</p><div class="skeleton-bar is-w70"></div><div class="skeleton-bar is-w90"></div><div class="skeleton-bar is-w50"></div></div>'
+			}</div>`;
 		}
 	}
 	if (view === "alerts" && s.alerts.ok) {
@@ -1309,6 +1663,89 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string)
 		}
 	}
 	return `<p class="eyebrow">${esc(LABELS[view] ?? "항목")}</p><h2 class="detail-title" id="detail-title" tabindex="-1">지금 목록에 없는 항목이에요</h2><p class="lead">처리됐거나 닫혀서 목록에서 빠졌어요. 왼쪽 목록에서 다시 골라 주세요.</p>`;
+}
+
+/**
+ * A monitor's `api/monitor/detail` answer as its panel's end: 하는 일, procedure files, 최근 실행; all text escaped.
+ * Self-contained apart from `MONITOR_STAGES`/`monitorTook` (shipped to the page).
+ */
+export function renderMonitorDetail(body: unknown): string {
+	const esc = (value: unknown): string =>
+		String(value ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	const answer = (body ?? {}) as {
+		instruction?: string;
+		procedures?: MonitorProcedure[];
+		runs?: MonitorDetailRun[];
+		error?: string;
+	};
+	if (typeof answer.instruction !== "string") {
+		return `<p class="note">하는 일과 최근 실행을 읽지 못했어요 (${esc(answer.error ?? "알 수 없는 응답")})</p>`;
+	}
+	const at = (iso: string): string => esc(iso.slice(5, 16).replace("T", " "));
+	const files = (Array.isArray(answer.procedures) ? answer.procedures : [])
+		.map(
+			(file) =>
+				`<h3 class="h2">절차 파일 <code>${esc(file.name)}</code></h3>${
+					"text" in file
+						? `<pre class="mon-text">${esc(file.text)}</pre>${file.truncated ? '<p class="note-sub">앞 2000자만 보여요.</p>' : ""}`
+						: '<p class="note">지금 읽을 수 없어요.</p>'
+				}`,
+		)
+		.join("");
+	const runs = (Array.isArray(answer.runs) ? answer.runs : []).map((run) => {
+		const [word, tone] = MONITOR_STAGES[run.stage] ?? [run.stage || "?", ""];
+		const took =
+			run.durationMs === null ? "진행 중" : `${run.attempts > 0 ? "지연 포함 " : ""}${monitorTook(run.durationMs)}`;
+		const notes = [
+			...(run.manual ? ["수동"] : []),
+			...(run.attempts > 0 ? [`재시도 ${run.attempts}회`] : []),
+			...(run.error ? [run.error] : []),
+		];
+		return `<tr><td class="num">${at(run.slotAt)}</td><td><span class="mon-dot ${tone}${
+			run.manual ? " is-manual" : ""
+		}" aria-hidden="true"></span> ${esc(word)}</td><td>${esc(took)}</td><td>${
+			notes.length === 0 ? "-" : esc(notes.join(" · "))
+		}</td></tr>`;
+	});
+	return `<h3 class="h2">하는 일</h3><pre class="mon-text" data-block="instruction">${esc(
+		answer.instruction,
+	)}</pre>${files}<h3 class="h2">최근 실행</h3>${
+		runs.length === 0
+			? '<p class="note">실행 기록이 아직 없어요.</p>'
+			: `<table class="mon-runs"><thead><tr><th scope="col">예정 시각</th><th scope="col">결과</th><th scope="col">끝날 때까지</th><th scope="col">비고</th></tr></thead><tbody>${runs.join(
+					"",
+				)}</tbody></table>`
+	}`;
+}
+
+/**
+ * The detail panel's tab buttons: a herdr card's 개요/대화/plan, or a conversation's 개요/대화/트레이스 (turn board).
+ * Self-contained (shipped to the page).
+ */
+export function renderDetailTabs(mode: "card" | "thread", selected: string): string {
+	const tabs =
+		mode === "thread"
+			? [
+					["head", "개요", "detail-head"],
+					["conv", "대화", "detail-conv"],
+					["trace", "트레이스", "detail-trace"],
+				]
+			: [
+					["head", "개요", "detail-head"],
+					["conv", "대화", "detail-conv"],
+					["plan", "plan", "detail-plan"],
+				];
+	return tabs
+		.map(
+			([id, label, panel]) =>
+				`<button id="tab-${id}" class="tab" type="button" role="tab" data-tab="${id}" aria-controls="${panel}" aria-selected="${id === selected}">${label}</button>`,
+		)
+		.join("");
 }
 
 /** herdr-web-ui's plan answer as a step list; nothing when the pane has no plan. Self-contained (shipped to the page). */
@@ -1372,10 +1809,18 @@ export function renderConversation(body: unknown, agent: string, md: (text: stri
 				const output = typeof p.output === "string" ? p.output : "";
 				const cut =
 					output.length > OUTPUT_CHARS ? `<p class="turn-note">… ${output.length - OUTPUT_CHARS}자 생략</p>` : "";
+				// `running`: a call with no result yet (omp sessions); herdr parts never carry it.
+				const running = p.running === true;
 				return fold(
-					`<code class="mono"><b>${esc(p.name)}</b></code> <span>${esc(p.summary)}</span>${p.error ? ' <span class="badge is-danger">실패</span>' : ' <span class="badge is-success">완료</span>'}`,
+					`<code class="mono"><b>${esc(p.name)}</b></code> <span>${esc(p.summary)}</span>${
+						running
+							? ' <span class="badge is-info">진행 중</span>'
+							: p.error
+								? ' <span class="badge is-danger">실패</span>'
+								: ' <span class="badge is-success">완료</span>'
+					}`,
 					output === ""
-						? '<p class="turn-note">출력 없음</p>'
+						? `<p class="turn-note">${running ? "결과를 기다리는 중" : "출력 없음"}</p>`
 						: `<pre class="md-code"><code>${esc(output.slice(0, OUTPUT_CHARS))}</code></pre>${cut}`,
 					"tool-call",
 				);
@@ -1417,6 +1862,72 @@ export function renderConversation(body: unknown, agent: string, md: (text: stri
 }
 
 /**
+ * The "생성 중" block under the conversation from a daemon `live` view: the text being written (through `md`), its
+ * thinking (folded), tool calls being written, running tools with their output tail, and a retry line. `settling`:
+ * the message ended and the block stays as "확정 중" until the conversation is read again; `error`: the daemon
+ * cannot be asked; `fail`: that read failed; `elapsedMs`: time since the view arrived, added to tool ages. Empty when
+ * there is nothing to show. Every string but the text and thinking is escaped. Self-contained (shipped to the page).
+ */
+export function renderLiveTurn(
+	live: unknown,
+	md: (text: string) => string,
+	state: { settling?: boolean; error?: string; fail?: string; elapsedMs?: number },
+): string {
+	const esc = (value: unknown): string =>
+		String(value ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	if (state.error === "daemon_unreachable") {
+		return '<p class="turn-note live-down">데몬에 연결할 수 없어 실시간 내용을 못 받고 있어요</p>';
+	}
+	const view = (live ?? {}) as {
+		text?: unknown;
+		thinking?: unknown;
+		toolCalls?: unknown;
+		running?: unknown;
+		retry?: { attempt?: unknown; error?: unknown } | null;
+	};
+	const text = typeof view.text === "string" ? view.text : "";
+	const thinking = typeof view.thinking === "string" ? view.thinking : "";
+	const calls = Array.isArray(view.toolCalls) ? view.toolCalls : [];
+	const running = Array.isArray(view.running) ? view.running : [];
+	const retry = view.retry ?? undefined;
+	if (text === "" && thinking === "" && calls.length === 0 && running.length === 0 && retry === undefined) return "";
+	const extra = Math.max(0, state.elapsedMs ?? 0);
+	const age = (ms: unknown): string => {
+		const seconds = Math.floor(((typeof ms === "number" ? ms : 0) + extra) / 1000);
+		return seconds < 60 ? `${seconds}초` : `${Math.floor(seconds / 60)}분 ${seconds % 60}초`;
+	};
+	const head = state.settling
+		? '<span class="live-state">확정 중</span>'
+		: '<span class="live-state"><span class="live-spin" aria-hidden="true"></span>생성 중</span>';
+	const parts = [
+		retry === undefined ? "" : `<p class="turn-note">재시도 ${esc(retry.attempt)}회 · ${esc(retry.error)}</p>`,
+		thinking === ""
+			? ""
+			: `<details class="fold" data-fold="thinking"><summary>생각</summary><div class="md">${md(thinking)}</div></details>`,
+		text === "" ? "" : `<div class="md">${md(text)}</div>`,
+		...calls.map(
+			(call: { name?: unknown; summary?: unknown } | null) =>
+				`<p class="live-tool"><code class="mono"><b>${esc(call?.name)}</b></code> <span>${esc(call?.summary)}</span> <span class="badge">준비 중</span></p>`,
+		),
+		...running.map(
+			(tool: { name?: unknown; summary?: unknown; ageMs?: unknown; outputTail?: unknown } | null, i: number) =>
+				`<details class="fold tool-call" data-fold="run-${i}" open><summary><code class="mono"><b>${esc(tool?.name)}</b></code> <span>${esc(tool?.summary)}</span> <span class="badge is-info">진행 중 · ${age(tool?.ageMs)}</span></summary>${
+					typeof tool?.outputTail === "string" && tool.outputTail !== ""
+						? `<pre class="md-code"><code>${esc(tool.outputTail)}</code></pre>`
+						: '<p class="turn-note">출력을 기다리는 중</p>'
+				}</details>`,
+		),
+		state.fail ? `<p class="turn-note">${esc(state.fail)}</p>` : "",
+	];
+	return `<article class="turn is-live${state.settling ? " is-settling" : ""}" aria-busy="${state.settling ? "false" : "true"}"><p class="turn-head"><b>omp</b>${head}</p>${parts.join("")}</article>`;
+}
+
+/**
  * Inline script: the renderers above as shipped source, then the page wiring — the 15-second snapshot refresh, the
  * board stream (`api/board/events`, only with a board), view switching (`?view=`), search and List sorting, theme
  * persistence, keyboard navigation (`j`/`k`, `Enter`, `Esc`, `g <key>`, `/`, `?`, `⌘K`/`Ctrl+K`), copy toast, and the
@@ -1425,16 +1936,25 @@ export function renderConversation(body: unknown, agent: string, md: (text: stri
  */
 const SCRIPT = `const GATE_LIMITS = ${JSON.stringify(GATE_LIMITS)};
 const TURN_LABELS = ${JSON.stringify(TURN_LABELS)};
+const JOB_LABELS = ${JSON.stringify(JOB_LABELS)};
+const MONITOR_STAGES = ${JSON.stringify(MONITOR_STAGES)};
+const monitorTook = ${monitorTook.toString()};
 const gateText = ${gateText.toString()};
 const alertText = ${alertText.toString()};
+const openTurnsText = ${openTurnsText.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderTaskDetail = ${renderTaskDetail.toString()};
 const renderDetailHead = ${renderDetailHead.toString()};
 const renderItemDetail = ${renderItemDetail.toString()};
+const renderMonitorDetail = ${renderMonitorDetail.toString()};
+const renderDetailTabs = ${renderDetailTabs.toString()};
 const renderPlan = ${renderPlan.toString()};
 const renderConversation = ${renderConversation.toString()};
+const renderLiveTurn = ${renderLiveTurn.toString()};
 const renderMarkdown = ${renderMarkdown.toString()};
+const renderTrace = ${renderTrace.toString()};
+${TRACE_CLIENT}
 function boot() {
 	const main = document.getElementById("main");
 	const stale = document.getElementById("stale");
@@ -1444,6 +1964,8 @@ function boot() {
 	const head = document.getElementById("detail-head");
 	const plan = document.getElementById("detail-plan");
 	const conv = document.getElementById("detail-conv");
+	const traceHost = document.getElementById("detail-trace");
+	const trace = traceController(traceHost);
 	const closer = detail.querySelector("[data-close]");
 	const cmdModal = document.getElementById("cmd-palette");
 	const cmdInput = document.getElementById("cmd-input");
@@ -1456,9 +1978,15 @@ function boot() {
 	// The board the server drew the page with, so the first snapshot refresh does not redraw without it.
 	const seeded = boardOn ? document.getElementById("board-data") : null;
 	let board = seeded && seeded.textContent ? JSON.parse(seeded.textContent) : null;
-	const ui = { view: "inbox", q: "", sort: "", desc: false, theme: "system" };
+	const ui = { view: "inbox", q: "", sort: "", desc: false, theme: "system", layout: "" };
 	let open = null;
 	let tab = "head";
+	// The turn the 트레이스 tab shows when not the thread's last one (a 최근 턴 row, or the old one-turn address).
+	let traceTurn = null;
+	// The open thread's updatedAt and last turn as the snapshot last told them: a change reads its conversation again.
+	let threadSeen = "";
+	// The open monitor's \`api/monitor/detail\` answer as drawn by renderMonitorDetail; null while it is being read.
+	let monitorHtml = null;
 	let drawnMain = "";
 	let drawnHead = "";
 	let loadedKey = null;
@@ -1466,6 +1994,20 @@ function boot() {
 	let cursor;
 	let paged = false;
 	let generation = 0;
+	// The 대화 tab's live stream (one at a time) and its block: the last view, when it came, and while "확정 중" the
+	// ended message kept on screen until a conversation read started after the end (ticket) has drawn it for good.
+	let liveSource = null;
+	let liveOrigin = null;
+	let liveView = null;
+	let liveAt = 0;
+	let liveKept = null;
+	let liveError = "";
+	let liveFail = "";
+	let drawnLive = "";
+	let loadTicket = 0;
+	let settleTicket = Infinity;
+	let reloading = null;
+	let reloadAgain = false;
 	let toastTimer = null;
 	let chordTimer = null;
 	let gPending = false;
@@ -1540,21 +2082,40 @@ function boot() {
 	const fromUrl = () => {
 		const query = new URLSearchParams(location.search);
 		const view = query.get("view") || "inbox";
+		const layout = query.get("layout") === "list" ? "list" : "";
 		for (const kind of ["card", "task", "item"]) {
 			const id = query.get(kind);
-			if (id) return { view, open: { kind, id } };
+			if (id) return { view, layout, open: { kind, id } };
 		}
-		return { view, open: null };
+		return { view, layout, open: null };
 	};
 	const toUrl = (target) => {
 		const url = new URL(location.href);
-		for (const name of ["view", "card", "task", "item"]) url.searchParams.delete(name);
+		for (const name of ["view", "layout", "card", "task", "item"]) url.searchParams.delete(name);
 		if (ui.view !== "inbox") url.searchParams.set("view", ui.view);
+		if (ui.view === "turns" && ui.layout === "list") url.searchParams.set("layout", "list");
 		if (target) url.searchParams.set(target.kind, target.id);
 		url.hash = "";
 		return url;
 	};
 	const cardOf = (key) => (board && board.ok ? board.cards.find((card) => card.key === key) : undefined);
+	/** A turn-board conversation is open (any turns-view item but a background job). */
+	const threadOpen = () => !!open && open.kind === "item" && ui.view === "turns" && !open.id.startsWith("job:");
+	/** The snapshot's thread by origin key, or the one holding inbound id \`id\` (the old one-turn address). */
+	const threadOf = (id) => {
+		if (!snapshot || !snapshot.turns.ok) return undefined;
+		const list = snapshot.turns.threads;
+		return /^\\d+$/.test(id)
+			? list.find((item) => item.recent.some((turn) => String(turn.inboundId) === id))
+			: list.find((item) => item.originKey === id);
+	};
+	/** A monitor row is open (\`?view=monitors&item=<id or name>\`). */
+	const monitorOpen = () => !!open && open.kind === "item" && ui.view === "monitors";
+	const monitorOf = (id) =>
+		snapshot && snapshot.monitors.ok
+			? snapshot.monitors.items.find((item) => item.id === id || item.name === id)
+			: undefined;
+	const threadSign = (thread) => (thread ? thread.updatedAt + "|" + thread.latest.inboundId + "|" + thread.latest.state : "");
 	const taskById = (id) =>
 		snapshot && snapshot.tasks.ok ? snapshot.tasks.items.find((task) => task.taskId === id) : undefined;
 	const rowOf = (id) => {
@@ -1622,6 +2183,7 @@ function boot() {
 			desc: ui.desc,
 			selected: open ? open.id : "",
 			theme: ui.theme,
+			layout: ui.layout,
 		});
 		if (html === drawnMain) return;
 		const view = document.getElementById("view");
@@ -1659,7 +2221,7 @@ function boot() {
 			if (open.kind === "task") {
 				const card = board && board.ok ? board.cards.find((item) => item.taskId === open.id) : undefined;
 				html = renderTaskDetail(open.id, taskById(open.id), card ? card.key : undefined);
-			} else html = renderItemDetail(snapshot, ui.view, open.id);
+			} else html = renderItemDetail(snapshot, ui.view, open.id, monitorHtml === null ? undefined : monitorHtml);
 		}
 		if (html === null || html === drawnHead) return;
 		const focused = document.activeElement && document.activeElement.id === "detail-title";
@@ -1671,23 +2233,30 @@ function boot() {
 	function setTab(name) {
 		tab = name;
 		const card = !!open && open.kind === "card";
+		const tabbed = card || threadOpen();
 		for (const button of tabs.querySelectorAll("[data-tab]")) {
 			button.setAttribute("aria-selected", String(button.getAttribute("data-tab") === name));
 		}
-		head.hidden = card && name !== "head";
-		conv.hidden = !card || name !== "conv";
+		head.hidden = tabbed && name !== "head";
+		conv.hidden = !tabbed || name !== "conv";
 		plan.hidden = !card || name !== "plan";
 		detail.scrollTop = name === "conv" ? detail.scrollHeight : 0;
+		syncTrace();
+		syncLive();
 	}
+	/** A herdr card's pane answer (\`api/pane/*\`), or a conversation's omp session (\`api/thread/conversation\`). */
 	async function readPane(kind, before) {
-		const query = new URLSearchParams({ card: open.id });
+		const thread = threadOpen();
+		const query = new URLSearchParams(thread ? { origin: open.id } : { card: open.id });
 		if (before) query.set("before", before);
-		const response = await fetch("api/pane/" + kind + "?" + query.toString(), { cache: "no-store" });
+		const path = thread ? "api/thread/conversation" : "api/pane/" + kind;
+		const response = await fetch(path + "?" + query.toString(), { cache: "no-store" });
 		if (!response.ok) throw new Error("HTTP " + response.status);
 		return response.json();
 	}
 	async function loadConversation(mode) {
 		const mine = generation;
+		const ticket = ++loadTicket;
 		try {
 			const body = await readPane("conversation", mode === "older" ? cursor : undefined);
 			if (mine !== generation) return;
@@ -1698,14 +2267,119 @@ function boot() {
 			const card = cardOf(open.id);
 			const nearEnd = detail.scrollHeight - detail.scrollTop - detail.clientHeight < 40;
 			const height = detail.scrollHeight;
-			conv.innerHTML = renderConversation({ turns: turns, cursor: cursor }, card ? card.agent : "agent", renderMarkdown, Date.now());
+			const agent = threadOpen() ? "omp" : card ? card.agent : "agent";
+			// The read that ends "확정 중" swaps the kept block for the final text in this one DOM update.
+			if (ticket >= settleTicket) {
+				liveKept = null;
+				liveFail = "";
+				settleTicket = Infinity;
+			}
+			drawnLive = liveHtml();
+			conv.innerHTML =
+				renderConversation({ turns: turns, cursor: cursor }, agent, renderMarkdown, Date.now()) +
+				(threadOpen() ? '<div class="live-slot" data-live>' + drawnLive + "</div>" : "");
 			if (tab !== "conv") return;
 			if (mode === "older") detail.scrollTop += detail.scrollHeight - height;
 			else if (mode === "first" || nearEnd) detail.scrollTop = detail.scrollHeight;
 		} catch (error) {
-			if (mine !== generation || mode === "refresh") return;
-			note(conv, "대화를 읽지 못했어요 (" + (error && error.message ? error.message : String(error)) + ")");
+			if (mine !== generation) return;
+			const failed = "대화를 읽지 못했어요 (" + (error && error.message ? error.message : String(error)) + ")";
+			if (mode !== "refresh") note(conv, failed);
+			else if (liveKept) {
+				liveFail = failed;
+				drawLive();
+			}
 		}
+	}
+	/** Reads the open conversation again: one read at a time, and one more right after when asked meanwhile. */
+	function reloadThread() {
+		if (!threadOpen() || loadedKey !== open.id || paged) return;
+		if (reloading) {
+			reloadAgain = true;
+			return;
+		}
+		reloading = loadConversation("refresh").finally(() => {
+			reloading = null;
+			if (!reloadAgain) return;
+			reloadAgain = false;
+			reloadThread();
+		});
+	}
+	const wrote = (view) => !!view && (view.text !== "" || view.thinking !== "" || view.toolCalls.length > 0);
+	/** The view the block draws: while "확정 중", the kept message with whatever runs now. */
+	function liveHtml() {
+		const shown = liveKept
+			? Object.assign({ running: [] }, liveView || {}, liveKept)
+			: liveView;
+		return renderLiveTurn(shown, renderMarkdown, {
+			settling: !!liveKept,
+			error: liveError,
+			fail: liveFail,
+			elapsedMs: Date.now() - liveAt,
+		});
+	}
+	/** Redraws only the live block; keeps its open folds, and the reader's place unless they were at the bottom. */
+	function drawLive() {
+		const slot = conv.querySelector("[data-live]");
+		if (!slot) return;
+		const html = liveHtml();
+		if (html === drawnLive) return;
+		const folds = new Map();
+		for (const fold of slot.querySelectorAll("details[data-fold]")) folds.set(fold.getAttribute("data-fold"), fold.open);
+		const nearEnd = detail.scrollHeight - detail.scrollTop - detail.clientHeight < 40;
+		const top = detail.scrollTop;
+		slot.innerHTML = html;
+		drawnLive = html;
+		for (const fold of slot.querySelectorAll("details[data-fold]")) {
+			const was = folds.get(fold.getAttribute("data-fold"));
+			if (was !== undefined) fold.open = was;
+		}
+		if (tab === "conv") detail.scrollTop = nearEnd ? detail.scrollHeight : top;
+	}
+	/**
+	 * One \`live\` event. A message that ended (the view went null, or its text, thinking and tool calls emptied) stays
+	 * on screen as "확정 중" and the conversation is read again; that read replaces the block.
+	 */
+	function onLive(body) {
+		const next = body && body.live ? body.live : null;
+		const prev = liveView;
+		liveError = body && body.error ? body.error : "";
+		liveView = next;
+		liveAt = Date.now();
+		if (prev && !liveError && (next === null || (next.seq > prev.seq && wrote(prev) && !wrote(next)))) {
+			if (wrote(prev) && !paged) {
+				liveKept = { text: prev.text, thinking: prev.thinking, toolCalls: prev.toolCalls };
+				liveFail = "";
+				settleTicket = loadTicket + 1;
+			}
+			reloadThread();
+		}
+		drawLive();
+	}
+	/**
+	 * The one live stream: open while the 대화 tab shows a conversation the snapshot counts as running. Closing it on the
+	 * same conversation counts as the turn ending; another conversation starts clean.
+	 */
+	function syncLive() {
+		const thread = threadOpen() && loadedKey === open.id && tab === "conv" ? threadOf(open.id) : undefined;
+		const want = thread && thread.openCount > 0 ? open.id : null;
+		if (want === liveOrigin) return;
+		if (liveSource) liveSource.close();
+		liveSource = null;
+		const same = liveOrigin !== null && !!open && liveOrigin === open.id;
+		liveOrigin = want;
+		if (same) onLive({ live: null });
+		else {
+			liveView = null;
+			liveKept = null;
+			liveError = "";
+			liveFail = "";
+			settleTicket = Infinity;
+			drawLive();
+		}
+		if (want === null) return;
+		liveSource = new EventSource("api/thread/live/events?origin=" + encodeURIComponent(want));
+		liveSource.addEventListener("live", (event) => onLive(JSON.parse(event.data)));
 	}
 	async function loadPlan() {
 		const mine = generation;
@@ -1719,14 +2393,67 @@ function boot() {
 			if (mine === generation) note(plan, "plan을 읽지 못했어요 (" + (error && error.message ? error.message : String(error)) + ")");
 		}
 	}
-	/** Starts reading the open card's pane once the board has it. */
+	/** Reads the open monitor's instruction, procedure files and runs (\`api/monitor/detail\`) into its panel. */
+	async function loadMonitor(id) {
+		const mine = generation;
+		let body;
+		try {
+			const response = await fetch("api/monitor/detail?" + new URLSearchParams({ id: id }).toString(), { cache: "no-store" });
+			body = await response.json();
+			if (!response.ok && !(body && body.error)) body = { error: "HTTP " + response.status };
+		} catch (error) {
+			body = { error: error && error.message ? error.message : String(error) };
+		}
+		if (mine !== generation) return;
+		monitorHtml = renderMonitorDetail(body);
+		drawDetail();
+	}
+	/** Starts reading the open card's pane once the board has it, the open conversation's session, or a monitor's detail. */
 	function sync() {
-		if (!open || open.kind !== "card" || loadedKey === open.id || !cardOf(open.id)) return;
+		if (!open || loadedKey === open.id) return;
+		if (threadOpen()) {
+			// The old one-turn address waits for the snapshot to name its conversation.
+			if (/^\\d+$/.test(open.id)) return;
+			loadedKey = open.id;
+			threadSeen = threadSign(threadOf(open.id));
+			shimmer(conv, "대화를 불러오는 중…");
+			loadConversation("first");
+			return;
+		}
+		if (monitorOpen()) {
+			// An old link by name waits for the snapshot to name the monitor's id.
+			const monitor = monitorOf(open.id);
+			if (!monitor) return;
+			loadedKey = open.id;
+			loadMonitor(monitor.id);
+			return;
+		}
+		if (open.kind !== "card" || !cardOf(open.id)) return;
 		loadedKey = open.id;
 		shimmer(conv, "대화를 불러오는 중…");
 		shimmer(plan, "plan을 불러오는 중…");
 		loadPlan();
 		loadConversation("first");
+	}
+	/**
+	 * The one path from a snapshot to the open conversation: when its thread's updatedAt or last turn moved, the 대화
+	 * tab reads the session again (kept at the bottom if it was there, else where the reader is). No timer of its own.
+	 */
+	function followThread() {
+		if (!threadOpen() || loadedKey !== open.id) return;
+		const seen = threadSign(threadOf(open.id));
+		if (seen === threadSeen) return;
+		threadSeen = seen;
+		reloadThread();
+	}
+	/** The old one-turn address (\`?view=turns&item=<inbound id>\`) becomes its conversation's, on the 트레이스 tab. */
+	function adoptOldTurn() {
+		if (!threadOpen() || !/^\\d+$/.test(open.id)) return;
+		const thread = threadOf(open.id);
+		if (!thread) return;
+		open = { kind: "item", id: thread.originKey };
+		drawnHead = "";
+		history.replaceState(history.state, "", toUrl(open));
 	}
 	function show(target, how) {
 		const before = open;
@@ -1745,16 +2472,21 @@ function boot() {
 		cursor = undefined;
 		paged = false;
 		drawnHead = "";
+		monitorHtml = null;
+		const thread = threadOpen();
+		traceTurn = thread && /^\\d+$/.test(open.id) ? open.id : null;
+		adoptOldTurn();
 		detail.hidden = !open;
 		detail.classList.toggle("is-open", !!open);
 		detail.setAttribute("aria-label", LABELS[open ? open.kind : "card"]);
 		document.body.classList.toggle("detail-open", !!open);
-		tabs.hidden = !open || open.kind !== "card";
+		tabs.hidden = !open || (open.kind !== "card" && !thread);
+		tabs.innerHTML = renderDetailTabs(thread ? "thread" : "card", thread ? (traceTurn ? "trace" : "conv") : "head");
 		const back = toUrl(null);
 		closer.setAttribute("href", back.search || "./");
 		plan.replaceChildren();
 		conv.replaceChildren();
-		setTab("head");
+		setTab(thread ? (traceTurn ? "trace" : "conv") : "head");
 		drawMain(false);
 		if (!open) {
 			const row = before ? rowOf(before.id) : null;
@@ -1763,8 +2495,19 @@ function boot() {
 		}
 		drawDetail();
 		sync();
+		syncLive();
 		const title = document.getElementById("detail-title");
 		if (title) title.focus({ preventScroll: true });
+	}
+	/** A conversation's 트레이스 tab carries the waterfall of its last (or chosen) turn and widens the panel. */
+	function syncTrace() {
+		const on = threadOpen() && tab === "trace";
+		document.body.classList.toggle("detail-trace", on);
+		const thread = on ? threadOf(open.id) : undefined;
+		const turnId = !on ? null : traceTurn || (thread ? String(thread.latest.inboundId) : null);
+		if (turnId === null) return trace.close();
+		const turn = thread ? thread.recent.find((item) => String(item.inboundId) === turnId) : undefined;
+		trace.open(turnId, turn && turn.preview ? turn.preview : thread ? thread.title : "");
 	}
 	function close() {
 		if (!open) return;
@@ -1773,6 +2516,7 @@ function boot() {
 	}
 	function setView(view) {
 		ui.view = view;
+		ui.layout = "";
 		if (open) show(null, "none");
 		history.pushState(null, "", toUrl(null));
 		drawMain(true);
@@ -1785,7 +2529,7 @@ function boot() {
 		const list = [
 			{ label: "보기: 에이전트 인박스 (Board)", sub: "g i", run: () => setView("inbox") },
 			{ label: "보기: 에이전트 목록 (List)", sub: "g l", run: () => setView("list") },
-			{ label: "보기: 진행 중 턴", sub: "g t", run: () => setView("turns") },
+			{ label: "보기: 턴", sub: "g t", run: () => setView("turns") },
 			{ label: "보기: 레인", sub: "g n", run: () => setView("lanes") },
 			{ label: "보기: 승인 대기", sub: "g a", run: () => setView("approvals") },
 			{ label: "보기: 모니터", sub: "g m", run: () => setView("monitors") },
@@ -1934,6 +2678,10 @@ function boot() {
 			event.preventDefault();
 			return closeHelp();
 		}
+		if (traceHost.contains(target) && trace.click(target)) {
+			event.preventDefault();
+			return;
+		}
 		if (target.closest("[data-clear-search]")) {
 			event.preventDefault();
 			search.value = "";
@@ -1954,6 +2702,12 @@ function boot() {
 		if (nav && snapshot && plain(event)) {
 			event.preventDefault();
 			const layout = nav.getAttribute("data-layout");
+			// On the turns view Board/List switch its own layout and keep the open conversation.
+			if (layout && ui.view === "turns") {
+				ui.layout = layout === "list" ? "list" : "";
+				history.pushState(history.state, "", toUrl(open));
+				return drawMain(true);
+			}
 			return setView(layout ? (layout === "list" ? "list" : "inbox") : nav.getAttribute("data-view"));
 		}
 		if (target.closest("[data-close]")) {
@@ -1969,6 +2723,11 @@ function boot() {
 				ui.desc = false;
 			}
 			return drawMain(false);
+		}
+		const recentTurn = target.closest("button[data-trace-turn]");
+		if (recentTurn) {
+			traceTurn = recentTurn.getAttribute("data-trace-turn");
+			return setTab("trace");
 		}
 		const tabButton = target.closest("button[data-tab]");
 		if (tabButton) return setTab(tabButton.getAttribute("data-tab"));
@@ -2024,6 +2783,11 @@ function boot() {
 			} else if (event.key === "Tab") {
 				trapTab(helpModal, event);
 			}
+			return;
+		}
+		// Inside the waterfall its tree keys win; Escape with no details open still closes the panel below.
+		if (event.target instanceof Element && traceHost.contains(event.target) && !event.metaKey && !event.ctrlKey && !event.altKey && trace.key(event)) {
+			event.preventDefault();
 			return;
 		}
 		const typing = event.target instanceof Element && Boolean(event.target.closest("input, textarea, select, [contenteditable]"));
@@ -2103,7 +2867,7 @@ function boot() {
 		}
 		if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && event.target instanceof Element && event.target.matches("button[data-tab]")) {
 			event.preventDefault();
-			const order = ["head", "conv", "plan"];
+			const order = ["head", "conv", threadOpen() ? "trace" : "plan"];
 			const idx = order.indexOf(tab);
 			const next = order[(idx + (event.key === "ArrowRight" ? 1 : 2)) % 3];
 			setTab(next);
@@ -2117,8 +2881,9 @@ function boot() {
 	});
 	window.addEventListener("popstate", () => {
 		const state = fromUrl();
-		const moved = state.view !== ui.view;
+		const moved = state.view !== ui.view || state.layout !== ui.layout;
 		ui.view = state.view;
+		ui.layout = state.layout;
 		show(state.open, "none");
 		if (moved) drawMain(true);
 	});
@@ -2127,10 +2892,15 @@ function boot() {
 			const response = await fetch("api/snapshot", { cache: "no-store" });
 			if (!response.ok) throw new Error("HTTP " + response.status);
 			snapshot = await response.json();
+			adoptOldTurn();
 			drawMain(false);
 			// Without the board stream this is the only redraw: a ?card= deep link loads its conversation here too.
 			drawDetail();
 			sync();
+			followThread();
+			syncLive();
+			// A ?view=turns&item= deep link starts its waterfall here, and the root row picks up the request line.
+			syncTrace();
 			stale.hidden = true;
 		} catch (error) {
 			stale.textContent = "갱신 실패: " + (error && error.message ? error.message : String(error)) + " · 15초 뒤 다시 시도해요";
@@ -2139,7 +2909,12 @@ function boot() {
 	}
 	const start = fromUrl();
 	ui.view = start.view;
+	ui.layout = start.layout;
 	open = start.open;
+	if (threadOpen()) {
+		traceTurn = /^\\d+$/.test(open.id) ? open.id : null;
+		tab = traceTurn ? "trace" : "conv";
+	}
 	search.value = "";
 	refresh();
 	// A hidden tab skips the poll (each snapshot can run herdr over ssh) and catches up the moment it shows again.
@@ -2154,6 +2929,11 @@ function boot() {
 			loadConversation("refresh");
 		}
 	}, 10000);
+	// One clock for the waterfall and the live block's tool ages (no timer of its own).
+	setInterval(() => {
+		trace.tick();
+		if (liveView && liveView.running.length > 0) drawLive();
+	}, 1000);
 	if (boardOn) {
 		const events = new EventSource("api/board/events");
 		events.addEventListener("snapshot", (event) => {
@@ -2178,11 +2958,13 @@ export interface DashboardPageOptions {
 	task?: string;
 	/** `?item=` of the request: the detail panel starts open on that row of the view. */
 	item?: string;
+	/** `?layout=` of the request (`list`: the turns view as a table). */
+	layout?: string;
 }
 
 /** The whole page: first render on the server (readable without JavaScript), then the inline script. */
 export function renderDashboardPage(snapshot: DashboardSnapshot, options: DashboardPageOptions = {}): string {
-	const { board, view, card, task, item } = options;
+	const { board, view, card, task, item, layout } = options;
 	const live = board?.ok === true ? board : undefined;
 	const tasks = snapshot.tasks.ok ? snapshot.tasks.items : [];
 	const open =
@@ -2210,11 +2992,25 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 	}
 	const label =
 		open === undefined || open.kind === "card" ? "카드 상세" : open.kind === "task" ? "TASK 상세" : "항목 상세";
+	const turnsList = view === "turns" && layout === "list";
 	const back =
-		view !== undefined && /^(list|turns|lanes|approvals|monitors|alerts|system)$/.test(view) ? `?view=${view}` : "./";
+		view !== undefined && /^(list|turns|lanes|approvals|monitors|alerts|system)$/.test(view)
+			? `?view=${view}${turnsList ? "&amp;layout=list" : ""}`
+			: "./";
+	// A turn-board conversation: tabs 개요/대화/트레이스, 대화 first; the old one-turn address opens on 트레이스.
+	const thread = open?.kind === "item" && view === "turns" && !open.id.startsWith("job:");
+	const oldTurn = thread && /^\d+$/.test(open.id);
+	const found =
+		thread && snapshot.turns.ok
+			? oldTurn
+				? snapshot.turns.threads.find((entry) => entry.recent.some((turn) => String(turn.inboundId) === open.id))
+				: snapshot.turns.threads.find((entry) => entry.originKey === open.id)
+			: undefined;
+	const tab = open?.kind === "card" ? "head" : thread ? (oldTurn ? "trace" : "conv") : undefined;
 	const ui = {
 		...(view === undefined ? {} : { view }),
-		...(open === undefined ? {} : { selected: open.id }),
+		...(open === undefined ? {} : { selected: found?.originKey ?? open.id }),
+		...(turnsList ? { layout: "list" } : {}),
 	};
 	return `<!doctype html>
 <html lang="ko">
@@ -2229,7 +3025,7 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 <meta name="theme-color" content="#15181D" media="(prefers-color-scheme: dark)">
 <style>${STYLE}</style>
 </head>
-<body${open === undefined ? "" : ' class="detail-open"'}>
+<body${open === undefined ? "" : tab === "trace" ? ' class="detail-open detail-trace"' : ' class="detail-open"'}>
 <div class="shell">
 <div id="main" data-board="${board === undefined ? "0" : "1"}">
 ${renderDashboardMain(snapshot, board, undefined, ui)}
@@ -2237,15 +3033,19 @@ ${renderDashboardMain(snapshot, board, undefined, ui)}
 <div class="search"><input id="search" type="search" placeholder="제목·TASK·머신 검색 ( / )" aria-label="제목·TASK ID·머신 검색" autocomplete="off"></div>
 ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" hidden>` : `<aside id="detail" class="detail is-open" aria-label="${label}">`}
 <div class="detail-bar"><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
-<div id="detail-tabs" class="tabs" role="tablist" aria-label="상세 보기"${open?.kind === "card" ? "" : " hidden"}><button id="tab-head" class="tab" type="button" role="tab" data-tab="head" aria-controls="detail-head" aria-selected="true">개요</button><button id="tab-conv" class="tab" type="button" role="tab" data-tab="conv" aria-controls="detail-conv" aria-selected="false">대화</button><button id="tab-plan" class="tab" type="button" role="tab" data-tab="plan" aria-controls="detail-plan" aria-selected="false">plan</button></div>
-<div id="detail-head" role="tabpanel" aria-labelledby="tab-head">${headHtml}</div>
+<div id="detail-tabs" class="tabs" role="tablist" aria-label="상세 보기"${tab === undefined ? " hidden" : ""}>${renderDetailTabs(
+		thread ? "thread" : "card",
+		tab ?? "head",
+	)}</div>
+<div id="detail-head" role="tabpanel" aria-labelledby="tab-head"${tab === undefined || tab === "head" ? "" : " hidden"}>${headHtml}</div>
 <section id="detail-plan" role="tabpanel" aria-labelledby="tab-plan" hidden></section>
-<section id="detail-conv" role="tabpanel" aria-labelledby="tab-conv" hidden></section>
+<section id="detail-conv" role="tabpanel" aria-labelledby="tab-conv"${tab === "conv" ? "" : " hidden"}></section>
+<section id="detail-trace" role="tabpanel" aria-labelledby="tab-trace" aria-label="턴 트레이스" hidden></section>
 </aside>
 <footer class="hint-bar" aria-label="단축키 안내"><span class="hint-item"><kbd>j</kbd><kbd>k</kbd><span>이동</span></span><span class="hint-item"><kbd>Enter</kbd><span>열기</span></span><span class="hint-item"><kbd>Esc</kbd><span>닫기</span></span><span class="hint-item"><kbd>/</kbd><span>검색</span></span><span class="hint-item"><kbd>g</kbd><kbd>i</kbd><span>인박스</span></span><span class="hint-item"><kbd>g</kbd><kbd>a</kbd><span>승인</span></span><button type="button" class="hint-btn" data-cmd-open><kbd>⌘K</kbd><span>명령 팔레트</span></button><button type="button" class="hint-btn" data-help-open><kbd>?</kbd><span>도움말</span></button></footer>
 </div>
 <div id="cmd-palette" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="명령 팔레트" hidden><div class="modal-card"><div class="cmd-head"><input id="cmd-input" type="text" placeholder="보기 전환, TASK ID·카드 이동, 테마 전환…" aria-label="명령 또는 TASK 검색" autocomplete="off"><button type="button" class="detail-close" data-cmd-close>닫기 <kbd>Esc</kbd></button></div><div id="cmd-list" class="cmd-list" role="listbox" aria-label="명령 목록"></div></div></div>
-<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
+<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <p id="stale" class="stale" role="status" hidden></p>
 ${board === undefined ? "" : `<script type="application/json" id="board-data">${JSON.stringify(board).replace(/</g, "\\u003c")}</script>\n`}<script>${SCRIPT}</script>

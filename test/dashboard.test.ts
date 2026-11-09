@@ -47,7 +47,7 @@ function seedDatabase(): void {
 		`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, thread_ref, last_event_at)
 		 VALUES ('m1', 'slack/dm/U1', 1, ?, 'dispatched', ?, ?, 'D1:1.0', ?), ('m2', 'slack/dm/U1', 1, ?, 'pending', ?, NULL, NULL, NULL),
 		        ('m3', 'slack/dm/U1', 1, ?, 'answered', ?, ?, NULL, NULL)`,
-		// An open turn shows an 80-char masked request line; the rest of its body and every answered body stay out.
+		// Every turn of the board's threads shows an 80-char masked request line; the rest of its body stays out.
 		[
 			`first request ${"가".repeat(80)} ${INBOUND_BODY}`,
 			NOW - hour,
@@ -55,7 +55,7 @@ function seedDatabase(): void {
 			NOW - 60_000,
 			"second request",
 			NOW - 1_000,
-			INBOUND_BODY,
+			`answered request ${"나".repeat(80)} ${INBOUND_BODY}`,
 			NOW - 2 * hour,
 			NOW,
 		],
@@ -78,7 +78,7 @@ function seedDatabase(): void {
 	);
 	db.run(
 		`INSERT INTO monitors (id, name, trigger_json, instruction, cursor_at, created_at, updated_at)
-		 VALUES ('mon1', 'nightly', ?, 'SECRET-INSTRUCTION', ?, ?, ?)`,
+		 VALUES ('mon1', 'nightly', ?, '야간 점검을 한다. SECRET-INSTRUCTION', ?, ?, ?)`,
 		[JSON.stringify({ kind: "at", at: "2026-11-05T00:00:00.000Z" }), NOW, NOW, NOW],
 	);
 	db.run(
@@ -172,6 +172,9 @@ const fakeHostOps = (): TaskHostOps => ({
 	},
 	headOf: async () => {
 		throw new Error("the dashboard never runs checks");
+	},
+	branchDiff: async () => {
+		throw new Error("the dashboard never reads the branch diff");
 	},
 });
 
@@ -386,7 +389,7 @@ describe("dashboard snapshot", () => {
 		});
 	});
 
-	test("AC-7: message bodies past the request line, approval replies and monitor payloads never reach the JSON", async () => {
+	test("AC-7: message bodies past the request line, approval replies, monitor payloads and instruction tails never reach the JSON", async () => {
 		const json = JSON.stringify(await buildSnapshot(deps()));
 		for (const secret of [
 			INBOUND_BODY,
@@ -400,13 +403,35 @@ describe("dashboard snapshot", () => {
 		}
 		const snapshot = JSON.parse(json) as DashboardSnapshot;
 		expect(snapshot.approvals.ok && snapshot.approvals.items[0]?.summary).toBe("push to main");
+		// Of the instruction only its first sentence: the rest is read through api/monitor/detail.
 		expect(snapshot.monitors.ok && snapshot.monitors.items[0]).toEqual({
+			id: "mon1",
 			name: "nightly",
 			kind: "at",
+			schedule: "한 번 · 11-05 09:00",
+			cron: null,
+			summary: "야간 점검을 한다.",
+			destination: "오너 DM",
+			copyTo: null,
+			model: null,
+			thinking: null,
+			deliver: "turn",
+			overlap: "queue",
+			files: [],
 			nextFireAt: "2026-11-05T09:00:00+09:00",
 			lastStage: "delivered",
 			lastAt: "2026-11-04T08:00:00+09:00",
 			openIncidents: 1,
+			recent: [{ stage: "delivered", manual: false, at: "2026-11-04T08:00:00+09:00" }],
+			lastRun: {
+				stage: "delivered",
+				at: "2026-11-04T08:00:00+09:00",
+				slotAt: "2026-11-04T08:00:00+09:00",
+				durationMs: 0,
+				attempts: 0,
+				manual: false,
+			},
+			scheduledRun: true,
 		});
 		expect(snapshot.lanes.ok && snapshot.lanes.items.map((lane) => lane.name)).toEqual(["lane-a"]);
 		expect(snapshot.alerts.ok && snapshot.alerts.items).toEqual([
@@ -614,28 +639,20 @@ describe("dashboard turn context", () => {
 		}
 	});
 
-	test("AC-6: turn cards show the request as title, kind·wait badges, 채널 메인/DM, and the drain line only while draining", async () => {
+	test("AC-6: thread cards show the first request as title, kind·place, the last turn's wait reason, and the drain line only while draining", async () => {
 		const draining = await buildSnapshot(deps(withStatus(DRAIN)));
 		const html = renderDashboardMain(draining, undefined, NOW, { view: "turns" });
-		expect(html).toContain('<p class="row-title">/new-ompbot</p>');
-		expect(html).toContain('<p class="row-title">첫 줄 둘째 줄 [REDACTED] [REDACTED] [첨부] 끝</p>');
-		expect(html).toContain('<p class="row-title">monitor/mon1</p>');
-		for (const label of [
-			"대화",
-			"명령",
-			"자동 후속",
-			"모니터",
-			"재시작 대기",
-			"재시작이 기다리는 턴",
-			"채널 메인",
-			"DM",
-		]) {
+		expect(html).toContain('<p class="card-title">/new-ompbot</p>');
+		expect(html).toContain('<p class="card-title">첫 줄 둘째 줄 [REDACTED] [REDACTED] [첨부] 끝</p>');
+		expect(html).toContain('<p class="card-title">nightly</p>');
+		for (const label of ["대화", "명령", "모니터", "재시작 대기", "재시작이 기다리는 턴", "C9 채널 메인", "DM"]) {
 			expect(html).toContain(`>${label}<`);
 		}
 		expect(html).toContain("진행 중인 턴 2개가 끝나면 재시작합니다 (가장 오래된 턴 경과 1시간 0분)");
 		expect(html).toContain("그동안 들어온 요청은 재시작 뒤 처리됩니다.");
 		const detail = renderItemDetail(draining, "turns", "4");
-		for (const fact of ["명령", "재시작 대기", "/new-ompbot", "슬래시 명령"]) expect(detail).toContain(fact);
+		for (const fact of ["명령", "재시작 대기", "/new-ompbot", "/followup-ompbot 이어서 해 줘"])
+			expect(detail).toContain(fact);
 
 		const calm = await buildSnapshot(deps());
 		const plain = renderDashboardMain(calm, undefined, NOW, { view: "turns" });
@@ -883,16 +900,16 @@ describe("dashboard review fixes", () => {
 		expect(turnsOf(await buildSnapshot(deps())).get(ids.silentEvent)?.stalled).toBe(true);
 	});
 
-	test("only the stalled turn gets 정체; the page script has copy failure, refresh→sync and the modal Tab trap", async () => {
-		const ids = seedStalls();
+	test("only the stalled thread gets 정체; the page script has copy failure, refresh→sync and the modal Tab trap", async () => {
+		seedStalls();
 		const snapshot = await buildSnapshot(deps());
 		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
-		const stalledRows = html
-			.split('<a class="row')
+		const stalledCards = html
+			.split('<a class="card')
 			.slice(1)
-			.filter((row) => row.includes(">정체<"))
-			.map((row) => Number(/data-row="(\d+)"/.exec(row)?.[1]));
-		expect(stalledRows).toEqual([ids.silentEvent]);
+			.filter((card) => card.includes(">정체<"))
+			.map((card) => /data-row="([^"]+)"/.exec(card)?.[1]);
+		expect(stalledCards).toEqual(["slack/ch/C7"]);
 
 		const source = await Bun.file(join(import.meta.dir, "..", "src", "dashboard", "html.ts")).text();
 		expect(source).not.toContain("STALL_MS");

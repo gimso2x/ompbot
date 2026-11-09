@@ -48,6 +48,7 @@ export type DeliveryEvent =
 	| "claim" // pending -> inflight
 	| "confirmed" // inflight -> confirmed
 	| "definitive_failure" // inflight -> pending (backoff) | expired
+	| "rate_limited" // inflight -> pending at the block's end, attempts kept | expired past freshness
 	| "ambiguous" // inflight -> failed_ambiguous
 	| "expire_check" // pending past freshness -> expired
 	| "recover"; // inflight left over from a dead process -> pending, redelivered
@@ -59,8 +60,15 @@ function requireState(f: DeliveryFacts, event: DeliveryEvent, expected: Delivery
 /**
  * Pure delivery state machine. `failed_ambiguous` is sticky: the send may have reached Slack, so neither failure
  * counts, backoff, nor the 24h freshness window move it; the row stays visible instead of being resent or dropped.
+ * `rate_limited` (a 429, or the method still blocked by one) is Slack saying "later", not a failed send: it keeps
+ * `attempts` and waits until `retryAt`, so a long block cannot expire an answer — only the freshness window can.
  */
-export function transitionDelivery(f: DeliveryFacts, event: DeliveryEvent, now: number): DeliveryFacts {
+export function transitionDelivery(
+	f: DeliveryFacts,
+	event: DeliveryEvent,
+	now: number,
+	retryAt: number = now,
+): DeliveryFacts {
 	if (f.state === "failed_ambiguous") return f;
 	const stale = now - f.createdAt >= FRESHNESS_MS;
 	switch (event) {
@@ -79,6 +87,10 @@ export function transitionDelivery(f: DeliveryFacts, event: DeliveryEvent, now: 
 			if (attempts >= MAX_DEFINITIVE_FAILURES || stale) return { ...f, attempts, state: "expired" };
 			return { ...f, attempts, state: "pending", nextAt: now + backoffMs(attempts) };
 		}
+		case "rate_limited":
+			requireState(f, event, "inflight");
+			if (stale) return { ...f, state: "expired" };
+			return { ...f, state: "pending", nextAt: Math.max(now, retryAt) };
 		case "expire_check":
 			return f.state === "pending" && stale ? { ...f, state: "expired" } : f;
 		case "recover":

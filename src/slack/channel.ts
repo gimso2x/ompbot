@@ -1,28 +1,64 @@
-import type { ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../channel/port";
+import type { ActionButton, ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../channel/port";
 import type { SlackTransport } from "./transport";
+
+/** Slack caps a `header` at 150 characters, a section field at 2,000 and a section at 10 fields. */
+const HEADER_LIMIT = 150;
+const FIELD_LIMIT = 2_000;
+const MAX_FIELDS = 10;
+
+/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
+function cut(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const last = text.charCodeAt(limit - 1);
+	return text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit);
+}
+
+function actionsBlock(buttons: readonly ActionButton[]): unknown {
+	return {
+		type: "actions",
+		elements: buttons.map((button) => ({
+			type: "button",
+			...(button.style === undefined ? {} : { style: button.style }),
+			text: { type: "plain_text", text: button.label },
+			action_id: button.actionId,
+			...(button.value === undefined ? {} : { value: button.value }),
+		})),
+	};
+}
 
 /**
  * Block Kit for a message with buttons: the text section, the buttons, and the optional note as a context line.
  * No `buttons` → no blocks at all (plain text message); `[]` → `blocks: []`, which removes earlier buttons.
+ * A card (`title`, `body` or `fields` set) is header → section(body ?? text) → fields → buttons → note, each only when
+ * present; `buttons: []` drops just the buttons, so the card keeps its title and fields after a decision.
  */
 function blocksOf(msg: OutboundMessage): readonly unknown[] | undefined {
-	if (msg.buttons === undefined) return undefined;
-	if (msg.buttons.length === 0) return [];
+	const note =
+		msg.buttonsNote === undefined ? [] : [{ type: "context", elements: [{ type: "mrkdwn", text: msg.buttonsNote }] }];
+	if (msg.title === undefined && msg.body === undefined && msg.fields === undefined) {
+		if (msg.buttons === undefined) return undefined;
+		if (msg.buttons.length === 0) return [];
+		return [{ type: "section", text: { type: "mrkdwn", text: msg.text } }, actionsBlock(msg.buttons), ...note];
+	}
+	const fields = (msg.fields ?? []).slice(0, MAX_FIELDS);
 	return [
-		{ type: "section", text: { type: "mrkdwn", text: msg.text } },
-		{
-			type: "actions",
-			elements: msg.buttons.map((button) => ({
-				type: "button",
-				...(button.style === undefined ? {} : { style: button.style }),
-				text: { type: "plain_text", text: button.label },
-				action_id: button.actionId,
-				...(button.value === undefined ? {} : { value: button.value }),
-			})),
-		},
-		...(msg.buttonsNote === undefined
+		...(msg.title === undefined
 			? []
-			: [{ type: "context", elements: [{ type: "mrkdwn", text: msg.buttonsNote }] }]),
+			: [{ type: "header", text: { type: "plain_text", text: cut(msg.title, HEADER_LIMIT), emoji: true } }]),
+		{ type: "section", text: { type: "mrkdwn", text: msg.body ?? msg.text } },
+		...(fields.length === 0
+			? []
+			: [
+					{
+						type: "section",
+						fields: fields.map((field) => ({
+							type: "mrkdwn",
+							text: cut(`*${field.label}*\n${field.value}`, FIELD_LIMIT),
+						})),
+					},
+				]),
+		...(msg.buttons === undefined || msg.buttons.length === 0 ? [] : [actionsBlock(msg.buttons)]),
+		...note,
 	];
 }
 

@@ -12,11 +12,16 @@ export interface RunProcessResult {
 export interface RunProcessOptions {
 	cwd?: string;
 	timeoutMs?: number;
+	/** Collects up to this many stdout characters; a longer tail is cut, the run still succeeds. */
+	stdoutCap?: number;
 	/** Drops Slack and bot credential prefixes plus inherited git overrides, like every other child ompbot spawns. */
 	env?: Record<string, string>;
 }
 
 export type ProcessRunner = (cmd: string[], opts: RunProcessOptions) => Promise<RunProcessResult>;
+
+/** Default stdout collection cap; callers that legitimately need more (a whole task-branch diff) pass `stdoutCap`. */
+export const DEFAULT_STDOUT_CAP = 64_000;
 
 /** The bot's own child hygiene: no Slack/bot credentials, no inherited git redirects. */
 export function dispatchEnv(inherited: Record<string, string | undefined>): Record<string, string> {
@@ -39,9 +44,10 @@ const spawnProcess: ProcessRunner = (cmd, opts) => {
 	});
 	let stdout = "";
 	let timedOut = false;
+	const stdoutCap = opts.stdoutCap ?? DEFAULT_STDOUT_CAP;
 	child.stdout?.setEncoding("utf8");
 	child.stdout?.on("data", (chunk: string) => {
-		if (stdout.length < 64_000) stdout += chunk;
+		if (stdout.length < stdoutCap) stdout += chunk;
 	});
 	let stderr = "";
 	child.stderr?.setEncoding("utf8");
@@ -185,18 +191,24 @@ function herdrFailure(result: RunProcessResult, max = 160): string {
 	return detail.slice(0, max);
 }
 
-/** `herdr workspace create`: returns the workspace's root pane id (the agent needs a shell prompt pane). */
+/**
+ * `herdr workspace create --no-focus` (the owner's view stays where it is): returns the workspace's root pane id (the
+ * agent needs a shell prompt pane) and the workspace id, so a failed start can close what it created.
+ */
 export async function herdrCreateWorkspace(
 	cwd: string,
 	label: string,
 	options: HerdrRunnerOptions = {},
-): Promise<{ paneId: string } | { error: string }> {
-	const result = await herdrRun(["workspace", "create", "--cwd", cwd, "--label", label], options);
+): Promise<{ paneId: string; workspaceId: string | undefined } | { error: string }> {
+	const result = await herdrRun(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], options);
 	if (result.code !== 0) return { error: `workspace create failed: ${herdrFailure(result)}` };
-	const parsed = parseHerdrJson<{ result?: { root_pane?: { pane_id?: string } } }>(result.stdout);
+	const parsed = parseHerdrJson<HerdrWorkspaceCreated>(result.stdout);
 	if (parsed === undefined) return { error: "workspace create output is not JSON" };
 	const paneId = parsed.result?.root_pane?.pane_id;
-	return paneId ? { paneId } : { error: "workspace create returned no root pane" };
+	const workspaceId = parsed.result?.workspace?.workspace_id;
+	return paneId
+		? { paneId, workspaceId: workspaceId === "" ? undefined : workspaceId }
+		: { error: "workspace create returned no root pane" };
 }
 
 /**
@@ -218,7 +230,11 @@ export async function herdrStartAgent(input: {
 		["agent", "start", name, "--kind", "omp", "--pane", ws.paneId, "--timeout", "60000"],
 		options,
 	);
-	if (started.code !== 0) return { ok: false, error: `agent start failed: ${herdrFailure(started)}` };
+	if (started.code !== 0) {
+		// Like the remote start: close only the workspace this call created. A failed prompt leaves the agent up.
+		if (ws.workspaceId !== undefined) await herdrRun(["workspace", "close", ws.workspaceId], options);
+		return { ok: false, error: `agent start failed: ${herdrFailure(started)}` };
+	}
 	const prompted = await herdrRun(["agent", "prompt", name, task], options);
 	if (prompted.code !== 0) return { ok: false, error: `agent prompt failed: ${herdrFailure(prompted)}` };
 	return { ok: true, agentName: name, paneId: ws.paneId };
@@ -246,7 +262,8 @@ export interface RemoteHerdrStartResult {
 /**
  * One remote agent start, following the hub fleet owner-start flow: reuse the shared owners workspace, create a
  * tab in it, rename, `agent start --kind omp`, then deliver the prompt. On a failed start the tab/workspace this
- * call created is closed again. Not concurrency-safe per host — the tool layer serializes remote starts.
+ * call created is closed again. Not concurrency-safe per host: nothing serializes remote starts, so two starts of
+ * one name at once can both pass the name check.
  */
 export async function herdrRemoteStart(
 	input: RemoteHerdrStartInput,
@@ -368,14 +385,54 @@ export async function herdrAgentStatus(
 	return { ok: true, status: isReportedStatus(agent.agent_status) ? agent.agent_status : "unknown" };
 }
 
-/** Delivers a follow-up prompt to an already-running herdr agent. */
+/** How long a follow-up waits for herdr to see the agent start (working) or stop on a question (blocked). */
+const PROMPT_CONFIRM_TIMEOUT_MS = 15_000;
+
+/** herdr error codes after which the prompt may have landed although no start was seen. */
+const UNCONFIRMED_CODES: Record<string, true> = { agent_prompt_stalled: true, timeout: true };
+
+export interface HerdrPromptResult {
+	ok: boolean;
+	error?: string;
+	/** Delivered as far as herdr knows, but the agent was not seen to start: the text may or may not be in. */
+	unconfirmed?: true;
+}
+
+/**
+ * Delivers a follow-up prompt to an already-running herdr agent and waits (bounded) until herdr sees it working or
+ * blocked. A herdr without `--wait` (usage error naming it) gets the plain prompt once instead.
+ */
 export async function herdrPromptExisting(
 	name: string,
 	task: string,
 	options: HerdrRunnerOptions = {},
-): Promise<{ ok: boolean; error?: string }> {
-	const result = await herdrRun(["agent", "prompt", name, task], options);
-	return result.code === 0 ? { ok: true } : { ok: false, error: `agent prompt failed: ${herdrFailure(result)}` };
+): Promise<HerdrPromptResult> {
+	const waited = await herdrRun(
+		[
+			"agent",
+			"prompt",
+			name,
+			task,
+			"--wait",
+			"--until",
+			"working",
+			"--until",
+			"blocked",
+			"--timeout",
+			String(PROMPT_CONFIRM_TIMEOUT_MS),
+		],
+		options,
+	);
+	if (waited.code === 0) return { ok: true };
+	const code = parseHerdrJson<{ error?: { code?: unknown } }>(waited.stderr?.trim() ?? "")?.error?.code;
+	if (typeof code === "string" && Object.hasOwn(UNCONFIRMED_CODES, code)) {
+		return { ok: false, unconfirmed: true, error: `agent prompt unconfirmed: ${code}` };
+	}
+	if (code === undefined && !waited.timedOut && waited.stderr?.includes("--wait") === true) {
+		const plain = await herdrRun(["agent", "prompt", name, task], options);
+		return plain.code === 0 ? { ok: true } : { ok: false, error: `agent prompt failed: ${herdrFailure(plain)}` };
+	}
+	return { ok: false, error: `agent prompt failed: ${herdrFailure(waited)}` };
 }
 
 /** Tails an agent's terminal output (bounded) — how the owner checks on a dispatched herdr agent. */

@@ -285,6 +285,13 @@ export class TaskLedger {
 		).map(toTask);
 	}
 
+	/** Tasks waiting on the owner's review: the sweep re-alerts the ones left there a day or more. */
+	listInReview(): TaskRow[] {
+		return (
+			this.#db.query(`SELECT * FROM tasks WHERE status = 'review' ORDER BY ${TASK_ORDER}`).all() as TaskSql[]
+		).map(toTask);
+	}
+
 	/** Whether a Slack thread root (`<channel>:<ts>`) carries a registered task. */
 	isTaskRoot(threadRef: string): boolean {
 		return this.#db.query("SELECT 1 FROM tasks WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;

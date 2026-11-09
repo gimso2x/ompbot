@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig } from "../config";
+import { defaultHomeDir, loadConfig } from "../config";
 import { runDoctor } from "../daemon/doctor";
 import { callDaemon } from "../daemon/ipc";
 import {
@@ -9,13 +9,16 @@ import {
 	applyPathEnv,
 	DEFAULT_DRAIN_TIMEOUT_MIN,
 	findBun,
+	findDaemonUnits,
 	isExecutableFile,
 	isReportOrigin,
+	type PeerApply,
 	REPORT_THREAD_PATTERN,
 	readLockStartedAt,
 	receiptPathFor,
 	runApply,
 	STAMP_PATTERN,
+	SYSTEMD_UNIT,
 	spawnRunner,
 } from "../ops/apply";
 import { backupStamp, runBackup } from "../ops/backup";
@@ -24,8 +27,10 @@ import { socketDrainCall, waitForDrain } from "./drain";
 
 export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D> --report-thread <ts>] [--json]
                                  precheck (main, HEAD==main, clean src, bun) → backup + config copy → drain --wait (default
-                                 60 min) → systemctl --user restart ompbot → wait for a fresh daemon (2 min) → gates/doctor
-                                 summary; on failure restores config and restarts once (code is not reverted). Receipt:
+                                 60 min) → systemctl --user restart <this home's unit> → wait for a fresh daemon (2 min) →
+                                 gates/doctor summary; on failure restores config and restarts once (code is not reverted).
+                                 Then the same apply runs for every other active install on this checkout (ompbot-<instance>,
+                                 own home and receipt); a failed one makes the exit 1. Receipt:
                                  <home>/logs/apply-<stamp>.json. --detach re-launches it as a systemd-run unit and returns.
                                  --stamp YYYYMMDD-HHMMSS: fix the receipt/backup stamp (--detach passes its own to the unit).
                                  --merged-at: skip when the daemon already started after that time. exit 0 ok/already
@@ -80,11 +85,49 @@ export async function applyCommand(
 	const pathEnv = applyPathEnv(env);
 	if (values.detach === true) return await detach({ values, stamp, pathEnv, homeDir, env });
 
+	const options = {
+		timeoutMin,
+		stamp,
+		...(mergedAt === undefined ? {} : { mergedAt }),
+	};
+	const units = await findDaemonUnits(spawnRunner, pathEnv, REPO_DIR, defaultHomeDir({}));
+	const self = resolve(homeDir);
+	const peers = units.filter((u) => resolve(u.homeDir) !== self);
+	const deps = homeDeps(homeDir, units.find((u) => resolve(u.homeDir) === self)?.unit ?? SYSTEMD_UNIT, pathEnv);
+	deps.peers = async () => {
+		const results: PeerApply[] = [];
+		for (const peer of peers) {
+			const { exitCode, receipt } = await runApply(options, homeDeps(peer.homeDir, peer.unit, pathEnv));
+			results.push({ unit: peer.unit, status: receipt.status, exitCode, receiptPath: receipt.receiptPath });
+		}
+		return results;
+	};
+	const { exitCode, receipt } = await runApply(
+		{
+			...options,
+			...(reportOrigin === undefined ? {} : { reportOrigin }),
+			...(reportThread === undefined ? {} : { reportThread }),
+		},
+		deps,
+	);
+	if (values.json === true) process.stdout.write(`${JSON.stringify(receipt)}\n`);
+	else {
+		for (const step of receipt.steps)
+			process.stdout.write(`step ${step.name} ok=${step.ok} ms=${step.ms} ${step.detail}\n`);
+		if (receipt.report !== undefined) process.stdout.write(`report ok=${receipt.report.ok} ${receipt.report.detail}\n`);
+		process.stdout.write(`apply_done status=${receipt.status} exit=${exitCode} receipt=${receipt.receiptPath}\n`);
+	}
+	return exitCode;
+}
+
+/** Everything `runApply` needs for one install: its home, socket, config-driven backup/gates and its unit. */
+function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
 	const config = existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir) : undefined;
 	const socketPath = join(homeDir, "ompbot.sock");
 	const omp = config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
-	const deps: ApplyDeps = {
+	return {
 		homeDir,
+		unit,
 		repoDir: REPO_DIR,
 		pathEnv,
 		now: () => Date.now(),
@@ -107,24 +150,6 @@ export async function applyCommand(
 		isExecutable: isExecutableFile,
 		log: (line) => process.stderr.write(`${line}\n`),
 	};
-	const { exitCode, receipt } = await runApply(
-		{
-			timeoutMin,
-			stamp,
-			...(mergedAt === undefined ? {} : { mergedAt }),
-			...(reportOrigin === undefined ? {} : { reportOrigin }),
-			...(reportThread === undefined ? {} : { reportThread }),
-		},
-		deps,
-	);
-	if (values.json === true) process.stdout.write(`${JSON.stringify(receipt)}\n`);
-	else {
-		for (const step of receipt.steps)
-			process.stdout.write(`step ${step.name} ok=${step.ok} ms=${step.ms} ${step.detail}\n`);
-		if (receipt.report !== undefined) process.stdout.write(`report ok=${receipt.report.ok} ${receipt.report.detail}\n`);
-		process.stdout.write(`apply_done status=${receipt.status} exit=${exitCode} receipt=${receipt.receiptPath}\n`);
-	}
-	return exitCode;
 }
 
 function parseValues(args: string[]) {

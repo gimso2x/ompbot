@@ -300,7 +300,7 @@ describe("dashboard alerts & system screens", () => {
 		expect(navChip(calm, "alerts")).toBe("nav-count");
 	});
 
-	test("AC-5: seven system cards, thirteen gate lines (real collectGates), backup past its age is a warning", async () => {
+	test("AC-5: seven system cards, fifteen gate lines (real collectGates), backup past its age is a warning", async () => {
 		stamp(STAMP_FILE, BACKUP_MAX_AGE_MS + HOUR);
 		stamp(OFFSITE_STAMP_FILE, HOUR);
 		const offsite = { offsite: { ssh: "backup-host", remoteDir: "/b" } };
@@ -312,7 +312,7 @@ describe("dashboard alerts & system screens", () => {
 		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "system" });
 		const cards = [...html.matchAll(/class="sys-card[^"]*" data-card="([a-z]+)"/g)].map((match) => match[1]);
 		expect(cards).toEqual(["daemon", "slack", "sweep", "ledger", "backup", "gates", "monitors"]);
-		expect(html.match(/class="gate-row/g)).toHaveLength(13);
+		expect(html.match(/class="gate-row/g)).toHaveLength(15);
 		const backup = sysCard(html, "backup");
 		expect(backup).toContain("주의");
 		expect(backup).toContain("is-warning");

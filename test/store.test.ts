@@ -313,6 +313,31 @@ describe("delivery backoff, expiry, ambiguity", () => {
 		expect(store.failDelivery(id, "e")).toMatchObject({ state: "expired", attempts: 1 });
 	});
 
+	test("a rate-limit deferral keeps attempts and waits for the block; past 24h it expires", () => {
+		const store = open();
+		const id = seedDelivery(store);
+		for (let i = 0; i < 7; i++) {
+			expect(store.claimDue().map((r) => r.deliveryId)).toEqual([id]);
+			const row = store.deferDelivery(id, "429", { at: clock.t + 30_000, sentParts: 1, replyTs: "1.1" });
+			expect(row).toMatchObject({
+				state: "pending",
+				attempts: 0,
+				nextAt: clock.t + 30_000,
+				sentParts: 1,
+				replyTs: "1.1",
+			});
+			clock.advance(29_999);
+			expect(store.claimDue()).toHaveLength(0);
+			clock.advance(1);
+		}
+		store.claimDue();
+		clock.advance(FRESHNESS_MS);
+		expect(store.deferDelivery(id, "429", { at: clock.t + 30_000, sentParts: 1 })).toMatchObject({
+			state: "expired",
+			attempts: 0,
+		});
+	});
+
 	test("failed_ambiguous is sticky: more failures, claims, sweeps and 48h do not move it", () => {
 		const store = open();
 		const id = seedDelivery(store);

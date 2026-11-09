@@ -121,7 +121,7 @@ function makeAdapter(transport: FakeSlackTransport, recorded: string[]): SlackAd
 			onCommand: () => "",
 			onAction: () => undefined,
 		},
-		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined },
+		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined, defer: () => undefined },
 		ownerUserId: "UOWNER",
 		clock: { now: () => 1_000 },
 		log: createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact }),
@@ -181,7 +181,12 @@ describe("log channel in the Slack adapter", () => {
 		const adapter = new SlackAdapter({
 			transport,
 			core: { onInbound: () => ({}), onCommand: () => "", onAction: () => undefined },
-			deliveries: { claimDue: () => queue.splice(0), confirm: () => undefined, fail: () => undefined },
+			deliveries: {
+				claimDue: () => queue.splice(0),
+				confirm: () => undefined,
+				fail: () => undefined,
+				defer: () => undefined,
+			},
 			ownerUserId: "UOWNER",
 			clock: { now: () => 1_000 },
 			log: createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact }),

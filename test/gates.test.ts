@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type GatesCommandDeps, gatesCommand } from "../src/cli/index";
 import { readSweepHeartbeat } from "../src/daemon/heartbeat";
+import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { STAMP_FILE } from "../src/ops/backup";
 import {
 	collectGates,
@@ -13,6 +15,8 @@ import {
 	SOCKET_DOWN_MS,
 	SWEEP_STALLED_MS,
 } from "../src/ops/gates";
+import { HERDR_HEALTH_FILE, HERDR_HEALTH_STALE_MS, HerdrHealthProbe, readHerdrHealth } from "../src/ops/herdr-health";
+import { TASK_SWEEP_MS } from "../src/tasks/sweeper";
 
 let home: string;
 let now: number;
@@ -115,8 +119,92 @@ function writeHeartbeat(ageMs: number, loopMs = 0): void {
 }
 
 describe("collectGates", () => {
+	describe("host resources", () => {
+		const GIB = 1024 ** 3;
+		/** `statfs` answering `[free, total]` GiB per path (4 KiB blocks); any other path cannot be asked. */
+		const statfs =
+			(disks: Record<string, [number, number]>) =>
+			(path: string): { bavail: number; blocks: number; bsize: number } => {
+				const disk = disks[path];
+				if (disk === undefined) throw new Error(`ENOENT: ${path}`);
+				return { bavail: (disk[0] * GIB) / 4096, blocks: (disk[1] * GIB) / 4096, bsize: 4096 };
+			};
+		const diskGate = (disks: Record<string, [number, number]>, paths = Object.keys(disks)) =>
+			collectGates({ homeDir: home, now, diskPaths: paths, statfs: statfs(disks) }).find((g) => g.name === "disk_low");
+		const MEMINFO = (availableKb: number, totalKb = 1_000_000) =>
+			`MemTotal:       ${totalKb} kB\nMemFree:          1000 kB\nMemAvailable:   ${availableKb} kB\n`;
+		const pressure = (load15: number, cpuCount: number, meminfo: string | undefined) =>
+			collectGates({
+				homeDir: home,
+				now,
+				hostLoad: { loadavg: () => [0, 0, load15], cpuCount: () => cpuCount, meminfo: () => meminfo },
+			}).find((g) => g.name === "host_pressure");
+
+		test("AC-6: disk_low opens under 5 GiB or under 10% free, whichever trips first", () => {
+			expect(diskGate({ "/a": [4, 100] })).toEqual({
+				name: "disk_low",
+				state: "open",
+				detail: "path=/a free_gib=4.0 pct=4",
+			});
+			expect(diskGate({ "/a": [8, 50] })).toEqual({
+				name: "disk_low",
+				state: "closed",
+				detail: "path=/a free_gib=8.0 pct=16",
+			});
+			expect(diskGate({ "/a": [20, 400] })).toMatchObject({ state: "open", detail: "path=/a free_gib=20.0 pct=5" });
+			// Exactly 5 GiB and exactly 10% are not low.
+			expect(diskGate({ "/a": [5, 50] })?.state).toBe("closed");
+		});
+
+		test("disk_low: any low path opens it and the detail names the tightest; unreadable paths are skipped", () => {
+			expect(diskGate({ "/home": [80, 100], "/agent": [4, 100], "/x": [9, 100] })).toMatchObject({
+				state: "open",
+				detail: "path=/agent free_gib=4.0 pct=4",
+			});
+			expect(diskGate({ "/home": [80, 100] }, ["/home", "/gone"])).toMatchObject({
+				state: "closed",
+				detail: "path=/home free_gib=80.0 pct=80",
+			});
+			expect(diskGate({}, ["/gone"])).toEqual({ name: "disk_low", state: "closed", detail: "statfs=unavailable" });
+		});
+
+		test("AC-6: host_pressure opens at load15 >= 2 x cpus or MemAvailable under 5%, closed otherwise", () => {
+			expect(pressure(8, 4, MEMINFO(500_000))).toEqual({
+				name: "host_pressure",
+				state: "open",
+				detail: "load15=8.00 cpus=4 mem_avail_pct=50",
+			});
+			expect(pressure(7.99, 4, MEMINFO(500_000))?.state).toBe("closed");
+			expect(pressure(0.5, 4, MEMINFO(49_999))).toMatchObject({
+				state: "open",
+				detail: "load15=0.50 cpus=4 mem_avail_pct=4",
+			});
+			expect(pressure(0.5, 4, MEMINFO(50_000))?.state).toBe("closed");
+			expect(pressure(1, 4, undefined)).toMatchObject({
+				state: "closed",
+				detail: "load15=1.00 cpus=4 mem_avail_pct=unknown",
+			});
+		});
+
+		test("both gates sit with the filesystem gates, so a missing ledger still reports them", () => {
+			const names = collectGates({
+				homeDir: home,
+				now,
+				diskPaths: ["/a"],
+				statfs: statfs({ "/a": [50, 100] }),
+				hostLoad: { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => MEMINFO(500_000) },
+			}).map((g) => g.name);
+			expect(names.slice(names.indexOf("frozen"), names.indexOf("inbound_starved"))).toEqual([
+				"frozen",
+				"disk_low",
+				"host_pressure",
+			]);
+		});
+	});
+
 	test("all gates close for a freshly backed-up, idle bot", () => {
 		writeStamp(0);
+		writeHeartbeat(0);
 		seedDb((db) => {
 			db.run(
 				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:1.1', 'slack/dm/D', 1, 't', 'answered', ?, ?)",
@@ -152,9 +240,9 @@ describe("collectGates", () => {
 		expect(gateState("backup_age").state).toBe("closed");
 	});
 
-	test("sweep_stalled: missing stamp is closed (nothing to judge); the gate opens past 3 sweeps", () => {
+	test("sweep_stalled: missing stamp is unknown (nothing to judge); the gate opens past 3 sweeps", () => {
 		writeStamp(0);
-		expect(gateState("sweep_stalled")).toEqual({ state: "closed", detail: "stamp=missing" });
+		expect(gateState("sweep_stalled")).toEqual({ state: "unknown", detail: "stamp=missing" });
 		// The heartbeat ages on the fake clock alone: exactly three sweeps is still alive, one past opens.
 		writeHeartbeat(SWEEP_STALLED_MS);
 		expect(gateState("sweep_stalled").state).toBe("closed");
@@ -202,8 +290,9 @@ describe("collectGates", () => {
 		expect(readSweepHeartbeat(home)?.draining).toBeUndefined();
 	});
 
-	test("slack_disconnected: exactly 10 minutes down opens, 1 ms less is closed; up and unknown are closed", () => {
+	test("slack_disconnected: exactly 10 minutes down opens, 1 ms less is closed; up and an old stamp are closed; no stamp is unknown", () => {
 		writeStamp(0);
+		expect(gateState("slack_disconnected")).toEqual({ state: "unknown", detail: "stamp=missing" });
 		const down = (ageMs: number) =>
 			writeFields(`socket=down socket_since=${new Date(now - ageMs).toISOString()} draining=0`);
 		down(SOCKET_DOWN_MS);
@@ -270,9 +359,9 @@ describe("collectGates", () => {
 			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
 		});
 
-		test("db missing: closed db=missing", () => {
+		test("db missing: unknown db=missing", () => {
 			writeStamp(0);
-			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "db=missing" });
+			expect(gateState("monitors_stalled")).toEqual({ state: "unknown", detail: "db=missing" });
 		});
 	});
 
@@ -513,10 +602,9 @@ describe("collectGates", () => {
 		expect(gateState("turns_failing")).toEqual({ state: "closed", detail: "recent=2" });
 	});
 
-	test("a database without any table keeps the db gates closed while backup_age still reports", () => {
-		// No db file at all.
+	test("no database file leaves the db gates unknown while backup_age still reports", () => {
 		expect(gateState("inbound_starved").detail).toBe("db=missing");
-		expect(gateState("inbound_starved").state).toBe("closed");
+		expect(gateState("inbound_starved").state).toBe("unknown");
 		expect(gateState("backup_age").state).toBe("open");
 	});
 
@@ -535,5 +623,125 @@ describe("collectGates", () => {
 		expect(runtimeGate(launcher(`>=${Bun.version}`))).toMatchObject({ state: "closed", detail: "ok" });
 		expect(runtimeGate(join(home, "no-such-omp"))).toMatchObject({ state: "open" });
 		expect(collectGates({ homeDir: home, now }).some((g) => g.name === "omp_runtime")).toBe(false);
+	});
+});
+
+describe("ompbot gates: open, closed and unknown (판정불가)", () => {
+	/** Disk and host load injected calm, so the exit code never depends on this machine. */
+	const calm: GatesCommandDeps = {
+		now: () => now,
+		statfs: () => ({ bavail: 50 * 262_144, blocks: 100 * 262_144, bsize: 4096 }), // 50 of 100 GiB free
+		hostLoad: { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => undefined },
+	};
+
+	function runGates(args: string[]): { code: number; out: string } {
+		const out: string[] = [];
+		const write = process.stdout.write.bind(process.stdout);
+		process.stdout.write = ((chunk: string) => {
+			out.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		try {
+			return { code: gatesCommand(args, home, calm), out: out.join("") };
+		} finally {
+			process.stdout.write = write;
+		}
+	}
+	const lastLine = (out: string) => out.trimEnd().split("\n").pop();
+
+	test("a home no daemon ever ran in (fresh backup stamp only): exit 0, unknown=9; --strict exits 1; --json counts unknown", () => {
+		writeStamp(0);
+		const plain = runGates([]);
+		expect(plain.code).toBe(0);
+		expect(lastLine(plain.out)).toBe(
+			"gates_done open=0 unknown=9 total=13 unknown_gates=sweep_stalled,slack_disconnected,inbound_starved,origin_silent,deliveries_overdue,lanes_stuck,monitors_failed,monitors_stalled,turns_failing",
+		);
+		expect(runGates(["--strict"]).code).toBe(1);
+		const json = runGates(["--json"]);
+		expect(json.code).toBe(0);
+		const parsed = JSON.parse(json.out) as { open: number; unknown: number; gates: Array<{ state: string }> };
+		expect(parsed).toMatchObject({ open: 0, unknown: 9 });
+		expect(parsed.gates.filter((gate) => gate.state === "unknown")).toHaveLength(9);
+		expect(runGates(["--json", "--strict"]).code).toBe(1);
+	});
+
+	test("a healthy home passes --strict; a corrupt ledger still opens ledger_unreadable with exit 1", () => {
+		writeStamp(0);
+		writeFileSync(
+			join(home, "sweep-heartbeat"),
+			`ts=${new Date(now).toISOString()} loop_ms=0 socket=up socket_since=${new Date(now).toISOString()} draining=0\n`,
+		);
+		seedDb(() => {});
+		const strict = runGates(["--strict"]);
+		expect(lastLine(strict.out)).toBe("gates_done open=0 unknown=0 total=13");
+		expect(strict.code).toBe(0);
+
+		writeFileSync(join(home, "ompbot.db"), "not a database at all\n".repeat(500));
+		const corrupt = runGates([]);
+		expect(corrupt.code).toBe(1);
+		expect(corrupt.out).toContain("gate=ledger_unreadable state=open");
+		expect(lastLine(corrupt.out)).toStartWith("gates_done open=1 unknown=0 total=7 opened=ledger_unreadable(");
+		expect(runGates(["--strict"]).code).toBe(1);
+	});
+});
+
+describe("herdr_unreachable (herdr-health stamp)", () => {
+	const herdrGate = () => collectGates({ homeDir: home, now }).find((g) => g.name === "herdr_unreachable");
+	const stamp = (ageMs: number, fails: number) =>
+		writeFileSync(
+			join(home, HERDR_HEALTH_FILE),
+			`ts=${new Date(now - ageMs).toISOString()} ok=${fails === 0 ? 1 : 0} fails=${fails} since=2026-11-05T00:00:00.000Z\n`,
+		);
+
+	test("no stamp: no gate; two failures closed, three open; a stamp older than three task sweeps is stale", () => {
+		expect(herdrGate()).toBeUndefined();
+		stamp(60_000, 2);
+		expect(herdrGate()).toMatchObject({ state: "closed", detail: "ok" });
+		stamp(60_000, 3);
+		expect(herdrGate()).toEqual({
+			name: "herdr_unreachable",
+			state: "open",
+			detail: "fails=3 since=2026-11-05T00:00:00.000Z",
+		});
+		stamp(HERDR_HEALTH_STALE_MS + 1_000, 5);
+		expect(herdrGate()).toMatchObject({ state: "closed", detail: "stamp=stale" });
+		expect(HERDR_HEALTH_STALE_MS).toBe(3 * TASK_SWEEP_MS);
+	});
+
+	test("the probe counts consecutive failed status checks, resets on success, and continues the streak after a restart", async () => {
+		const answers: RunProcessResult[] = [];
+		const calls: string[][] = [];
+		const run: ProcessRunner = async (cmd, opts) => {
+			calls.push(cmd);
+			expect(opts.timeoutMs).toBe(10_000);
+			return answers.shift() ?? { code: 0, stdout: "", timedOut: false };
+		};
+		const running: RunProcessResult = {
+			code: 0,
+			stdout: "status: running\nversion: 0.9.5\nsocket: /tmp/h.sock\n",
+			timedOut: false,
+		};
+		const down: RunProcessResult = { code: 1, stdout: "", stderr: "server not running\n", timedOut: false };
+		const probe = () => new HerdrHealthProbe({ homeDir: home, bin: "/opt/herdr", run, now: () => now });
+
+		const first = probe();
+		answers.push(down, down);
+		expect((await first.check()).fails).toBe(1);
+		expect(await first.check()).toMatchObject({ ok: false, fails: 2, error: "server_not_running" });
+		expect(calls[0]).toEqual(["/opt/herdr", "status", "server"]);
+		expect(herdrGate()?.state).toBe("closed");
+
+		const restarted = probe();
+		answers.push(down);
+		expect((await restarted.check()).fails).toBe(3);
+		expect(herdrGate()?.state).toBe("open");
+		expect(readHerdrHealth(home)?.since).toBe(new Date(now).toISOString());
+
+		answers.push(running);
+		expect(await restarted.check()).toMatchObject({ ok: true, fails: 0, since: "-" });
+		expect(herdrGate()).toMatchObject({ state: "closed", detail: "ok" });
+		// exit 0 without a running line still counts as a failure
+		answers.push({ code: 0, stdout: "status: stopped\n", timedOut: false });
+		expect((await restarted.check()).fails).toBe(1);
 	});
 });

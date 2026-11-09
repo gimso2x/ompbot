@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { OmpbotConfig } from "../config";
 import { TOP_LEVEL_TS } from "../core/normalize";
@@ -20,13 +20,16 @@ import {
 	type ProcessRunner,
 	type RunProcessResult,
 } from "../dispatch/omp";
-import { MONITOR_ORIGIN_PREFIX, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
+import { DEFAULT_TIMEZONE } from "../monitors/cron";
+import { MONITOR_ORIGIN_PREFIX, type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
+import type { MonitorDeliver, MonitorOverlap, MonitorTrigger } from "../monitors/spec";
 import { readLockStartedAt } from "../ops/apply";
 import { readStamp } from "../ops/backup";
 import type { FreezeState } from "../ops/freeze";
 import { collectGates, type Gate, type GateState, type GatesOptions, INBOUND_STARVATION_MS } from "../ops/gates";
 import { OFFSITE_STAMP_FILE } from "../ops/offsite";
 import { redact } from "../redact";
+import { type FeedbackVerdict, readTurnVerdicts } from "../store/feedback";
 import { formatKst, type TaskRisk } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import type { TaskHostOps } from "../tasks/host";
@@ -105,6 +108,56 @@ export interface TurnInfo {
 export type TurnKind = "message" | "command" | "auto" | "monitor";
 export type TurnWaitReason = "restart" | "frozen" | "followup" | "behind" | "queued";
 
+/** A thread's turn-board column: someone should look · a turn is open · every turn has ended. */
+export type ThreadColumn = "attention" | "working" | "done";
+
+/** One turn of a thread as its detail lists it. */
+export interface ThreadTurn {
+	inboundId: number;
+	state: string;
+	createdAt: string;
+	/** The request in one masked line of at most {@link PREVIEW_CHARS} chars; null for monitor turns. */
+	preview: string | null;
+}
+
+/**
+ * One conversation of the turn board (origin = Slack thread = omp session): open turns or activity in the last
+ * {@link THREAD_WINDOW_MS}. Of message bodies only masked one-line previews are here.
+ */
+export interface ThreadInfo {
+	originKey: string;
+	threadRef: string | null;
+	/** The last turn's kind. */
+	kind: TurnKind;
+	/** The thread's first turn as one masked line; a monitor's name for monitor threads. */
+	title: string;
+	/** attention: an open turn is stalled, or none is open and the last failed · working: a turn is open · done. */
+	column: ThreadColumn;
+	latest: ThreadTurn & Pick<TurnInfo, "ageMs" | "silentMs" | "stalled" | "waitReason">;
+	/** Turns open or active within {@link THREAD_WINDOW_MS}. */
+	turnCount: number;
+	/** pending + dispatched turns. */
+	openCount: number;
+	/**
+	 * omp runs behind the dispatched turns: messages steered into a running turn share its `op_ref`, so three rows
+	 * can be one run.
+	 */
+	runCount: number;
+	/** Open turns still pending (not handed to omp yet). */
+	pendingCount: number;
+	/** Open turns {@link TurnInfo.stalled} marks. */
+	stalledCount: number;
+	/** Last activity: the newest `COALESCE(last_event_at, dispatched_at, created_at)` of its turns. */
+	updatedAt: string;
+	/** Newest first, at most {@link THREAD_RECENT}. */
+	recent: ThreadTurn[];
+}
+
+/** A thread with no open turn stays on the board this long after its last activity. */
+export const THREAD_WINDOW_MS = 24 * 3_600_000;
+const THREAD_LIMIT = 200;
+const THREAD_RECENT = 20;
+
 /** Longest request line a turn shows. */
 export const PREVIEW_CHARS = 80;
 const AUTO_FOLLOWUP_PREFIX = "[자동 후속";
@@ -178,13 +231,150 @@ export interface ApprovalInfo {
 	originLabel: string | null;
 }
 
+/** A file a monitor uses, by name only (never its directory). */
+export interface MonitorFile {
+	kind: "procedure" | "script";
+	name: string;
+}
+
+/** One monitor event as the list shows its last run. */
+export interface MonitorRun {
+	stage: string;
+	at: string;
+	slotAt: string;
+	/** {@link monitorDurationMs}: slot to settle for an ended event; null while it runs. */
+	durationMs: number | null;
+	attempts: number;
+	manual: boolean;
+}
+
+/** One enabled monitor. Of its instruction only {@link MonitorInfo.summary}; event answers and payloads never. */
 export interface MonitorInfo {
+	/** The detail key (`?item=`, `api/monitor/detail?id=`). */
+	id: string;
 	name: string;
 	kind: string;
+	/** When it fires in words (`매일 07:30`, `평일 09:00`, `한 번 · 11-07 09:30`, …); an odd cron stays `cron <expr>`. */
+	schedule: string;
+	/** A cron's expression and time zone (`30 7 * * * (Asia/Seoul)`); null for other triggers. */
+	cron: string | null;
+	/** The instruction's first sentence as one masked line of at most {@link PREVIEW_CHARS} chars. */
+	summary: string;
+	/** Where the answer goes: `오너 DM`, `로그 채널`, `에스컬레이션 채널` or `채널 <ID>`. */
+	destination: string;
+	/** Where the copy goes, named like `destination`; null without a copy channel. */
+	copyTo: string | null;
+	/** null = the default model. */
+	model: string | null;
+	thinking: string | null;
+	deliver: MonitorDeliver;
+	overlap: MonitorOverlap;
+	/** Its procedure files and the scripts its instruction names, at most {@link MONITOR_FILES}. */
+	files: MonitorFile[];
 	nextFireAt: string | null;
 	lastStage: string | null;
 	lastAt: string | null;
 	openIncidents: number;
+	/** The last {@link MONITOR_RECENT} events, oldest first. */
+	recent: Array<{ stage: string; manual: boolean; at: string }>;
+	/** The newest event; null before the first. */
+	lastRun: MonitorRun | null;
+	/** Whether any scheduled (not manual) event exists, beyond {@link recent} too. */
+	scheduledRun: boolean;
+}
+
+const MONITOR_RECENT = 7;
+const MONITOR_FILES = 4;
+const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토", "일"];
+/** Stages after which an event is over (the rest are still on their way). */
+const ENDED_STAGES: Record<string, true> = {
+	delivered: true,
+	no_report: true,
+	failed: true,
+	failed_no_retry: true,
+	skipped: true,
+};
+/** A script path in an instruction; no backtick, quote or Hangul in the set, so `` `…/x.py`를 `` gives `…/x.py`. */
+const SCRIPT_PATH = /[A-Za-z0-9_.~/-]+\.(?:py|sh|ts|js)(?![A-Za-z0-9_])/g;
+/** A Korean sentence end: a syllable, then `.`/`?`/`!` before a space or the line end (`README.md 의` is not one). */
+const SENTENCE_END = /[가-힣][.?!](?=\s|$)/;
+
+/** Slot to settle (`updated_at − slot_at`, ≥ 0, retry waits included) of an ended event; null while running. */
+export function monitorDurationMs(stage: string, slotAt: number, updatedAt: number): number | null {
+	return ENDED_STAGES[stage] === true ? Math.max(0, updatedAt - slotAt) : null;
+}
+
+/** A cron expression in words, in the monitor's own time zone (named when not Asia/Seoul); else `cron <expr>`. */
+function cronWords(schedule: string, timezone: string): string {
+	const fields = schedule.trim().split(/\s+/);
+	const [minute = "", hour = "", dom, month, dow = ""] = fields;
+	const upTo = (field: string, max: number): boolean => /^\d{1,2}$/.test(field) && Number(field) <= max;
+	const pad = (field: string): string => field.padStart(2, "0");
+	let words: string | undefined;
+	if (fields.length === 5 && dom === "*" && month === "*") {
+		if (upTo(minute, 59) && upTo(hour, 23)) {
+			const time = `${pad(hour)}:${pad(minute)}`;
+			if (dow === "*") words = `매일 ${time}`;
+			else if (dow === "1-5") words = `평일 ${time}`;
+			else if (/^[0-7](?:,[0-7])*$/.test(dow)) {
+				words = `매주 ${[...new Set(dow.split(",").map((day) => WEEKDAYS[Number(day)]))].join("·")} ${time}`;
+			}
+		} else if (hour === "*" && dow === "*") {
+			if (upTo(minute, 59)) words = `매시 ${pad(minute)}분`;
+			else if (/^\*\/[1-9]\d?$/.test(minute)) words = `${Number(minute.slice(2))}분마다`;
+		}
+	}
+	const label = words ?? `cron ${schedule}`;
+	return timezone === DEFAULT_TIMEZONE ? label : `${label} (${timezone})`;
+}
+
+function monitorSchedule(trigger: MonitorTrigger): string {
+	switch (trigger.kind) {
+		case "cron":
+			return cronWords(trigger.schedule, trigger.timezone);
+		case "at":
+			return `한 번 · ${formatKst(Date.parse(trigger.at)).slice(5, 16).replace("T", " ")}`;
+		case "script": {
+			const every = trigger.intervalMs;
+			return `조건 감시 · ${every % 60_000 === 0 ? `${every / 60_000}분` : `${every / 1000}초`}마다`;
+		}
+		case "webhook":
+			return "외부 호출 때";
+		case "watcher":
+			return "파일 바뀔 때";
+	}
+}
+
+/** The first sentence ({@link SENTENCE_END}) of the masked instruction's first line, as a {@link previewLine}. */
+function monitorSummary(instruction: string): string {
+	const line = redact(instruction).trim().split("\n")[0] ?? "";
+	const end = SENTENCE_END.exec(line);
+	return previewLine(end === null ? line : line.slice(0, end.index + 2));
+}
+
+/** File names of the procedure files, then of the scripts the instruction names; no directories, no repeats. */
+function monitorFiles(row: MonitorRow): MonitorFile[] {
+	const files: MonitorFile[] = [];
+	const paths: Array<[MonitorFile["kind"], string]> = [
+		...row.procedureFiles.map((path): [MonitorFile["kind"], string] => ["procedure", path]),
+		...Array.from(row.instruction.matchAll(SCRIPT_PATH), (match): [MonitorFile["kind"], string] => [
+			"script",
+			match[0],
+		]),
+	];
+	for (const [kind, path] of paths) {
+		const name = redact(path.slice(path.lastIndexOf("/") + 1));
+		if (name !== "" && !files.some((file) => file.name === name)) files.push({ kind, name });
+	}
+	return files.slice(0, MONITOR_FILES);
+}
+
+/** A Slack channel as the owner knows it: the DM, the config's log or escalation channel, else its id. */
+function channelName(channel: string | null, config: DashboardConfig | undefined): string {
+	if (channel === null) return "오너 DM";
+	if (channel === config?.logChannel) return "로그 채널";
+	if (channel === config?.escalationChannel) return "에스컬레이션 채널";
+	return `채널 ${channel}`;
 }
 
 export interface AlertInfo {
@@ -212,10 +402,83 @@ export interface BackupInfo {
 	offsite?: StampAge | null;
 }
 
+/** `<home>/jobs/<name>.json` names the dashboard reads; any other entry of the directory is skipped unread. */
+const JOB_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const JOB_LIMIT = 50;
+/** A running job whose `updatedAt` is older than this reads as `stale`. */
+export const JOB_STALE_MS = 10 * 60_000;
+/** A `done` job leaves the list once its `updatedAt` is older than this. */
+export const JOB_DONE_KEEP_MS = 24 * 3_600_000;
+const JOB_TITLE_CHARS = 120;
+const JOB_DETAIL_CHARS = 200;
+const JOB_FIELD_CHARS = 200;
+const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+
+export type JobState = "running" | "done" | "failed";
+/**
+ * ok: running and updated within {@link JOB_STALE_MS}, or done · stale: running, not updated since · dead: running, its
+ * `pid` is gone · failed: `state: "failed"` · invalid: the file is not JSON or lacks `state`/`updatedAt`.
+ */
+export type JobHealth = "ok" | "stale" | "dead" | "failed" | "invalid";
+
+/** One long-running job's progress file (`<home>/jobs/<name>.json`), read and never written by the dashboard. */
+export interface JobInfo {
+	name: string;
+	/** Masked, at most 120 chars; the file name for an `invalid` file. */
+	title: string;
+	/** null for an `invalid` file. */
+	state: JobState | null;
+	/** `done`/`total` only when both are integers ≥ 0 with `done ≤ total`. */
+	done?: number;
+	total?: number;
+	unit?: string;
+	/** `done/total` in percent, one decimal; absent when `total` is 0 or the counts are absent. */
+	percent?: number;
+	startedAt?: string;
+	/** The file's `updatedAt` (its modification time for an `invalid` file), KST. */
+	updatedAt: string;
+	ageMs: number;
+	pid?: number;
+	/** Conversation the job was started from (`<channel>:<ts>`); shown as text only. */
+	thread?: string;
+	/** Masked, at most 200 chars; what was wrong for an `invalid` file. */
+	detail?: string;
+	/** Log path as text; the file is never opened. */
+	log?: string;
+	health: JobHealth;
+}
+
+/** Days the dashboard's feedback counts cover, and the 👎 turns it lists. */
+export const FEEDBACK_DAYS = 7;
+const FEEDBACK_RECENT = 20;
+
+/** One turn whose current verdict is 👎. */
+export interface FeedbackTurn {
+	/** The turn's first inbound row (opens its waterfall); null when the row is gone. */
+	inboundId: number | null;
+	originKey: string;
+	/** When the verdict was set (KST). */
+	at: string;
+	/** The request in one masked line of at most {@link PREVIEW_CHARS} chars; null for monitor turns or no row. */
+	preview: string | null;
+}
+
+/** The owner's 👍/👎 per turn (a turn with reactions on several parts counts once) over the last `days`. */
+export interface FeedbackInfo {
+	days: number;
+	up: number;
+	down: number;
+	/** 👎 turns, newest verdict first. */
+	recentDown: FeedbackTurn[];
+	/** Verdict by inbound id (as text) for every row of a judged turn: the turn board's and waterfall's badges. */
+	verdicts: Record<string, FeedbackVerdict>;
+}
+
 export interface DashboardSnapshot {
 	generatedAt: string;
 	daemon: Section<DaemonInfo>;
-	turns: Section<{ items: TurnInfo[] }>;
+	turns: Section<{ items: TurnInfo[]; threads: ThreadInfo[] }>;
+	feedback: Section<FeedbackInfo>;
 	tasks: Section<{ items: TaskInfo[] }>;
 	lanes: Section<{ items: LaneInfo[] }>;
 	/** `herdr agent list` per host; while the agent board is live, its column counts instead (`hosts` empty). */
@@ -226,11 +489,14 @@ export interface DashboardSnapshot {
 	/** Every health gate, as `ompbot gates` lists them. */
 	gates: Section<{ items: Gate[] }>;
 	backup: Section<BackupInfo>;
+	/** Progress files of long-running jobs outside the bot (`<home>/jobs/*.json`), newest update first. */
+	jobs: Section<{ items: JobInfo[] }>;
 }
 
 export type DashboardConfig = Partial<
 	Pick<OmpbotConfig, "agent" | "ompExecutable" | "offsite" | "herdr" | "dispatchHosts" | "herdrBoard">
->;
+> &
+	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">>;
 
 export interface SnapshotDeps {
 	homeDir: string;
@@ -252,6 +518,8 @@ export interface SnapshotDeps {
 	board?: () => BoardState | undefined;
 	/** The health gates; default {@link collectGates}. */
 	collectGates?: (options: GatesOptions) => Gate[];
+	/** Whether a job's `pid` still runs; default {@link processAlive}. */
+	isAlive?: (pid: number) => boolean;
 }
 
 const message = (error: unknown): string =>
@@ -490,9 +758,173 @@ function previewLine(text: string): string {
 }
 
 /**
+ * Turn feedback of the last `days` through a read-only handle: up/down turn counts, the 👎 turns (newest first, at
+ * most `limit`) with their masked request line, and the verdict of every inbound row of any judged turn (not cut to
+ * `days`: a recent-turn line must badge like the waterfall it opens).
+ */
+export function readFeedbackSummary(db: Database, now: number, window: { days: number; limit?: number }): FeedbackInfo {
+	const since = now - window.days * 24 * 3_600_000;
+	const judged = readTurnVerdicts(db, 0);
+	const turns = judged.filter((turn) => turn.at >= since);
+	const rowsOf = db.query<{ inbound_id: number }, [string, string]>(
+		"SELECT inbound_id FROM inbound WHERE origin_key = ? AND op_ref = ?",
+	);
+	const textOf = db.query<{ text_ref: string }, [number]>("SELECT text_ref FROM inbound WHERE inbound_id = ?");
+	const verdicts: Record<string, FeedbackVerdict> = {};
+	for (const turn of judged) {
+		for (const row of rowsOf.all(turn.originKey, turn.opRef)) verdicts[String(row.inbound_id)] = turn.verdict;
+	}
+	const down = turns.filter((turn) => turn.verdict === "down");
+	return {
+		days: window.days,
+		up: turns.length - down.length,
+		down: down.length,
+		recentDown: down.slice(0, window.limit).map((turn) => {
+			const text =
+				turn.inboundId === null || turn.originKey.startsWith(MONITOR_ORIGIN_PREFIX) ? null : textOf.get(turn.inboundId);
+			return {
+				inboundId: turn.inboundId,
+				originKey: turn.originKey,
+				at: formatKst(turn.at),
+				preview: text === null ? null : previewLine(text.text_ref),
+			};
+		}),
+		verdicts,
+	};
+}
+
+/** `kill(pid, 0)`: no such process (ESRCH) is dead; any other answer (EPERM: someone else's process) is alive. */
+export function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
+/** Masked and cut to `limit` chars (the last one `…` when cut); undefined for a missing or blank value. */
+function jobText(value: unknown, limit: number): string | undefined {
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	const chars = Array.from(redact(value));
+	return chars.length > limit ? `${chars.slice(0, limit - 1).join("")}…` : chars.join("");
+}
+
+const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+
+/** One job file; a file that cannot be read as a job comes back `invalid` instead of failing the section. */
+function readJob(dir: string, file: string, now: number, isAlive: (pid: number) => boolean): JobInfo {
+	const name = file.slice(0, -".json".length);
+	const path = join(dir, file);
+	const invalid = (why: string): JobInfo => {
+		let modified = now;
+		try {
+			modified = statSync(path).mtimeMs;
+		} catch {
+			modified = now; // removed since the listing: its age is unknown
+		}
+		return {
+			name,
+			title: file,
+			state: null,
+			updatedAt: formatKst(modified),
+			ageMs: now - modified,
+			detail: jobText(why, JOB_DETAIL_CHARS) ?? "",
+			health: "invalid",
+		};
+	};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		return invalid(`읽기 실패: ${message(error)}`);
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return invalid("JSON 객체가 아님");
+	const fields = parsed as Record<string, unknown>;
+	const state = fields.state;
+	if (state !== "running" && state !== "done" && state !== "failed") {
+		return invalid("state가 없거나 running·done·failed가 아님");
+	}
+	const updatedMs =
+		typeof fields.updatedAt === "string" && ISO_8601.test(fields.updatedAt) ? Date.parse(fields.updatedAt) : Number.NaN;
+	if (Number.isNaN(updatedMs)) return invalid("updatedAt이 없거나 ISO 8601 시각이 아님");
+	const startedMs =
+		typeof fields.startedAt === "string" && ISO_8601.test(fields.startedAt) ? Date.parse(fields.startedAt) : Number.NaN;
+	const { done, total } = fields;
+	const counts = isCount(done) && isCount(total) && done <= total;
+	const pid = Number.isSafeInteger(fields.pid) && (fields.pid as number) > 0 ? (fields.pid as number) : undefined;
+	const ageMs = now - updatedMs;
+	const health: JobHealth =
+		state === "failed"
+			? "failed"
+			: state === "done"
+				? "ok"
+				: pid !== undefined && !isAlive(pid)
+					? "dead"
+					: ageMs > JOB_STALE_MS
+						? "stale"
+						: "ok";
+	const unit = jobText(fields.unit, JOB_FIELD_CHARS);
+	const thread = jobText(fields.thread, JOB_FIELD_CHARS);
+	const detail = jobText(fields.detail, JOB_DETAIL_CHARS);
+	const log = jobText(fields.log, JOB_FIELD_CHARS);
+	return {
+		name,
+		title: jobText(fields.title, JOB_TITLE_CHARS) ?? name,
+		state,
+		...(counts ? { done, total } : {}),
+		...(counts && total > 0 ? { percent: Math.round((done / total) * 1000) / 10 } : {}),
+		...(unit === undefined ? {} : { unit }),
+		...(Number.isNaN(startedMs) ? {} : { startedAt: formatKst(startedMs) }),
+		updatedAt: formatKst(updatedMs),
+		ageMs,
+		...(pid === undefined ? {} : { pid }),
+		...(thread === undefined ? {} : { thread }),
+		...(detail === undefined ? {} : { detail }),
+		...(log === undefined ? {} : { log }),
+		health,
+	};
+}
+
+/**
+ * `<home>/jobs/<name>.json` files whose name passes {@link JOB_NAME}: newest update first, at most {@link JOB_LIMIT},
+ * `done` jobs only for {@link JOB_DONE_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
+ */
+function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean): JobInfo[] {
+	const dir = join(homeDir, "jobs");
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	return entries
+		.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && JOB_NAME.test(entry.name.slice(0, -5)))
+		.map((entry) => readJob(dir, entry.name, now, isAlive))
+		.filter((job) => !(job.state === "done" && job.ageMs > JOB_DONE_KEEP_MS))
+		.sort((a, b) => a.ageMs - b.ageMs)
+		.slice(0, JOB_LIMIT);
+}
+
+/** The inbound columns a turn row is read with. */
+interface TurnSql {
+	inbound_id: number;
+	platform_message_id: string;
+	origin_key: string;
+	text_ref: string;
+	thread_ref: string | null;
+	state: string;
+	created_at: number;
+	dispatched_at: number | null;
+	last_event_at: number | null;
+}
+
+/**
  * One read-only picture of the bot. Never opens a `Store` or the task ledger (both write on open: the store re-queues
- * inflight deliveries); every table is read through a `readonly` handle. Of message bodies only open turns' are read,
- * and only their masked one-line preview leaves this function.
+ * inflight deliveries); every table is read through a `readonly` handle. Of message bodies only the turns of the board's
+ * threads are read (open ones, and the last {@link THREAD_WINDOW_MS}'s), and only their masked one-line preview leaves
+ * this function.
  */
 export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapshot> {
 	const now = deps.now();
@@ -560,31 +992,23 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 		});
 
 		const turns = section(async () => {
-			const open = rows<{
-				inbound_id: number;
-				platform_message_id: string;
-				origin_key: string;
-				text_ref: string;
-				thread_ref: string | null;
-				state: string;
-				created_at: number;
-				dispatched_at: number | null;
-				last_event_at: number | null;
-			}>(
-				needDb(),
-				`SELECT inbound_id, platform_message_id, origin_key, text_ref, thread_ref, state, created_at, dispatched_at,
-					last_event_at FROM inbound WHERE state IN ('pending','dispatched') ORDER BY created_at, inbound_id LIMIT ?`,
+			const handle = needDb();
+			const TURN_COLUMNS = `inbound_id, platform_message_id, origin_key, text_ref, thread_ref, state, created_at,
+				dispatched_at, last_event_at`;
+			const open = rows<TurnSql>(
+				handle,
+				`SELECT ${TURN_COLUMNS} FROM inbound WHERE state IN ('pending','dispatched') ORDER BY created_at, inbound_id LIMIT ?`,
 				TURN_LIMIT,
 			);
 			// Origins waiting on a live approval card, as `inbound_starved` counts them: a card past `expires_at` waits
 			// on nobody even while its row still reads `pending`.
 			const approvalColumns = new Set(
-				rows<{ name: string }>(needDb(), "PRAGMA table_info(approvals)").map((column) => column.name),
+				rows<{ name: string }>(handle, "PRAGMA table_info(approvals)").map((column) => column.name),
 			);
 			const waitingOnOwner = new Set(
 				approvalColumns.has("origin_key")
 					? rows<{ origin_key: string }>(
-							needDb(),
+							handle,
 							`SELECT DISTINCT origin_key FROM approvals WHERE status = 'pending' AND origin_key IS NOT NULL${
 								approvalColumns.has("expires_at") ? " AND expires_at > ?" : ""
 							}`,
@@ -597,53 +1021,137 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const draining = status.ok && (status.drain !== undefined || status.heartbeat?.draining === true);
 			const frozen = status.ok && status.frozen !== undefined;
 			const running = new Set(open.filter((r) => r.state === "dispatched").map((r) => r.origin_key));
-			return {
-				items: open.map((r): TurnInfo => {
-					const slash = r.platform_message_id.startsWith("slash:");
-					const command = parseCommand(r.text_ref);
-					const kind: TurnKind = r.origin_key.startsWith(MONITOR_ORIGIN_PREFIX)
-						? "monitor"
-						: command !== undefined || slash
-							? "command"
-							: r.text_ref.trimStart().startsWith(AUTO_FOLLOWUP_PREFIX)
-								? "auto"
-								: "message";
-					const request =
-						command === undefined
-							? r.text_ref
-							: `${COMMAND_TEXT[command.kind]}${command.arg === "" ? "" : ` ${command.arg}`}`;
-					let waitReason: TurnWaitReason | null = null;
-					if (r.state === "pending") {
-						if (draining) waitReason = "restart";
-						else if (frozen) waitReason = "frozen";
-						else if (command?.kind === "followup") waitReason = "followup";
-						else if (running.has(r.origin_key)) waitReason = "behind";
-						else waitReason = "queued";
-					}
-					const lastSign = r.state === "dispatched" ? (r.last_event_at ?? r.dispatched_at) : null;
-					const silentMs = lastSign === null ? null : now - lastSign;
-					return {
-						inboundId: r.inbound_id,
-						originKey: r.origin_key,
-						threadRef: r.thread_ref,
-						state: r.state,
-						createdAt: formatKst(r.created_at),
-						ageMs: now - r.created_at,
-						silentMs,
-						stalled:
-							r.dispatched_at !== null &&
-							silentMs !== null &&
-							silentMs > INBOUND_STARVATION_MS &&
-							!waitingOnOwner.has(r.origin_key),
-						kind,
-						preview: kind === "monitor" ? null : previewLine(request),
-						waitReason,
-						blocksRestart: draining && r.state === "dispatched",
-						topLevel: r.thread_ref?.endsWith(`:${TOP_LEVEL_TS}`) === true,
-						slash,
-					};
-				}),
+			const turnOf = (r: TurnSql): TurnInfo => {
+				const slash = r.platform_message_id.startsWith("slash:");
+				const command = parseCommand(r.text_ref);
+				const kind: TurnKind = r.origin_key.startsWith(MONITOR_ORIGIN_PREFIX)
+					? "monitor"
+					: command !== undefined || slash
+						? "command"
+						: r.text_ref.trimStart().startsWith(AUTO_FOLLOWUP_PREFIX)
+							? "auto"
+							: "message";
+				const request =
+					command === undefined
+						? r.text_ref
+						: `${COMMAND_TEXT[command.kind]}${command.arg === "" ? "" : ` ${command.arg}`}`;
+				let waitReason: TurnWaitReason | null = null;
+				if (r.state === "pending") {
+					if (draining) waitReason = "restart";
+					else if (frozen) waitReason = "frozen";
+					else if (command?.kind === "followup") waitReason = "followup";
+					else if (running.has(r.origin_key)) waitReason = "behind";
+					else waitReason = "queued";
+				}
+				const lastSign = r.state === "dispatched" ? (r.last_event_at ?? r.dispatched_at) : null;
+				const silentMs = lastSign === null ? null : now - lastSign;
+				return {
+					inboundId: r.inbound_id,
+					originKey: r.origin_key,
+					threadRef: r.thread_ref,
+					state: r.state,
+					createdAt: formatKst(r.created_at),
+					ageMs: now - r.created_at,
+					silentMs,
+					stalled:
+						r.dispatched_at !== null &&
+						silentMs !== null &&
+						silentMs > INBOUND_STARVATION_MS &&
+						!waitingOnOwner.has(r.origin_key),
+					kind,
+					preview: kind === "monitor" ? null : previewLine(request),
+					waitReason,
+					blocksRestart: draining && r.state === "dispatched",
+					topLevel: r.thread_ref?.endsWith(`:${TOP_LEVEL_TS}`) === true,
+					slash,
+				};
 			};
+			const brief = (turn: TurnInfo): ThreadTurn => ({
+				inboundId: turn.inboundId,
+				state: turn.state,
+				createdAt: turn.createdAt,
+				preview: turn.preview,
+			});
+			// Every conversation with an open turn, then the ones active in the window: newest activity first.
+			const since = now - THREAD_WINDOW_MS;
+			const ACTIVE = "COALESCE(last_event_at, dispatched_at, created_at)";
+			const OPEN = "state IN ('pending','dispatched')";
+			const monitorNames = new Map(
+				rows<{ id: string; name: string }>(handle, "SELECT id, name FROM monitors").map((m) => [m.id, m.name]),
+			);
+			const threads = rows<{ origin_key: string; active: number }>(
+				handle,
+				`SELECT origin_key, MAX(${ACTIVE}) AS active, SUM(CASE WHEN ${OPEN} THEN 1 ELSE 0 END) AS open FROM inbound
+					GROUP BY origin_key HAVING open > 0 OR active >= ? ORDER BY open > 0 DESC, active DESC LIMIT ?`,
+				since,
+				THREAD_LIMIT,
+			).flatMap((thread): ThreadInfo[] => {
+				const key = thread.origin_key;
+				const recent = rows<TurnSql>(
+					handle,
+					`SELECT ${TURN_COLUMNS} FROM inbound WHERE origin_key = ? ORDER BY created_at DESC, inbound_id DESC LIMIT ?`,
+					key,
+					THREAD_RECENT,
+				).map(turnOf);
+				const [first] = rows<TurnSql>(
+					handle,
+					`SELECT ${TURN_COLUMNS} FROM inbound WHERE origin_key = ? ORDER BY created_at, inbound_id LIMIT 1`,
+					key,
+				).map(turnOf);
+				const latest = recent[0];
+				if (latest === undefined || first === undefined) return [];
+				const openTurns = rows<TurnSql>(
+					handle,
+					`SELECT ${TURN_COLUMNS} FROM inbound WHERE origin_key = ? AND ${OPEN}`,
+					key,
+				).map(turnOf);
+				const [count] = rows<{ n: number }>(
+					handle,
+					`SELECT COUNT(*) AS n FROM inbound WHERE origin_key = ? AND (${OPEN} OR ${ACTIVE} >= ?)`,
+					key,
+					since,
+				);
+				const [runs] = rows<{ n: number }>(
+					handle,
+					`SELECT COUNT(DISTINCT COALESCE(op_ref, 'row:' || inbound_id)) AS n FROM inbound
+						WHERE origin_key = ? AND state = 'dispatched'`,
+					key,
+				);
+				const stalledCount = openTurns.filter((turn) => turn.stalled).length;
+				const column: ThreadColumn =
+					stalledCount > 0 || (openTurns.length === 0 && latest.state === "failed_notified")
+						? "attention"
+						: openTurns.length > 0
+							? "working"
+							: "done";
+				const monitor = key.startsWith(MONITOR_ORIGIN_PREFIX)
+					? (monitorNames.get(key.slice(MONITOR_ORIGIN_PREFIX.length)) ?? key)
+					: undefined;
+				return [
+					{
+						originKey: key,
+						threadRef: latest.threadRef ?? first.threadRef,
+						kind: latest.kind,
+						title: monitor ?? first.preview ?? key,
+						column,
+						latest: {
+							...brief(latest),
+							ageMs: latest.ageMs,
+							silentMs: latest.silentMs,
+							stalled: latest.stalled,
+							waitReason: latest.waitReason,
+						},
+						turnCount: count?.n ?? 0,
+						openCount: openTurns.length,
+						runCount: runs?.n ?? 0,
+						pendingCount: openTurns.filter((turn) => turn.state === "pending").length,
+						stalledCount,
+						updatedAt: formatKst(thread.active),
+						recent: recent.map(brief),
+					},
+				];
+			});
+			return { items: open.map(turnOf), threads };
 		});
 
 		const herdrStateOf = async (row: TaskRow): Promise<HerdrState> => {
@@ -796,32 +1304,71 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 
 		const monitors = section(() => {
 			const handle = needDb();
-			return {
-				items: rows<MonitorSql>(handle, "SELECT * FROM monitors WHERE enabled = 1 ORDER BY created_at, id").map(
-					(sql): MonitorInfo => {
-						const monitor = toMonitor(sql);
-						const next = nextFireOf(monitor);
-						const last = rows<{ stage: string; updated_at: number }>(
+			const listed = rows<MonitorSql>(handle, "SELECT * FROM monitors WHERE enabled = 1").map((sql) => {
+				const monitor = toMonitor(sql);
+				const next = nextFireOf(monitor);
+				// Newest first; `recent` turns them around.
+				const events = rows<{ stage: string; slot_at: number; updated_at: number; attempts: number; manual: number }>(
+					handle,
+					"SELECT stage, slot_at, updated_at, attempts, manual FROM monitor_events WHERE monitor_id = ? ORDER BY event_id DESC LIMIT ?",
+					monitor.id,
+					MONITOR_RECENT,
+				);
+				const last = events[0];
+				const incidents = rows<{ n: number }>(
+					handle,
+					"SELECT COUNT(*) AS n FROM monitor_incidents WHERE monitor_id = ? AND status = 'alerted'",
+					monitor.id,
+				)[0];
+				const { trigger } = monitor;
+				const info: MonitorInfo = {
+					id: monitor.id,
+					name: redact(monitor.name),
+					kind: trigger.kind,
+					schedule: monitorSchedule(trigger),
+					cron: trigger.kind === "cron" ? `${trigger.schedule} (${trigger.timezone})` : null,
+					summary: monitorSummary(monitor.instruction),
+					destination: channelName(monitor.channel, config),
+					copyTo: monitor.copyChannel === null ? null : channelName(monitor.copyChannel, config),
+					model: monitor.model,
+					thinking: monitor.thinking,
+					deliver: monitor.deliver,
+					overlap: monitor.overlap,
+					files: monitorFiles(monitor),
+					nextFireAt: next === null ? null : formatKst(next),
+					lastStage: last?.stage ?? null,
+					lastAt: last === undefined ? null : formatKst(last.updated_at),
+					openIncidents: incidents?.n ?? 0,
+					recent: events
+						.map((event) => ({ stage: event.stage, manual: event.manual === 1, at: formatKst(event.updated_at) }))
+						.reverse(),
+					lastRun:
+						last === undefined
+							? null
+							: {
+									stage: last.stage,
+									at: formatKst(last.updated_at),
+									slotAt: formatKst(last.slot_at),
+									durationMs: monitorDurationMs(last.stage, last.slot_at, last.updated_at),
+									attempts: last.attempts,
+									manual: last.manual === 1,
+								},
+					scheduledRun:
+						rows<{ n: number }>(
 							handle,
-							"SELECT stage, updated_at FROM monitor_events WHERE monitor_id = ? ORDER BY event_id DESC LIMIT 1",
+							"SELECT EXISTS(SELECT 1 FROM monitor_events WHERE monitor_id = ? AND manual = 0) AS n",
 							monitor.id,
-						)[0];
-						const incidents = rows<{ n: number }>(
-							handle,
-							"SELECT COUNT(*) AS n FROM monitor_incidents WHERE monitor_id = ? AND status = 'alerted'",
-							monitor.id,
-						)[0];
-						return {
-							name: redact(monitor.name),
-							kind: monitor.trigger.kind,
-							nextFireAt: next === null ? null : formatKst(next),
-							lastStage: last?.stage ?? null,
-							lastAt: last === undefined ? null : formatKst(last.updated_at),
-							openIncidents: incidents?.n ?? 0,
-						};
-					},
-				),
-			};
+						)[0]?.n === 1,
+				};
+				return { next, info };
+			});
+			// Next to fire first, monitors with no next fire last, then by name.
+			listed.sort(
+				(a, b) =>
+					(a.next ?? Number.POSITIVE_INFINITY) - (b.next ?? Number.POSITIVE_INFINITY) ||
+					a.info.name.localeCompare(b.info.name, "ko"),
+			);
+			return { items: listed.map(({ info }) => info) };
 		});
 
 		const gates = await section(() => ({
@@ -876,10 +1423,15 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
+		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? processAlive) }));
+
+		const feedback = section(() => readFeedbackSummary(needDb(), now, { days: FEEDBACK_DAYS, limit: FEEDBACK_RECENT }));
+
 		return {
 			generatedAt: formatKst(now),
 			daemon: await daemon,
 			turns: await turns,
+			feedback: await feedback,
 			tasks: await tasks,
 			lanes: await lanes,
 			herdr: await herdr,
@@ -888,6 +1440,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			alerts: await alerts,
 			gates,
 			backup: await backup,
+			jobs: await jobs,
 		};
 	} finally {
 		db?.close();

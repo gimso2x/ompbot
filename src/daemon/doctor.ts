@@ -78,16 +78,26 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 		}
 
 		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
-		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere).
+		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere)
+		// and for agent "claude", which never spawns omp; an unreadable launcher (a directory, no permission) is a
+		// failed line, not an exception that ends the whole report.
 		const runtimeBun = Bun.which("bun");
-		if (runtimeBun !== null && existsSync(config.ompExecutable)) {
-			const cliPath = realpathSync(config.ompExecutable);
-			const problem = checkOmpRuntime(cliPath, runtimeBun);
-			report(
-				problem === undefined,
-				"omp runtime",
-				problem === undefined ? `launcher=${cliPath}` : `${problem.code} ${problem.message}`,
-			);
+		if (config.agent !== "claude" && runtimeBun !== null && existsSync(config.ompExecutable)) {
+			try {
+				const cliPath = realpathSync(config.ompExecutable);
+				const problem = checkOmpRuntime(cliPath, runtimeBun);
+				report(
+					problem === undefined,
+					"omp runtime",
+					problem === undefined ? `launcher=${cliPath}` : `${problem.code} ${problem.message}`,
+				);
+			} catch (error) {
+				report(
+					false,
+					"omp runtime",
+					`${config.ompExecutable} unreadable (${(error as NodeJS.ErrnoException).code ?? String(error)})`,
+				);
+			}
 		}
 
 		if (config.webhook !== undefined) {

@@ -120,6 +120,44 @@ describe("backup bundle (sessions + config.json)", () => {
 		writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
 	}
 
+	/**
+	 * A `tar` that does the real work, then — for the create call only — prints `stderr` and exits 1, like GNU tar
+	 * does when a session file grows while it is archived.
+	 */
+	function warningTar(stderr: string): string {
+		const realTar = Bun.which("tar");
+		if (realTar === null) throw new Error("tar not on PATH");
+		const bin = join(home, "fake-bin");
+		mkdirSync(bin);
+		const script = join(bin, "tar");
+		writeFileSync(
+			script,
+			`#!/bin/sh\n"${realTar}" "$@" || exit $?\nif [ "$1" = "-czf" ]; then printf '%s\\n' '${stderr}' >&2; exit 1; fi\n`,
+			{ mode: 0o755 },
+		);
+		return script;
+	}
+
+	test("tar exit 1 with only 'file changed as we read it' still yields a verified bundle", () => {
+		seedDb(home);
+		seedSources();
+		const result = runBackup({
+			homeDir: home,
+			now: new Date(2026, 9, 23, 4, 30, 0),
+			tarBin: warningTar("tar: sessions/slack-dm-D1/e1/s.jsonl: file changed as we read it"),
+		});
+		expect(existsSync(result.bundle as string)).toBe(true);
+		expect(readStamp(join(home, "backups"))?.bundle).toBe("ompbot-bundle-20261023-043000.tar.gz");
+	});
+
+	test("tar exit 1 with any other message fails the whole backup", () => {
+		seedDb(home);
+		seedSources();
+		const tarBin = warningTar("tar: sessions/slack-dm-D1/e1/s.jsonl: Cannot open: Permission denied");
+		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0), tarBin })).toThrow(/bundle_failed/);
+		expect(readStamp(join(home, "backups"))).toBeUndefined();
+	});
+
 	test("a verified tar.gz lands next to the db and the stamp records its name and sha256", () => {
 		seedDb(home);
 		seedSources();

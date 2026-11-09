@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { openBotStore } from "../src/core/origin";
 import { INTERRUPTED_NOTICE, recoverDispatched } from "../src/daemon/recovery";
 import { createLogger } from "../src/log";
+import { INTERIM_CLOSING } from "../src/omp/answers";
 import { OmpDriverError, type OmpFinal, type OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore, type FakeTurnMessage } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
@@ -142,6 +143,39 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
 		expect(result).toEqual({ answered: 1, interrupted: 0 });
 		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["LONG REPORT\n\nshort follow-up"]);
+	});
+
+	test("a recovered turn leaves out what the dead process already sent as interim deliveries", async () => {
+		const note = "지도 생성 중이에요. 브라우저는 절반만 됩니다(헤드리스만).";
+		const script = (last: string) => () =>
+			[
+				{ role: "assistant", text: "LONG REPORT", stopReason: "stop" },
+				{ role: "developer", text: "<system-reminder>" },
+				{ role: "assistant", text: note, stopReason: "toolUse", toolCalls: ["wait"] },
+				{ role: "toolResult", text: "ok" },
+				{ role: "assistant", text: last, stopReason: "stop" },
+			] satisfies FakeTurnMessage[];
+		const first = await dispatchedTurn("m1", "report", { finish: true, script: script("short follow-up") });
+		const second = await dispatchedTurn("m2", "again", { finish: true, script: script(" LONG REPORT\n") });
+		for (const [id, { opRef }] of [
+			["m1", first],
+			["m2", second],
+		] as const) {
+			const threadRef = `D1:${id}`;
+			store.recordInterim({ originKey: ORIGIN, opRef, threadRef, index: 0, body: "LONG REPORT" });
+			store.recordInterim({ originKey: ORIGIN, opRef, threadRef, index: 1, body: note });
+		}
+		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
+		expect(result).toEqual({ answered: 2, interrupted: 0 });
+		const turnEnd = store
+			.listDeliveries({ originKey: ORIGIN })
+			.filter((d) => !d.opRef.includes(":interim:"))
+			.map((d) => [d.opRef, d.body]);
+		expect(turnEnd).toEqual([
+			[first.opRef, "short follow-up"],
+			[second.opRef, INTERIM_CLOSING],
+		]);
+		expect([store.getInbound("m1")?.state, store.getInbound("m2")?.state]).toEqual(["answered", "answered"]);
 	});
 
 	test("a followup row in a resumed (pinned) session is answered from that session file", async () => {

@@ -28,8 +28,17 @@ export interface OutboundMessage {
 	text: string;
 	/** Buttons under the text. `[]` on an edit removes the buttons an earlier version had. */
 	buttons?: readonly ActionButton[];
-	/** One small line under the buttons (a deadline); shown only together with buttons. */
+	/**
+	 * One small line under the buttons (a deadline). A plain message shows it only together with buttons; a card
+	 * (`title`/`body`/`fields`) shows it on its own too (the result line once the buttons are gone).
+	 */
 	buttonsNote?: string;
+	/** Card title (Slack: a `header` block); a port without cards ignores it and `text` carries everything. */
+	title?: string;
+	/** Card body in place of `text`, which then only serves notifications and clients that cannot show the card. */
+	body?: string;
+	/** Labelled values under the body (Slack: one section of `fields`). */
+	fields?: ReadonlyArray<{ label: string; value: string }>;
 }
 
 export interface ChannelPort {

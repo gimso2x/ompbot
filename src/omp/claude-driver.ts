@@ -1,7 +1,9 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { classifyPermission } from "./claude-permission";
+import type { Logger } from "../log";
+import { redact } from "../redact";
+import { classifyPermission, type PermissionDecision } from "./claude-permission";
 import {
 	type OmpCompactResult,
 	OmpDriverError,
@@ -100,6 +102,8 @@ export interface ClaudeOmpDriverOptions {
 	secretsDir?: string;
 	/** Owner approval bridge for dangerous Bash; absent → dangerous Bash is denied outright. */
 	approval?: ClaudeApprovalHook;
+	/** Where a failed permission decision is reported; absent → stderr. */
+	log?: Logger;
 	/** Parent environment source (tests); default `process.env`. */
 	baseEnv?: Record<string, string | undefined>;
 	/** How long `start()` waits for an immediate child death before assuming a healthy quiet child. */
@@ -712,14 +716,26 @@ export class ClaudeOmpDriver implements OmpSessionDriver {
 		const toolName = str(request.tool_name) ?? "";
 		const input = recordOf(request.input) ?? {};
 		const approval = this.#options.approval;
-		const decision = await classifyPermission({
-			toolName,
-			input,
-			cwd: resolve(this.#options.cwd),
-			secretsDir: this.#options.secretsDir === undefined ? undefined : resolve(this.#options.secretsDir),
-			// `{replied}` (a free-text owner answer) is NOT an approval: the deny quotes it instead.
-			ask: approval === undefined ? undefined : async (asked) => (await approval(asked)) === "approved",
-		});
+		let decision: PermissionDecision;
+		try {
+			decision = await classifyPermission({
+				toolName,
+				input,
+				cwd: resolve(this.#options.cwd),
+				secretsDir: this.#options.secretsDir === undefined ? undefined : resolve(this.#options.secretsDir),
+				// `{replied}` (a free-text owner answer) is NOT an approval: the deny quotes it instead.
+				ask: approval === undefined ? undefined : async (asked) => (await approval(asked)) === "approved",
+			});
+		} catch (error) {
+			// The CLI blocks until it gets an answer: a failed approval post (429, network) must still answer it.
+			if (this.#options.log === undefined)
+				console.error(redact(`[ompbot] claude_permission_failed: tool=${toolName} ${String(error)}`));
+			else this.#options.log.warn("claude_permission_failed", { tool: toolName, error: String(error) });
+			decision = {
+				behavior: "deny",
+				message: `승인 요청을 올리지 못해 거부했습니다: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
 		this.#writeRaw({
 			type: "control_response",
 			response: { subtype: "success", request_id: requestId, response: decision },

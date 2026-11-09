@@ -19,6 +19,7 @@ import {
 } from "../monitors/ledger";
 import type { ApprovalDetail } from "../safety/approval";
 import { TaskLedger } from "../tasks/ledger";
+import { FEEDBACK_DDL, FeedbackLedger } from "./feedback";
 import {
 	assertInboundTransition,
 	type DeliveryEvent,
@@ -39,6 +40,8 @@ const MONITOR_COPY_SUFFIX = ":copy";
 /** Op ref infix of the pointer a steered message's own thread gets (`<opRef>:steer:<n>`). */
 const STEER_NOTICE_SUFFIX = ":steer:";
 const STEER_NOTICE_HEAD = "↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어";
+/** Op ref infix of a text a running turn sent before its end (`<opRef>:interim:<n>`); it never finishes the status. */
+export const INTERIM_INFIX = ":interim:";
 /** Head of a failed-turn notice delivery (`failedNotice` in the mailbox); never recall material. */
 const TURN_FAILED_HEAD = "[turn failed]";
 /** How far back recall candidates reach. */
@@ -117,6 +120,8 @@ export interface InboundRow {
 	entryCursor: string | null;
 	/** Slack thread the reply goes to (`<channel>:<thread_ts>`); backfilled from platform_message_id for pre-migration rows. */
 	threadRef: string;
+	/** Slack user id of the peer bot that wrote this row; null for every owner row (and rows from before the column). */
+	peerUserId: string | null;
 }
 
 export interface DeliveryRow {
@@ -132,6 +137,10 @@ export interface DeliveryRow {
 	redelivered: boolean;
 	createdAt: number;
 	lastError: string | null;
+	/** Slack messages of this row already posted before a rate limit cut the send (resume skips them); 0 when none. */
+	sentParts: number;
+	/** Top-level answer cut after part 1: the ts parts 2+ reply under. */
+	replyTs: string | null;
 }
 
 /** One ledger row a recall search may quote: an owner message (`inbound`) or a confirmed bot answer (`delivery`). */
@@ -145,11 +154,22 @@ export interface RecallCandidate {
 	opRef: string | null;
 }
 
+/** A pending approval the sweep just expired, for its card rewrite (the mirror too, and `다시 요청` with a thread). */
+type ExpiredApproval = {
+	approvalId: string;
+	channel: string;
+	messageTs: string;
+	summary: string;
+	originThreadRef: string | null;
+	mirrorRef: string | null;
+};
+
 /**
  * Approval card ledger. `origin_key`/`origin_thread_ref` map a card back to the conversation that asked (NULL on rows
  * from before the mapping existed), `reply_ts`/`reply_text` hold the owner's thread reply that settled it as `replied`.
  * `detail_json` holds the card's redacted, cut structured sections and `card_url`/`origin_url` the card and asking-thread
  * permalinks, for the dashboard (all NULL on older rows, when absent or when the permalink lookup failed).
+ * `mirror_ref` (`<channel>:<ts>`, added by `migrate`) is the card's copy in the asking thread, NULL without one.
  */
 const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
 	approval_id TEXT PRIMARY KEY,
@@ -190,7 +210,8 @@ CREATE TABLE IF NOT EXISTS inbound (
 	op_ref TEXT,
 	entry_cursor TEXT,
 	thread_ref TEXT,
-	last_event_at INTEGER
+	last_event_at INTEGER,
+	peer_user_id TEXT
 );
 CREATE INDEX IF NOT EXISTS inbound_origin_state ON inbound(origin_key, state);
 CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
@@ -209,6 +230,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
 	redelivered INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	last_error TEXT,
+	sent_parts INTEGER,
+	reply_ts TEXT,
 	UNIQUE (origin_key, op_ref, part)
 );
 CREATE INDEX IF NOT EXISTS deliveries_state_next ON deliveries(state, next_at);
@@ -249,6 +272,7 @@ CREATE TABLE IF NOT EXISTS thread_mutes (
 	thread_ref TEXT PRIMARY KEY,
 	muted_at INTEGER NOT NULL
 );
+${FEEDBACK_DDL}
 `;
 
 interface LaneSql {
@@ -293,6 +317,10 @@ export interface ApprovalRow {
 	originThreadRef: string | null;
 	replyTs: string | null;
 	replyText: string | null;
+	/** The request text as the card shows it (redacted, cut). */
+	summary: string;
+	/** `<channel>:<ts>` of the card's mirror in the asking thread; null without one (and on older rows). */
+	mirrorRef: string | null;
 }
 
 interface ApprovalSql {
@@ -304,6 +332,8 @@ interface ApprovalSql {
 	origin_thread_ref: string | null;
 	reply_ts: string | null;
 	reply_text: string | null;
+	summary: string;
+	mirror_ref: string | null;
 }
 
 interface OriginSql {
@@ -326,6 +356,7 @@ interface InboundSql {
 	op_ref: string | null;
 	entry_cursor: string | null;
 	thread_ref: string | null;
+	peer_user_id: string | null;
 }
 interface DeliverySql {
 	delivery_id: number;
@@ -340,6 +371,8 @@ interface DeliverySql {
 	redelivered: number;
 	created_at: number;
 	last_error: string | null;
+	sent_parts: number | null;
+	reply_ts: string | null;
 }
 
 const toOrigin = (r: OriginSql): OriginRow => ({
@@ -363,6 +396,7 @@ const toInbound = (r: InboundSql): InboundRow => ({
 	opRef: r.op_ref,
 	entryCursor: r.entry_cursor,
 	threadRef: r.thread_ref ?? r.platform_message_id,
+	peerUserId: r.peer_user_id ?? null,
 });
 
 const toDelivery = (r: DeliverySql): DeliveryRow => ({
@@ -378,6 +412,8 @@ const toDelivery = (r: DeliverySql): DeliveryRow => ({
 	redelivered: r.redelivered === 1,
 	createdAt: r.created_at,
 	lastError: r.last_error,
+	sentParts: r.sent_parts ?? 0,
+	replyTs: r.reply_ts,
 });
 
 export class Store {
@@ -391,6 +427,8 @@ export class Store {
 	readonly monitors: MonitorLedger;
 	/** [TASK] registry; shares this connection. */
 	readonly tasks: TaskLedger;
+	/** Posted delivery messages and the owner's 👍/👎 on them; shares this connection. */
+	readonly feedback: FeedbackLedger;
 	private readonly ownerSlackUserId: string | undefined;
 	private logChannel: string | undefined;
 
@@ -414,6 +452,7 @@ export class Store {
 		this.migrate();
 		this.monitors = new MonitorLedger(this.db, { clock: options.clock, redact: options.redact });
 		this.tasks = new TaskLedger(this.db, { clock: options.clock });
+		this.feedback = new FeedbackLedger(this.db, { clock: options.clock });
 		this.recoveredInflight = this.db
 			.query("UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'inflight'")
 			.run(this.clock.now()).changes;
@@ -522,7 +561,18 @@ export class Store {
 					originThreadRef: row.origin_thread_ref,
 					replyTs: row.reply_ts,
 					replyText: row.reply_text,
+					summary: row.summary,
+					mirrorRef: row.mirror_ref ?? null,
 				};
+	}
+
+	/** Records the mirror card of a still-pending approval; false when the row is gone or already settled. */
+	setApprovalMirrorRef(approvalId: string, mirrorRef: string): boolean {
+		return (
+			this.db
+				.query("UPDATE approvals SET mirror_ref = ? WHERE approval_id = ? AND status = 'pending'")
+				.run(mirrorRef, approvalId).changes === 1
+		);
 	}
 
 	/**
@@ -555,15 +605,25 @@ export class Store {
 		);
 	}
 
-	/** Expires every still-pending approval that is due (or all of them when `due` is false — the boot sweep). */
-	expirePendingApprovals(now: number, due = true): Array<{ approvalId: string; channel: string; messageTs: string }> {
-		return this.db.transaction((): Array<{ approvalId: string; channel: string; messageTs: string }> => {
+	/**
+	 * Expires every still-pending approval that is due (or all of them when `due` is false — the boot sweep). The
+	 * summary comes back so the broker can tell a choice card (its body) from an approval when rewriting the card.
+	 */
+	expirePendingApprovals(now: number, due = true): ExpiredApproval[] {
+		return this.db.transaction((): ExpiredApproval[] => {
 			const rows = this.db
 				.query(
-					`SELECT approval_id, channel, message_ts FROM approvals
+					`SELECT approval_id, channel, message_ts, summary, origin_thread_ref, mirror_ref FROM approvals
 					 WHERE status = 'pending' AND (${due ? "expires_at <= ?" : "1 = 1"})`,
 				)
-				.all(...(due ? [now] : [])) as Array<{ approval_id: string; channel: string; message_ts: string }>;
+				.all(...(due ? [now] : [])) as Array<{
+				approval_id: string;
+				channel: string;
+				message_ts: string;
+				summary: string;
+				origin_thread_ref: string | null;
+				mirror_ref: string | null;
+			}>;
 			if (rows.length === 0) return [];
 			this.db
 				.query(
@@ -571,7 +631,14 @@ export class Store {
 					 WHERE status = 'pending' AND (${due ? "expires_at <= ?" : "1 = 1"})`,
 				)
 				.run(...(due ? [now, now] : [now]));
-			return rows.map((row) => ({ approvalId: row.approval_id, channel: row.channel, messageTs: row.message_ts }));
+			return rows.map((row) => ({
+				approvalId: row.approval_id,
+				channel: row.channel,
+				messageTs: row.message_ts,
+				summary: row.summary,
+				originThreadRef: row.origin_thread_ref,
+				mirrorRef: row.mirror_ref,
+			}));
 		})();
 	}
 
@@ -655,15 +722,50 @@ export class Store {
 		return this.db.query("SELECT 1 FROM inbound WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
 	}
 
+	/** Whether the thread has an inbound row recorded before the given one (any origin, owner or peer). */
+	hasInboundThreadBefore(threadRef: string, platformMessageId: string): boolean {
+		return (
+			this.db
+				.query(
+					"SELECT 1 FROM inbound WHERE thread_ref = ? AND inbound_id < (SELECT inbound_id FROM inbound WHERE platform_message_id = ?) LIMIT 1",
+				)
+				.get(threadRef, platformMessageId) !== null
+		);
+	}
+
+	/** Whether any peer bot's message was recorded for this origin: its omp child runs with the reduced host tools. */
+	originHasPeerInbound(originKey: string): boolean {
+		return (
+			this.db
+				.query("SELECT 1 FROM inbound WHERE origin_key = ? AND peer_user_id IS NOT NULL LIMIT 1")
+				.get(originKey) !== null
+		);
+	}
+
+	/** Peer rows recorded in a thread at or after `sinceMs` (the hop cap's window). */
+	countPeerInboundSince(threadRef: string, sinceMs: number): number {
+		const row = this.db
+			.query("SELECT COUNT(*) AS n FROM inbound WHERE thread_ref = ? AND peer_user_id IS NOT NULL AND created_at >= ?")
+			.get(threadRef, sinceMs) as { n: number };
+		return row.n;
+	}
+
 	/** Idempotent on platform_message_id: a second insert of the same id returns the existing row. */
-	recordInbound(input: { originKey: string; platformMessageId: string; textRef: string; threadRef?: string }): {
+	recordInbound(input: {
+		originKey: string;
+		platformMessageId: string;
+		textRef: string;
+		threadRef?: string;
+		/** Set only for a peer bot's row (taints the origin: see `originHasPeerInbound`). */
+		peerUserId?: string;
+	}): {
 		inserted: boolean;
 		row: InboundRow;
 	} {
 		const origin = this.requireOrigin(input.originKey);
 		const result = this.db
 			.query(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(platform_message_id) DO NOTHING",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref, peer_user_id) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(platform_message_id) DO NOTHING",
 			)
 			.run(
 				input.platformMessageId,
@@ -672,6 +774,7 @@ export class Store {
 				this.redact(input.textRef),
 				this.clock.now(),
 				input.threadRef ?? input.platformMessageId,
+				input.peerUserId ?? null,
 			);
 		return { inserted: result.changes === 1, row: this.requireInbound(input.platformMessageId) };
 	}
@@ -778,7 +881,7 @@ export class Store {
 		const rows = this.db
 			.query(
 				`SELECT 'inbound' AS kind, origin_key, thread_ref, created_at, substr(text_ref, 1, 1200) AS text, op_ref
-				 FROM inbound WHERE ${scope} AND state <> 'discarded'
+				 FROM inbound WHERE ${scope} AND state <> 'discarded' AND peer_user_id IS NULL
 				 UNION ALL
 				 SELECT 'delivery' AS kind, origin_key, thread_ref, created_at, substr(body, 1, 1200) AS text, op_ref
 				 FROM deliveries WHERE ${scope} AND state = 'confirmed' AND part = 0
@@ -858,13 +961,16 @@ export class Store {
 
 	/**
 	 * One transaction: every dispatched inbound row of the op becomes `answered` and the delivery rows are created.
-	 * Any throw in between rolls both back. Re-recording the same (origin, op_ref, part) is a no-op.
+	 * Any throw in between rolls both back. Re-recording the same (origin, op_ref, part) is a no-op. `answer` is the
+	 * turn's whole answer when `parts` leave out what interim deliveries already sent: the log-channel copy and the
+	 * steered-thread pointers are judged on it (default: `parts`).
 	 */
 	recordAnswer(input: {
 		originKey: string;
 		opRef: string;
 		threadRef: string;
 		parts: readonly string[];
+		answer?: string;
 	}): DeliveryRow[] {
 		if (input.parts.length === 0) throw new StoreError("invalid_argument", "recordAnswer needs at least one part");
 		if (input.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return this.recordMonitorAnswer(input);
@@ -873,10 +979,35 @@ export class Store {
 			this.closeDispatched(input.originKey, input.opRef, "answered");
 			this.hooks.afterInboundAnswered?.();
 			const rows = input.parts.map((body, part) => this.insertDelivery(input, part, body));
-			this.notifySteeredThreads(input, steered, input.parts.join("\n"));
-			this.copyCompletion(input);
+			const whole = input.answer ?? input.parts.join("\n");
+			this.notifySteeredThreads(input, steered, whole);
+			this.copyCompletion(input, whole);
 			return rows;
 		})();
+	}
+
+	/**
+	 * A text a still-running turn sends right away (a finished answer, a note next to `wait`): one delivery under
+	 * `<opRef>:interim:<index>`. Inbound rows stay `dispatched`, and no log-channel copy or steered-thread pointer is
+	 * made — the turn end does those. Re-recording the same index is a no-op.
+	 */
+	recordInterim(input: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		index: number;
+		body: string;
+	}): DeliveryRow {
+		return this.insertDelivery({ ...input, opRef: `${input.opRef}${INTERIM_INFIX}${input.index}` }, 0, input.body);
+	}
+
+	/** Bodies of the op's interim deliveries in the order they were recorded (stored, so redacted). */
+	interimBodies(originKey: string, opRef: string): string[] {
+		const prefix = `${opRef}${INTERIM_INFIX}`;
+		const rows = this.db
+			.query("SELECT body FROM deliveries WHERE origin_key = ? AND substr(op_ref, 1, ?) = ? ORDER BY delivery_id")
+			.all(originKey, prefix.length, prefix) as Array<{ body: string }>;
+		return rows.map((row) => row.body);
 	}
 
 	/**
@@ -923,15 +1054,9 @@ export class Store {
 	 * report: a Slack chat or work-lane answer (never commands) whose first non-empty line starts with `✅ 완료`.
 	 * The copy is one delivery on `<logChannel>:-` under `<opRef>:log-copy`, so a replayed answer inserts nothing new.
 	 */
-	private copyCompletion(input: {
-		originKey: string;
-		opRef: string;
-		threadRef: string;
-		parts: readonly string[];
-	}): void {
+	private copyCompletion(input: { originKey: string; opRef: string; threadRef: string }, body: string): void {
 		if (this.logChannel === undefined || COMMAND_OP_REF.test(input.opRef)) return;
 		if (!input.originKey.startsWith("slack/") && !input.originKey.startsWith(LANE_ORIGIN_PREFIX)) return;
-		const body = input.parts.join("\n");
 		const first = body.split("\n").find((line) => line.trim() !== "");
 		if (first === undefined || !COMPLETION_MARKER.test(first.trim())) return;
 		const requested = parseThreadRef(input.threadRef);
@@ -1260,6 +1385,26 @@ export class Store {
 		return this.applyEvent(this.requireDelivery(deliveryId), "definitive_failure", this.clock.now(), error);
 	}
 
+	/**
+	 * Slack refused the send for now (429, or the method still blocked): back to `pending` at `retry.at` without
+	 * counting an attempt; `sentParts`/`replyTs` record how far a multi-message answer got, so the resume posts only
+	 * the rest. Still expires past the freshness window.
+	 */
+	deferDelivery(
+		deliveryId: number,
+		error: string,
+		retry: { at: number; sentParts: number; replyTs?: string | undefined },
+	): DeliveryRow {
+		return this.db.transaction(() => {
+			const row = this.applyEvent(this.requireDelivery(deliveryId), "rate_limited", this.clock.now(), error, retry.at);
+			if (row.state !== "pending") return row;
+			this.db
+				.query("UPDATE deliveries SET sent_parts = ?, reply_ts = COALESCE(?, reply_ts) WHERE delivery_id = ?")
+				.run(retry.sentParts, retry.replyTs ?? null, deliveryId);
+			return this.requireDelivery(deliveryId);
+		})();
+	}
+
 	/** A send whose outcome is unknown. Sticky; never resent or expired automatically. */
 	markAmbiguous(deliveryId: number, error: string): DeliveryRow {
 		return this.applyEvent(this.requireDelivery(deliveryId), "ambiguous", this.clock.now(), error);
@@ -1409,12 +1554,23 @@ export class Store {
 		if (!columns.some((column) => column.name === "last_event_at")) {
 			this.db.run("ALTER TABLE inbound ADD COLUMN last_event_at INTEGER");
 		}
+		if (!columns.some((column) => column.name === "peer_user_id")) {
+			this.db.run("ALTER TABLE inbound ADD COLUMN peer_user_id TEXT");
+		}
+		const deliveryColumns = this.db.query("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
+		if (!deliveryColumns.some((column) => column.name === "sent_parts")) {
+			this.db.run("ALTER TABLE deliveries ADD COLUMN sent_parts INTEGER");
+		}
+		if (!deliveryColumns.some((column) => column.name === "reply_ts")) {
+			this.db.run("ALTER TABLE deliveries ADD COLUMN reply_ts TEXT");
+		}
 		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
 		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");
 		this.migrateApprovals();
-		// After the rebuild (which already creates them): a 'replied'-era table only lacks the dashboard columns.
+		// After the rebuild (which already creates the dashboard columns): a 'replied'-era table lacks them, and every
+		// table lacks `mirror_ref` until this adds it.
 		const approvalColumns = this.db.query("PRAGMA table_info(approvals)").all() as Array<{ name: string }>;
-		for (const column of ["detail_json", "card_url", "origin_url"]) {
+		for (const column of ["detail_json", "card_url", "origin_url", "mirror_ref"]) {
 			if (!approvalColumns.some((existing) => existing.name === column)) {
 				this.db.run(`ALTER TABLE approvals ADD COLUMN ${column} TEXT`);
 			}
@@ -1495,7 +1651,13 @@ export class Store {
 		return row;
 	}
 
-	private applyEvent(row: DeliveryRow, event: DeliveryEvent, now: number, error?: string): DeliveryRow {
+	private applyEvent(
+		row: DeliveryRow,
+		event: DeliveryEvent,
+		now: number,
+		error?: string,
+		retryAt?: number,
+	): DeliveryRow {
 		const facts: DeliveryFacts = {
 			state: row.state,
 			attempts: row.attempts,
@@ -1503,7 +1665,7 @@ export class Store {
 			redelivered: row.redelivered,
 			createdAt: row.createdAt,
 		};
-		const next = transitionDelivery(facts, event, now);
+		const next = transitionDelivery(facts, event, now, retryAt);
 		if (next === facts) return row;
 		this.db
 			.query(

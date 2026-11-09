@@ -22,7 +22,15 @@ import { IDLE_STOP_MS, type InboundRecord, MONITOR_IDLE_STOP_MS } from "../src/c
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
-import { OmpDriverError, type OmpEntries, type OmpEvent, type OmpOpenResult, type OmpState } from "../src/omp/driver";
+import { INTERIM_CLOSING, NO_ANSWER } from "../src/omp/answers";
+import {
+	OmpDriverError,
+	type OmpEntries,
+	type OmpEvent,
+	type OmpFinal,
+	type OmpOpenResult,
+	type OmpState,
+} from "../src/omp/driver";
 import {
 	FakeOmpDriver,
 	type FakeOmpDriverOptions,
@@ -30,7 +38,7 @@ import {
 	type FakeTurnMessage,
 } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import type { Store } from "../src/store/db";
+import { openStore, type Store } from "../src/store/db";
 
 class FakeClock {
 	t = 1_000_000;
@@ -67,7 +75,23 @@ class SteerFailingDriver extends FakeOmpDriver {
 	}
 	override async prompt(text: string): Promise<string> {
 		if (this.stale) throw new OmpDriverError("rpc_error", "Could not restore model: fake/alpha");
-		return super.prompt(text);
+		this.lastOpRef = await super.prompt(text);
+		return this.lastOpRef;
+	}
+	lastOpRef: string | undefined;
+	readonly #finals = new Set<(final: OmpFinal) => void>();
+	override onFinal(listener: (final: OmpFinal) => void): () => void {
+		this.#finals.add(listener);
+		const off = super.onFinal(listener);
+		return () => {
+			this.#finals.delete(listener);
+			off();
+		};
+	}
+	/** Ends the running turn like omp's `agent_end` with an error (a provider stream that broke off). */
+	failTurn(error: string): void {
+		for (const listener of [...this.#finals])
+			listener({ opRef: this.lastOpRef ?? "", status: "error", text: "", error });
 	}
 	override async availableModels(): Promise<string[]> {
 		return this.stale
@@ -193,6 +217,8 @@ let escalations: TurnFailureEscalation[];
 let escalateAfter: number | undefined;
 let restoreListed: readonly string[] | undefined;
 let sessionBackupsRoot: string | undefined;
+/** Set: the router gets a Slack thread source whose `botUserId()` returns `id` (peer failure notices mention it). */
+let threadBot: { id: string | undefined } | undefined;
 
 /** Fresh router over the current test knobs; `defaultModel` is only readable here, so stale-model tests rebuild the router. */
 function buildRouter(): OriginRouter {
@@ -203,6 +229,7 @@ function buildRouter(): OriginRouter {
 		...(defaultModel === undefined ? {} : { defaultModel }),
 		...(escalateAfter === undefined ? {} : { escalateAfter }),
 		...(sessionBackupsRoot === undefined ? {} : { sessionBackupsRoot }),
+		...(threadBot === undefined ? {} : { threadSource: { botUserId: () => threadBot?.id, replies: async () => [] } }),
 		log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
 		statusProvider: (origin) => {
 			statusCalls.push(origin);
@@ -241,6 +268,7 @@ beforeEach(() => {
 	escalateAfter = undefined;
 	restoreListed = undefined;
 	sessionBackupsRoot = undefined;
+	threadBot = undefined;
 	router = buildRouter();
 });
 
@@ -1038,6 +1066,204 @@ describe("mailbox: every stop-ended answer of a turn is delivered", () => {
 	});
 });
 
+describe("mailbox: finished answers and wait notes reach the thread before the turn ends", () => {
+	const FIRST = "분석 결과: wap 데몬은 CDP 9222 게이트 중계기로 붙고, 세션 쿠키는 매 실행마다 새로 받는다.";
+	const NOTE = "⏳ 코드 지도는 아직 생성 중이에요. OCI에서 브라우저는 절반만 됩니다(헤드리스만).";
+	const LAST = "지도 완료: 파일 412개, 진입점 3곳.";
+	/** 2026-11-08 wap shape: stop answer, rule-guards continuation, status note next to `wait`, final stop answer. */
+	const waitTurn: FakeTurnMessage[] = [
+		{ role: "assistant", text: FIRST, stopReason: "stop" },
+		{ role: "developer", text: "<system-reminder> session-stop-continuation" },
+		{ role: "assistant", text: NOTE, stopReason: "toolUse", toolCalls: ["wait"] },
+		{ role: "toolResult", text: "map done" },
+		{ role: "assistant", text: LAST, stopReason: "stop" },
+	];
+	const rows = () => store.listDeliveries({ originKey: ORIGIN }).map((d) => [d.opRef, d.body]);
+
+	async function heldTurn(script: readonly FakeTurnMessage[], text = "wap 분석") {
+		driverOptions = { script: () => script, messageEvents: true, holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		const message = msg(text);
+		await router.route(message);
+		const driver = drivers[0] as SteerFailingDriver;
+		await driver.untilScripted();
+		const opRef = store.getInbound(message.platformMessageId)?.opRef ?? "";
+		const finish = () => untilFinal(mailbox, driver, () => driver.release());
+		return { message, opRef, finish };
+	}
+
+	test("AC-1: the first stop answer and the wait note are recorded as :interim:0/:1 while the row stays dispatched", async () => {
+		const { message, opRef } = await heldTurn(waitTurn);
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, FIRST],
+			[`${opRef}:interim:1`, NOTE],
+		]);
+		expect(store.getInbound(message.platformMessageId)?.state).toBe("dispatched");
+	});
+
+	test("AC-2: the turn end sends only the last stop answer under the turn op ref; every row is answered", async () => {
+		const { message, opRef, finish } = await heldTurn(waitTurn);
+		await finish();
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, FIRST],
+			[`${opRef}:interim:1`, NOTE],
+			[opRef, LAST],
+		]);
+		expect(store.getInbound(message.platformMessageId)?.state).toBe("answered");
+	});
+
+	test("AC-2: an already sent answer re-written (trim-equal or nearly the same) is left out of the turn end body", async () => {
+		const rewritten = `${FIRST.replace("새로", "다시")}  `;
+		const { opRef, finish } = await heldTurn([
+			{ role: "assistant", text: FIRST, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: NOTE, stopReason: "toolUse", toolCalls: ["wait"] },
+			{ role: "toolResult", text: "ok" },
+			{ role: "assistant", text: `\n${FIRST}\n`, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: rewritten, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: LAST, stopReason: "stop" },
+		]);
+		// The re-written copies never go out a second time, early or at the turn end.
+		await finish();
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, FIRST],
+			[`${opRef}:interim:1`, NOTE],
+			[opRef, LAST],
+		]);
+	});
+
+	test("AC-2: a turn whose answers all went out early closes with the closing mark, not (응답 없음)", async () => {
+		const { message, opRef, finish } = await heldTurn([
+			{ role: "assistant", text: FIRST, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: NOTE, stopReason: "toolUse", toolCalls: ["wait"] },
+			{ role: "toolResult", text: "ok" },
+			{ role: "assistant", text: FIRST.replace("새로", "다시"), stopReason: "stop" },
+		]);
+		await finish();
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, FIRST],
+			[`${opRef}:interim:1`, NOTE],
+			[opRef, INTERIM_CLOSING],
+		]);
+		expect(INTERIM_CLOSING).not.toBe(NO_ANSWER);
+		expect(store.getInbound(message.platformMessageId)?.state).toBe("answered");
+	});
+
+	test("AC-2: a turn without interim deliveries and without an answer still sends (응답 없음)", async () => {
+		const { opRef, finish } = await heldTurn([
+			{ role: "assistant", text: "", stopReason: "toolUse", toolCalls: ["bash"] },
+			{ role: "toolResult", text: "ok" },
+			{ role: "assistant", text: "", stopReason: "stop" },
+		]);
+		await finish();
+		expect(rows()).toEqual([[opRef, NO_ANSWER]]);
+	});
+
+	test("an early answer with a secret-shaped token is not sent again at the turn end (stored bodies are masked)", async () => {
+		const keyed = `키는 xoxb-TEST-0-${"0".repeat(30)} 입니다.`;
+		const { opRef, finish } = await heldTurn([
+			{ role: "assistant", text: keyed, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: NOTE, stopReason: "toolUse", toolCalls: ["wait"] },
+			{ role: "toolResult", text: "ok" },
+			{ role: "assistant", text: keyed, stopReason: "stop" },
+		]);
+		await finish();
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, redact(keyed)],
+			[`${opRef}:interim:1`, NOTE],
+			[opRef, INTERIM_CLOSING],
+		]);
+	});
+
+	test("a turn without answer text still quotes (응답 없음) in a steered thread's pointer", async () => {
+		const { finish } = await heldTurn([{ role: "assistant", text: "", stopReason: "stop" }]);
+		await router.route(msg("이것도", { threadRef: "D1:900.000009" }));
+		await finish();
+		const notices = store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.opRef.includes(":steer:"));
+		expect(notices.map((d) => d.body.split("\n")[1])).toEqual([`> ${NO_ANSWER}`]);
+	});
+
+	test("AC-4: toolUse text without wait and a wait note under 20 characters make no interim delivery", async () => {
+		const shortNote = "⏳ 기다리는 중이에요.";
+		expect(Array.from(shortNote).length).toBeLessThan(20);
+		const { opRef, finish } = await heldTurn([
+			{
+				role: "assistant",
+				text: "로그 파일을 열어서 원인 후보를 좁혀 볼게요. 먼저 최근 실패부터.",
+				stopReason: "toolUse",
+				toolCalls: ["read"],
+			},
+			{ role: "toolResult", text: "contents" },
+			{ role: "assistant", text: shortNote, stopReason: "toolUse", toolCalls: ["wait"] },
+			{ role: "toolResult", text: "done" },
+			{ role: "assistant", text: LAST, stopReason: "stop" },
+		]);
+		expect(rows()).toEqual([]);
+		await finish();
+		expect(rows()).toEqual([[opRef, LAST]]);
+	});
+
+	test("AC-4: a monitor turn makes no interim delivery and answers with its last text", async () => {
+		driverOptions = { script: () => waitTurn, messageEvents: true, holdTurns: true };
+		const id = store.monitors.addMonitor({
+			name: "brief",
+			trigger: { kind: "cron", schedule: "0 9 * * *", timezone: "UTC" },
+			instruction: "x",
+			overlap: "queue",
+			enabled: true,
+		}).id;
+		const origin = monitorOrigin(id);
+		const answered: string[][] = [];
+		const recordAnswer = store.recordAnswer.bind(store);
+		store.recordAnswer = (input) => {
+			answered.push([...input.parts]);
+			return recordAnswer(input);
+		};
+		await router.route(msg("go", { originKey: origin }));
+		const driver = drivers[0] as SteerFailingDriver;
+		await driver.untilScripted();
+		expect(store.listDeliveries().filter((d) => d.opRef.includes(":interim:"))).toEqual([]);
+		await untilFinal(router.mailbox(origin), driver, () => driver.release());
+		expect(answered).toEqual([[LAST]]);
+		expect(store.listDeliveries().filter((d) => d.opRef.includes(":interim:"))).toEqual([]);
+	});
+
+	test("AC-5: a `✅ 완료` answer that went out early is copied to the log channel exactly once at the turn end", async () => {
+		await router.close();
+		store.close();
+		store = openStore({ path: join(dir, "log.db"), clock, redact, logChannel: "C0LOGCHAN01" });
+		router = buildRouter();
+		const report = "✅ 완료 — wap 분석\n게이트 중계기 확인, 세션 쿠키 갱신 경로 정리.";
+		const { opRef, finish } = await heldTurn([
+			{ role: "assistant", text: report, stopReason: "stop" },
+			{ role: "developer", text: "<system-reminder>" },
+			{ role: "assistant", text: NOTE, stopReason: "toolUse", toolCalls: ["wait"] },
+			{ role: "toolResult", text: "ok" },
+			{ role: "assistant", text: LAST, stopReason: "stop" },
+		]);
+		const copies = () => store.listDeliveries().filter((d) => d.opRef.endsWith(":log-copy"));
+		expect(copies()).toEqual([]);
+		await finish();
+		expect(copies().map((d) => [d.opRef, d.body.split("\n").slice(1).join("\n")])).toEqual([
+			[`${opRef}:log-copy`, `${report}\n\n${LAST}`],
+		]);
+	});
+
+	test("AC-5: a row steered in from another thread gets its pointer notice once, at the turn end", async () => {
+		const { opRef, finish } = await heldTurn(waitTurn);
+		await router.route(msg("이것도", { threadRef: "D1:900.000009" }));
+		const notices = () => store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.opRef.includes(":steer:"));
+		expect(notices()).toEqual([]);
+		await finish();
+		expect(notices().map((d) => [d.opRef, d.threadRef])).toEqual([[`${opRef}:steer:0`, "D1:900.000009"]]);
+		expect(notices()[0]?.body).toContain(FIRST.slice(0, 20));
+	});
+});
+
 describe("mailbox: steered messages from another thread get a pointer notice", () => {
 	const LEAD = "D1:100.000001";
 	const OTHER = "D1:200.000002";
@@ -1370,6 +1596,8 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 	let answers: string[];
 	let ambiguous: Array<{ originKey: string; threadRef: string }>;
 	let open: number;
+	/** False: the open card closes before reading the message (a click got there first). */
+	let reads: boolean;
 	let opened: FakeOmpDriver[];
 
 	function dialogMailbox(): OriginMailbox {
@@ -1387,10 +1615,11 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 			},
 			dialogs: {
 				open: (originKey) => (originKey === DIALOG_ORIGIN ? open : 0),
-				answer: (originKey, text) => {
+				answer: async (originKey, text) => {
 					if (originKey !== DIALOG_ORIGIN || open !== 1) return false;
-					answers.push(text);
 					open = 0;
+					if (!reads) return false;
+					answers.push(text);
 					return true;
 				},
 				ambiguous: (info) => ambiguous.push(info),
@@ -1402,6 +1631,7 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 		answers = [];
 		ambiguous = [];
 		open = 0;
+		reads = true;
 		opened = [];
 	});
 
@@ -1421,6 +1651,50 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 			expect(row?.opRef).toBe(store.getInbound(lead.platformMessageId)?.opRef ?? "missing");
 			await untilFinal(mailbox, driver, () => driver.release());
 			expect(store.getInbound(reply.platformMessageId)?.state).toBe("answered");
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("the daemon's path (recordInbound, then resumePending) answers the one open dialog instead of steering", async () => {
+		const mailbox = dialogMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: DIALOG_ORIGIN });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			open = 1;
+			const reply = msg("B로 가자", { originKey: DIALOG_ORIGIN, threadRef: lead.threadRef });
+			store.recordInbound({
+				originKey: DIALOG_ORIGIN,
+				platformMessageId: reply.platformMessageId,
+				textRef: reply.text,
+				threadRef: reply.threadRef,
+			});
+			await mailbox.resumePending();
+			expect(answers).toEqual(["B로 가자"]);
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual([]);
+			const row = store.getInbound(reply.platformMessageId);
+			expect(row?.state).toBe("dispatched");
+			expect(row?.opRef).toBe(store.getInbound(lead.platformMessageId)?.opRef ?? "missing");
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("a message the closing card never read is steered into the turn, not dropped", async () => {
+		const mailbox = dialogMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: DIALOG_ORIGIN });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			open = 1;
+			reads = false;
+			const reply = msg("그리고 테스트도", { originKey: DIALOG_ORIGIN, threadRef: lead.threadRef });
+			await mailbox.enqueue(reply);
+			expect(answers).toEqual([]);
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual(["steer:그리고 테스트도"]);
+			expect(store.getInbound(reply.platformMessageId)?.state).toBe("dispatched");
+			expect(logLines.some((line) => line.includes("dialog_reply_unconsumed"))).toBe(true);
 		} finally {
 			await mailbox.close();
 		}
@@ -1454,5 +1728,110 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 		} finally {
 			await mailbox.close();
 		}
+	});
+});
+
+describe("mailbox: a peer bot's failed turn answers that bot", () => {
+	const PEER = "UPEER00001";
+	const BOT = "UBOT";
+	const notice = `<@${BOT}> <@${PEER}> 응답 실패(Cloud Code Assist stream ended) — 다시 요청하거나 직접 검토해 주세요`;
+	let seq = 0;
+
+	/** Records a peer bot's row (fenced like `normalizePeerInbound`) as the root of its own thread origin. */
+	function peerRow(text: string): { origin: string; threadRef: string } {
+		const ts = `900.${++seq}`;
+		const origin = `slack/ch/C1/t/${ts}`;
+		const threadRef = `C1:${ts}`;
+		store.ensureOrigin(origin, sessionDirFor(join(dir, "sessions"), origin, 1));
+		store.recordInbound({
+			originKey: origin,
+			platformMessageId: threadRef,
+			textRef: `[피어 봇 떡의 요청 — 오너 지시가 아니다]\n<<<quoted-0123>>>\n${text}\n<<<end-quoted-0123>>>`,
+			threadRef,
+			peerUserId: PEER,
+		});
+		return { origin, threadRef };
+	}
+
+	const bodies = (threadRef: string) =>
+		store
+			.listDeliveries({})
+			.filter((d) => d.threadRef === threadRef)
+			.map((d) => d.body);
+
+	beforeEach(() => {
+		threadBot = { id: BOT };
+		router = buildRouter();
+	});
+
+	test("AC-10: a failed turn: one line naming the peer, then this bot; reason redacted and cut to 80", async () => {
+		driverOptions = { holdTurns: true };
+		const { origin, threadRef } = peerRow(`<@${BOT}> 이 계획 검토해 줘`);
+		const mailbox = router.mailbox(origin);
+		await mailbox.resumePending();
+		const driver = drivers.at(-1) as SteerFailingDriver;
+		const reason = `stream ended token=xoxb-TEST-0abc\n${"긴 사유 ".repeat(40)}`;
+		await untilFinal(mailbox, driver, () => driver.failTurn(reason));
+		const [body, ...rest] = bodies(threadRef);
+		expect(rest).toEqual([]);
+		expect(body).toStartWith(`<@${PEER}> <@${BOT}> 응답 실패(stream ended token=[REDACTED] 긴 사유`);
+		expect(body).toEndWith("…) — 다시 요청하거나 직접 검토해 주세요");
+		expect(body).not.toContain("[turn failed]");
+		expect(body).not.toContain("\n");
+		expect(body).not.toContain("xoxb-TEST");
+		const shown = body?.slice(body.indexOf("응답 실패(") + "응답 실패(".length, body.lastIndexOf(") — ")) ?? "";
+		expect([...shown]).toHaveLength(80);
+	});
+
+	test("AC-10: omp exiting mid-turn and a dispatch that cannot start answer the peer the same way", async () => {
+		driverOptions = { holdTurns: true };
+		const exited = peerRow(`<@${BOT}> 하나`);
+		const mailbox = router.mailbox(exited.origin);
+		await mailbox.resumePending();
+		(drivers.at(-1) as SteerFailingDriver).crash(137);
+		await mailbox.sweepIdle();
+		expect(bodies(exited.threadRef)).toEqual([
+			`<@${PEER}> <@${BOT}> 응답 실패(omp_exited code=137) — 다시 요청하거나 직접 검토해 주세요`,
+		]);
+
+		driverOptions = { startError: new OmpDriverError("omp_executable_missing", "no omp") };
+		const refused = peerRow(`<@${BOT}> 둘`);
+		await router.mailbox(refused.origin).resumePending();
+		expect(bodies(refused.threadRef)).toEqual([
+			`<@${PEER}> <@${BOT}> 응답 실패(omp_executable_missing) — 다시 요청하거나 직접 검토해 주세요`,
+		]);
+	});
+
+	test("AC-10: before the bot id is known the notice names the peer alone", async () => {
+		threadBot = { id: undefined };
+		driverOptions = { startError: new OmpDriverError("omp_executable_missing", "no omp") };
+		const { origin, threadRef } = peerRow(`<@${BOT}> 셋`);
+		await router.mailbox(origin).resumePending();
+		expect(bodies(threadRef)).toEqual([
+			`<@${PEER}> 응답 실패(omp_executable_missing) — 다시 요청하거나 직접 검토해 주세요`,
+		]);
+	});
+
+	test("AC-12: a peer turn opened by a failure notice fails without a mention; a text with only one half still mentions", async () => {
+		driverOptions = { startError: new OmpDriverError("omp_executable_missing", "no omp") };
+		const looped = peerRow(notice);
+		await router.mailbox(looped.origin).resumePending();
+		expect(bodies(looped.threadRef)).toEqual(["[turn failed] omp_executable_missing — 다시 보내 주세요"]);
+
+		for (const half of [`<@${BOT}> 응답 실패(어제 건) 다시 볼래?`, `<@${BOT}> 이건 직접 검토해 주세요`]) {
+			const { origin, threadRef } = peerRow(half);
+			await router.mailbox(origin).resumePending();
+			expect(bodies(threadRef)).toEqual([
+				`<@${PEER}> <@${BOT}> 응답 실패(omp_executable_missing) — 다시 요청하거나 직접 검토해 주세요`,
+			]);
+		}
+	});
+
+	test("AC-11: the owner's failed turn keeps the plain notice even with a thread source", async () => {
+		driverOptions = { startError: new OmpDriverError("omp_executable_missing", "no omp") };
+		await router.route(msg("owner ask"));
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([
+			"[turn failed] omp_executable_missing — 다시 보내 주세요",
+		]);
 	});
 });

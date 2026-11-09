@@ -34,14 +34,15 @@ import {
 } from "../src/core/types";
 import { Daemon, GATE_RESOLVE_CLOSED_SWEEPS } from "../src/daemon/daemon";
 import { runDoctor } from "../src/daemon/doctor";
+import { SWEEP_HEARTBEAT_FILE } from "../src/daemon/heartbeat";
 import { renderStatusText } from "../src/daemon/status";
-import type { ProcessRunner } from "../src/dispatch/omp";
+import { herdrSshArgv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { MONITOR_SCHEMA } from "../src/monitors/ledger";
 import { OmpDriverError, type OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { STAMP_FILE } from "../src/ops/backup";
-import { collectGates, INBOUND_STARVATION_MS, TURNS_FAILING_WINDOW_MS } from "../src/ops/gates";
+import { collectGates, INBOUND_STARVATION_MS, SWEEP_STALLED_MS, TURNS_FAILING_WINDOW_MS } from "../src/ops/gates";
 import { gcSessions } from "../src/ops/gc";
 import { LOG_FILES, LOG_MAX_BYTES, LogDirError, openLogSink, rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
@@ -658,6 +659,12 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		expect(toolActivityText("mcp", { payload: { nested: true } })).toBe("mcp"); // non-scalar args are not shown
 		expect(toolActivityText("bash", "git push --force")).toBe("bash git push --force");
 		expect(toolActivityText("bash", undefined)).toBe("bash");
+		// omp's intent (or an `i` left in the args) names the call better than a heredoc's first characters.
+		expect(toolActivityText("bash", { command: "cat > /tmp/a.js <<'EOF'" }, "Reading  Slack\nthread")).toBe(
+			"bash · Reading Slack thread",
+		);
+		expect(toolActivityText("read", { path: "a.ts", i: "Reading config" })).toBe("read · Reading config");
+		expect(toolActivityText("bash", { command: "git status" }, "  ")).toBe("bash command=git status");
 	});
 });
 
@@ -1148,6 +1155,44 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		expect(transport.posts((text) => text.includes("게이트 turns_failing 회복"))).toHaveLength(0);
 	});
 
+	test("an unknown gate (nothing to judge) keeps its previous state: no notice, no resolve, recovery only on a real close", async () => {
+		await startDaemon({ gateSweepMs: 5_000 });
+		writeBackupStamp(home.dir);
+		await daemon.sweep(); // first observation: sweep_stalled and slack_disconnected closed
+		const heartbeat = join(home.dir, SWEEP_HEARTBEAT_FILE);
+		const notices = (gate: string) => transport.posts((text) => text.includes(`[자가진단] 게이트 ${gate}`));
+
+		// (a) closed -> unknown: the stamp is gone, so both heartbeat gates cannot be judged; nothing is said.
+		rmSync(heartbeat);
+		// (d) unknown is not an open gate for status.
+		expect(daemon.status().openGates.map((gate) => gate.name)).not.toContain("sweep_stalled");
+		await sweepOnce();
+		expect(notices("sweep_stalled")).toHaveLength(0);
+		expect(notices("slack_disconnected")).toHaveLength(0);
+
+		// sweep_stalled opens: the stamp written by the last sweep is older than three sweeps.
+		clock.advance(SWEEP_STALLED_MS + 6_000);
+		const opened = transport.waitForPosts((text) => text.includes("게이트 sweep_stalled 열림"));
+		await daemon.sweep();
+		await opened;
+		expect(gateIncidentStatus("sweep_stalled")).toBe("alerted");
+
+		// (b) open -> unknown for longer than the resolve run: no "회복", the alerted row stays.
+		for (let sweep = 0; sweep < GATE_RESOLVE_CLOSED_SWEEPS + 1; sweep++) {
+			rmSync(heartbeat);
+			await sweepOnce();
+		}
+		expect(transport.posts((text) => text.includes("게이트 sweep_stalled 회복"))).toHaveLength(0);
+		expect(gateIncidentStatus("sweep_stalled")).toBe("alerted");
+
+		// (c) a real close (fresh stamp from the last sweep) reports the recovery once.
+		const recovered = transport.waitForPosts((text) => text.includes("게이트 sweep_stalled 회복"));
+		await sweepOnce();
+		await recovered;
+		expect(transport.posts((text) => text.includes("게이트 sweep_stalled 회복"))).toHaveLength(1);
+		expect(notices("slack_disconnected")).toHaveLength(0);
+	});
+
 	test("gateSweepMs=0 disables gate reporting entirely: an open gate never DMs, status still lists it", async () => {
 		await startDaemon({ gateSweepMs: 0 }); // no backup stamp -> backup_age is open from boot
 		await daemon.sweep();
@@ -1220,6 +1265,12 @@ describe("ompbot doctor claude agent checks", () => {
 		expect(lines[1]).toContain("fail claude auth:");
 		expect(lines[1]).toContain(join(dir, ".claude", ".credentials.json"));
 	});
+
+	test("agent claude never spawns omp: no omp runtime line (its ompExecutable here is a standalone binary)", async () => {
+		const lines: string[] = [];
+		await runDoctor(dir, (line) => lines.push(line));
+		expect(lines.filter((line) => line.includes("omp runtime"))).toEqual([]);
+	});
 });
 
 describe("ompbot doctor omp runtime check", () => {
@@ -1263,6 +1314,25 @@ describe("ompbot doctor omp runtime check", () => {
 		expect(await runtimeLine(launcher(">=999.0.0"))).toStartWith("fail omp runtime: bun_too_old ");
 		const ok = launcher(`>=${Bun.version}`);
 		expect(await runtimeLine(ok)).toBe(`ok omp runtime: launcher=${realpathSync(ok)}`);
+	});
+
+	test("an ompExecutable that is a directory is a failed line, and the rest of the report still runs", async () => {
+		const folder = mkdtempSync(join(dir, "omp-dir-"));
+		writeFileSync(
+			join(dir, "config.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				ownerSlackUserId: "UOWNER0",
+				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				ompExecutable: folder,
+				workspaceDir: "workspace",
+			}),
+			{ mode: 0o600 },
+		);
+		const lines: string[] = [];
+		await runDoctor(dir, (line) => lines.push(line));
+		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(`fail omp runtime: ${folder} unreadable (`);
+		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
 	});
 });
 
@@ -1325,12 +1395,18 @@ describe("ompbot doctor dispatch hosts", () => {
 		write("ok config: stub");
 		return 0;
 	};
+	/** `herdr integration status`, local (`<bin> integration status`) or over ssh (quoted remote words). */
+	const isIntegrationStatus = (cmd: string[]) =>
+		(cmd[1] === "integration" && cmd[2] === "status") || cmd.slice(-2).join(" ") === "'integration' 'status'";
+	const INTEGRATION_CURRENT =
+		"codex: not installed (/home/u/.codex/hooks.json)\nomp: current (v10) (/home/u/.omp/agent/extensions/herdr-omp-agent-state.ts)\n";
 
 	test("herdr on: the local herdr --version line comes first; a missing herdr fails the exit code", async () => {
 		setHerdr({ bin: "/opt/herdr/bin/herdr" });
 		const calls: string[][] = [];
 		const ok: ProcessRunner = async (cmd) => {
 			calls.push(cmd);
+			if (isIntegrationStatus(cmd)) return { code: 0, stdout: INTEGRATION_CURRENT, stderr: "", timedOut: false };
 			return { code: 0, stdout: cmd[0] === "/opt/herdr/bin/herdr" ? "herdr 0.9.1\n" : "", stderr: "", timedOut: false };
 		};
 		const lines: string[] = [];
@@ -1338,8 +1414,11 @@ describe("ompbot doctor dispatch hosts", () => {
 		expect(lines).toEqual([
 			"ok config: stub",
 			"ok herdr: /opt/herdr/bin/herdr herdr 0.9.1",
+			"ok herdr omp integration: omp: current (v10)",
 			"ok dispatch host wsl: ssh wsl",
+			"ok herdr omp integration on wsl: omp: current (v10)",
 			"ok dispatch host oci: ssh host2",
+			"ok herdr omp integration on oci: omp: current (v10)",
 		]);
 		expect(calls[0]).toEqual(["/opt/herdr/bin/herdr", "--version"]);
 
@@ -1366,10 +1445,73 @@ describe("ompbot doctor dispatch hosts", () => {
 		expect(calls).toEqual([]);
 	});
 
+	test("herdr omp integration: current is ok; not installed or a failing command is a warning that keeps the exit code", async () => {
+		setHerdr({ bin: "/opt/herdr/bin/herdr" });
+		const path = join(home.dir, "config.json");
+		const withHerdrBin = JSON.parse(readFileSync(path, "utf8"));
+		writeFileSync(
+			path,
+			JSON.stringify({ ...withHerdrBin, dispatchHosts: { wsl: { ssh: "wsl", herdrBin: "/home/u/.local/bin/herdr" } } }),
+			{ mode: 0o600 },
+		);
+		const lineOf = async (integration: RunProcessResult, doctorCode: number) => {
+			const calls: string[][] = [];
+			const run: ProcessRunner = async (cmd) => {
+				calls.push(cmd);
+				if (isIntegrationStatus(cmd)) return integration;
+				return { code: 0, stdout: "herdr 0.9.5\n", stderr: "", timedOut: false };
+			};
+			const lines: string[] = [];
+			const code = await doctorCommand(home.dir, (line) => lines.push(line), {
+				doctor: async (_home, write) => {
+					write("ok config: stub");
+					return doctorCode;
+				},
+				run,
+			});
+			return { code, lines, calls };
+		};
+		const notInstalled: RunProcessResult = {
+			code: 0,
+			stdout: "omp: not installed (/home/u/.omp/agent/extensions/herdr-omp-agent-state.ts)\n",
+			stderr: "",
+			timedOut: false,
+		};
+		const broken: RunProcessResult = {
+			code: 2,
+			stdout: "",
+			stderr: "error: unrecognized subcommand 'integration'\n",
+			timedOut: false,
+		};
+		for (const doctorCode of [0, 1]) {
+			const missing = await lineOf(notInstalled, doctorCode);
+			expect(missing.code).toBe(doctorCode);
+			expect(missing.lines[2]).toBe(
+				"fail herdr omp integration: omp: not installed — herdr integration install omp (warning only)",
+			);
+			expect(missing.lines[4]).toBe(
+				"fail herdr omp integration on wsl: omp: not installed — herdr integration install omp (warning only)",
+			);
+			const failing = await lineOf(broken, doctorCode);
+			expect(failing.code).toBe(doctorCode);
+			expect(failing.lines[2]).toBe(
+				"fail herdr omp integration: integration status failed: error: unrecognized subcommand 'integration' — herdr integration install omp (warning only)",
+			);
+			const current = await lineOf({ code: 0, stdout: INTEGRATION_CURRENT, stderr: "", timedOut: false }, doctorCode);
+			expect(current.code).toBe(doctorCode);
+			expect(current.lines[2]).toBe("ok herdr omp integration: omp: current (v10)");
+			expect(current.calls).toContainEqual(["/opt/herdr/bin/herdr", "integration", "status"]);
+			expect(current.calls).toContainEqual(herdrSshArgv("wsl", "/home/u/.local/bin/herdr", ["integration", "status"]));
+		}
+	});
+
 	test("one ok/fail line per dispatch host through the injected runner; a down host never changes the exit code", async () => {
 		const calls: string[][] = [];
 		const run: ProcessRunner = async (cmd) => {
 			calls.push(cmd);
+			if (isIntegrationStatus(cmd) && !cmd.includes("wsl")) {
+				return { code: 0, stdout: INTEGRATION_CURRENT, stderr: "", timedOut: false };
+			}
 			if (cmd[0] === "herdr") return { code: 0, stdout: "herdr 0.9.1\n", stderr: "", timedOut: false };
 			return cmd.includes("wsl")
 				? { code: 255, stdout: "", stderr: "ssh: connect to host x port 2222: Connection refused\n", timedOut: false }
@@ -1388,11 +1530,14 @@ describe("ompbot doctor dispatch hosts", () => {
 			expect(lines).toEqual([
 				"ok config: stub",
 				"ok herdr: herdr herdr 0.9.1",
+				"ok herdr omp integration: omp: current (v10)",
 				"fail dispatch host wsl: ssh: connect to host x port 2222: Connection refused (warning only)",
+				"fail herdr omp integration on wsl: integration status failed: ssh: connect to host x port 2222: Connection refused — herdr integration install omp (warning only)",
 				"ok dispatch host oci: ssh host2",
+				"ok herdr omp integration on oci: omp: current (v10)",
 			]);
 		}
-		expect(calls[1]).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", "wsl", "true"]);
+		expect(calls[2]).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", "wsl", "true"]);
 	});
 });
 

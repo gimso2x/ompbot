@@ -224,8 +224,8 @@ function headBytes(text: string): { head: string; truncated: boolean } {
 }
 
 /**
- * Scans a brief line by line; see `doc/plans/handoff-risk-scan.md` for the rules and `doc/plans/review-fixes-202611.md`
- * for the clause-scoped downgrade.
+ * Scans the first `HANDOFF_SCAN_BYTES` of a brief line by line for the high-risk patterns above; a hit whose own
+ * clause forbids the command (`commandContext`) is downgraded to advisory.
  */
 export function scanHandoffBrief(brief: string, options: { protectedBranches?: readonly string[] } = {}): HandoffScan {
 	const branches = options.protectedBranches ?? DEFAULT_PROTECTED_BRANCHES;

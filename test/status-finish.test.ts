@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
-import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -22,6 +22,11 @@ class SettlingTransport extends WaitingTransport {
 		this.#notify();
 	}
 
+	override async deleteMessage(args: { channel: string; ts: string }): Promise<void> {
+		await super.deleteMessage(args);
+		this.#notify();
+	}
+
 	override async addReaction(args: { channel: string; timestamp: string; name: string }): Promise<void> {
 		await super.addReaction(args);
 		this.#notify();
@@ -32,16 +37,21 @@ class SettlingTransport extends WaitingTransport {
 		this.#notify();
 	}
 
-	/** Status messages (`⏳` posts) whose last text is still `⏳`. */
+	/** Status messages (`⏳` posts) neither deleted nor relabelled: their last text is still `⏳`. */
 	stuckStatuses(): string[] {
 		const stuck: string[] = [];
 		for (const call of this.calls) {
 			if (call.method !== "postMessage" || !call.text.startsWith("⏳")) continue;
+			if (this.deleted().includes(call.ts)) continue;
 			const updates = this.calls.filter((c) => c.method === "updateMessage" && c.ts === call.ts);
 			const last = updates.at(-1);
 			if (last?.method !== "updateMessage" || last.text.startsWith("⏳")) stuck.push(call.ts);
 		}
 		return stuck;
+	}
+
+	deleted(): string[] {
+		return this.calls.flatMap((c) => (c.method === "deleteMessage" ? [c.ts] : []));
 	}
 
 	/** Messages that still carry our 👀. */
@@ -97,19 +107,26 @@ afterEach(async () => {
 	home.remove();
 });
 
-async function boot(transport: SettlingTransport, holdTurns: boolean): Promise<Daemon> {
+async function boot(
+	transport: SettlingTransport,
+	holdTurns: boolean,
+	extra: Pick<FakeOmpDriverOptions, "script" | "messageEvents"> & { sweepMs?: number } = {},
+): Promise<Daemon> {
+	const { sweepMs, ...driverExtra } = extra;
 	const d = new Daemon({
 		config: home.config,
 		slack: new SlackChannel(transport),
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
+		...(sweepMs === undefined ? {} : { sweepMs }),
 		driverFactory: (_origin, sessionDir) => {
 			const driver = new SteerSignalDriver({
 				sessionDir,
 				store: sessions,
 				holdTurns,
 				respond: (prompt, steers) => `ANSWER ${[prompt, ...steers].join("+")}`,
+				...driverExtra,
 			});
 			drivers.push(driver);
 			return driver;
@@ -133,9 +150,12 @@ describe("status messages are finished for every row of a turn and for commands"
 		await driver.steered.promise;
 		driver.release();
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
-		await transport.settled(() => transport.calls.filter((c) => c.method === "updateMessage").length >= 2);
+		await transport.settled(() => transport.deleted().length >= 1);
+		// The lead thread holds the answer, so its status goes away; the steered thread's status ends as ✅.
+		const [lead, steered] = transport.posts((t) => t.startsWith("⏳")).map((c) => c.ts);
+		expect(transport.deleted()).toEqual([lead ?? ""]);
 		const finals = transport.calls.filter((c) => c.method === "updateMessage" && c.text.startsWith("✅"));
-		expect(finals).toHaveLength(2);
+		expect(finals.map((c) => (c.method === "updateMessage" ? c.ts : ""))).toEqual([steered ?? ""]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 		// Exactly one answer even though two threads were finished.
@@ -184,11 +204,51 @@ describe("status messages are finished for every row of a turn and for commands"
 		if (!driver) throw new Error("driver not created");
 		driver.release();
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
-		await transport.settled(() => transport.calls.filter((c) => c.method === "updateMessage").length >= 2);
+		await transport.settled(() => transport.deleted().length >= 1);
 		expect(transport.calls.some((c) => c.method === "updateMessage" && c.text.startsWith("🚫 취소됨"))).toBe(true);
 		// The cancelled followup never reaches omp; the running turn answers normally.
 		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job"]);
 		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => c.text)).toEqual(["ANSWER long job"]);
+		expect(transport.stuckStatuses()).toEqual([]);
+		expect(transport.eyesLeft()).toEqual([]);
+	});
+});
+
+describe("interim deliveries go out while the turn runs", () => {
+	test("an interim record wakes the delivery pump; the ⏳ status stays until the turn-end delivery", async () => {
+		const transport = new SettlingTransport();
+		// No periodic sweep within the test: only the nudge after recording can post the interim texts.
+		const d = await boot(transport, true, {
+			sweepMs: 3_600_000,
+			messageEvents: true,
+			script: () => [
+				{ role: "assistant", text: "EARLY 분석 답", stopReason: "stop" },
+				{ role: "developer", text: "<system-reminder>" },
+				{
+					role: "assistant",
+					text: "NOTE 지도 생성 중, 브라우저는 절반만 됩니다.",
+					stopReason: "toolUse",
+					toolCalls: ["wait"],
+				},
+				{ role: "toolResult", text: "ok" },
+				{ role: "assistant", text: "ANSWER 지도 완료", stopReason: "stop" },
+			],
+		});
+		await d.inject({ origin: ORIGIN, asOwner: true, text: "wap 분석" });
+		await transport.waitForPosts((t) => t.startsWith("NOTE"));
+		expect(transport.posts((t) => t.startsWith("EARLY") || t.startsWith("NOTE")).map((c) => c.text)).toEqual([
+			"EARLY 분석 답",
+			"NOTE 지도 생성 중, 브라우저는 절반만 됩니다.",
+		]);
+		// The turn still runs: its ⏳ message is neither deleted nor relabelled, and no answer went out yet.
+		expect(transport.stuckStatuses()).toHaveLength(1);
+		expect(transport.posts((t) => t.startsWith("ANSWER"))).toEqual([]);
+		const driver = drivers[0];
+		if (!driver) throw new Error("driver not created");
+		driver.release();
+		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
+		await transport.settled(() => transport.deleted().length >= 1);
+		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => c.text)).toEqual(["ANSWER 지도 완료"]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});

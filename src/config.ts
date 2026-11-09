@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { TASK_RISKS, type TaskRisk } from "./tasks/docs";
 
 export type ConfigErrorCode =
 	| "home_missing"
@@ -70,6 +71,16 @@ export interface OmpbotConfig {
 	/** Slack channel IDs where owner messages are answered without a mention (solo channels). */
 	mentionFreeChannels?: string[];
 	/**
+	 * Other bots in the workspace whose channel messages that mention this bot are accepted as peer requests: no
+	 * owner authority, no delegation or monitor tools. `userId` is the peer's Slack user id, `name` how its requests
+	 * are labelled in the prompt. Default none (every bot message is dropped).
+	 */
+	peerBots?: Array<{ userId: string; name: string }>;
+	/** In a channel answer only when this bot is mentioned (mentionFreeChannels and thread participation no longer count). Default false. */
+	requireMention?: boolean;
+	/** Peer input cap per thread: more than `turns` peer messages within `windowMinutes` are dropped. Default 3 per 30. */
+	peerHopLimit?: { turns: number; windowMinutes: number };
+	/**
 	 * herdr switch: present (`{}`) → `ompbot_dispatch` offers herdr/taskSpec and the [TASK] sweep runs; absent → simple
 	 * dispatch only. `bin` is the absolute path of the local herdr (default: `herdr` on PATH).
 	 */
@@ -82,6 +93,13 @@ export interface OmpbotConfig {
 	 * Needs `herdr`.
 	 */
 	herdrBoard?: { url: string; api?: string };
+	/**
+	 * [TASK] auto-merge: a local task (never a `dispatchHosts` one) whose repository shares its git common directory
+	 * with one of `repos` (absolute, trailing slash dropped), whose risk is at most `maxRisk` (default L2), and whose
+	 * outcome stands on at least one passing re-run check without warnings gets "머지해" from the bot instead of a
+	 * question. Unset → every reached task waits for the owner. Needs `herdr`.
+	 */
+	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk };
 	/** Slack channel id that receives approval cards (owner mention, link back to the asking thread). Default: the asking conversation. */
 	escalationChannel?: string;
 	/** Slack channel id of the #log ledger: completion reports are copied there and nothing said there becomes a turn. */
@@ -158,6 +176,7 @@ function optionalString(
 }
 
 const CHANNEL_ID = /^[CG][A-Z0-9]{8,}$/;
+const SLACK_USER_ID = /^U[A-Z0-9]{8,}$/;
 
 /** An optional integer no smaller than `min`. */
 function optionalInt(configPath: string, obj: Record<string, unknown>, key: string, min: number): number | undefined {
@@ -265,6 +284,38 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		invalid(configPath, "mentionFreeChannels");
 	}
 
+	const peerBotsRaw = root.peerBots;
+	if (peerBotsRaw !== undefined) {
+		if (!Array.isArray(peerBotsRaw)) invalid(configPath, "peerBots");
+		peerBotsRaw.forEach((entry, i) => {
+			const record = asRecord(entry);
+			if (record === undefined || typeof record.userId !== "string" || !SLACK_USER_ID.test(record.userId)) {
+				invalid(configPath, `peerBots.${i}.userId`);
+			}
+			// The owner is never a peer: a peer message carries no owner authority, so listing the owner would only shadow it.
+			if (record.userId === root.ownerSlackUserId) invalid(configPath, `peerBots.${i}.userId`);
+			if (typeof record.name !== "string" || record.name.length < 1 || record.name.length > 32) {
+				invalid(configPath, `peerBots.${i}.name`);
+			}
+			for (const key of Object.keys(record))
+				if (key !== "userId" && key !== "name") invalid(configPath, `peerBots.${i}.${key}`);
+		});
+	}
+	const requireMention = root.requireMention;
+	if (requireMention !== undefined && typeof requireMention !== "boolean") invalid(configPath, "requireMention");
+	const peerHopLimit = root.peerHopLimit;
+	if (peerHopLimit !== undefined) {
+		const record = asRecord(peerHopLimit);
+		if (record === undefined) invalid(configPath, "peerHopLimit");
+		for (const key of ["turns", "windowMinutes"]) {
+			const value = record[key];
+			if (!Number.isSafeInteger(value) || (value as number) < 1) invalid(configPath, `peerHopLimit.${key}`);
+		}
+		for (const key of Object.keys(record)) {
+			if (key !== "turns" && key !== "windowMinutes") invalid(configPath, `peerHopLimit.${key}`);
+		}
+	}
+
 	const dispatchHosts = root.dispatchHosts;
 	if (dispatchHosts !== undefined) {
 		const hosts = asRecord(dispatchHosts);
@@ -318,6 +369,28 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		}
 	}
 
+	let taskAutoLand: OmpbotConfig["taskAutoLand"];
+	if (root.taskAutoLand !== undefined) {
+		const record = asRecord(root.taskAutoLand);
+		if (record === undefined) invalid(configPath, "taskAutoLand");
+		const repos = record.repos;
+		if (!Array.isArray(repos) || repos.length === 0) invalid(configPath, "taskAutoLand.repos");
+		repos.forEach((repo, i) => {
+			if (typeof repo !== "string" || !isAbsolute(repo)) invalid(configPath, `taskAutoLand.repos.${i}`);
+		});
+		const maxRisk = record.maxRisk;
+		if (maxRisk !== undefined && !(TASK_RISKS as readonly unknown[]).includes(maxRisk)) {
+			invalid(configPath, "taskAutoLand.maxRisk");
+		}
+		for (const key of Object.keys(record)) {
+			if (key !== "repos" && key !== "maxRisk") invalid(configPath, `taskAutoLand.${key}`);
+		}
+		taskAutoLand = {
+			repos: (repos as string[]).map((repo) => repo.replace(/(?<=.)\/+$/, "")),
+			...(maxRisk === undefined ? {} : { maxRisk: maxRisk as TaskRisk }),
+		};
+	}
+
 	const herdrRaw = root.herdr;
 	let herdr: OmpbotConfig["herdr"];
 	if (herdrRaw !== undefined) {
@@ -326,8 +399,8 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		const bin = optionalString(configPath, record, "bin", "herdr.bin");
 		if (bin !== undefined && !isAbsolute(bin)) invalid(configPath, "herdr.bin");
 		herdr = bin === undefined ? {} : { bin };
-	} else if (dispatchHosts !== undefined || herdrBoard !== undefined) {
-		// Both are herdr features: without the switch they would be silently dead, so refuse the file instead.
+	} else if (dispatchHosts !== undefined || herdrBoard !== undefined || taskAutoLand !== undefined) {
+		// All three are herdr features: without the switch they would be silently dead, so refuse the file instead.
 		invalid(configPath, "herdr");
 	}
 
@@ -410,6 +483,14 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (idleTimeoutMinutes !== undefined) config.idleTimeoutMinutes = idleTimeoutMinutes;
 	if (skillReviewTurns !== undefined) config.skillReviewTurns = skillReviewTurns;
 	if (mentionFreeChannels !== undefined) config.mentionFreeChannels = mentionFreeChannels as string[];
+	if (peerBotsRaw !== undefined) {
+		config.peerBots = (peerBotsRaw as Array<{ userId: string; name: string }>).map(({ userId, name }) => ({
+			userId,
+			name,
+		}));
+	}
+	if (requireMention !== undefined) config.requireMention = requireMention;
+	if (peerHopLimit !== undefined) config.peerHopLimit = peerHopLimit as { turns: number; windowMinutes: number };
 	if (escalationChannel !== undefined) config.escalationChannel = escalationChannel;
 	if (logChannel !== undefined) config.logChannel = logChannel;
 	if (restartNotice !== undefined) config.restartNotice = restartNotice;
@@ -423,6 +504,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	}
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
+	if (taskAutoLand !== undefined) config.taskAutoLand = taskAutoLand;
 
 	if (options.checkTokens !== false) readSlackTokens(config); // fail at startup on permissions/prefix; values are discarded here
 	return config;

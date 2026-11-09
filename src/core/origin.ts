@@ -2,6 +2,7 @@ import { join } from "node:path";
 import type { Logger } from "../log";
 import { redact } from "../redact";
 import { openStore, type Store } from "../store/db";
+import type { LiveView } from "./live-turn";
 import { type DriverFactory, type MailboxDeps, OriginMailbox } from "./mailbox";
 import { isThreadOrigin } from "./normalize";
 import { chatOriginKey } from "./origin-key";
@@ -32,8 +33,12 @@ export interface OriginRouterDeps {
 	statusProvider: StatusProvider;
 	/** Passed to every mailbox: the `/usage-ompbot` answer; see `MailboxDeps`. */
 	usageProvider?: MailboxDeps["usageProvider"];
+	/** Passed to every mailbox: the `!distill` answer; see `MailboxDeps`. */
+	distillProvider?: MailboxDeps["distillProvider"];
 	/** Passed to every mailbox: whether a turn prompt may carry channel-scoped recall; see `MailboxDeps`. */
 	recallEnabled?: MailboxDeps["recallEnabled"];
+	/** Passed to every mailbox: Slack thread reader for turn context; see `MailboxDeps.threadSource`. */
+	threadSource?: MailboxDeps["threadSource"];
 	log: Logger;
 	sessionsRoot: string;
 	/** Config default model (`provider/id`); fallback when a restored session's model no longer exists. */
@@ -122,6 +127,11 @@ export class OriginRouter {
 	/** Alerts origins whose running turn has gone silent; returns how many alerted now. */
 	sweepStalls(): number {
 		return [...this.#mailboxes.values()].filter((mailbox) => mailbox.checkStall()).length;
+	}
+
+	/** What the origin's running turn is writing now; null for an origin with no mailbox (never creates one). */
+	liveView(originKey: string): LiveView | null {
+		return this.#mailboxes.get(originKey)?.liveView() ?? null;
 	}
 
 	/** Origins with a running turn. */

@@ -3,12 +3,16 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
-export const UNITS_USAGE = `  units render [--out <dir>] [--dry-run]
+export const UNITS_USAGE = `  units render [--out <dir>] [--dry-run] [--instance <name>]
                                  fill packaging/*.service|*.timer with this bun, this checkout and HOME (plus
                                  OMPBOT_HOME when set) and write them to --out (default ~/.config/systemd/user);
                                  --dry-run prints '# <file>' + content instead; an existing file with other content is
-                                 never overwritten (exit 2, nothing written); never runs systemctl
+                                 never overwritten (exit 2, nothing written); never runs systemctl;
+                                 --instance <name> (^[a-z][a-z0-9-]{0,23}$, needs OMPBOT_HOME) renders a second install
+                                 as ompbot-<name>[-backup|-gc].service|timer, without the dashboard unit
 `;
+
+const INSTANCE_NAME = /^[a-z][a-z0-9-]{0,23}$/;
 
 /** The checkout this file belongs to: src/cli/units.ts → repo root. */
 const REPO_DIR = resolve(import.meta.dir, "..", "..");
@@ -50,12 +54,32 @@ function renderUnit(name: string, template: string, values: UnitValues): string 
 	return text;
 }
 
-/** Every unit template under packaging/, rendered, in file-name order. */
-function renderUnits(values: UnitValues): RenderedUnit[] {
+/** `ompbot.service` → `ompbot-<instance>.service`, `ompbot-gc.timer` → `ompbot-<instance>-gc.timer`. */
+const instanceUnitName = (name: string, instance: string): string =>
+	name.replace(/^ompbot(?=[-.])/, `ompbot-${instance}`);
+
+/**
+ * Every unit template under packaging/, rendered, in file-name order. With `instance` the units are renamed
+ * (file names, the `After=`/`Description=` references) and the dashboard unit is left out.
+ */
+function renderUnits(values: UnitValues, instance?: string): RenderedUnit[] {
 	return readdirSync(PACKAGING_DIR)
 		.filter((name) => name.endsWith(".service") || name.endsWith(".timer"))
+		.filter((name) => instance === undefined || name !== "ompbot-dashboard.service")
 		.sort()
-		.map((name) => ({ name, text: renderUnit(name, readFileSync(join(PACKAGING_DIR, name), "utf8"), values) }));
+		.map((name) => {
+			const text = renderUnit(name, readFileSync(join(PACKAGING_DIR, name), "utf8"), values);
+			if (instance === undefined) return { name, text };
+			return {
+				name: instanceUnitName(name, instance),
+				text: text
+					.replace(/^Description=ompbot(?=[ :])/m, `Description=ompbot-${instance}`)
+					.replace(
+						/^(After=|Unit=)(ompbot-\S+)$/gm,
+						(_m, key: string, unit: string) => `${key}${instanceUnitName(unit, instance)}`,
+					),
+			};
+		});
 }
 
 function usage(message: string): number {
@@ -67,19 +91,31 @@ function usage(message: string): number {
 export function unitsCommand(args: string[], env: Record<string, string | undefined>): number {
 	const [sub, ...rest] = args;
 	if (sub !== "render") return usage(sub === undefined ? "missing subcommand" : `unknown subcommand ${sub}`);
-	let values: { out?: string; "dry-run"?: boolean };
+	let values: { out?: string; "dry-run"?: boolean; instance?: string };
 	try {
-		({ values } = parseArgs({ args: rest, options: { out: { type: "string" }, "dry-run": { type: "boolean" } } }));
+		({ values } = parseArgs({
+			args: rest,
+			options: { out: { type: "string" }, "dry-run": { type: "boolean" }, instance: { type: "string" } },
+		}));
 	} catch (error) {
 		return usage(error instanceof Error ? error.message : String(error));
 	}
+	const instance = values.instance;
+	if (instance !== undefined) {
+		if (!INSTANCE_NAME.test(instance)) return usage(`--instance must match ${INSTANCE_NAME.source}`);
+		if (env.OMPBOT_HOME === undefined)
+			return usage("--instance needs OMPBOT_HOME (a second install needs its own home)");
+	}
 	const home = homedir();
-	const units = renderUnits({
-		bun: process.execPath,
-		repoDir: REPO_DIR,
-		home,
-		...(env.OMPBOT_HOME === undefined ? {} : { ompbotHome: resolve(env.OMPBOT_HOME) }),
-	});
+	const units = renderUnits(
+		{
+			bun: process.execPath,
+			repoDir: REPO_DIR,
+			home,
+			...(env.OMPBOT_HOME === undefined ? {} : { ompbotHome: resolve(env.OMPBOT_HOME) }),
+		},
+		instance,
+	);
 	if (values["dry-run"] === true) {
 		for (const unit of units) process.stdout.write(`# ${unit.name}\n${unit.text}`);
 		return 0;
@@ -104,12 +140,13 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 		if (unit.state === "new") writeFileSync(unit.path, unit.text, { mode: 0o644 });
 		process.stdout.write(`units ${unit.state === "new" ? "written" : "unchanged"} file=${unit.path}\n`);
 	}
+	const base = instance === undefined ? "ompbot" : `ompbot-${instance}`;
 	process.stdout.write(
 		[
 			"next (not run by ompbot):",
 			"  systemctl --user daemon-reload",
-			"  systemctl --user enable --now ompbot",
-			"  systemctl --user enable --now ompbot-backup.timer ompbot-gc.timer",
+			`  systemctl --user enable --now ${base}`,
+			`  systemctl --user enable --now ${base}-backup.timer ${base}-gc.timer`,
 			"",
 		].join("\n"),
 	);

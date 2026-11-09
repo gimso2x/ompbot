@@ -49,10 +49,17 @@ async function runTaskChecks(
 	return { head: head.sha, results };
 }
 
+/** The task branch's diff for the integrity classifier; a failed read defers the classification, never passes it. */
+async function readBranchDiff(row: TaskRow, ops: TaskHostOps): Promise<{ diff: string } | { error: string }> {
+	const read = await ops.branchDiff({ worktree: row.worktree, branch: row.branch, taskId: row.taskId });
+	return read.ok ? { diff: read.value } : { error: read.error };
+}
+
 /**
  * Reads spec.md, PROGRESS.md and outcome.md from the task's host and judges them. Any read that cannot be answered
  * (host down, timeout) is a failed evaluation — never a verdict; a file that is simply absent is judged as absent.
- * `checks` (the sweep's cache) turns on the `[check: …]` runs; other readers (CLI, dashboard) judge the documents only.
+ * `checks` (the sweep's cache) turns on the `[check: …]` runs and the branch-diff integrity read; other readers (CLI,
+ * dashboard) judge the documents only.
  */
 export async function evaluateTask(row: TaskRow, ops: TaskHostOps, checks?: TaskCheckCache): Promise<TaskEvaluation> {
 	const dir = docsDirOf(row.worktree, row.taskId);
@@ -71,7 +78,12 @@ export async function evaluateTask(row: TaskRow, ops: TaskHostOps, checks?: Task
 			outcome: text(outcome),
 			commitCheck: (hash) =>
 				ops.commitOnTaskBranch({ worktree: row.worktree, branch: row.branch, taskId: row.taskId, hash }),
-			...(checks === undefined ? {} : { runChecks: (requests) => runTaskChecks(row, ops, checks, requests) }),
+			...(checks === undefined
+				? {}
+				: {
+						runChecks: (requests) => runTaskChecks(row, ops, checks, requests),
+						integrity: () => readBranchDiff(row, ops),
+					}),
 		});
 		return { ok: true, judgement };
 	} catch (error) {

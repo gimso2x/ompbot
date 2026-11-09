@@ -1,4 +1,4 @@
-// Channel root isolation (doc/plans/root-thread-isolation.md): every new channel root is its own origin
+// Channel root isolation: every new channel root is its own origin
 // `slack/ch/<C>/t/<rootTs>` — its own omp session and mailbox — so a second root never steers into the first root's
 // running turn and answers, taskSpec threads and approval rows stay on their own root thread. Waits are on log lines,
 // posts and finals (bounded), never fixed sleeps.

@@ -216,6 +216,11 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 				type: "object",
 				properties: {
 					summary: { type: "string", description: "What you are about to do and why, in one or two lines" },
+					external: {
+						type: "string",
+						description:
+							"Where it is published outside the owner's own systems and who can see it (public GitHub issue/PR/comment, email, another workspace, a web post), one line; omit when nothing leaves",
+					},
 					action: { type: "string", description: "The exact action (command or file paths), one line" },
 					why: { type: "string", description: "Why this action is needed now, one line" },
 					impact: { type: "string", description: "What changes or breaks when it runs, one line" },
@@ -230,6 +235,7 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 				if (summary === undefined) throw new Error("summary is required");
 				// Empty sections are omitted by the card renderer, so a summary-only call renders exactly as before.
 				const detail: ApprovalDetail = {
+					external: stringParam(params, "external"),
 					action: stringParam(params, "action"),
 					why: stringParam(params, "why"),
 					impact: stringParam(params, "impact"),

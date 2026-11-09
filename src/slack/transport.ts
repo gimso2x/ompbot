@@ -33,6 +33,16 @@ export interface SlackMessageEvent {
 	files?: ReadonlyArray<SlackInboundFile> | undefined;
 }
 
+/** `reaction_added` / `reaction_removed` (Events API); the adapter reads only reactions on messages. */
+export interface SlackReactionEvent {
+	type: "reaction_added" | "reaction_removed";
+	user?: string | undefined;
+	/** Emoji name without colons; a skin tone rides as `::skin-tone-N`. */
+	reaction: string;
+	item: { type: string; channel?: string | undefined; ts?: string | undefined };
+	event_ts: string;
+}
+
 export interface SlackSlashPayload {
 	command: string;
 	user_id: string;
@@ -54,6 +64,7 @@ export interface SlashAck {
 
 export interface SlackHandlers {
 	message(event: SlackMessageEvent): Promise<void>;
+	reaction(event: SlackReactionEvent): Promise<void>;
 	/** `undefined` acks with no message: the command's answer arrives as a post of its own. */
 	slash(payload: SlackSlashPayload): Promise<SlashAck | undefined>;
 	blockAction(payload: SlackBlockActionPayload): Promise<void>;
@@ -107,6 +118,8 @@ export interface SlackTransport {
 		text: string;
 		blocks?: readonly unknown[] | undefined;
 	}): Promise<void>;
+	/** `chat.delete` of one of the bot's own messages (the ⏳ status message once the answer is in). */
+	deleteMessage(args: { channel: string; ts: string }): Promise<void>;
 	postEphemeral(args: { channel: string; user: string; text: string; threadTs?: string | undefined }): Promise<void>;
 	/** `chat.getPermalink`: the URL of one message (a thread root links to its thread). */
 	getPermalink(args: { channel: string; ts: string }): Promise<string>;

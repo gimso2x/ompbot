@@ -1,3 +1,4 @@
+import { dirname } from "node:path";
 import type { ChannelPort } from "../channel/port";
 import { parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
 import type { BoardLinkResolver } from "../dispatch/board";
@@ -9,6 +10,7 @@ import {
 	herdrStartAgent,
 	type ProcessRunner,
 } from "../dispatch/omp";
+import { type DiskView, diskHeadroom, diskLow } from "../ops/host-resources";
 import { summarizeJudgement } from "./checker";
 import {
 	acceptanceItems,
@@ -23,7 +25,7 @@ import {
 import { evaluateTask } from "./evaluate";
 import { resolveTaskHost, type TaskHostOps } from "./host";
 import type { TaskLedger, TaskRow } from "./ledger";
-import { formatAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
+import { buildAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
 import { buildTaskPrompt } from "./prompt";
 
 type HostEntry = { ssh: string; workDir?: string; herdrBin?: string };
@@ -42,6 +44,8 @@ export interface TaskDispatchDeps {
 	run?: ProcessRunner;
 	/** Test seam: host ops override. */
 	hostOps?: (host: string | null) => TaskHostOps;
+	/** Test seam: free space of the filesystem holding a path (default `statfsSync`); local starts only. */
+	diskHeadroom?: (path: string) => DiskView;
 	/** herdr board card link of a started agent (`config.herdrBoard`); absent → the card carries no link. */
 	boardLink?: BoardLinkResolver;
 	log: TaskSlackLog & { info(event: string, fields?: Record<string, unknown>): void };
@@ -120,6 +124,15 @@ export async function startTask(
 		throw new Error("taskSpec은 [TASK] 요청이 온 Slack 스레드 안에서만 쓸 수 있습니다(현재 스레드를 알 수 없음)");
 	}
 	hostEntryOf(deps, host); // unknown host fails before anything is reserved
+	if (host === null) {
+		// A worktree, a docs commit and an agent on a nearly full disk fail half-way; refuse before reserving anything.
+		const disk = (deps.diskHeadroom ?? diskHeadroom)(dirname(spec.repo));
+		if (diskLow(disk)) {
+			const gib = ((disk.freeBytes ?? 0) / 1024 ** 3).toFixed(1);
+			deps.log.warn("task_start_refused_disk", { repo: spec.repo, path: disk.path, freeBytes: disk.freeBytes });
+			return `시작 거부: 디스크 여유 부족 (${disk.path} free_gib=${gib}, 기준 5GiB·10%)`;
+		}
+	}
 	const ops = opsFor(deps, host);
 
 	const row = deps.ledger.register({
@@ -189,7 +202,7 @@ export async function startTask(
 
 	deps.log.info("task_started", { task: row.taskId, host: row.host, agent: row.agent });
 	const link = await cardLink(deps, row, paneId);
-	const posted = await postToThread(deps.port, deps.log, threadRef, formatAcceptedCard(row, spec, link));
+	const posted = await postToThread(deps.port, deps.log, threadRef, buildAcceptedCard(row, spec, link));
 	await setStatusReaction(deps.port, deps.log, threadRef, "working", []);
 	const where = `${row.host ?? "local"}:${row.worktree}`;
 	return [
@@ -229,8 +242,11 @@ export async function resumeTask(
 	let link: string | undefined;
 	if (alive.exists) {
 		const sent = await herdrPromptExisting(row.agent, prompt, options);
-		if (!sent.ok) return `재개 실패: ${sent.error ?? "unknown"}`;
-		how = "살아 있는 에이전트에 재개 프롬프트를 보냈습니다";
+		// Unconfirmed: herdr took the text but saw no start; the resume goes on (the sweep watches what follows).
+		if (!sent.ok && sent.unconfirmed !== true) return `재개 실패: ${sent.error ?? "unknown"}`;
+		how = sent.ok
+			? "살아 있는 에이전트에 재개 프롬프트를 보냈습니다"
+			: "살아 있는 에이전트에 재개 프롬프트를 보냈습니다(시작 확인 안 됨)";
 	} else {
 		const present = await opsFor(deps, row.host).pathExists(row.worktree);
 		if (!present.ok) return `재개 실패: ${present.error}`;
@@ -245,7 +261,10 @@ export async function resumeTask(
 		await setStatusReaction(deps.port, deps.log, row.threadRef, "working");
 	}
 	// A resumed task gets a fresh staleness baseline: the agent has not had a chance to update PROGRESS.md yet.
-	deps.ledger.setProgressAt(row.taskId, deps.now());
+	const now = deps.now();
+	deps.ledger.setProgressAt(row.taskId, now);
+	// ... and a fresh nudge count (the sweep counts unmet nudges since the latest mark).
+	deps.ledger.recordNotice(row.taskId, `resume:${now}`);
 	deps.log.info("task_resumed", { task: row.taskId, alive: alive.exists });
 	return `${row.taskId}: ${how} (${row.status} → working).${link === undefined ? "" : ` 진행 보기: ${link}.`} 진행 확인: ompbot_dispatch ${row.host === null ? '{mode:"herdr"' : `{host:"${row.host}"`}, name:"${row.agent}"}`;
 }

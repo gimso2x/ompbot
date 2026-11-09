@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { createLogger } from "../src/log";
 import { normalizeIncidentError } from "../src/monitors/incidents";
 import { type ClaimResult, MONITOR_INCIDENT_REPEAT_MS } from "../src/monitors/ledger";
-import { isWakeGateOff, MonitorScheduler } from "../src/monitors/scheduler";
-import { runScript } from "../src/monitors/script";
+import { MonitorScheduler } from "../src/monitors/scheduler";
+import { isWakeGateOff, runScript } from "../src/monitors/script";
 import { type MonitorSpec, parseMonitorSpec } from "../src/monitors/spec";
 import { redact } from "../src/redact";
 import {
@@ -22,6 +22,7 @@ import {
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { openStore, type Store } from "../src/store/db";
+import { hasButtons } from "./helpers/bot-home";
 
 const OWNER = "UOWNER";
 const T0 = Date.UTC(2026, 5, 1, 0, 0, 0);
@@ -539,7 +540,7 @@ class CardTransport extends FakeSlackTransport {
 		blocks?: readonly unknown[] | undefined;
 	}): Promise<void> {
 		await super.updateMessage(args);
-		if (args.blocks !== undefined && args.blocks.length > 0) this.shown.resolve({ ts: args.ts });
+		if (hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts });
 		else this.finalized.resolve({ text: args.text });
 	}
 }
@@ -801,6 +802,7 @@ describe("ApprovalBroker races", () => {
 			},
 			decideApproval: () => false,
 			getApproval: () => undefined,
+			setApprovalMirrorRef: () => false,
 			replyApproval: () => false,
 			expirePendingApprovals: () => [],
 		};
@@ -817,6 +819,7 @@ describe("ApprovalBroker races", () => {
 				throw new Error("database is locked");
 			},
 			getApproval: (id) => real.getApproval(id),
+			setApprovalMirrorRef: (id, mirrorRef) => real.setApprovalMirrorRef(id, mirrorRef),
 			replyApproval: (id, ts, text, now) => real.replyApproval(id, ts, text, now),
 			expirePendingApprovals: (now, due) => real.expirePendingApprovals(now, due),
 		};

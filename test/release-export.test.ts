@@ -200,6 +200,32 @@ describe.skipIf(mod === undefined || gitleaks === undefined)("release export", (
 		expect(git(pub, "log", "-1", "--format=%B")).toBe("release: v1.2.4");
 	});
 
+	test("a version tag that disagrees with the manifest refuses before the install check; matching tags and branches pass", async () => {
+		const dev = makeDevRepo();
+		commitFiles(dev, { "package.json": '{ "name": "demo", "version": "0.1.0" }\n' }, "manifest 0.1.0");
+		git(dev, "tag", "v9.9.9");
+		const pub = makePublic();
+		const before = snapshot(pub);
+		const run = await runExport(dev, pub, { ref: "v9.9.9" });
+		expect(run.code).toBe(1);
+		expect(run.out).toContain("tag v9.9.9 != version 0.1.0");
+		expect(snapshot(pub)).toEqual(before);
+		expect(run.installCalls).toBe(0);
+
+		git(dev, "tag", "v0.1.0");
+		const tagged = await runExport(dev, pub, { ref: "v0.1.0" });
+		expect(tagged.code).toBe(0);
+		expect(git(pub, "log", "-1", "--format=%B")).toBe("release: v0.1.0");
+
+		// A commit expression on a tag is not the tag itself, so it is not checked.
+		expect((await runExport(dev, pub, { ref: "v9.9.9~0" })).code).toBe(0);
+
+		// Only tags are checked: a branch named like a version exports with the manifest's version, as before.
+		git(dev, "branch", "v8.8.8");
+		expect((await runExport(dev, pub, { ref: "v8.8.8" })).code).toBe(0);
+		expect(git(pub, "log", "-1", "--format=%B")).toBe("release: v0.1.0");
+	});
+
 	test("a dirty public checkout or a failing install check refuses without touching it", async () => {
 		const dev = makeDevRepo();
 		const pub = makePublic();

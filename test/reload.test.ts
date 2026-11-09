@@ -115,6 +115,93 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	expect(daemon.store.getInbound(`${CHANNEL}:1000.000003`)).toBeDefined();
 });
 
+describe("peer bot policy reload", () => {
+	const PEER = "UPEER00001";
+	const peerMessage = (ts: string, threadTs?: string) => ({
+		type: "message" as const,
+		channel: CHANNEL,
+		channel_type: "channel",
+		user: PEER,
+		bot_id: "B0PEER0001",
+		text: "<@UBOT> 검토 부탁",
+		ts,
+		...(threadTs === undefined ? {} : { thread_ts: threadTs }),
+	});
+
+	test("peerBots, requireMention and peerHopLimit are live fields", () => {
+		const plan = planReload(
+			{ ...home.config },
+			{
+				...home.config,
+				peerBots: [{ userId: PEER, name: "떡" }],
+				requireMention: true,
+				peerHopLimit: { turns: 1, windowMinutes: 5 },
+			},
+		);
+		expect(plan.changed).toEqual(["peerBots", "requireMention", "peerHopLimit"]);
+		expect(plan.restartRequired).toEqual([]);
+		expect(plan.next.peerBots).toEqual([{ userId: PEER, name: "떡" }]);
+	});
+
+	test("a reload reaches the running adapter: peers, requireMention and the hop limit apply to the next message", async () => {
+		const transport = new WaitingTransport();
+		const clock = { now: () => Date.now() };
+		const sessions = new FakeSessionStore();
+		daemon = new Daemon({
+			config: { ...home.config, mentionFreeChannels: [CHANNEL] },
+			slack: new SlackChannel(transport),
+			clock,
+			log: createLogger({ sink: () => undefined, clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: "boot-reload-peer",
+			sweepMs: 3_600_000,
+			gateSweepMs: 0,
+			taskSweepMs: 0,
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		await daemon.start();
+		const owner = (ts: string) =>
+			transport.emitMessage({
+				type: "message",
+				channel: CHANNEL,
+				channel_type: "channel",
+				user: OWNER,
+				text: "hi",
+				ts,
+			});
+		const row = (ts: string) => daemon?.store.getInbound(`${CHANNEL}:${ts}`);
+
+		await transport.emitMessage(peerMessage("1000.000001"));
+		expect(row("1000.000001")).toBeUndefined(); // no peerBots yet: any bot message is dropped
+
+		// The file is the source of truth for every live field: the mention-free channel stays in each patch.
+		const solo = { mentionFreeChannels: [CHANNEL] };
+		patchConfig({ ...solo, peerBots: [{ userId: PEER, name: "떡" }], peerHopLimit: { turns: 1, windowMinutes: 30 } });
+		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["peerBots", "peerHopLimit"] });
+		await transport.emitMessage(peerMessage("1000.000002"));
+		expect(row("1000.000002")?.peerUserId).toBe(PEER);
+		await transport.emitMessage(peerMessage("1000.000003", "1000.000002"));
+		expect(row("1000.000003")).toBeUndefined(); // the reloaded limit (1 turn) caps the thread
+
+		patchConfig({
+			...solo,
+			peerBots: [{ userId: PEER, name: "떡" }],
+			peerHopLimit: { turns: 1, windowMinutes: 30 },
+			requireMention: true,
+		});
+		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["requireMention"] });
+		await owner("1000.000004"); // mention-free channel, but requireMention wins
+		expect(row("1000.000004")).toBeUndefined();
+
+		patchConfig({ ...solo, peerBots: undefined, peerHopLimit: undefined, requireMention: undefined });
+		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true });
+		await transport.emitMessage(peerMessage("1000.000005"));
+		expect(row("1000.000005")).toBeUndefined(); // peers removed again
+		await owner("1000.000006");
+		expect(row("1000.000006")).toBeDefined(); // requireMention removed again
+	});
+});
+
 test("reloading a config that turns herdr on answers restartRequired with herdr", async () => {
 	const clock = { now: () => Date.now() };
 	const sessions = new FakeSessionStore();

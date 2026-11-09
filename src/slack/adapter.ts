@@ -5,6 +5,7 @@ import type { TurnProgress } from "../core/mailbox";
 import {
 	isOwner,
 	normalizeInbound,
+	normalizePeerInbound,
 	parseThreadRef,
 	THREAD_LINK_PREFIX,
 	TOP_LEVEL_TS,
@@ -19,8 +20,19 @@ import {
 	type ThreadMuteCommand,
 } from "../core/types";
 import type { Logger } from "../log";
+import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { scanForInjection } from "../safety/injection";
-import { formatElapsed, renderParts, STALL_STATUS_TEXT } from "./format";
+import {
+	type CardFallback,
+	formatElapsed,
+	HEADER_LIMIT,
+	headerBlock,
+	type MentionNames,
+	plainHeaderText,
+	renderMarkdownParts,
+	renderParts,
+	STALL_STATUS_TEXT,
+} from "./format";
 import {
 	type SlackBlockActionPayload,
 	SlackCallError,
@@ -28,6 +40,7 @@ import {
 	type SlackInboundFile,
 	type SlackMessageEvent,
 	SlackRateLimitedError,
+	type SlackReactionEvent,
 	type SlackSlashPayload,
 	type SlackTransport,
 	type SlashAck,
@@ -36,6 +49,8 @@ import {
 export const STATUS_MIN_INTERVAL_MS = 15_000;
 /** Longest text of one progress line (a tool call, the current todo item) in the running status message. */
 const ACTIVITY_MAX = 60;
+/** Posted once in a thread whose peer-input cap was hit; mentions no bot. */
+export const PEER_HOP_NOTICE = "피어 대화 상한에 닿았습니다. 이어 가려면 오너가 말해 주세요.";
 export const DENIED_TEXT = "권한 없음: 이 봇은 오너만 사용할 수 있습니다.";
 /** Inbound attachment budget (hermes-agent parity: images get more room than documents). */
 export const MAX_INBOUND_FILES = 6;
@@ -91,8 +106,40 @@ export interface InboundMessage {
 	ownerVerified: true;
 }
 
-/** The adapter's whole view of the core. Only ever called for the verified owner. */
+/**
+ * What the core receives for an accepted peer bot message. Its own type, without `ownerVerified`: it can never be
+ * passed where an owner message is expected.
+ */
+export interface PeerInboundMessage {
+	platformMessageId: string;
+	originKey: string;
+	/** Header and fenced body (see `normalizePeerInbound`). */
+	text: string;
+	threadRef: string;
+	peer: { userId: string; name: string };
+}
+
+/** The core's verdict on a peer message: recorded (empty), a redelivery, or dropped (`notice`: post the cap notice now). */
+export interface PeerInboundOutcome {
+	duplicate?: true;
+	dropped?: "peer_in_lane_thread" | "peer_hop_cap";
+	notice?: boolean;
+}
+
+/** Default per-thread cap on peer input (`peerHopLimit` unset). */
+export const DEFAULT_PEER_HOP_LIMIT = { turns: 3, windowMinutes: 30 } as const;
+
+/** Peer bots the adapter accepts (config `peerBots`). */
+export type PeerBotList = ReadonlyArray<{ userId: string; name: string }>;
+
+/** The adapter's whole view of the core. Owner input arrives through `onInbound`, peer bot input through `onPeerInbound`. */
 export interface CoreSink {
+	/**
+	 * A peer bot's request. The core decides what the adapter cannot see: a duplicate, a work lane's thread
+	 * (`peer_in_lane_thread`) and the thread's hop cap (`peer_hop_cap`; `notice` is true exactly once per cap episode,
+	 * the adapter then posts the cap notice).
+	 */
+	onPeerInbound?(message: PeerInboundMessage, hop: { turns: number; windowMs: number }): PeerInboundOutcome;
 	/** `duplicate: true` (Slack redelivery of a message already recorded) suppresses the 👀 and the status message. */
 	onInbound(
 		message: InboundMessage,
@@ -154,6 +201,22 @@ export interface DeliveryItem {
 	 * entry is then left alone instead of getting the post-restart ✅ reaction. Default true.
 	 */
 	finishUntracked?: boolean | undefined;
+	/**
+	 * A text sent while its turn still runs (interim delivery): the thread's status message and progress keep going,
+	 * and the answer gets no elapsed-time footer. Default false.
+	 */
+	keepStatus?: boolean | undefined;
+	/** Messages of this answer a rate-limited earlier send already posted: the send resumes after them. */
+	sentParts?: number | undefined;
+	/** Top-level answer resumed after part 1: the ts parts 2+ reply under. */
+	replyTs?: string | null | undefined;
+}
+
+/** Where a rate-limited send stopped and when Slack takes `chat.postMessage` again. */
+export interface DeliveryRetry {
+	at: number;
+	sentParts: number;
+	replyTs?: string | undefined;
 }
 
 /** Implemented by the daemon on top of the store; the adapter never imports the mailbox or the store. */
@@ -162,7 +225,30 @@ export interface DeliverySource {
 	confirm(deliveryId: number): Promise<void> | void;
 	/** `definitive`: nothing was posted (backoff and retry). `ambiguous`: a message may exist (sticky, never auto-resent). */
 	fail(deliveryId: number, error: string, outcome: "definitive" | "ambiguous"): Promise<void> | void;
+	/** Rate limited (429 or still blocked): nothing more was posted; retry at `retry.at` without counting a failure. */
+	defer(deliveryId: number, error: string, retry: DeliveryRetry): Promise<void> | void;
+	/**
+	 * One Slack message a delivery posted (`part`: its 0-based index in the answer), so a reaction on it finds the turn.
+	 * A throw is logged (`delivery_post_record_failed`) and never stops the delivery. Absent: nothing is recorded.
+	 */
+	recordPost?(post: { channel: string; ts: string; deliveryId: number; part: number }): Promise<void> | void;
+	/** The owner added or removed 👍/👎 on a message; the source ignores messages no delivery posted. */
+	recordFeedback?(feedback: {
+		channel: string;
+		ts: string;
+		verdict: "up" | "down";
+		action: "added" | "removed";
+		eventTs: string;
+	}): Promise<void> | void;
 }
+
+/** 👍/👎 reaction names (a skin tone suffix `::skin-tone-N` dropped) → verdict; any other emoji is no feedback. */
+const FEEDBACK_REACTIONS = new Map<string, "up" | "down">([
+	["+1", "up"],
+	["thumbsup", "up"],
+	["-1", "down"],
+	["thumbsdown", "down"],
+]);
 
 export interface AdapterClock {
 	now(): number;
@@ -181,6 +267,12 @@ export interface SlackAdapterOptions {
 	mentionFreeChannels?: readonly string[];
 	/** The #log ledger channel: inbound there never becomes a turn, even with a mention. */
 	logChannel?: string;
+	/** Peer bots whose channel messages that mention this bot are accepted (config `peerBots`). Default none. */
+	peerBots?: PeerBotList;
+	/** In a channel only a mention addresses the bot (mentionFreeChannels and thread participation are ignored). */
+	requireMention?: boolean;
+	/** Peer input cap per thread. Default `DEFAULT_PEER_HOP_LIMIT`. */
+	peerHopLimit?: { turns: number; windowMinutes: number };
 	/**
 	 * Whether a thread root (`<channel>:<ts>`) is a registered [TASK]: its single status reaction belongs to the task
 	 * sweep, so a finished turn only removes its 👀 there and leaves no ✅/⚠️/❌ mark.
@@ -224,6 +316,8 @@ interface StatusEntry {
 	stalled: boolean;
 	/** The turn's progress summary (`setProgress`), shown under the first status line. */
 	progress: TurnProgress | undefined;
+	/** How the status message ends: `delete` once the answer carries its footer, `update` to the final label. */
+	finalAction: "delete" | "update";
 	statusDone: boolean;
 	reactionsDone: boolean;
 }
@@ -301,11 +395,20 @@ export class SlackAdapter {
 	private readonly mediaRoot: string | undefined;
 	private mentionFreeChannels: ReadonlySet<string>;
 	private logChannel: string | undefined;
+	private peerBots: PeerBotList;
+	private requireMention: boolean;
+	private peerHopLimit: { turns: number; windowMinutes: number };
 	private readonly statusIntervalMs: number;
 	private readonly isTaskRoot: ((threadRef: string) => boolean) | undefined;
 	private readonly onInboundFailure: (() => void) | undefined;
 	private readonly statuses = new Map<string, StatusEntry>();
 	private readonly blockedUntil = new Map<string, number>();
+	/** Slack refused a `markdown` block once: every later answer takes the plain mrkdwn path until the restart. */
+	#markdownBlocksOff = false;
+	/** Slack refused a card holding a chart once: every later card draws its charts as ASCII until the restart. */
+	#chartBlocksOff = false;
+	/** The path a delivery's first attempt chose, so a rate-limited resume counts `sentParts` in the same chunks. */
+	readonly #deliveryPaths = new Map<number, "markdown" | "plain">();
 	private ready: Promise<string> | undefined;
 	#botUserId: string | undefined;
 
@@ -319,20 +422,33 @@ export class SlackAdapter {
 		this.mediaRoot = options.mediaRoot;
 		this.mentionFreeChannels = new Set(options.mentionFreeChannels ?? []);
 		this.logChannel = options.logChannel;
+		this.peerBots = options.peerBots ?? [];
+		this.requireMention = options.requireMention === true;
+		this.peerHopLimit = options.peerHopLimit ?? DEFAULT_PEER_HOP_LIMIT;
 		this.statusIntervalMs = options.statusIntervalMs ?? STATUS_MIN_INTERVAL_MS;
 		this.isTaskRoot = options.isTaskRoot;
 		this.onInboundFailure = options.onInboundFailure;
 	}
 
 	/** Config reload: the next inbound event follows the new channel policy. */
-	setChannelPolicy(policy: { mentionFreeChannels?: readonly string[]; logChannel?: string }): void {
+	setChannelPolicy(policy: {
+		mentionFreeChannels?: readonly string[];
+		logChannel?: string;
+		peerBots?: PeerBotList;
+		requireMention?: boolean;
+		peerHopLimit?: { turns: number; windowMinutes: number };
+	}): void {
 		this.mentionFreeChannels = new Set(policy.mentionFreeChannels ?? []);
 		this.logChannel = policy.logChannel;
+		this.peerBots = policy.peerBots ?? [];
+		this.requireMention = policy.requireMention === true;
+		this.peerHopLimit = policy.peerHopLimit ?? DEFAULT_PEER_HOP_LIMIT;
 	}
 
 	async start(): Promise<void> {
 		const handlers: SlackHandlers = {
 			message: (event) => this.handleMessage(event),
+			reaction: (event) => this.handleReaction(event),
 			slash: (payload) => this.handleSlash(payload),
 			blockAction: (payload) => this.handleBlockAction(payload),
 		};
@@ -398,6 +514,12 @@ export class SlackAdapter {
 		if (botUserId === undefined) return "dropped";
 		const cardReply = await this.#processCardReply(event, botUserId);
 		if (cardReply !== undefined) return cardReply;
+		const peer = event.user === botUserId ? undefined : this.peerBots.find((p) => p.userId === event.user);
+		if (peer !== undefined) return this.#processPeerMessage(event, botUserId, peer, inChannel);
+		if (event.bot_id !== undefined && !isOwner(event.user, this.ownerUserId)) {
+			this.log.info("inbound_dropped", { reason: "bot_message", channel: event.channel, ts: event.ts });
+			return "dropped";
+		}
 		// A file message is un-subtyped (the subtype rejection must not drop it) only for file_share itself: an edit or
 		// delete event that merely carries `files` stays rejected.
 		const files = event.files ?? [];
@@ -421,9 +543,13 @@ export class SlackAdapter {
 			const muteRef = `${event.channel}:${event.thread_ts ?? event.ts}`;
 			const muted = this.core.isThreadMuted?.(muteRef) === true;
 			const command = parseThreadMuteCommand(text);
-			const audible =
-				mentionFree || mentioned || (threadRef !== undefined && this.core.knowsThread?.(threadRef) === true);
-			const addressed = audible && (mentioned || command !== undefined || !muted);
+			// `requireMention` makes the mention the only address; otherwise a mention-free channel or a known thread counts too.
+			const audible = this.requireMention
+				? mentioned
+				: mentionFree || mentioned || (threadRef !== undefined && this.core.knowsThread?.(threadRef) === true);
+			// A message that mentions a peer bot but not this bot is meant for the peer, whatever the channel policy says.
+			const forPeer = !mentioned && this.peerBots.some((p) => text.includes(`<@${p.userId}>`));
+			const addressed = audible && !forPeer && (mentioned || command !== undefined || !muted);
 			if (!addressed) {
 				this.log.info("inbound_dropped", {
 					reason: muted ? "thread_muted" : "not_addressed",
@@ -502,6 +628,74 @@ export class SlackAdapter {
 				inbound.originKey,
 				command === undefined || command.kind === "followup",
 			);
+		}
+		return "recorded";
+	}
+
+	/**
+	 * A message of an allowlisted peer bot: accepted only in a channel, un-subtyped and mentioning this bot. It never
+	 * takes an owner path — no mute handling, no attachment download, no card reply, no command parsing (the text goes
+	 * to the core fenced) — and is capped per thread by the core (`onPeerInbound`).
+	 */
+	async #processPeerMessage(
+		event: SlackMessageEvent,
+		botUserId: string,
+		peer: { userId: string; name: string },
+		inChannel: boolean,
+	): Promise<IngestOutcome> {
+		const drop = (reason: string): IngestOutcome => {
+			this.log.info("inbound_dropped", { reason, channel: event.channel, ts: event.ts, peer: peer.userId });
+			return "dropped";
+		};
+		if (!inChannel) return drop("peer_dm");
+		if (event.subtype !== undefined && event.subtype !== "") return drop("subtype");
+		const mention = `<@${botUserId}>`;
+		const raw = unescapeSlackText(event.text ?? "");
+		if (!raw.includes(mention)) return drop("peer_not_mentioned");
+		if (this.core.onPeerInbound === undefined) return drop("peer_unsupported");
+		// An owner-muted thread stays quiet for peers too, and a peer mention never releases the mute.
+		if (this.core.isThreadMuted?.(`${event.channel}:${event.thread_ts ?? event.ts}`) === true) {
+			return drop("thread_muted");
+		}
+		const quoted = (event.attachments ?? [])
+			.flatMap((a) => [a.pretext, a.text ?? a.fallback])
+			.filter((t): t is string => typeof t === "string" && t !== "")
+			.map(unescapeSlackText);
+		const result = normalizePeerInbound({
+			peer,
+			text: raw.split(mention).join(" ").trim(),
+			quoted,
+			channel: event.channel,
+			ts: event.ts,
+			threadTs: event.thread_ts,
+			subtype: event.subtype,
+		});
+		if (!result.accept) return drop(result.reason);
+		const { inbound } = result;
+		const outcome = this.core.onPeerInbound(inbound, {
+			turns: this.peerHopLimit.turns,
+			windowMs: this.peerHopLimit.windowMinutes * 60_000,
+		});
+		if (outcome.duplicate) {
+			this.log.info("inbound_duplicate", { id: inbound.platformMessageId });
+			return "duplicate";
+		}
+		if (outcome.dropped !== undefined) {
+			this.log.info("inbound_dropped", {
+				reason: outcome.dropped,
+				channel: event.channel,
+				ts: event.ts,
+				peer: peer.userId,
+			});
+			if (outcome.dropped === "peer_hop_cap" && outcome.notice === true) {
+				// No bot mention in the notice: it must not invite another peer reply.
+				await this.postNotice(event.channel, PEER_HOP_NOTICE, event.thread_ts ?? event.ts);
+			}
+			return "dropped";
+		}
+		const parsed = parseThreadRef(inbound.threadRef);
+		if (parsed) {
+			await this.beginStatus(inbound.threadRef, parsed.channel, parsed.threadTs, event, inbound.originKey, true);
 		}
 		return "recorded";
 	}
@@ -596,16 +790,55 @@ export class SlackAdapter {
 		}
 	}
 
-	/** Best-effort root message (missed-message notice), or a reply when `threadTs` is given; failures are logged, never thrown. */
+	/**
+	 * Best-effort root message (missed-message notice), or a reply when `threadTs` is given; failures are logged, never
+	 * thrown. A notice of two or more lines goes out as a card: its first line as the header, the rest as one section;
+	 * `text` stays the whole notice. Blocks Slack refuses (`invalid_blocks`) are dropped and the notice is sent once more.
+	 */
 	async postNotice(channel: string, text: string, threadTs?: string): Promise<void> {
-		try {
-			// Same rate-limit key as the delivery pump and the status/mute posts: one chat.postMessage 429 blocks them all.
-			await this.call("chat.postMessage", () =>
-				this.transport.postMessage({ channel, text, ...(threadTs === undefined ? {} : { threadTs }) }),
+		const blocks = this.#noticeBlocks(text);
+		// Same rate-limit key as the delivery pump and the status/mute posts: one chat.postMessage 429 blocks them all.
+		const send = (withBlocks: readonly unknown[] | undefined) =>
+			this.call("chat.postMessage", () =>
+				this.transport.postMessage({
+					channel,
+					text,
+					...(threadTs === undefined ? {} : { threadTs }),
+					...(withBlocks === undefined ? {} : { blocks: withBlocks }),
+				}),
 			);
+		try {
+			try {
+				await send(blocks);
+			} catch (err) {
+				const refused =
+					err instanceof SlackCallError &&
+					err.kind === "definitive" &&
+					/invalid_blocks|invalid_arguments/.test(errorText(err));
+				if (blocks === undefined || !refused) throw err;
+				this.log.warn("notice_blocks_rejected", { channel, error: errorText(err) });
+				await send(undefined);
+			}
 		} catch (err) {
 			this.log.warn("backfill_notice_failed", { channel, error: errorText(err) });
 		}
+	}
+
+	/** Header (first line, at most 150 chars, mrkdwn stripped) + section (the rest) for a notice of two or more lines. */
+	#noticeBlocks(text: string): readonly unknown[] | undefined {
+		const newline = text.indexOf("\n");
+		if (newline < 0) return undefined;
+		const first = text.slice(0, newline);
+		const rest = text.slice(newline + 1);
+		// A section's text holds 3,000 characters; a longer notice stays plain rather than be refused.
+		if (first.length > HEADER_LIMIT || rest.trim() === "" || rest.length > 3_000) return undefined;
+		const title = plainHeaderText(first, this.#mentionNames());
+		if (title === "") return undefined;
+		return [headerBlock(title), { type: "section", text: { type: "mrkdwn", text: rest } }];
+	}
+
+	#mentionNames(): MentionNames {
+		return { ownerUserId: this.ownerUserId, peerBots: this.peerBots };
 	}
 
 	/** Downloads inbound files (up to `MAX_INBOUND_FILES`) and returns the prompt note lines for them. */
@@ -687,6 +920,26 @@ export class SlackAdapter {
 			this.log.info("inbound_ack", { origin: originKey, ts: event.ts, ack_ms: ackMs });
 		} catch (err) {
 			this.log.warn("ack_failed", { origin: originKey, ts: event.ts, error: errorText(err) });
+		}
+	}
+
+	// ---- owner feedback reactions ----
+
+	/**
+	 * The owner's 👍/👎 added to or removed from a message goes to the delivery source, which binds it to the turn of the
+	 * answer that posted it. Anyone else's reaction, other emoji and non-message items are dropped without a log line.
+	 */
+	async handleReaction(event: SlackReactionEvent): Promise<void> {
+		if (!isOwner(event.user, this.ownerUserId)) return;
+		const { channel, ts } = event.item;
+		if (event.item.type !== "message" || channel === undefined || ts === undefined) return;
+		const verdict = FEEDBACK_REACTIONS.get(event.reaction.split("::")[0] ?? "");
+		if (verdict === undefined) return;
+		const action = event.type === "reaction_added" ? "added" : "removed";
+		try {
+			await this.deliveries.recordFeedback?.({ channel, ts, verdict, action, eventTs: event.event_ts });
+		} catch (err) {
+			this.log.warn("feedback_record_failed", { channel, ts, error: errorText(err) });
 		}
 	}
 
@@ -779,6 +1032,7 @@ export class SlackAdapter {
 			final: undefined,
 			stalled: false,
 			progress: undefined,
+			finalAction: "update",
 			statusDone: false,
 			reactionsDone: false,
 		};
@@ -858,8 +1112,11 @@ export class SlackAdapter {
 		}
 	}
 
-	/** Marks the turn finished: status becomes ✅/⚠️, 👀 is removed, ✅/⚠️ reaction added. Retried by tick() under a rate limit. */
-	async finishStatus(threadRef: string, outcome: FinalOutcome): Promise<void> {
+	/**
+	 * Marks the turn finished: the status message is deleted (`delete`: the answer carries the footer) or becomes
+	 * ✅/⚠️ (`update`), 👀 is removed, ✅/⚠️ reaction added. Retried by tick() under a rate limit.
+	 */
+	async finishStatus(threadRef: string, outcome: FinalOutcome, action: "delete" | "update" = "update"): Promise<void> {
 		let entry = this.statuses.get(threadRef);
 		if (!entry) {
 			const parsed = parseThreadRef(threadRef);
@@ -877,12 +1134,14 @@ export class SlackAdapter {
 				final: undefined,
 				stalled: false,
 				progress: undefined,
+				finalAction: "update",
 				statusDone: false,
 				reactionsDone: false,
 			};
 			this.statuses.set(threadRef, entry);
 		}
 		entry.final = outcome;
+		entry.finalAction = action;
 		await this.flushFinal(threadRef, entry);
 	}
 
@@ -893,7 +1152,20 @@ export class SlackAdapter {
 		if (!entry.statusDone) {
 			if (entry.statusTs === undefined) {
 				entry.statusDone = true;
-			} else {
+			} else if (entry.finalAction === "delete") {
+				const statusTs = entry.statusTs;
+				try {
+					await this.call("chat.delete", () => this.transport.deleteMessage({ channel: entry.channel, ts: statusTs }));
+					entry.statusDone = true;
+				} catch (err) {
+					// Rate limited: tick() deletes again. Refused: the status stays and shows the final label instead.
+					if (!(err instanceof BlockedError || err instanceof SlackRateLimitedError)) {
+						this.log.warn("status_delete_failed", { thread: threadRef, error: errorText(err) });
+						entry.finalAction = "update";
+					}
+				}
+			}
+			if (!entry.statusDone && entry.statusTs !== undefined && entry.finalAction === "update") {
 				const statusTs = entry.statusTs;
 				const text = `${FINAL_MARKS[outcome].label} · ${formatElapsed(this.clock.now() - entry.startedAt)}`;
 				try {
@@ -943,14 +1215,37 @@ export class SlackAdapter {
 
 	// ---- deliveries ----
 
-	/** Claims due deliveries and posts them. Does nothing while chat.postMessage is rate limited. Returns how many were confirmed. */
+	/**
+	 * Claims due deliveries and posts them. Does nothing while chat.postMessage is rate limited; a 429 mid-batch sends
+	 * the rest of the batch back unsent to wait for the same block. Returns how many were confirmed.
+	 */
 	async pumpDeliveries(): Promise<number> {
 		if (this.isBlocked("chat.postMessage")) return 0;
 		let confirmed = 0;
 		for (const delivery of await this.deliveries.claimDue()) {
+			if (this.isBlocked("chat.postMessage")) {
+				await this.#deferDelivery(delivery, new BlockedError("chat.postMessage"), delivery.sentParts ?? 0);
+				continue;
+			}
 			if (await this.sendDelivery(delivery)) confirmed += 1;
 		}
 		return confirmed;
+	}
+
+	/** Back to pending until chat.postMessage's block ends; `sent` messages of it are already in Slack. */
+	async #deferDelivery(delivery: DeliveryItem, err: unknown, sent: number, replyTs?: string): Promise<void> {
+		const at = this.blockedUntil.get("chat.postMessage") ?? this.clock.now();
+		this.log.warn("delivery_deferred", {
+			id: delivery.deliveryId,
+			sent_parts: sent,
+			retry_in_ms: Math.max(0, at - this.clock.now()),
+			error: errorText(err),
+		});
+		await this.deliveries.defer(delivery.deliveryId, errorText(err), {
+			at,
+			sentParts: sent,
+			...(replyTs === undefined ? {} : { replyTs }),
+		});
 	}
 
 	/** Swaps each `{{thread-link:<channel>:<ts>}}` the ledger left (log copy, steered-thread pointer) for ` · [스레드 보기](<permalink>)`; none on failure. */
@@ -980,46 +1275,206 @@ export class SlackAdapter {
 			await this.deliveries.fail(delivery.deliveryId, `invalid thread_ref ${delivery.threadRef}`, "definitive");
 			return false;
 		}
-		const parts = renderParts(await this.#resolveThreadLinks(delivery.body), delivery.redelivered);
-		let sent = 0;
-		// A top-level answer is one message: parts 2+ reply under part 1 instead of becoming further top-level posts.
-		let threadTs = target.threadTs === TOP_LEVEL_TS ? undefined : target.threadTs;
-		try {
-			for (const text of parts) {
-				const posted = await this.call("chat.postMessage", () =>
-					this.transport.postMessage({
-						channel: target.channel,
-						text,
-						...(threadTs === undefined ? {} : { threadTs }),
-					}),
-				);
-				if (target.threadTs === TOP_LEVEL_TS) threadTs ??= posted.ts;
-				sent += 1;
-			}
-		} catch (err) {
-			const definitive =
-				sent === 0 &&
-				(err instanceof BlockedError ||
-					err instanceof SlackRateLimitedError ||
-					(err instanceof SlackCallError && err.kind === "definitive"));
-			this.log.warn("delivery_failed", {
-				id: delivery.deliveryId,
-				sent_parts: sent,
-				outcome: definitive ? "definitive" : "ambiguous",
-				error: errorText(err),
-			});
-			await this.deliveries.fail(delivery.deliveryId, errorText(err), definitive ? "definitive" : "ambiguous");
-			return false;
-		}
-		await this.deliveries.confirm(delivery.deliveryId);
-		this.log.info("delivery_sent", { id: delivery.deliveryId, parts: parts.length, redelivered: delivery.redelivered });
-		// Every row the op closed (steered messages sit in their own threads) gets its status finished, not only the lead.
+		const body = await this.#resolveThreadLinks(delivery.body);
 		const outcome = delivery.body.startsWith("[turn failed]") ? "failed" : "done";
 		const cancelled = new Set(delivery.cancelThreadRefs ?? []);
+		// The answer's own thread loses its status message below, so the elapsed time and tool count move under it.
+		const footer =
+			delivery.keepStatus || cancelled.has(delivery.threadRef)
+				? undefined
+				: this.#footerOf(delivery.threadRef, outcome);
+		let path = this.#deliveryPaths.get(delivery.deliveryId) ?? (this.#markdownBlocksOff ? "plain" : "markdown");
+		let parts: ReadonlyArray<{ text: string; blocks?: readonly unknown[]; card?: CardFallback }>;
+		for (;;) {
+			const markdown =
+				path === "markdown"
+					? renderMarkdownParts(body, delivery.redelivered, footer, {
+							names: this.#mentionNames(),
+							monitorHeader: delivery.originKey.startsWith(MONITOR_ORIGIN_PREFIX),
+							cards: true,
+							charts: !this.#chartBlocksOff,
+						})
+					: undefined;
+			if (markdown?.cardIssues !== undefined) {
+				this.log.warn("card_spec_invalid", {
+					id: delivery.deliveryId,
+					issues: markdown.cardIssues.slice(0, 5).map((issue) => issue.slice(0, 200)),
+				});
+			}
+			if (markdown === undefined) path = "plain";
+			parts = markdown ?? renderParts(body, delivery.redelivered, footer).map((text) => ({ text }));
+			this.#deliveryPaths.set(delivery.deliveryId, path);
+			// A rate-limited earlier send already posted the first `sent` messages: resume after them.
+			let sent = Math.min(delivery.sentParts ?? 0, parts.length);
+			// A top-level answer is one message: parts 2+ reply under part 1 instead of becoming further top-level posts.
+			let threadTs =
+				target.threadTs === TOP_LEVEL_TS ? (sent > 0 ? (delivery.replyTs ?? undefined) : undefined) : target.threadTs;
+			try {
+				const post = (text: string, blocks: readonly unknown[] | undefined) =>
+					this.call("chat.postMessage", () =>
+						this.transport.postMessage({
+							channel: target.channel,
+							text,
+							...(threadTs === undefined ? {} : { threadTs }),
+							...(blocks === undefined ? {} : { blocks }),
+						}),
+					);
+				// Whether a text part of this answer is already in Slack as a `markdown` block, and whether text parts now go
+				// without blocks. Neither changes the parts, so a resume posts the same messages in the same order.
+				let markdownPosted = parts.slice(0, sent).some((part) => part.card === undefined);
+				let plainText = this.#markdownBlocksOff;
+				for (const part of parts.slice(sent)) {
+					let posted: { ts: string };
+					if (part.card !== undefined) {
+						posted = await this.#postCard(delivery.deliveryId, sent, part, part.card, post);
+					} else if (plainText) {
+						posted = await post(part.text, undefined);
+					} else {
+						try {
+							posted = await post(part.text, part.blocks);
+						} catch (err) {
+							// Only cards are up (the first part's refusal starts over plain below): this part goes once
+							// without blocks, the cards are not resent, and so does every later text part and answer.
+							const refusedAfterCards =
+								path === "markdown" &&
+								sent > 0 &&
+								!markdownPosted &&
+								err instanceof SlackCallError &&
+								err.kind === "definitive" &&
+								/invalid_blocks|invalid_arguments/.test(errorText(err));
+							if (!refusedAfterCards) throw err;
+							if (!this.#markdownBlocksOff) {
+								this.#markdownBlocksOff = true;
+								this.log.warn("markdown_blocks_disabled", { id: delivery.deliveryId, error: errorText(err) });
+							}
+							plainText = true;
+							posted = await post(part.text, undefined);
+						}
+						markdownPosted = !plainText;
+					}
+					if (target.threadTs === TOP_LEVEL_TS) threadTs ??= posted.ts;
+					await this.#recordPost({
+						channel: target.channel,
+						ts: posted.ts,
+						deliveryId: delivery.deliveryId,
+						part: sent,
+					});
+					sent += 1;
+				}
+				break;
+			} catch (err) {
+				// Slack answered "later" for this message: it and the ones after it were not posted.
+				if (err instanceof BlockedError || err instanceof SlackRateLimitedError) {
+					await this.#deferDelivery(delivery, err, sent, target.threadTs === TOP_LEVEL_TS ? threadTs : undefined);
+					return false;
+				}
+				const definitive = sent === 0 && err instanceof SlackCallError && err.kind === "definitive";
+				const refused = path === "markdown" && /invalid_blocks|invalid_arguments/.test(errorText(err));
+				if (refused && definitive) {
+					// Nothing of this answer is in Slack yet: it starts over on the plain path, and so does every later one.
+					if (!this.#markdownBlocksOff) {
+						this.#markdownBlocksOff = true;
+						this.log.warn("markdown_blocks_disabled", { id: delivery.deliveryId, error: errorText(err) });
+					}
+					path = "plain";
+					continue;
+				}
+				if (refused) {
+					this.log.warn("markdown_blocks_rejected_midway", {
+						id: delivery.deliveryId,
+						sent_parts: sent,
+						error: errorText(err),
+					});
+				}
+				this.#deliveryPaths.delete(delivery.deliveryId);
+				this.log.warn("delivery_failed", {
+					id: delivery.deliveryId,
+					sent_parts: sent,
+					outcome: definitive ? "definitive" : "ambiguous",
+					error: errorText(err),
+				});
+				await this.deliveries.fail(delivery.deliveryId, errorText(err), definitive ? "definitive" : "ambiguous");
+				return false;
+			}
+		}
+		this.#deliveryPaths.delete(delivery.deliveryId);
+		await this.deliveries.confirm(delivery.deliveryId);
+		this.log.info("delivery_sent", {
+			id: delivery.deliveryId,
+			parts: parts.length,
+			path,
+			redelivered: delivery.redelivered,
+		});
+		// The turn still runs: its status stays until the turn-end delivery.
+		if (delivery.keepStatus) return true;
+		// Every row the op closed (steered messages sit in their own threads) gets its status finished, not only the lead.
 		for (const threadRef of new Set([delivery.threadRef, ...(delivery.finishThreadRefs ?? [])])) {
 			if (delivery.finishUntracked === false && !this.statuses.has(threadRef)) continue;
-			await this.finishStatus(threadRef, cancelled.has(threadRef) ? "cancelled" : outcome);
+			const final = cancelled.has(threadRef) ? "cancelled" : outcome;
+			// Only the thread holding the answer (and its footer) drops the status; the other threads keep the label.
+			await this.finishStatus(
+				threadRef,
+				final,
+				threadRef === delivery.threadRef && final !== "cancelled" ? "delete" : "update",
+			);
 		}
 		return true;
+	}
+
+	/** Best effort: a failed record is one warn line, and the answer goes on to its next part. */
+	async #recordPost(post: { channel: string; ts: string; deliveryId: number; part: number }): Promise<void> {
+		try {
+			await this.deliveries.recordPost?.(post);
+		} catch (err) {
+			this.log.warn("delivery_post_record_failed", { id: post.deliveryId, part: post.part, error: errorText(err) });
+		}
+	}
+
+	/**
+	 * Posts a card part. A definitive `invalid_blocks`/`invalid_arguments` refusal is retried at once, never touching
+	 * `#markdownBlocksOff`: a card with a native chart next goes with ASCII charts (turning `#chartBlocksOff` on, so later
+	 * cards and a resume start there), then any card as its fence's code block without blocks. The text step's error,
+	 * and any other error, goes to the caller's catch.
+	 */
+	async #postCard<T>(
+		id: number,
+		index: number,
+		part: { text: string; blocks?: readonly unknown[] },
+		card: CardFallback,
+		post: (text: string, blocks: readonly unknown[] | undefined) => Promise<T>,
+	): Promise<T> {
+		const steps: Array<{ step: "blocks" | "ascii"; blocks: readonly unknown[] | undefined }> = [];
+		// Charts turned off by an earlier card of this answer: its ASCII form goes first.
+		if (card.asciiBlocks === undefined || !this.#chartBlocksOff) steps.push({ step: "blocks", blocks: part.blocks });
+		if (card.asciiBlocks !== undefined) steps.push({ step: "ascii", blocks: card.asciiBlocks });
+		for (const { step, blocks } of steps) {
+			try {
+				return await post(part.text, blocks);
+			} catch (err) {
+				const refused =
+					err instanceof SlackCallError &&
+					err.kind === "definitive" &&
+					/invalid_blocks|invalid_arguments/.test(errorText(err));
+				if (!refused) throw err;
+				this.log.warn("card_blocks_rejected", { id, part: index, step, error: errorText(err) });
+				if (step === "blocks" && card.asciiBlocks !== undefined && !this.#chartBlocksOff) {
+					this.#chartBlocksOff = true;
+					this.log.warn("card_chart_blocks_disabled", { id, error: errorText(err) });
+				}
+			}
+		}
+		return post(card.text, undefined);
+	}
+
+	/**
+	 * `✅ 00:42 · 도구 6회` for a thread whose running status this answer replaces; none without a running status
+	 * (monitor, post-restart) or for a command thread, which never showed a `⏳` message.
+	 */
+	#footerOf(threadRef: string, outcome: "done" | "failed"): string | undefined {
+		const entry = this.statuses.get(threadRef);
+		if (entry === undefined || entry.final !== undefined || !entry.showStatus) return undefined;
+		const mark = FINAL_MARKS[outcome].label.split(" ")[0];
+		const tools = entry.progress?.tools ?? 0;
+		return `${mark} ${formatElapsed(this.clock.now() - entry.startedAt)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
 	}
 }

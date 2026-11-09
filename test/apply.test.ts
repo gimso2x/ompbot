@@ -15,6 +15,8 @@ import {
 	type ApplyDeps,
 	type ApplyOptions,
 	type ApplyReceipt,
+	findDaemonUnits,
+	type PeerApply,
 	type RunResult,
 	revertCommandFor,
 	runApply,
@@ -121,6 +123,7 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 	];
 	return {
 		homeDir: home,
+		unit: "ompbot",
 		repoDir: repo,
 		pathEnv: "/h/.local/bin:/h/.bun/bin:/usr/bin",
 		now: () => world.clock,
@@ -380,6 +383,16 @@ describe("runApply rollback and drain safety", () => {
 		expect(receipt.steps.at(-1)?.detail).toContain("drain cancelled");
 	});
 
+	test("a drain that ends unreachable is cancelled, so the daemon is not left holding new turns", async () => {
+		const world = makeWorld();
+		world.drainResult = { ok: false, reason: "unreachable", error: "ipc timeout" };
+		const { exitCode, receipt } = await runApply(base, makeDeps(world));
+		expect(exitCode).toBe(1);
+		expect(world.drainCancels).toBe(1);
+		expect(receipt.steps.at(-1)).toMatchObject({ name: "drain", ok: false });
+		expect(receipt.steps.at(-1)?.detail).toContain("drain cancelled");
+	});
+
 	test("a rollback that brings a fresh daemon back does not need a drain cancel", async () => {
 		const world = makeWorld();
 		world.restartMakesFreshDaemon = false;
@@ -399,6 +412,93 @@ describe("runApply rollback and drain safety", () => {
 		expect(exitCode).toBe(3);
 		expect(receipt.steps[0]?.detail).toContain("is-active");
 		expect(world.backups).toBe(0);
+	});
+});
+
+describe("runApply peers (other installs on the checkout)", () => {
+	const peer = (exitCode: 0 | 1 | 3, status: PeerApply["status"]): PeerApply => ({
+		unit: "ompbot-tteok",
+		status,
+		exitCode,
+		receiptPath: "/t/logs/apply-x.json",
+	});
+
+	test("this install's own unit is the one restarted", async () => {
+		const world = makeWorld();
+		await runApply(base, makeDeps(world, { unit: "ompbot-tteok" }));
+		expect(restartCommands(world)).toEqual([["systemctl", "--user", "restart", "ompbot-tteok"]]);
+	});
+
+	test("peers run after a fresh restart and after already_applied, but never after a SKIP or failure", async () => {
+		let calls = 0;
+		const peers = async () => {
+			calls += 1;
+			return [peer(0, "ok")];
+		};
+		const ok = await runApply(base, makeDeps(makeWorld(), { peers }));
+		expect(ok.receipt.status).toBe("ok");
+		expect(ok.receipt.steps.at(-1)).toMatchObject({ name: "peers", ok: true });
+		expect(calls).toBe(1);
+
+		const done = makeWorld();
+		done.activeEnterUnix = `@${Math.floor((T0 + 60_000) / 1000)}`;
+		const already = await runApply({ ...base, mergedAt: new Date(T0) }, makeDeps(done, { peers }));
+		expect(already.receipt.status).toBe("already_applied");
+		expect(calls).toBe(2);
+
+		const skipped = makeWorld();
+		skipped.branch = "other";
+		await runApply(base, makeDeps(skipped, { peers }));
+		const failed = makeWorld();
+		failed.restartRc = 1;
+		await runApply(base, makeDeps(failed, { peers }));
+		expect(calls).toBe(2);
+	});
+
+	test("a peer that fails or is skipped makes the whole apply fail with exit 1", async () => {
+		for (const result of [peer(1, "failed"), peer(3, "skipped")]) {
+			const { exitCode, receipt } = await runApply(base, makeDeps(makeWorld(), { peers: async () => [result] }));
+			expect(exitCode).toBe(1);
+			expect(receipt.status).toBe("failed");
+			expect(receipt.steps.at(-1)?.detail).toContain(`ompbot-tteok=${result.status}`);
+		}
+	});
+});
+
+describe("findDaemonUnits", () => {
+	test("keeps active units running this checkout's daemon, with OMPBOT_HOME or the default home", async () => {
+		const repoDir = "/w/ompbot";
+		const run = async (cmd: string[]): Promise<RunResult> => {
+			if (cmd[2] === "list-units")
+				return {
+					code: 0,
+					stdout:
+						"ompbot.service loaded active running x\nompbot-tteok.service loaded active running y\nompbot-dashboard.service loaded active running z\nompbot-backup.timer loaded active waiting t\n",
+					stderr: "",
+				};
+			expect(cmd).not.toContain("ompbot-backup.timer");
+			return {
+				code: 0,
+				stdout: [
+					"ExecStart={ path=/b/bun ; argv[]=/b/bun /w/ompbot/src/main.ts daemon ; ignore_errors=no }",
+					"Environment=PATH=/b",
+					"Id=ompbot.service",
+					"",
+					"ExecStart={ path=/b/bun ; argv[]=/b/bun /w/ompbot/src/main.ts daemon ; ignore_errors=no }",
+					"Environment=OMPBOT_HOME=/h/.ompbot-tteok PATH=/b",
+					"Id=ompbot-tteok.service",
+					"",
+					"ExecStart={ path=/b/bun ; argv[]=/b/bun /w/ompbot/src/main.ts dashboard ; ignore_errors=no }",
+					"Environment=PATH=/b",
+					"Id=ompbot-dashboard.service",
+				].join("\n"),
+				stderr: "",
+			};
+		};
+		expect(await findDaemonUnits(run, "/b", repoDir, "/h/.ompbot")).toEqual([
+			{ unit: "ompbot", homeDir: "/h/.ompbot" },
+			{ unit: "ompbot-tteok", homeDir: "/h/.ompbot-tteok" },
+		]);
 	});
 });
 

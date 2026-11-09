@@ -10,6 +10,7 @@ import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackTransport } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
+import { hasButtons } from "./helpers/bot-home";
 
 let dir: string;
 let store: Store;
@@ -38,7 +39,7 @@ class CardTransport extends FakeSlackTransport {
 		blocks?: readonly unknown[] | undefined;
 	}): Promise<void> {
 		await super.updateMessage(args);
-		if (args.blocks !== undefined && args.blocks.length > 0) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
+		if (args.blocks !== undefined && hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
 		else this.finalized.resolve({ text: args.text, blocks: args.blocks });
 	}
 }
@@ -201,7 +202,9 @@ describe("durable approvals", () => {
 		expect(store.getApproval(`D1:${ts}`)?.status).toBe("expired");
 		const final = await transport.finalized.promise;
 		expect(final.text).not.toContain("⛔ 거부됨");
-		expect(final.blocks).toEqual([]);
+		// The buttons are gone; the card keeps its title and shows the abort as its result line.
+		expect(hasButtons(final.blocks)).toBe(false);
+		expect(JSON.stringify(final.blocks)).toContain("기다리던 작업이 중단돼 만료됨");
 	});
 
 	test("a ledger without the detail and link columns gains them; old rows stay and a second open is a no-op", () => {

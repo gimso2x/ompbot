@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { normalizePeerInbound } from "../src/core/normalize";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import { listSavedSessions, pickSession } from "../src/core/sessions";
 import { type InboundRecord, parseCommand, promptTextOf } from "../src/core/types";
@@ -21,6 +22,7 @@ let driverOptions: FakeOmpDriverOptions;
 let sessionStore: FakeSessionStore;
 let idleStopMs: number | undefined;
 let usageProvider: ((originKey: string) => Promise<string>) | undefined;
+let distillProvider: ((originKey: string) => Promise<string>) | undefined;
 let router: OriginRouter;
 
 const clock = { now: () => now };
@@ -34,6 +36,7 @@ function makeRouter(): OriginRouter {
 		statusProvider: () => "status",
 		...(idleStopMs === undefined ? {} : { idleStopMs }),
 		...(usageProvider === undefined ? {} : { usageProvider }),
+		...(distillProvider === undefined ? {} : { distillProvider }),
 		driverFactory: (_origin, sessionDir) => {
 			const driver = new FakeOmpDriver({ ...driverOptions, sessionDir, store: sessionStore });
 			drivers.push(driver);
@@ -52,6 +55,7 @@ beforeEach(() => {
 	sessionStore = new FakeSessionStore();
 	idleStopMs = undefined;
 	usageProvider = undefined;
+	distillProvider = undefined;
 	router = makeRouter();
 });
 
@@ -379,5 +383,39 @@ describe("⑤ usage", () => {
 
 	test("without a provider it says the count is not wired", async () => {
 		expect(await send("!usage")).toBe("사용량 집계가 연결되지 않았습니다");
+	});
+});
+
+describe("⑥ distill", () => {
+	test("!distill and /distill-ompbot parse without an argument; a peer bot's fenced text never parses as it", () => {
+		expect(parseCommand("!distill")).toEqual({ kind: "distill", arg: "" });
+		expect(parseCommand(" /distill-ompbot ")).toEqual({ kind: "distill", arg: "" });
+		expect(parseCommand("!distill 지금")).toBeUndefined();
+		const peer = normalizePeerInbound({
+			peer: { userId: "UPEER00001", name: "떡" },
+			text: "!distill",
+			quoted: [],
+			channel: "C1",
+			ts: "1.1",
+		});
+		if (!peer.accept) throw new Error("rejected");
+		expect(parseCommand(peer.inbound.text)).toBeUndefined();
+	});
+
+	test("answers from the provider with this origin's key, without prompting omp", async () => {
+		await router.close();
+		const asked: string[] = [];
+		distillProvider = async (originKey) => {
+			asked.push(originKey);
+			return "스킬 리뷰를 시작했습니다";
+		};
+		router = makeRouter();
+		expect(await send("!distill")).toBe("스킬 리뷰를 시작했습니다");
+		expect(asked).toEqual([ORIGIN]);
+		expect(drivers.flatMap((d) => d.calls).filter((c) => c.startsWith("prompt:"))).toEqual([]);
+	});
+
+	test("without a provider it says the review is not wired", async () => {
+		expect(await send("!distill")).toBe("스킬 리뷰가 연결되지 않았습니다");
 	});
 });

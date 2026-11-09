@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "../config";
 import { callDaemon } from "../daemon/ipc";
+import { exportFlow, writeFlowStatus } from "../flow/task-flow";
 import { summarizeJudgement } from "../tasks/checker";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
@@ -11,6 +12,7 @@ export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
   tasks show <id>                registry row, transition history and the current Outcome judgement
   tasks check <id>               judge now; the running daemon posts/reacts like its sweep does
   tasks close <id> --as done|cancelled   human-only completion (the bot can never do this); worktree and branch stay
+  tasks flow --out <dir> [--watch <s>]   flow viewer html + status.json from a read-only database; --watch rewrites status.json
 `;
 
 function describe(row: TaskRow): string {
@@ -21,7 +23,9 @@ function describe(row: TaskRow): string {
 function dispatchHostsOf(homeDir: string): Record<string, { ssh: string }> | undefined {
 	try {
 		return loadConfig(homeDir).dispatchHosts;
-	} catch {
+	} catch (error) {
+		// Without the config a remote TASK resolves as local and fails later with a misleading read error.
+		process.stderr.write(`tasks: config unreadable, dispatch hosts unknown: ${String(error)}\n`);
 		return undefined;
 	}
 }
@@ -42,15 +46,30 @@ async function askDaemon(
 /** `ompbot tasks ...` against the ledger file directly; Slack side effects go through the running daemon. */
 export async function tasksCommand(args: string[], homeDir: string): Promise<number> {
 	const [sub, ...rest] = args;
-	if (sub !== "list" && sub !== "show" && sub !== "check" && sub !== "close") {
-		process.stderr.write(`usage: ompbot tasks <list|show|check|close>\n${TASKS_USAGE}`);
+	if (sub !== "list" && sub !== "show" && sub !== "check" && sub !== "close" && sub !== "flow") {
+		process.stderr.write(`usage: ompbot tasks <list|show|check|close|flow>\n${TASKS_USAGE}`);
 		return 2;
 	}
 	const { values, positionals } = parseArgs({
 		args: rest,
 		allowPositionals: true,
-		options: { json: { type: "boolean" }, as: { type: "string" } },
+		options: { json: { type: "boolean" }, as: { type: "string" }, out: { type: "string" }, watch: { type: "string" } },
 	});
+	if (sub === "flow") {
+		// Before the ledger: opening it migrates the schema, and the flow export must never write the database.
+		const seconds = values.watch === undefined ? 0 : Number(values.watch);
+		if (values.out === undefined || !(seconds >= 0)) {
+			process.stderr.write("tasks flow: --out <dir> required, --watch takes seconds\n");
+			return 2;
+		}
+		const dbPath = join(homeDir, "ompbot.db");
+		const outDir = values.out;
+		exportFlow(dbPath, outDir);
+		process.stdout.write(`${join(outDir, "viewer.html")}\n`);
+		if (seconds === 0) return 0;
+		setInterval(() => writeFlowStatus(dbPath, outDir), seconds * 1000);
+		return await new Promise<number>(() => {});
+	}
 	const ledger = openTaskLedger(join(homeDir, "ompbot.db"));
 	try {
 		const out = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);

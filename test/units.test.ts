@@ -103,6 +103,79 @@ describe("ompbot units render --dry-run", () => {
 	});
 });
 
+describe("ompbot units render --instance", () => {
+	const INSTANCE_UNITS = [
+		"ompbot-tteok-backup.service",
+		"ompbot-tteok-backup.timer",
+		"ompbot-tteok-gc.service",
+		"ompbot-tteok-gc.timer",
+		"ompbot-tteok.service",
+	];
+
+	test("renames every unit, drops the dashboard and keeps the instance's OMPBOT_HOME", () => {
+		const home = tempDir("ompbot-units-home-");
+		const ompbotHome = join(home, "tteok-home");
+		const run = render(["--instance", "tteok", "--dry-run"], home, ompbotHome);
+		expect(run.err).toBe("");
+		expect(run.code).toBe(0);
+		expect(run.out).toContain("# ompbot-tteok.service\n");
+		expect(run.out).not.toContain("ompbot-dashboard");
+		const units = sections(run.out);
+		expect([...units.keys()].sort()).toEqual(INSTANCE_UNITS);
+		for (const name of INSTANCE_UNITS.filter((unit) => unit.endsWith(".service"))) {
+			expect(units.get(name)?.split("\n")).toContain(`Environment=OMPBOT_HOME=${ompbotHome}`);
+		}
+		expect(units.get("ompbot-tteok.service")).toContain("Description=ompbot-tteok (Slack bot");
+		expect(units.get("ompbot-tteok-gc.service")).toContain("\nAfter=ompbot-tteok-backup.service\n");
+		expect(units.get("ompbot-tteok-backup.timer")).toContain("Description=ompbot-tteok daily backup timer");
+	});
+
+	test("without --instance the rendered units are the unchanged ones", () => {
+		const home = tempDir("ompbot-units-home-");
+		const plain = render(["--dry-run"], home, join(home, "h"));
+		expect([...sections(plain.out).keys()].sort()).toEqual(UNITS);
+		expect(plain.out).not.toContain("ompbot-tteok");
+	});
+
+	test("rejects a missing OMPBOT_HOME and a bad name with exit 2", () => {
+		const home = tempDir("ompbot-units-home-");
+		expect(render(["--instance", "tteok", "--dry-run"], home).code).toBe(2);
+		for (const bad of ["Tteok", "1a", "a_b", "a".repeat(25), ""]) {
+			const run = render(["--instance", bad, "--dry-run"], home, join(home, "h"));
+			expect(run.code).toBe(2);
+			expect(run.out).toBe("");
+		}
+	});
+
+	test("--out writes the instance files", () => {
+		const home = tempDir("ompbot-units-home-");
+		const out = join(tempDir("ompbot-units-out-"), "user");
+		const run = render(["--instance", "tteok", "--out", out], home, join(home, "h"));
+		expect(run.code).toBe(0);
+		expect(readdirSync(out).sort()).toEqual(INSTANCE_UNITS);
+		expect(run.out).toContain("enable --now ompbot-tteok-backup.timer ompbot-tteok-gc.timer");
+	});
+
+	test("the peer manifest is the shipped one without slash commands and without turn-feedback reactions", () => {
+		const read = (file: string) => JSON.parse(readFileSync(join(REPO, "packaging", file), "utf8"));
+		const base = read("slack-manifest.json");
+		const peer = read("slack-manifest-peer.json");
+		expect(peer.features.slash_commands).toBeUndefined();
+		expect([peer.display_information.name, peer.features.bot_user.display_name]).toEqual([
+			"ompbot-peer",
+			"ompbot-peer",
+		]);
+		// Owner 👍/👎 feedback is collected by the shipped app only: the peer keeps the message-only subscription.
+		const feedback = new Set(["reactions:read", "reaction_added", "reaction_removed"]);
+		const withoutFeedback = (list: string[]) => list.filter((entry) => !feedback.has(entry));
+		expect(peer.oauth_config).toEqual({ scopes: { bot: withoutFeedback(base.oauth_config.scopes.bot) } });
+		expect(peer.settings).toEqual({
+			...base.settings,
+			event_subscriptions: { bot_events: withoutFeedback(base.settings.event_subscriptions.bot_events) },
+		});
+	});
+});
+
 describe("ompbot units render --out", () => {
 	test("AC-5: writes all units, a second run with the same content exits 0", () => {
 		const home = tempDir("ompbot-units-home-");

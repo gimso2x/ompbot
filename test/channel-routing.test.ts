@@ -6,7 +6,7 @@ import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
 import { SlackChannel } from "../src/slack/channel";
 import type { FakeCall } from "../src/slack/fake-transport";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const ESCALATION = "C0ESCALATE1";
 const DM = "D1";
@@ -28,7 +28,7 @@ class CardTransport extends WaitingTransport {
 		blocks?: readonly unknown[] | undefined;
 	}): Promise<void> {
 		await super.updateMessage(args);
-		if (args.blocks !== undefined && args.blocks.length > 0) this.shown.resolve({ channel: args.channel, ts: args.ts });
+		if (hasButtons(args.blocks)) this.shown.resolve({ channel: args.channel, ts: args.ts });
 		else if (args.text.startsWith("🔐")) this.finalized.resolve({ method: "updateMessage", ...args });
 	}
 }
@@ -103,7 +103,7 @@ afterEach(async () => {
 });
 
 describe("escalation channel", () => {
-	test("the card goes to the escalation channel with the owner mention and a link; one pointer line lands in the asking thread", async () => {
+	test("the card goes to the escalation channel with the owner mention and a link; its mirror with the same buttons lands in the asking thread", async () => {
 		await boot({ escalationChannel: ESCALATION });
 		const thread = await seedThread();
 		const result = ask("force push main\n자세히");
@@ -112,14 +112,16 @@ describe("escalation channel", () => {
 		const card = cardPost(ESCALATION);
 		expect(card.text.split("\n")[0]).toBe(`🔐 승인 요청 <@${OWNER}>`);
 		expect(card.text).toContain(`요청 위치: DM · <https://slack.test/archives/${DM}/p1700000001|스레드 보기>`);
-		// Exactly one pointer in the requesting thread, naming the escalation channel and the card.
-		await transport.waitForPosts((text) => text.startsWith("🔐 승인 요청을"));
-		const pointers = transport.posts((text) => text.startsWith("🔐 승인 요청을"));
-		expect(pointers).toHaveLength(1);
-		expect(pointers[0]).toMatchObject({ channel: DM, threadTs: thread });
-		expect(pointers[0]?.text).toBe(
-			`🔐 승인 요청을 <#${ESCALATION}>에 올렸습니다 — force push main (<https://slack.test/archives/${ESCALATION}/p${ts.replace(".", "")}|카드 보기>)`,
+		// Exactly one mirror card in the requesting thread, its buttons carrying the escalation card's key; no pointer.
+		await transport.waitForPosts((text) => text.startsWith("🔐 승인 요청\nforce push main"));
+		const mirrors = transport.posts((text) => text.startsWith("🔐 승인 요청\nforce push main"));
+		expect(mirrors).toHaveLength(1);
+		expect(mirrors[0]).toMatchObject({ channel: DM, threadTs: thread });
+		expect(JSON.stringify(mirrors[0]?.blocks)).toContain(approvalActionId("approve", ESCALATION, ts));
+		expect(JSON.stringify(mirrors[0]?.blocks)).toContain(
+			`<https://slack.test/archives/${ESCALATION}/p${ts.replace(".", "")}|#escalation에서 보기>`,
 		);
+		expect(transport.posts((text) => text.startsWith("🔐 승인 요청을"))).toHaveLength(0);
 		// The ledger row maps the card back to the asking conversation and thread.
 		expect(daemon.store.getApproval(`${ESCALATION}:${ts}`)).toMatchObject({
 			status: "pending",
@@ -141,10 +143,10 @@ describe("escalation channel", () => {
 		transport.failNext.getPermalink = [new Error("boom"), new Error("boom")];
 		void ask();
 		await transport.shown.promise;
-		await transport.waitForPosts((text) => text.startsWith("🔐 승인 요청을"));
+		await transport.waitForPosts((text) => text.startsWith("🔐 승인 요청\nforce push main"));
 		expect(cardPost(ESCALATION).text.endsWith("요청 위치: DM")).toBe(true);
-		const pointer = transport.posts((text) => text.startsWith("🔐 승인 요청을"))[0];
-		expect(pointer?.text).toBe(`🔐 승인 요청을 <#${ESCALATION}>에 올렸습니다 — force push main`);
+		const mirror = transport.posts((text) => text.startsWith("🔐 승인 요청\nforce push main"))[0];
+		expect(JSON.stringify(mirror?.blocks)).toContain(`정본 카드: <#${ESCALATION}>`);
 	});
 
 	test("a pending card's thread reply settles it as replied: the tool returns the text, the card says so, no session starts", async () => {
@@ -159,8 +161,9 @@ describe("escalation channel", () => {
 		await ownerReply(ESCALATION, ts, "1800.000102", "네, 그 브랜치만 진행하세요");
 		expect(await result).toBe("replied: 네, 그 브랜치만 진행하세요");
 		const final = await transport.finalized.promise;
-		expect(final.blocks).toEqual([]);
+		expect(hasButtons(final.blocks)).toBe(false);
 		expect(final.text).toContain("💬 답장으로 처리됨: 네, 그 브랜치만 진행하세요");
+		expect(JSON.stringify(final.blocks)).toContain("💬 답장으로 처리됨: 네, 그 브랜치만 진행하세요");
 		expect(daemon.store.getApproval(`${ESCALATION}:${ts}`)).toMatchObject({
 			status: "replied",
 			replyTs: "1800.000102",
@@ -211,7 +214,7 @@ describe("escalation channel", () => {
 			thread: ts,
 		});
 		expect(injected.threadRef).toBe(`${ESCALATION}:${ts}`);
-		expect(transport.posts((text) => text === `🧪 inject ${injected.nonce}`)[0]).toMatchObject({
+		expect(transport.posts((text) => text === `🧪 inject ${injected.nonce}\n> 진행해`)[0]).toMatchObject({
 			channel: ESCALATION,
 			threadTs: ts,
 		});

@@ -1,4 +1,4 @@
-import type { ActionButton, ChannelPort, MessageRef } from "../channel/port";
+import type { ActionButton, ChannelPort, MessageRef, OutboundMessage } from "../channel/port";
 import type { Logger } from "../log";
 import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import { redact } from "../redact";
@@ -35,6 +35,8 @@ const CARD_LIMIT = 2900;
 
 /** Optional structured sections of an approval card; every one is omitted when empty (summary-only callers unchanged). */
 export interface ApprovalDetail {
+	/** Where the action publishes outside the owner's own systems and who can see it; puts the card under the 🌐 title. */
+	external?: string;
 	/** What exactly is about to run (command, file paths). */
 	action?: string;
 	/** Why the action is needed now. */
@@ -46,6 +48,7 @@ export interface ApprovalDetail {
 }
 
 const DETAIL_SECTIONS: Array<{ key: keyof ApprovalDetail; label: string }> = [
+	{ key: "external", label: "🌐 외부 공개" },
 	{ key: "action", label: "할 일" },
 	{ key: "why", label: "이유" },
 	{ key: "impact", label: "영향" },
@@ -63,6 +66,25 @@ function shownDetail(detail: ApprovalDetail | undefined): ApprovalDetail {
 	return shown;
 }
 
+/** `gh` commands that write to GitHub where others can see it (issue/PR/comment/release/gist/repo, mutating `gh api`). */
+const GITHUB_PUBLISH =
+	/\bgh\s+(?:(?:issue|pr)\s+(?:create|comment|edit|close|reopen|review|merge)|release\s+(?:create|edit|upload)|gist\s+create|repo\s+(?:create|edit|rename)|api\b[^\n]*?(?:-X|--method)[\s=]*(?:POST|PATCH|PUT|DELETE))\b/i;
+
+/**
+ * The detail with `external` filled in when the caller left it empty but the action (or summary) publishes to GitHub,
+ * so a public post never reaches the owner looking like an ordinary local approval.
+ */
+function withExposure(summary: string, detail: ApprovalDetail | undefined): ApprovalDetail | undefined {
+	if (detail?.external !== undefined && detail.external.trim() !== "") return detail;
+	const hit = GITHUB_PUBLISH.exec(`${detail?.action ?? ""}\n${summary}`);
+	if (hit === null) return detail;
+	return { ...detail, external: `GitHub에 게시합니다. 공개 저장소면 누구나 봅니다(감지: ${hit[0]})` };
+}
+
+function cardTitle(detail: ApprovalDetail): string {
+	return detail.external === undefined ? "🔐 승인 요청" : "🌐 외부 공개 승인 요청";
+}
+
 /**
  * The card text: header (with the owner mention when the card is escalated, so it notifies) + the already-redacted,
  * already-cut summary, an optional `요청 위치` line, then one `• 라벨: 값` line per filled (already shown) section.
@@ -72,7 +94,8 @@ function renderCard(
 	detail: ApprovalDetail,
 	escalation: { ownerMention: string; where: string } | undefined,
 ): string {
-	const header = escalation === undefined ? "🔐 승인 요청" : `🔐 승인 요청 ${escalation.ownerMention}`;
+	const title = cardTitle(detail);
+	const header = escalation === undefined ? title : `${title} ${escalation.ownerMention}`;
 	const lines = [`${header}\n${shownSummary}`];
 	if (escalation !== undefined) lines.push(`요청 위치: ${escalation.where}`);
 	for (const { key, label } of DETAIL_SECTIONS) {
@@ -82,8 +105,11 @@ function renderCard(
 	return cutCodePointSafe(lines.join("\n"), CARD_LIMIT);
 }
 
-/** `ompbot:approval:<approve|deny>:<channel>:<ts>`; channel ids and message ts contain no colon. */
-export function approvalActionId(decision: ApprovalDecision, channel: string, ts: string): string {
+/**
+ * `ompbot:approval:<approve|deny|retry>:<channel>:<ts>`; channel ids and message ts contain no colon. The key is always
+ * the canonical card's, also on its mirror in the asking thread, so either card settles the same pending request.
+ */
+export function approvalActionId(decision: ApprovalDecision | "retry", channel: string, ts: string): string {
 	return `${APPROVAL_ACTION_PREFIX}:${decision}:${channel}:${ts}`;
 }
 
@@ -93,6 +119,17 @@ function approvalButtons(channel: string, ts: string): ActionButton[] {
 		{ actionId: approvalActionId("approve", channel, ts), label: "승인", value: "approve", style: "primary" },
 		{ actionId: approvalActionId("deny", channel, ts), label: "거부", value: "deny", style: "danger" },
 	];
+}
+
+/** The one button of a timed-out card that came from a thread: the daemon asks that thread again (`다시 요청`). */
+function retryButton(channel: string, ts: string): ActionButton {
+	return { actionId: approvalActionId("retry", channel, ts), label: "다시 요청", value: "retry" };
+}
+
+/** The mirror's grey line: buttons only (a thread reply here is an ordinary message), the canonical card, the deadline. */
+function mirrorNote(cardChannel: string, cardUrl: string | undefined, expiresAt: number): string {
+	const canonical = cardUrl === undefined ? `<#${cardChannel}>` : `<${cardUrl}|#escalation에서 보기>`;
+	return `버튼으로 답해 주세요(이 스레드의 글 답장은 승인으로 세지 않음) · 정본 카드: ${canonical} · ⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 답이 없으면 거부로 처리됩니다`;
 }
 
 function deadlineNote(expiresAt: number, timeoutMs: number): string {
@@ -114,12 +151,18 @@ export function parseChoiceActionId(actionId: string): { index: number; channel:
 
 export function parseApprovalActionId(
 	actionId: string,
-): { decision: ApprovalDecision; channel: string; ts: string } | undefined {
+): { decision: ApprovalDecision | "retry"; channel: string; ts: string } | undefined {
 	const parts = actionId.split(":");
 	if (parts.length !== 5 || `${parts[0]}:${parts[1]}` !== APPROVAL_ACTION_PREFIX) return undefined;
 	const [, , decision, channel, ts] = parts;
-	if ((decision !== "approve" && decision !== "deny") || !channel || !ts) return undefined;
+	if ((decision !== "approve" && decision !== "deny" && decision !== "retry") || !channel || !ts) return undefined;
 	return { decision, channel, ts };
+}
+
+/** The canonical card of a `다시 요청` click; `undefined` for any other action id. */
+export function parseApprovalRetryActionId(actionId: string): { channel: string; ts: string } | undefined {
+	const parsed = parseApprovalActionId(actionId);
+	return parsed?.decision === "retry" ? { channel: parsed.channel, ts: parsed.ts } : undefined;
 }
 
 export interface ApprovalTimers {
@@ -152,14 +195,29 @@ export interface ApprovalStore {
 		| {
 				status: string;
 				originKey: string | null;
+				originThreadRef: string | null;
 				replyTs: string | null;
+				summary: string;
+				mirrorRef: string | null;
 		  }
 		| undefined;
+	/** Records the mirror card (`<channel>:<ts>`) of a pending approval; false when it is no longer pending. */
+	setApprovalMirrorRef(approvalId: string, mirrorRef: string): boolean;
 	/** Settles a pending approval as `replied`; false when it was no longer pending (or already due). */
 	replyApproval(approvalId: string, replyTs: string, text: string, now: number): boolean;
 	decideApproval(approvalId: string, status: "approved" | "denied" | "expired", now: number): boolean;
 	/** Expires due (or, with `due = false`, ALL) pending approvals and returns them for card updates. */
-	expirePendingApprovals(now: number, due?: boolean): Array<{ approvalId: string; channel: string; messageTs: string }>;
+	expirePendingApprovals(
+		now: number,
+		due?: boolean,
+	): Array<{
+		approvalId: string;
+		channel: string;
+		messageTs: string;
+		summary: string;
+		originThreadRef: string | null;
+		mirrorRef: string | null;
+	}>;
 }
 
 export interface ApprovalBrokerOptions {
@@ -210,11 +268,18 @@ export interface ChoiceCardHandle {
 	close(finalLine: string, answer?: string): Promise<void>;
 }
 
+/** Where a queued choice input came from: a card-thread reply's ts, and who waits to learn whether it was read. */
+interface ChoiceSource {
+	replyTs?: string;
+	/** Called once: true when the card read the input, false when the card closed with it still unread. */
+	onRead?: (read: boolean) => void;
+}
+
 interface ChoicePending {
 	originKey: string;
 	buttons: number;
 	/** Queues one owner input; false once the card is closed or ended. */
-	push: (event: ChoiceEvent) => boolean;
+	push: (event: ChoiceEvent, source?: ChoiceSource) => boolean;
 	isOpen: () => boolean;
 	/** Card-thread reply ts already taken (a backfill replay is a duplicate). */
 	replies: Set<string>;
@@ -225,6 +290,8 @@ interface ChoicePending {
  * writes the real outcome, so the approval sweeper never races it to an approval-worded card.
  */
 const CHOICE_LEDGER_GRACE_MS = 60_000;
+/** First characters of every choice card body (choice.ts): how a ledger row tells a choice card from an approval. */
+const CHOICE_HEADS = ["❓", "🔒"];
 /** Slack: at most 75 characters per button label. */
 const BUTTON_LABEL_LIMIT = 75;
 
@@ -332,17 +399,30 @@ export class ApprovalBroker {
 		const channel = escalated ? escalation : requestChannel;
 		// Computed once: the card header and the ledger summary (and sections) must show the exact same text.
 		const shown = cutCodePointSafe(redact(summary), SUMMARY_LIMIT);
-		const sections = shownDetail(detail);
+		const sections = shownDetail(withExposure(summary, detail));
 		const originUrl =
 			origin?.threadTs === undefined ? undefined : await this.#permalink(origin.channel, origin.threadTs);
-		const header = renderCard(
-			shown,
-			sections,
-			escalated
-				? { ownerMention: port.mentionUser(this.#options.ownerUserId), where: this.#whereOf(origin, originUrl) }
-				: undefined,
-		);
-		const card = await port.post({ conversationId: channel }, { text: header });
+		const escalationLine = escalated
+			? { ownerMention: port.mentionUser(this.#options.ownerUserId), where: this.#whereOf(origin, originUrl) }
+			: undefined;
+		// `header` stays the notification/fallback text; the card itself shows the sections as fields, not as lines.
+		const header = renderCard(shown, sections, escalationLine);
+		const fields = DETAIL_SECTIONS.flatMap(({ key, label }) => {
+			const value = sections[key];
+			return value === undefined ? [] : [{ label, value }];
+		});
+		const cardShape = {
+			title: cardTitle(sections),
+			body:
+				escalationLine === undefined
+					? shown
+					: `${escalationLine.ownerMention}\n${shown}\n요청 위치: ${escalationLine.where}`,
+			...(fields.length === 0 ? {} : { fields }),
+		};
+		// The mirror in the asking thread: same title and fields, no owner mention (one notification is enough).
+		const mirrorShape = { ...cardShape, body: shown };
+		let mirror: MessageRef | undefined;
+		const card = await port.post({ conversationId: channel }, { text: header, ...cardShape });
 		const key = `${channel}:${card.messageId}`;
 		// Before the buttons go up (no click can arrive yet); a failed lookup only leaves the dashboard without a link.
 		const cardUrl = await this.#permalink(channel, card.messageId);
@@ -392,11 +472,27 @@ export class ApprovalBroker {
 			// The action ids carry the message's own ts, which exists only after the post.
 			await port.edit(card, {
 				text: header,
+				...cardShape,
 				buttons: approvalButtons(channel, card.messageId),
 				buttonsNote: deadlineNote(now + timeoutMs, timeoutMs),
 			});
 			log.info("approval_requested", { channel, ts: card.messageId });
-			if (escalated) await this.#postPointer(origin, channel, cardUrl, shown);
+			if (escalated) {
+				mirror =
+					origin.threadTs === undefined
+						? undefined
+						: await this.#postMirror(origin.channel, origin.threadTs, {
+								text: renderCard(shown, sections, undefined),
+								...mirrorShape,
+								buttons: approvalButtons(channel, card.messageId),
+								buttonsNote: mirrorNote(channel, cardUrl, now + timeoutMs),
+							});
+				if (mirror === undefined) await this.#postPointer(origin, channel, cardUrl, shown);
+				else {
+					if (recorded) this.#recordMirror(key, mirror);
+					log.info("approval_mirrored", { channel, ts: card.messageId, mirror: mirror.messageId });
+				}
+			}
 			if (signal?.aborted) onAbort();
 			result = await decision.promise;
 			log.info("approval_resolved", {
@@ -424,13 +520,32 @@ export class ApprovalBroker {
 				log.warn("approval_decide_failed", { channel, ts: card.messageId, error: String(error) });
 			}
 		}
+		const outcomeText = aborted
+			? ABORTED_TEXT
+			: typeof result === "string"
+				? FINAL_TEXT[result]
+				: `💬 답장으로 처리됨: ${replyLine(result.replied)}`;
+		// The buttons give way to the result line; title and fields stay so the card still says what was decided.
+		const resultLine = `${outcomeText} · ${DEADLINE_FORMAT.format(this.#clock.now())}`;
+		// A timed-out request from a thread offers one `다시 요청` (the daemon asks that thread again); no other outcome does.
+		const buttons =
+			result === "timeout" && recorded && origin?.threadTs !== undefined ? [retryButton(channel, card.messageId)] : [];
 		try {
-			await port.edit(card, {
-				text: `${header}\n${aborted ? ABORTED_TEXT : typeof result === "string" ? FINAL_TEXT[result] : `💬 답장으로 처리됨: ${replyLine(result.replied)}`}`,
-				buttons: [],
-			});
+			await port.edit(card, { text: `${header}\n${resultLine}`, ...cardShape, buttons, buttonsNote: resultLine });
 		} catch (error) {
 			log.warn("approval_final_update_failed", { channel, ts: card.messageId, error: String(error) });
+		}
+		if (mirror !== undefined) {
+			try {
+				await port.edit(mirror, {
+					text: `${renderCard(shown, sections, undefined)}\n${resultLine}`,
+					...mirrorShape,
+					buttons,
+					buttonsNote: resultLine,
+				});
+			} catch (error) {
+				log.warn("approval_mirror_update_failed", { channel: mirror.conversationId, error: String(error) });
+			}
 		}
 		return result;
 	}
@@ -487,12 +602,14 @@ export class ApprovalBroker {
 		} catch (error) {
 			log.warn("choice_record_failed", { channel, ts, error: String(error) });
 		}
-		const queue: ChoiceResult[] = [];
+		const queue: Array<{ result: ChoiceResult; source?: ChoiceSource | undefined }> = [];
 		let wake: (() => void) | undefined;
 		let ended: ChoiceResult | undefined;
 		let closed = false;
-		const enqueue = (result: ChoiceResult): void => {
-			queue.push(result);
+		/** The latest card-thread reply the card read: the ledger's `reply_ts`, so its backfill replay is a duplicate. */
+		let replyTs: string | undefined;
+		const enqueue = (result: ChoiceResult, source?: ChoiceSource): void => {
+			queue.push({ result, source });
 			wake?.();
 		};
 		const end = (result: { kind: "timeout" } | { kind: "cancelled" }): void => {
@@ -506,9 +623,9 @@ export class ApprovalBroker {
 		const pending: ChoicePending = {
 			originKey: origin.originKey,
 			buttons: card.buttons.length,
-			push: (event) => {
+			push: (event, source) => {
 				if (closed || ended !== undefined) return false;
-				enqueue(event);
+				enqueue(event, source);
 				return true;
 			},
 			isOpen: () => !closed && ended === undefined,
@@ -520,6 +637,11 @@ export class ApprovalBroker {
 			this.#timers.clear(timer);
 			signal?.removeEventListener("abort", onAbort);
 			this.#choices.delete(key);
+			// Inputs the card never read (a reply right behind the click that closed a select) go back to their sender.
+			const unread = queue.filter((entry) => entry.source?.onRead !== undefined);
+			queue.splice(0, queue.length, ...queue.filter((entry) => entry.source?.onRead === undefined));
+			if (unread.length > 0) log.info("choice_reply_unread", { channel, ts, count: unread.length });
+			for (const entry of unread) entry.source?.onRead?.(false);
 		};
 		try {
 			if (card.buttons.length > 0) await port.edit(posted, render(body, card.buttons));
@@ -533,9 +655,12 @@ export class ApprovalBroker {
 				for (;;) {
 					const head = queue.shift();
 					if (head !== undefined) {
+						const { result, source } = head;
 						// A terminal result stays readable: every later read returns it too.
-						if (head.kind === "timeout" || head.kind === "cancelled") queue.unshift(head);
-						return head;
+						if (result.kind === "timeout" || result.kind === "cancelled") queue.unshift(head);
+						if (source?.replyTs !== undefined) replyTs = source.replyTs;
+						source?.onRead?.(true);
+						return result;
 					}
 					const arrived = Promise.withResolvers<void>();
 					wake = arrived.resolve;
@@ -561,7 +686,7 @@ export class ApprovalBroker {
 				release();
 				try {
 					if (answer === undefined) store.decideApproval(key, "expired", this.#clock.now());
-					else store.replyApproval(key, `choice:${ts}`, answer, this.#clock.now());
+					else store.replyApproval(key, replyTs ?? `choice:${ts}`, answer, this.#clock.now());
 				} catch (error) {
 					log.warn("choice_decide_failed", { channel, ts, error: String(error) });
 				}
@@ -586,11 +711,40 @@ export class ApprovalBroker {
 		return open;
 	}
 
-	/** The owner's plain message in the asking conversation answers its one open choice card; false otherwise. */
-	answerDialog(originKey: string, text: string): boolean {
+	/**
+	 * The owner's plain message in the asking conversation answers its one open choice card. Resolves true once the
+	 * card has read it; false when there is no single open card or the card closed before reading it (a select
+	 * answered by a click a moment earlier) — the caller then delivers the message the normal way.
+	 */
+	answerDialog(originKey: string, text: string): Promise<boolean> {
 		const open = [...this.#choices.values()].filter((choice) => choice.originKey === originKey && choice.isOpen());
 		const only = open.length === 1 ? open[0] : undefined;
-		return only?.push({ kind: "text", text }) ?? false;
+		const read = Promise.withResolvers<boolean>();
+		return only?.push({ kind: "text", text }, { onRead: read.resolve }) === true
+			? read.promise
+			: Promise.resolve(false);
+	}
+
+	/**
+	 * The mirror card in the asking thread, its buttons carrying the canonical card's key; `undefined` when the post
+	 * failed (the caller falls back to the pointer line).
+	 */
+	async #postMirror(channel: string, threadTs: string, card: OutboundMessage): Promise<MessageRef | undefined> {
+		try {
+			return await this.#options.port.post({ conversationId: channel, threadId: threadTs }, card);
+		} catch (error) {
+			this.#options.log.warn("approval_mirror_failed", { channel, error: String(error) });
+			return undefined;
+		}
+	}
+
+	/** The mirror goes on the ledger row, so a restart expiry can rewrite it too; a failure only loses that rewrite. */
+	#recordMirror(approvalId: string, mirror: MessageRef): void {
+		try {
+			this.#options.store.setApprovalMirrorRef(approvalId, `${mirror.conversationId}:${mirror.messageId}`);
+		} catch (error) {
+			this.#options.log.warn("approval_mirror_record_failed", { id: approvalId, error: String(error) });
+		}
 	}
 
 	/** One pointer line in the asking thread (or the channel's main view) naming the escalation card; best effort. */
@@ -626,7 +780,7 @@ export class ApprovalBroker {
 		// An open choice card takes every reply in its thread as one more answer (an `ask` card may need several).
 		const choice = this.#choices.get(reply.approvalId);
 		if (choice?.replies.has(reply.ts)) return { kind: "duplicate" };
-		if (choice?.push({ kind: "text", text: reply.text })) {
+		if (choice?.push({ kind: "text", text: reply.text }, { replyTs: reply.ts })) {
 			choice.replies.add(reply.ts);
 			log.info("choice_reply", { id: reply.approvalId, ts: reply.ts });
 			return { kind: "settled" };
@@ -654,16 +808,59 @@ export class ApprovalBroker {
 		const { store, port, log } = this.#options;
 		const expired = store.expirePendingApprovals(this.#clock.now(), due);
 		for (const row of expired) {
-			try {
-				await port.edit(this.#ref(row.channel, row.messageTs), {
-					text: `🔐 승인 요청\n${due ? FINAL_TEXT.timeout : "⌛ 데몬 재시작으로 만료됨 — 다시 요청해 주세요"}`,
-					buttons: [],
-				});
-			} catch (error) {
-				log.warn("approval_expire_card_failed", { channel: row.channel, ts: row.messageTs, error: String(error) });
+			// A choice card's ledger summary is its own body, which always opens with its ❓/🔒 head (`choose`);
+			// an approval's summary is the request text under the separate 🔐 header.
+			const choice = CHOICE_HEADS.some((head) => row.summary.startsWith(head));
+			const reason = due
+				? choice
+					? "⌛ 시간 초과로 만료됨"
+					: FINAL_TEXT.timeout
+				: "⌛ 데몬 재시작으로 만료됨 — 다시 요청해 주세요";
+			// An approval from a thread offers `다시 요청` on the card and on its mirror; a choice card never does.
+			const message = {
+				text: `${choice ? "❓ 질문" : "🔐 승인 요청"}\n${reason}`,
+				buttons: !choice && row.originThreadRef !== null ? [retryButton(row.channel, row.messageTs)] : [],
+			};
+			for (const ref of [`${row.channel}:${row.messageTs}`, ...(row.mirrorRef === null ? [] : [row.mirrorRef])]) {
+				const [channel = "", ts = ""] = ref.split(":");
+				try {
+					await port.edit(this.#ref(channel, ts), message);
+				} catch (error) {
+					log.warn("approval_expire_card_failed", { channel, ts, error: String(error) });
+				}
 			}
 		}
 		return expired.length;
+	}
+
+	/**
+	 * Rewrites a settled approval's cards (canonical, mirror, and the clicked message when it is neither) to `note`
+	 * with no buttons: the result of a `다시 요청` click. Without a ledger row only the canonical and clicked cards
+	 * are known.
+	 */
+	async redrawCards(approvalId: string, note: string, clicked?: { channel: string; ts: string }): Promise<void> {
+		const { store, port, log } = this.#options;
+		const row = store.getApproval(approvalId);
+		const message =
+			row === undefined
+				? { text: `🔐 승인 요청\n${note}`, buttons: [] }
+				: {
+						text: `🔐 승인 요청\n${row.summary}\n${note}`,
+						title: "🔐 승인 요청",
+						body: row.summary,
+						buttons: [],
+						buttonsNote: note,
+					};
+		const refs = new Set([approvalId, ...(row === undefined || row.mirrorRef === null ? [] : [row.mirrorRef])]);
+		if (clicked !== undefined) refs.add(`${clicked.channel}:${clicked.ts}`);
+		for (const ref of refs) {
+			const [channel = "", ts = ""] = ref.split(":");
+			try {
+				await port.edit(this.#ref(channel, ts), message);
+			} catch (error) {
+				log.warn("approval_redraw_failed", { channel, ts, error: String(error) });
+			}
+		}
 	}
 
 	/** A message of the approval conversation (card or asking thread) on the broker's port. */
@@ -693,7 +890,8 @@ export class ApprovalBroker {
 			return true;
 		}
 		const parsed = parseApprovalActionId(action.actionId);
-		if (!parsed) return false;
+		// `다시 요청` belongs to the daemon (it feeds the asking thread), not to a pending request.
+		if (!parsed || parsed.decision === "retry") return false;
 		if (action.userId !== ownerUserId) {
 			log.warn("approval_click_ignored", { user: action.userId, reason: "not_owner" });
 			return false;
