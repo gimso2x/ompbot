@@ -140,7 +140,14 @@ function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
 				homeDir,
 				...(config?.maxBundleBytes === undefined ? {} : { maxBundleBytes: config.maxBundleBytes }),
 			}),
-		gates: () => collectGates({ homeDir, now: Date.now(), offsiteConfigured: config?.offsite !== undefined, ...omp }),
+		gates: () =>
+			collectGates({
+				homeDir,
+				now: Date.now(),
+				offsiteConfigured: config?.offsite !== undefined,
+				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
+				...omp,
+			}),
 		doctor: async () => {
 			const lines: string[] = [];
 			const code = await runDoctor(homeDir, (line) => lines.push(line));

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ChatPlatform, chatPlatformOf, parseChatOrigin } from "../core/origin-key";
 import { isLaneOrigin } from "../lanes/status";
+import { DISCORD_LANE_CHANNEL_MISSING } from "../lanes/trigger";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { isPersonaOrigin } from "../monitors/tools";
 import { truncateUtf8 } from "../redact";
@@ -60,8 +61,8 @@ export const OMPBOT_MAIN = join(import.meta.dir, "..", "main.ts");
  */
 export function backgroundResumeLine(originKey: string): string | undefined {
 	const ref = parseChatOrigin(originKey);
-	if (ref?.platform !== "slack") return undefined;
-	const target = `--origin slack/${ref.kind}/${ref.conversationId}${ref.threadId === undefined ? "" : ` --thread ${ref.threadId}`}`;
+	if (ref?.platform !== "slack" && ref?.platform !== "discord") return undefined;
+	const target = `--origin ${ref.platform}/${ref.kind}/${ref.conversationId}${ref.threadId === undefined ? "" : ` --thread ${ref.threadId}`}`;
 	return `- 5분 넘게 걸릴 백그라운드 작업(코드 지도·대량 빌드·외부 처리 대기)은 턴 안에서 sleep 루프·폴링·\`wait\`로 끝까지 기다리지 않는다. 열린 턴은 ompbot 재시작 drain을 붙잡아 모든 대화의 새 메시지를 막는다. 작업은 분리 실행(\`systemd-run --user\` 등)하고, 끝날 때(성공·실패 모두) \`bun ${OMPBOT_MAIN} inject ${target} --as-owner --text '[자동 후속] <작업> 끝남(<결과·산출물 경로>). 다음: <이어서 할 일>'\`이 돌게 걸어 둔 뒤, 지금 상태와 이어서 할 일을 보고하고 턴을 끝낸다. 그 메시지가 오면 이 대화에서 이어 간다. Never block a turn on work longer than ~5 minutes (an open turn holds the restart drain for every conversation): run it detached, chain the inject above to its end (success or failure), report, end the turn, and continue when the [자동 후속] message arrives.`;
 }
 
@@ -112,6 +113,17 @@ const formatSection = (herdr: boolean, discord: boolean): string =>
 				]),
 	].join("\n");
 
+/** What the floors text needs to know about an origin beyond its key (daemon `floorsSurfaceFor`). */
+export interface FloorsSurface {
+	/** A lane session: the platform of the lane's thread, which names its upload tool. */
+	lanePlatform?: ChatPlatform;
+	/** A Discord owner DM without `channels.discord.laneChannelId`: it has no lane tool and is told why. */
+	noLaneChannel?: boolean;
+}
+
+/** A Discord DM session without a lane channel: what to tell the owner who asks for a lane. */
+const NO_LANE_CHANNEL_LINE = `- 이 디스코드 DM에는 작업 레인 도구(\`ompbot_work_start\`)가 없고 \`작업: … @…\` 메시지도 레인을 열지 않는다. ${DISCORD_LANE_CHANNEL_MISSING} 오너가 레인을 원하면 이 설정을 안내한다. This Discord DM cannot open work lanes: the owner must set channels.discord.laneChannelId (a server text channel id) or ask from a server channel.`;
+
 /**
  * ActionGuard floors for the omp child, appended to its system prompt (`--append-system-prompt`). The owner's
  * rule-guards extension enforces what a tool call can be checked for; these floors cover the rest.
@@ -128,12 +140,16 @@ export function buildFloorsPrompt(
 	herdr = false,
 	ownerDialogs = false,
 	peerTouched = false,
+	surface: FloorsSurface = {},
 ): string {
-	// Owner-DM persona sessions get the monitor tools line (monitor tools are Slack-only for now); every Slack chat
-	// session gets the answer-format section.
-	const persona = originKey !== undefined && isPersonaOrigin(originKey) && chatPlatformOf(originKey) === "slack";
+	// Owner-DM persona sessions (Slack and Discord) get the monitor tools line; every chat session gets the
+	// answer-format section.
+	const persona = originKey !== undefined && isPersonaOrigin(originKey);
 	const chat = originKey !== undefined && chatPlatformOf(originKey) !== undefined;
-	const fileTool = sendFileToolName((originKey === undefined ? undefined : chatPlatformOf(originKey)) ?? "slack");
+	// A chat origin names its own platform's upload tool; a lane session its thread's.
+	const fileTool = sendFileToolName(
+		(originKey === undefined ? undefined : chatPlatformOf(originKey)) ?? surface.lanePlatform ?? "slack",
+	);
 	const askable = ownerDialogs && originKey !== undefined && (chat || isLaneOrigin(originKey));
 	const discord = originKey !== undefined && chatPlatformOf(originKey) === "discord";
 	const resumeLine = originKey === undefined ? undefined : backgroundResumeLine(originKey);
@@ -161,6 +177,7 @@ export function buildFloorsPrompt(
 		`- 구조·흐름·비교를 설명할 때는 글만 늘어놓지 말고 mermaid·SVG·HTML 파일을 만들어 \`${fileTool}\`로 올린다. For structures, flows or comparisons, make a mermaid/SVG/HTML file and send it instead of prose.`,
 		"- `ompbot_request_approval(summary, external?, action?, why?, impact?, rollback?)`: 오너에게 승인/거부 버튼을 보내고 결과를 기다린다. 되돌릴 수 없는 작업이면 되돌릴 수 없는 이유(rollback)와 영향(impact)까지 채운다. 오너 환경 밖(외부 저장소 이슈·PR·댓글, 메일, 다른 워크스페이스, 웹 게시)으로 나가는 작업이면 어디에 누구에게 공개되는지(external)를 채운다. Asks the owner with approve/deny buttons and waits; for irreversible actions fill at least `rollback` and `impact`; for anything published outside the owner's systems fill `external` (where, who can see it).",
 		...(persona ? [MONITOR_LINE] : []),
+		...(surface.noLaneChannel === true ? [NO_LANE_CHANNEL_LINE] : []),
 		...(peerTouched ? [peerTouchedToolsLine(fileTool)] : []),
 		"- 작업 디렉터리는 ompbot workspace다. 그 밖의 파일은 필요할 때만 건드린다. Your cwd is the ompbot workspace; touch files elsewhere only when needed.",
 		...(chat ? [discord ? DISCORD_THREAD_LOOKUP_LINE : THREAD_LOOKUP_LINE, WAIT_INTERIM_LINE] : []),
@@ -218,6 +235,7 @@ export function floorsSystemPrompt(
 	herdr = false,
 	ownerDialogs = false,
 	peerTouched = false,
+	surface: FloorsSurface = {},
 ): string {
 	let injected = "";
 	if (originKey !== undefined && files !== undefined) {
@@ -248,7 +266,7 @@ export function floorsSystemPrompt(
 			);
 		}
 	}
-	return buildFloorsPrompt(secretsDir, originKey, herdr, ownerDialogs, peerTouched) + injected;
+	return buildFloorsPrompt(secretsDir, originKey, herdr, ownerDialogs, peerTouched, surface) + injected;
 }
 
 /** CLI args that make omp use the floors text. */
@@ -260,9 +278,10 @@ export function floorsArgs(
 	herdr = false,
 	ownerDialogs = false,
 	peerTouched = false,
+	surface: FloorsSurface = {},
 ): string[] {
 	return [
 		"--append-system-prompt",
-		floorsSystemPrompt(secretsDir, originKey, files, onPersonaError, herdr, ownerDialogs, peerTouched),
+		floorsSystemPrompt(secretsDir, originKey, files, onPersonaError, herdr, ownerDialogs, peerTouched, surface),
 	];
 }

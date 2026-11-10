@@ -78,6 +78,16 @@ describe("planReload", () => {
 		expect(plan.restartRequired).toEqual([]);
 		expect(plan.next.recallEnabled).toBe(false);
 	});
+
+	test("costCap applies live: a new ceiling is taken without a restart, a removed one is dropped", () => {
+		const added = planReload({ ...home.config }, { ...home.config, costCap: { turnUsd: 20, dailyUsd: 300 } });
+		expect(added.changed).toEqual(["costCap"]);
+		expect(added.restartRequired).toEqual([]);
+		expect(added.next.costCap).toEqual({ turnUsd: 20, dailyUsd: 300 });
+		const removed = planReload({ ...home.config, costCap: { dailyUsd: 300 } }, { ...home.config });
+		expect(removed.changed).toEqual(["costCap"]);
+		expect(removed.next.costCap).toBeUndefined();
+	});
 });
 
 test("ompbot reload applies a new mention-free channel to the next message; an invalid file keeps the running config", async () => {

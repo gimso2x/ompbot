@@ -15,6 +15,13 @@ import {
 	UPLOAD_LIMIT_BYTES,
 } from "./transport";
 
+/** Discord's "a thread has already been created for this message": the thread is there. */
+export const THREAD_EXISTS = 160004;
+/** PUBLIC_THREAD: what a thread started from a message in a text channel is. */
+export const PUBLIC_THREAD = 11;
+/** Discord's limit on a thread name. */
+export const THREAD_NAME_MAX = 100;
+
 /** Channel types of threads (announcement, public, private). */
 const THREAD_TYPES: ReadonlySet<number> = new Set([10, 11, 12]);
 /** Channel types of direct messages (DM, group DM). */
@@ -269,6 +276,24 @@ export class DiscordChannel implements ChannelPort {
 			allowedMentions: this.allowedMentions(content ?? ""),
 		});
 		return { fileId: id };
+	}
+
+	/**
+	 * Starts the thread of `ref`'s message (a server channel message: the thread id is its id) and remembers it, so
+	 * posts with `threadId` = that id go into it. A thread already started from it counts as started.
+	 */
+	async openThread(ref: MessageRef, name: string): Promise<void> {
+		try {
+			await this.transport.startThread({
+				channelId: ref.conversationId,
+				messageId: ref.messageId,
+				name: cutCodePointSafe(name, THREAD_NAME_MAX),
+			});
+		} catch (err) {
+			if (!(err instanceof DiscordCallError && err.code === THREAD_EXISTS)) throw err;
+		}
+		const parent = await this.channelInfo(ref.conversationId);
+		this.remember({ id: ref.messageId, type: PUBLIC_THREAD, parentId: ref.conversationId, guildId: parent?.guildId });
 	}
 
 	/** `https://discord.com/channels/<guild|@me>/<channel>/<message>`; a thread's starter links into the thread. */

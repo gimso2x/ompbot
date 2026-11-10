@@ -35,8 +35,8 @@ export interface SlackConfig {
 	botUserId?: string;
 }
 
-/** Which child process powers a conversation: omp's RPC child (default) or the Claude Code CLI. */
-export type AgentKind = "omp" | "claude";
+/** Which child process powers a conversation: omp's RPC child (default), the Claude Code CLI or the Antigravity CLI (`agy`). */
+export type AgentKind = "omp" | "claude" | "agy";
 
 /** `channels.discord`: present → the daemon also talks on Discord (Gateway + REST with the bot token). */
 export interface DiscordChannelConfig {
@@ -51,6 +51,8 @@ export interface DiscordChannelConfig {
 	mentionFreeChannels?: string[];
 	/** In a server channel only a mention addresses the bot. Default false. */
 	requireMention?: boolean;
+	/** Server text channel where lanes asked for from the Discord DM open (a DM has no threads); absent: no DM lanes. */
+	laneChannelId?: string;
 }
 
 /** Per-platform chat settings: who the owner is on each platform the bot talks on. Slack is required, Discord optional. */
@@ -80,10 +82,12 @@ export interface OmpbotConfig {
 	slack: SlackConfig;
 	ompExecutable: string;
 	workspaceDir: string;
-	/** Child agent behind chat origins: omp (`omp --mode rpc`) or the Claude Code CLI. Default "omp". */
+	/** Child agent behind chat origins: omp (`omp --mode rpc`), the Claude Code CLI or the Antigravity CLI. Default "omp". */
 	agent?: AgentKind;
 	/** Absolute claude CLI path for `agent: "claude"`; default resolves `claude` on the child PATH. */
 	claudeExecutable?: string;
+	/** Absolute agy CLI path for `agent: "agy"`; default resolves `agy` on the child PATH. */
+	agyExecutable?: string;
 	model?: string;
 	thinking?: string;
 	sessionRetentionDays?: number;
@@ -114,6 +118,12 @@ export interface OmpbotConfig {
 	requireMention?: boolean;
 	/** Peer input cap per thread: more than `turns` peer messages within `windowMinutes` are dropped. Default 3 per 30. */
 	peerHopLimit?: { turns: number; windowMinutes: number };
+	/**
+	 * Cost ceiling in dollars as omp prices it (`usage.cost.total`, not the real bill): a turn that reaches `turnUsd`
+	 * is steered to wrap up and one that reaches 1.5x is stopped; a day (KST) whose session-file total passes
+	 * `dailyUsd` stops monitor fires until midnight or `!budget off`. Each key off when absent or not positive.
+	 */
+	costCap?: { turnUsd?: number; dailyUsd?: number };
 	/**
 	 * herdr switch: present (`{}`) → `ompbot_dispatch` offers herdr/taskSpec and the [TASK] sweep runs; absent → simple
 	 * dispatch only. `bin` is the absolute path of the local herdr (default: `herdr` on PATH).
@@ -157,6 +167,11 @@ export interface OmpbotConfig {
 	recallEnabled?: boolean;
 	/** Absolute directories a `watcher` monitor may watch (its root must sit inside one, symlinks resolved). */
 	watcherRoots?: string[];
+	/**
+	 * Git work trees whose changes a conversation turn snapshots for `!undo` (absolute paths; each must be a git work
+	 * tree). Absent or empty = the feature is off and no git is ever run.
+	 */
+	turnSnapshot?: { repos: string[] };
 	/**
 	 * Loopback listener for `webhook` monitor triggers (POST /hook/<id> with a bearer token). Absent = no server and
 	 * webhook triggers cannot be created. `bind` must be a loopback address; the default is 127.0.0.1.
@@ -270,6 +285,7 @@ const DISCORD_KEYS: Record<string, true> = {
 	guildIds: true,
 	mentionFreeChannels: true,
 	requireMention: true,
+	laneChannelId: true,
 };
 
 function parseDiscordChannel(configPath: string, value: unknown, home: string): DiscordChannelConfig {
@@ -299,6 +315,7 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 	const applicationId = snowflake("applicationId");
 	const guildIds = snowflakes("guildIds");
 	const mentionFreeChannels = snowflakes("mentionFreeChannels");
+	const laneChannelId = record.laneChannelId === undefined ? undefined : snowflake("laneChannelId");
 	const requireMention = record.requireMention;
 	if (requireMention !== undefined && typeof requireMention !== "boolean") {
 		invalid(configPath, "channels.discord.requireMention");
@@ -310,6 +327,7 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 		...(guildIds === undefined ? {} : { guildIds }),
 		...(mentionFreeChannels === undefined ? {} : { mentionFreeChannels }),
 		...(requireMention === undefined ? {} : { requireMention }),
+		...(laneChannelId === undefined ? {} : { laneChannelId }),
 	};
 }
 
@@ -436,9 +454,11 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (!isAbsolute(ompExecutable)) invalid(configPath, "ompExecutable");
 
 	const agent = root.agent;
-	if (agent !== undefined && agent !== "omp" && agent !== "claude") invalid(configPath, "agent");
+	if (agent !== undefined && agent !== "omp" && agent !== "claude" && agent !== "agy") invalid(configPath, "agent");
 	const claudeExecutable = optionalString(configPath, root, "claudeExecutable");
 	if (claudeExecutable !== undefined && !isAbsolute(claudeExecutable)) invalid(configPath, "claudeExecutable");
+	const agyExecutable = optionalString(configPath, root, "agyExecutable");
+	if (agyExecutable !== undefined && !isAbsolute(agyExecutable)) invalid(configPath, "agyExecutable");
 
 	const sessionRetentionDays = optionalInt(configPath, root, "sessionRetentionDays", 1);
 	const maxBundleBytes = optionalInt(configPath, root, "maxBundleBytes", 1);
@@ -473,6 +493,19 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				if (key !== "userId" && key !== "name") invalid(configPath, `peerBots.${i}.${key}`);
 		});
 	}
+	const costCap = root.costCap;
+	if (costCap !== undefined) {
+		const record = asRecord(costCap);
+		if (record === undefined) invalid(configPath, "costCap");
+		for (const key of Object.keys(record)) {
+			if (key !== "turnUsd" && key !== "dailyUsd") invalid(configPath, `costCap.${key}`);
+			const value = record[key];
+			if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+				invalid(configPath, `costCap.${key}`);
+			}
+		}
+	}
+
 	const requireMention = root.requireMention;
 	if (requireMention !== undefined && typeof requireMention !== "boolean") invalid(configPath, "requireMention");
 	const peerHopLimit = root.peerHopLimit;
@@ -594,6 +627,32 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		invalid(configPath, "watcherRoots");
 	}
 
+	const turnSnapshotRaw = root.turnSnapshot;
+	let turnSnapshot: { repos: string[] } | undefined;
+	if (turnSnapshotRaw !== undefined) {
+		const record = asRecord(turnSnapshotRaw);
+		if (record === undefined) invalid(configPath, "turnSnapshot");
+		const repos = record.repos;
+		if (
+			repos !== undefined &&
+			(!Array.isArray(repos) || repos.some((repo) => typeof repo !== "string" || !isAbsolute(repo)))
+		) {
+			invalid(configPath, "turnSnapshot.repos");
+		}
+		for (const key of Object.keys(record)) if (key !== "repos") invalid(configPath, `turnSnapshot.${key}`);
+		for (const repo of (repos as string[] | undefined) ?? []) {
+			// Each entry must be a git work tree now: a wrong path would otherwise fail mid-turn, long after startup.
+			let workTree = false;
+			try {
+				workTree = statSync(join(repo, ".git")).isDirectory() || statSync(join(repo, ".git")).isFile();
+			} catch {
+				workTree = false;
+			}
+			if (!workTree) invalid(configPath, "turnSnapshot.repos");
+		}
+		turnSnapshot = { repos: (repos as string[] | undefined) ?? [] };
+	}
+
 	const webhook = root.webhook;
 	if (webhook !== undefined) {
 		const record = asRecord(webhook);
@@ -653,6 +712,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (thinking !== undefined) config.thinking = thinking;
 	if (agent !== undefined) config.agent = agent;
 	if (claudeExecutable !== undefined) config.claudeExecutable = claudeExecutable;
+	if (agyExecutable !== undefined) config.agyExecutable = agyExecutable;
 	if (sessionRetentionDays !== undefined) config.sessionRetentionDays = sessionRetentionDays;
 	if (maxBundleBytes !== undefined) config.maxBundleBytes = maxBundleBytes;
 	if (offsite !== undefined) config.offsite = offsite;
@@ -667,11 +727,19 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	}
 	if (requireMention !== undefined) config.requireMention = requireMention;
 	if (peerHopLimit !== undefined) config.peerHopLimit = peerHopLimit as { turns: number; windowMinutes: number };
+	if (costCap !== undefined) {
+		const record = costCap as { turnUsd?: number; dailyUsd?: number };
+		const capped: { turnUsd?: number; dailyUsd?: number } = {};
+		if (record.turnUsd !== undefined) capped.turnUsd = record.turnUsd;
+		if (record.dailyUsd !== undefined) capped.dailyUsd = record.dailyUsd;
+		config.costCap = capped;
+	}
 	if (escalationChannel !== undefined) config.escalationChannel = escalationChannel;
 	if (logChannel !== undefined) config.logChannel = logChannel;
 	if (restartNotice !== undefined) config.restartNotice = restartNotice;
 	if (recallEnabled !== undefined) config.recallEnabled = recallEnabled;
 	if (watcherRoots !== undefined) config.watcherRoots = (watcherRoots as string[]).map((r) => resolve(r));
+	if (turnSnapshot !== undefined) config.turnSnapshot = { repos: turnSnapshot.repos.map((repo) => resolve(repo)) };
 	if (webhook !== undefined) config.webhook = webhook as { port: number; bind?: "127.0.0.1" | "::1" };
 	if (dashboard !== undefined) config.dashboard = dashboard as NonNullable<OmpbotConfig["dashboard"]>;
 	if (herdr !== undefined) config.herdr = herdr;

@@ -19,11 +19,14 @@ export type CommandKind =
 	| "followup"
 	| "usage"
 	| "distill"
-	| "btw";
+	| "btw"
+	| "undo"
+	| "budget";
 
 /**
  * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` and `btw` are typed
- * as `!distill` / `!btw` only: their slash names are not in the Slack app manifests.
+ * as `!distill` / `!btw` only: their slash names are not in the Slack app manifests. `undo` restores the newest
+ * conversation turn's files (doc/plans/turn-undo.md), so its slash name is registered.
  */
 export const COMMAND_TEXT: Record<CommandKind, string> = {
 	new: "/new-ompbot",
@@ -37,6 +40,8 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
 	usage: "/usage-ompbot",
 	distill: "/distill-ompbot",
 	btw: "/btw-ompbot",
+	undo: "/undo-ompbot",
+	budget: "/budget-ompbot",
 };
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
@@ -53,6 +58,7 @@ export const TAKES_ARG: ReadonlySet<CommandKind> = new Set([
 	"queue",
 	"followup",
 	"btw",
+	"budget",
 ]);
 
 export interface ParsedCommand {

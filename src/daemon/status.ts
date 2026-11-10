@@ -88,8 +88,18 @@ export function frozenField(homeDir: string): { frozen?: FreezeState } {
 }
 
 /** Open gates of a home, as the status lines list them; the daemon and the CLI fallback use the same projection. */
-export function openGateSummary(dbPath: string, now = Date.now(), offsiteConfigured = false): OpenGateSummary[] {
-	return collectGates({ homeDir: dirname(dbPath), now, offsiteConfigured })
+export function openGateSummary(
+	dbPath: string,
+	now = Date.now(),
+	offsiteConfigured = false,
+	dailyCapUsd?: number,
+): OpenGateSummary[] {
+	return collectGates({
+		homeDir: dirname(dbPath),
+		now,
+		offsiteConfigured,
+		...(dailyCapUsd === undefined ? {} : { dailyCapUsd }),
+	})
 		.filter((gate) => gate.state === "open")
 		.map((gate) => ({ name: gate.name, detail: gate.detail }));
 }
@@ -122,7 +132,12 @@ export function buildStatus(
 }
 
 /** Read-only fallback when no daemon answers: never opens a `Store`, because opening one re-queues inflight deliveries. */
-export function readStatusFromDb(dbPath: string, ompVersion: string, offsiteConfigured = false): StatusReport {
+export function readStatusFromDb(
+	dbPath: string,
+	ompVersion: string,
+	offsiteConfigured = false,
+	dailyCapUsd?: number,
+): StatusReport {
 	const db = new Database(dbPath, { readonly: true, strict: true });
 	try {
 		const inbound = emptyInbound();
@@ -152,7 +167,7 @@ export function readStatusFromDb(dbPath: string, ompVersion: string, offsiteConf
 			ledger: ledgerFrom(deliveryCounts),
 			inbound,
 			monitors: readMonitorsStatus(db),
-			openGates: openGateSummary(dbPath, Date.now(), offsiteConfigured),
+			openGates: openGateSummary(dbPath, Date.now(), offsiteConfigured, dailyCapUsd),
 			...frozenField(dirname(dbPath)),
 		};
 	} finally {

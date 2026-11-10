@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { openBotStore } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import { readStatusFromDb, renderStatusText, summarizeMonitors } from "../src/daemon/status";
+import { DiscordBinding } from "../src/discord/binding";
+import { DiscordChannel } from "../src/discord/channel";
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { type MonitorLedger, monitorOrigin, openMonitorLedger } from "../src/monitors/ledger";
@@ -13,7 +15,14 @@ import { redact } from "../src/redact";
 import { buildFloorsPrompt } from "../src/safety/prompt";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	DISCORD_OWNER,
+	makeHome,
+	type TestHome,
+	WaitingDiscordTransport,
+	WaitingTransport,
+	withDiscord,
+} from "./helpers/bot-home";
 
 const ORIGIN = "slack/dm/D1";
 /** 2026-10-19 06:00:00 UTC = 15:00 in Asia/Seoul. */
@@ -217,8 +226,42 @@ describe("who gets the tools", () => {
 		}
 	});
 
+	test("a Discord owner DM gets the monitor tools, a Discord thread does not; Slack origins keep their tool lists", async () => {
+		const sessions = new FakeSessionStore();
+		const discordDm = "discord/dm/123456789012345678"; // gitleaks:allow (fake snowflake)
+		const discordThread = "discord/ch/111111111111111111/t/222222222222222222"; // gitleaks:allow (fake snowflake)
+		const daemon = new Daemon({
+			config: withDiscord(home),
+			channels: [
+				new SlackBinding(new SlackChannel(new WaitingTransport())),
+				new DiscordBinding(new DiscordChannel(new WaitingDiscordTransport(), { ownerUserId: DISCORD_OWNER })),
+			],
+			log,
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		await daemon.start();
+		try {
+			const names = (origin: string) => daemon.hostToolsFor(origin).map((tool) => tool.name);
+			const monitorNames = ["ompbot_monitor_add", "ompbot_monitor_list", "ompbot_monitor_remove"];
+			for (const name of monitorNames) expect(names(discordDm)).toContain(name);
+			for (const name of monitorNames) expect(names(discordThread)).not.toContain(name);
+			// The Slack lists as main 627d14a built them.
+			const withLaneStart = ["ompbot_dispatch", "slack_send_file", "ompbot_request_approval", "ompbot_work_start"];
+			expect(names(ORIGIN)).toEqual([...withLaneStart, ...monitorNames]);
+			for (const origin of ["slack/ch/C1", "slack/ch/C1/t/1.2", "slack/dm/D1/t/1.2"]) {
+				expect(names(origin)).toEqual(withLaneStart);
+			}
+		} finally {
+			await daemon.stop();
+		}
+	});
+
 	test("the system prompt mentions the monitor tools for persona sessions only", () => {
 		expect(buildFloorsPrompt("/s", ORIGIN)).toContain("ompbot_monitor_add");
+		expect(buildFloorsPrompt("/s", "discord/dm/123456789012345678")).toContain("ompbot_monitor_add"); // gitleaks:allow (fake snowflake)
+		expect(buildFloorsPrompt("/s", "discord/ch/111111111111111111/t/2")).not.toContain("ompbot_monitor_add"); // gitleaks:allow (fake snowflake)
 		expect(buildFloorsPrompt("/s", monitorOrigin("mabc12345"))).not.toContain("ompbot_monitor_add");
 		expect(buildFloorsPrompt("/s")).not.toContain("ompbot_monitor_add");
 	});

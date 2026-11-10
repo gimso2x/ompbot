@@ -104,6 +104,29 @@ describe("loadConfig", () => {
 		expect(err.message).toContain("field=claudeExecutable");
 	});
 
+	test("agent agy with an absolute agyExecutable is accepted", () => {
+		writeConfig(
+			baseConfig({ agent: "agy", agyExecutable: "/home/u/.local/bin/agy", model: "agy/gemini-3.8-flash-high" }),
+		);
+		const cfg = loadConfig(home);
+		expect(cfg.agent).toBe("agy");
+		expect(cfg.agyExecutable).toBe("/home/u/.local/bin/agy");
+		expect(cfg.model).toBe("agy/gemini-3.8-flash-high");
+	});
+
+	test("agent agy without agyExecutable leaves it unset (resolved on PATH)", () => {
+		writeConfig(baseConfig({ agent: "agy" }));
+		const cfg = loadConfig(home);
+		expect(cfg.agent).toBe("agy");
+		expect(cfg.agyExecutable).toBeUndefined();
+	});
+
+	test("relative agyExecutable is rejected", () => {
+		writeConfig(baseConfig({ agent: "agy", agyExecutable: "agy" }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.message).toContain("field=agyExecutable");
+	});
+
 	test("readSlackTokens returns trimmed token values", () => {
 		expect(readSlackTokens(loadConfig(home))).toEqual({ botToken: "xoxb-TEST-0", appToken: "xapp-TEST-0" });
 	});
@@ -208,6 +231,12 @@ describe("loadConfig", () => {
 		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 1.5 } })],
 		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3 } })],
 		["peerHopLimit.extra", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 30, extra: 1 } })],
+		["costCap", baseConfig({ costCap: 20 })],
+		["costCap.turnUsd", baseConfig({ costCap: { turnUsd: 0 } })],
+		["costCap.turnUsd", baseConfig({ costCap: { turnUsd: -1 } })],
+		["costCap.dailyUsd", baseConfig({ costCap: { dailyUsd: "300" } })],
+		["costCap.dailyUsd", baseConfig({ costCap: { dailyUsd: Number.POSITIVE_INFINITY } })],
+		["costCap.warnUsd", baseConfig({ costCap: { turnUsd: 20, dailyUsd: 300, warnUsd: 10 } })],
 	])("invalid field %s is reported by name", (field, cfg) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
@@ -252,6 +281,14 @@ describe("loadConfig", () => {
 			requireMention: true,
 			peerHopLimit: { turns: 2, windowMinutes: 10 },
 		});
+	});
+
+	test("costCap is optional, keeps only the ceilings given, and reload treats it as live", () => {
+		expect(loadConfig(home).costCap).toBeUndefined();
+		writeConfig(baseConfig({ costCap: { turnUsd: 20 } }));
+		expect(loadConfig(home).costCap).toEqual({ turnUsd: 20 });
+		writeConfig(baseConfig({ costCap: { turnUsd: 20, dailyUsd: 300 } }));
+		expect(loadConfig(home).costCap).toEqual({ turnUsd: 20, dailyUsd: 300 });
 	});
 
 	test("mentionFreeChannels is optional and accepts only channel ids", () => {
@@ -357,6 +394,7 @@ describe("channels.discord", () => {
 				guildIds: ["345678901234567890"],
 				mentionFreeChannels: ["456789012345678901"],
 				requireMention: true,
+				laneChannelId: "567890123456789012",
 			}),
 		);
 		const cfg = loadConfig(home);
@@ -367,6 +405,7 @@ describe("channels.discord", () => {
 			guildIds: ["345678901234567890"],
 			mentionFreeChannels: ["456789012345678901"],
 			requireMention: true,
+			laneChannelId: "567890123456789012",
 		});
 		expect(JSON.stringify(cfg)).not.toContain(TOKEN);
 		writeConfig(withDiscord());
@@ -403,6 +442,16 @@ describe("channels.discord", () => {
 			"field=channels.discord.mentionFreeChannels",
 		],
 		["requireMention not a boolean", withDiscord({ requireMention: "yes" }), "field=channels.discord.requireMention"],
+		[
+			"a Slack-style laneChannelId",
+			withDiscord({ laneChannelId: "C0123ABCD" }),
+			"field=channels.discord.laneChannelId",
+		],
+		[
+			"a numeric laneChannelId",
+			withDiscord({ laneChannelId: 45678901234567890 }),
+			"field=channels.discord.laneChannelId",
+		],
 		["an unknown key", withDiscord({ botToken: "x" }), "field=channels.discord.botToken"],
 		[
 			"discord not an object",

@@ -65,6 +65,17 @@
 				"command": "/usage-ompbot",
 				"description": "토큰·비용 사용량 보기",
 				"should_escape": false
+			},
+			{
+				"command": "/undo-ompbot",
+				"description": "최근 변경 턴 되돌리기",
+				"should_escape": false
+			},
+			{
+				"command": "/budget-ompbot",
+				"description": "오늘 비용과 상한 보기·오늘 상한 끄기",
+				"usage_hint": "[off|on]",
+				"should_escape": false
 			}
 		]
 	},

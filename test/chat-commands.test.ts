@@ -119,6 +119,23 @@ describe("command parsing", () => {
 		expect(promptTextOf("/followup-ompbot 테스트 돌려")).toBe("테스트 돌려");
 		expect(promptTextOf("그냥 메시지")).toBe("그냥 메시지");
 	});
+
+	test("!undo and /undo-ompbot parse as the undo command and take no argument", () => {
+		expect(parseCommand("!undo")).toEqual({ kind: "undo", arg: "" });
+		expect(parseCommand("/undo-ompbot")).toEqual({ kind: "undo", arg: "" });
+		expect(parseCommand("  !undo  ")).toEqual({ kind: "undo", arg: "" });
+		expect(parseCommand("/undo-ompbot now")).toBeUndefined();
+		expect(parseCommand("undo 해줘")).toBeUndefined();
+	});
+
+	test("!budget and /budget-ompbot take an argument, so off/on reach the command and bare !budget answers totals", () => {
+		expect(parseCommand("!budget")).toEqual({ kind: "budget", arg: "" });
+		expect(parseCommand("!budget off")).toEqual({ kind: "budget", arg: "off" });
+		expect(parseCommand("!budget on")).toEqual({ kind: "budget", arg: "on" });
+		expect(parseCommand(" /budget-ompbot off ")).toEqual({ kind: "budget", arg: "off" });
+		// A bare `!budget` in the middle of a sentence is a prompt, not a command.
+		expect(parseCommand("예산 보려면 !budget")).toBeUndefined();
+	});
 });
 
 describe("① model and thinking", () => {

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { isThreadOrigin } from "../core/normalize";
 import { sessionDirFor } from "../core/origin";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
+import { removeTurnRefsSync, TURN_SNAPSHOT_RETENTION_DAYS } from "./turn-snapshot";
 
 export const DEFAULT_SESSION_RETENTION_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -25,6 +26,8 @@ export interface GcResult {
 	threadOriginsRemoved: string[];
 	/** Origins of deleted monitors (`monitor/<id>` with no row in `monitors`) removed whole past retention. */
 	monitorOriginsRemoved: string[];
+	/** `!undo` turn snapshots past retention: rows deleted and their refs released. */
+	turnSnapshotsRemoved: number;
 }
 
 /** Newest modification time of a directory tree (symlinks are not followed). */
@@ -48,7 +51,13 @@ function newestMtimeMs(path: string): number {
  * newest file mtime (the ledger's `updated_at` is not bumped on turns); a missing directory counts as expired.
  */
 export function gcSessions(options: GcOptions): GcResult {
-	const result: GcResult = { removed: [], retained: [], threadOriginsRemoved: [], monitorOriginsRemoved: [] };
+	const result: GcResult = {
+		removed: [],
+		retained: [],
+		threadOriginsRemoved: [],
+		monitorOriginsRemoved: [],
+		turnSnapshotsRemoved: 0,
+	};
 	const dbPath = join(options.homeDir, "ompbot.db");
 	if (!existsSync(dbPath)) return result;
 	const sessionsRoot = join(options.homeDir, "sessions");
@@ -121,8 +130,26 @@ export function gcSessions(options: GcOptions): GcResult {
 			}
 			(orphanMonitor ? result.monitorOriginsRemoved : result.threadOriginsRemoved).push(origin.origin_key);
 		}
+		result.turnSnapshotsRemoved = write === undefined ? 0 : gcTurnSnapshots(write, options);
 	} finally {
 		write?.close();
 	}
 	return result;
+}
+
+/**
+ * `!undo` rows past the turn-snapshot retention (7 days, independent of the session window) leave the ledger, and the
+ * `refs/ompbot/turns/<id>/…` that kept their trees alive go with them. Runs on the writable handle `gcSessions` already
+ * opened; a dry run reads the count and writes nothing.
+ */
+function gcTurnSnapshots(db: Database, options: GcOptions): number {
+	const cutoff = options.now - TURN_SNAPSHOT_RETENTION_DAYS * DAY_MS;
+	const rows = db.query("SELECT id, repo FROM turn_snapshots WHERE ended_at < ?").all(cutoff) as Array<{
+		id: number;
+		repo: string;
+	}>;
+	if (rows.length === 0 || options.dryRun === true) return rows.length;
+	db.query("DELETE FROM turn_snapshots WHERE ended_at < ?").run(cutoff);
+	removeTurnRefsSync(rows.map((row) => ({ id: row.id, repo: row.repo })));
+	return rows.length;
 }

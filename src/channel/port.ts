@@ -52,6 +52,11 @@ export interface ChannelPort {
 	/** Link to one message (a thread root links to its thread); `undefined` when the platform has none. */
 	permalink(ref: MessageRef): Promise<string | undefined>;
 	mentionUser(userId: string): string;
+	/**
+	 * Starts the thread of the message `ref` (its id becomes the thread id), for a platform whose replies do not open
+	 * one by themselves (Discord). Absent where a reply to the message is already its thread (Slack).
+	 */
+	openThread?(ref: MessageRef, name: string): Promise<void>;
 }
 
 /**

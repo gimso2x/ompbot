@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_SWEEP_MS, readSweepHeartbeat } from "../daemon/heartbeat";
 import { nextFireOf, toMonitor } from "../monitors/ledger";
 import { checkOmpRuntime } from "../omp/runtime-check";
+import { kstDay } from "../tasks/docs";
 import { readStamp } from "./backup";
 import { readFreeze } from "./freeze";
 import { HERDR_HEALTH_STALE_MS, HERDR_UNREACHABLE_AFTER, readHerdrHealth } from "./herdr-health";
@@ -85,6 +86,11 @@ export interface GatesOptions {
 	statfs?: StatfsReader;
 	/** Test seam: load average, CPU count and /proc/meminfo for `host_pressure` (default this machine's). */
 	hostLoad?: Partial<HostLoadReader>;
+	/**
+	 * `costCap.dailyUsd`. With a ceiling the `cost_cap` gate exists and opens while today's ledger total has reached it
+	 * (the day `!budget off` lifted it stays closed); without one there is nothing to judge and no gate.
+	 */
+	dailyCapUsd?: number;
 }
 
 function gate(name: string, open: boolean, detail: string): Gate {
@@ -118,6 +124,19 @@ function columnExists(db: Database, table: string, column: string): boolean {
 function scalar(db: Database, sql: string): number {
 	const row = db.query(sql).get() as Record<string, number> | null;
 	return row == null ? 0 : Number(Object.values(row)[0] ?? 0);
+}
+
+/** Today's `usage_daily` total (`src/ops/cost-cap.ts` keys it by the KST day). */
+function dailySpend(db: Database, day: string): number {
+	const row = db.query("SELECT COALESCE(SUM(cost), 0) AS cost FROM usage_daily WHERE day = ?").get(day) as {
+		cost: number;
+	} | null;
+	return row?.cost ?? 0;
+}
+
+/** Whether one of the ledger's stored flags (`slack_cursors`) exists: the day-scoped `!budget off` lives there. */
+function cursorExists(db: Database, cursorKey: string): boolean {
+	return db.query("SELECT 1 FROM slack_cursors WHERE cursor_key = ?").get(cursorKey) != null;
 }
 
 /**
@@ -407,6 +426,23 @@ export function collectGates(options: GatesOptions): Gate[] {
 					)
 				: 0;
 		ledger.push(gate("turns_failing", failedTurns >= TURNS_FAILING_THRESHOLD, `recent=${failedTurns}`));
+
+		// The daily cost ceiling (`costCap.dailyUsd`): open while today's spend has reached it and monitors are stopped.
+		// A day the owner switched off with `!budget off` is closed (the brake is lifted, so nothing is wrong), and a
+		// ledger without the table (a daemon that never finished a turn) reads as zero spend.
+		if (options.dailyCapUsd !== undefined) {
+			const day = kstDay(now);
+			const spend = tableExists(db, "usage_daily") ? dailySpend(db, day) : 0;
+			const off = tableExists(db, "slack_cursors") && cursorExists(db, `cost-cap-off:${day}`);
+			const over = spend >= options.dailyCapUsd && !off;
+			ledger.push(
+				gate(
+					"cost_cap",
+					over,
+					`today=${spend.toFixed(2)} cap=${options.dailyCapUsd.toFixed(2)}${off ? " off=today" : ""}`,
+				),
+			);
+		}
 		gates.push(...ledger);
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);

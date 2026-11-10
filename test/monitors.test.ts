@@ -64,6 +64,7 @@ let drivers: FakeOmpDriver[];
 let behavior: Behavior;
 let logLines: string[];
 let frozenState: { since: string; reason: string; by: string } | undefined;
+let budgetState: { day: string; cost: number; cap: number } | undefined;
 
 const scriptsRoot = () => join(dir, "scripts");
 
@@ -76,6 +77,7 @@ beforeEach(() => {
 	drivers = [];
 	behavior = {};
 	frozenState = undefined;
+	budgetState = undefined;
 	const sessions = new FakeSessionStore();
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
 	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
@@ -105,6 +107,7 @@ beforeEach(() => {
 		scriptsRoot: scriptsRoot(),
 		workspaceDir: join(dir, "workspace"),
 		frozen: () => frozenState,
+		budgetExceeded: () => budgetState,
 	});
 	scheduler.start();
 });
@@ -171,6 +174,75 @@ describe("monitors: exactly once", () => {
 		expect(store.monitors.listEvents()).toHaveLength(1);
 		expect(store.monitors.listSlots(monitor.id)).toEqual([{ slotAt: slot, state: "claimed", reason: null }]);
 		expect(prompts()).toHaveLength(1);
+	});
+});
+
+describe("monitors: daily cost ceiling", () => {
+	const BUDGET = { day: "20260601", cost: 12, cap: 10 };
+
+	test("due slots become skipped `budget` events with nothing dispatched; lifting it fires again without replaying", async () => {
+		const monitor = cronMonitor("* * * * *");
+		budgetState = BUDGET;
+		clock.advance(3 * MINUTE);
+		const held = await run();
+		expect(held).toMatchObject({ claimed: 0, skippedBudget: 3, dispatched: 0 });
+		expect(stages()).toEqual(["skipped", "skipped", "skipped"]);
+		expect(store.monitors.listEvents().every((event) => event.payload?.startsWith("budget"))).toBe(true);
+		expect(prompts()).toHaveLength(0);
+
+		budgetState = undefined;
+		clock.advance(MINUTE);
+		const resumed = await run();
+		expect(resumed.claimed).toBe(1);
+		await until(() => store.monitors.listEvents().filter(answered).length === 1);
+		expect(prompts()).toHaveLength(1);
+		// The three held minutes stay skipped: only the new minute runs.
+		expect(store.monitors.listEvents()).toHaveLength(4);
+		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(clock.now());
+	});
+
+	test("an event admitted before the ceiling is reached is skipped, not queued for a burst after midnight", async () => {
+		const monitor = cronMonitor("0 0 1 1 *");
+		const claim = store.monitors.claimSlot({ monitorId: monitor.id, slotAt: clock.now(), manual: true });
+		if (claim.status !== "admitted") throw new Error("expected an admitted event");
+		budgetState = BUDGET;
+		await run();
+		const event = store.monitors.getEvent(claim.event.eventId);
+		expect(event?.stage).toBe("skipped");
+		expect(event?.error).toBe("budget");
+		expect(logLines.filter((line) => line.includes("event=monitor_budget_skip"))).toHaveLength(1);
+		budgetState = undefined;
+		await run();
+		expect(prompts()).toHaveLength(0);
+	});
+
+	test("a script check does not run while the ceiling stands, and the freeze reason wins when both hold", async () => {
+		const script = join(scriptsRoot(), "c.sh");
+		writeFileSync(script, "#!/bin/sh\necho met\nexit 0\n", { mode: 0o755 });
+		const monitor = store.monitors.addMonitor({
+			name: "check",
+			trigger: { kind: "script", command: [script], intervalMs: MINUTE },
+			instruction: "act",
+			overlap: "queue",
+			enabled: true,
+		});
+		budgetState = BUDGET;
+		clock.advance(MINUTE);
+		expect(await run()).toMatchObject({ claimed: 0, dispatched: 0 });
+		expect(store.monitors.listEvents()).toHaveLength(0);
+		// Not running the check leaves its cursor where it was: a held check never starts a turn.
+		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(T0);
+		expect(store.monitors.getMonitor(monitor.id)?.lastScriptState).toBeNull();
+
+		// Both holds at once: the freeze switch names the skip, so a frozen tick keeps its own reason.
+		const cron = cronMonitor("* * * * *");
+		frozenState = { since: "2026-06-01T00:00:00.000Z", reason: "점검", by: "cli" };
+		clock.advance(MINUTE);
+		const both = await run();
+		expect(both).toMatchObject({ claimed: 0, skippedFrozen: 1, skippedBudget: 0 });
+		const events = store.monitors.listEvents().filter((event) => event.monitorId === cron.id);
+		expect(events).toHaveLength(1);
+		expect(events[0]?.payload?.startsWith("frozen")).toBe(true);
 	});
 });
 

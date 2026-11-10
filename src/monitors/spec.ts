@@ -54,9 +54,9 @@ export interface MonitorSpec {
 	instruction: string;
 	overlap: MonitorOverlap;
 	enabled: boolean;
-	/** Slack channel id the answer is posted into as one top-level thread; absent = the owner DM. */
+	/** Slack or Discord channel id the answer is posted into as one top-level thread; absent = the owner DM. */
 	channel?: string;
-	/** Slack channel id that also gets a top-level copy of every settled event (delivered or silent); absent = none. */
+	/** Slack or Discord channel id that also gets a top-level copy of every settled event (delivered or silent); absent = none. */
 	copyChannel?: string;
 	/** omp model id (`provider/id`) this monitor's session is pinned to; absent = the global default / origin choice. */
 	model?: string;
@@ -111,6 +111,10 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 export type MonitorThinking = (typeof THINKING_LEVELS)[number];
 const MODEL_ID = /^\S+\/\S+$/;
 const CHANNEL_ID = /^[CG][A-Z0-9]{8,}$/;
+/** A Discord channel or DM id (snowflake), the grammar `config.ts` takes for Discord ids. */
+const DISCORD_CHANNEL_ID = /^[0-9]{17,20}$/;
+const isChannelId = (value: unknown): value is string =>
+	typeof value === "string" && (CHANNEL_ID.test(value) || DISCORD_CHANNEL_ID.test(value));
 
 function record(value: unknown, what: string): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -374,13 +378,13 @@ export function mergeMonitorSpec(current: MonitorSpec | undefined, patch: unknow
 	if (typeof enabled !== "boolean") throw new MonitorSpecError("enabled must be true or false");
 	// `channel: null` clears it back to the owner DM.
 	const channel = obj.channel === null ? undefined : (obj.channel ?? current?.channel);
-	if (channel !== undefined && (typeof channel !== "string" || !CHANNEL_ID.test(channel))) {
-		throw new MonitorSpecError("channel must be a Slack channel id like C0123456789");
+	if (channel !== undefined && !isChannelId(channel)) {
+		throw new MonitorSpecError("channel must be a Slack channel id like C0123456789 or a Discord channel id");
 	}
 	// `copyChannel: null` stops the copies.
 	const copyChannel = obj.copyChannel === null ? undefined : (obj.copyChannel ?? current?.copyChannel);
-	if (copyChannel !== undefined && (typeof copyChannel !== "string" || !CHANNEL_ID.test(copyChannel))) {
-		throw new MonitorSpecError("copyChannel must be a Slack channel id like C0123456789");
+	if (copyChannel !== undefined && !isChannelId(copyChannel)) {
+		throw new MonitorSpecError("copyChannel must be a Slack channel id like C0123456789 or a Discord channel id");
 	}
 	// `model: null` / `thinking: null` unpin the field.
 	const model = obj.model === null ? undefined : (obj.model ?? current?.model);

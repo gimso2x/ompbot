@@ -55,6 +55,8 @@ export interface FakeOmpDriverOptions {
 	models?: readonly string[];
 	/** Active model at start, overriding `models[0]` — may be absent from `models`, like a session restored with a model the provider removed. */
 	restoredModel?: string;
+	/** Reported as `state().sessionFile` (the transcript on disk a turn's cost is read from); absent = none. */
+	sessionFile?: string;
 	/** Emitted in order right after each turn starts, before `toolCalls` (omp payload shape, e.g. `auto_retry_start`). */
 	events?: readonly OmpEvent[];
 	/** Reported as `tool_execution_start` events right after each turn starts (omp payload shape). */
@@ -352,6 +354,7 @@ export class FakeOmpDriver implements OmpSessionDriver {
 			messageCount: session.entries.length,
 			model: this.#model,
 			thinking: this.#thinking,
+			...(this.#options.sessionFile === undefined ? {} : { sessionFile: this.#options.sessionFile }),
 		};
 	}
 

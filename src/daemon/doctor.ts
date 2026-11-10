@@ -126,10 +126,10 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 
 		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
 		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere)
-		// and for agent "claude", which never spawns omp; an unreadable launcher (a directory, no permission) is a
+		// and for agents "claude"/"agy", which never spawn omp; an unreadable launcher (a directory, no permission) is a
 		// failed line, not an exception that ends the whole report.
 		const runtimeBun = Bun.which("bun");
-		if (config.agent !== "claude" && runtimeBun !== null && existsSync(config.ompExecutable)) {
+		if ((config.agent ?? "omp") === "omp" && runtimeBun !== null && existsSync(config.ompExecutable)) {
 			try {
 				const cliPath = realpathSync(config.ompExecutable);
 				const problem = checkOmpRuntime(cliPath, runtimeBun);
@@ -185,6 +185,23 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 					`no ${credentials} and no ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN (run: claude /login)`,
 				);
 			}
+		}
+
+		// agent "agy": the Antigravity CLI must exist, and its Google login must be on disk (presence only).
+		if (config.agent === "agy") {
+			const given = config.agyExecutable ?? "agy";
+			try {
+				const executable = given.includes("/") ? given : (Bun.which(given) ?? "");
+				if (executable === "") throw new Error("not on PATH");
+				accessSync(executable, constants.X_OK);
+				const version = await readVersion([executable, "--version"]);
+				report(version !== "unknown", "agy", `${executable} ${version}`);
+			} catch {
+				report(false, "agy", `${given} not executable`);
+			}
+			const credentials = join(homedir(), ".gemini", "oauth_creds.json");
+			const present = existsSync(credentials);
+			report(present, "agy auth", present ? `${credentials} present` : `no ${credentials} (run: agy, then sign in)`);
 		}
 	}
 	const bunPath = Bun.which("bun");

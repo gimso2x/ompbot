@@ -25,6 +25,7 @@ export type OmpDriverErrorCode =
 	| "bun_too_old"
 	| "claude_executable_missing"
 	| "claude_not_authenticated"
+	| "agy_executable_missing"
 	| "invalid_env"
 	| "already_started"
 	| "not_started"

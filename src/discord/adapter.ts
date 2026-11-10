@@ -42,7 +42,7 @@ import {
 } from "../core/types";
 import type { Logger } from "../log";
 import { type BackfillCursors, type BackfillTarget, DiscordBackfill } from "./backfill";
-import type { Destination, DiscordChannel } from "./channel";
+import { type Destination, type DiscordChannel, PUBLIC_THREAD, THREAD_EXISTS, THREAD_NAME_MAX } from "./channel";
 import { fromDiscordEmoji, toDiscordEmoji } from "./emoji";
 import { type DiscordPart, mrkdwnToDiscord, renderDiscordMessages } from "./format";
 import {
@@ -60,12 +60,6 @@ import {
 
 /** Message types the bot reads: a plain message and a reply. Everything else is a system message. */
 const READ_TYPES: ReadonlySet<number> = new Set([0, 19]);
-/** "A thread has already been created for this message": the message's thread exists and has its id. */
-const THREAD_EXISTS = 160004;
-/** Thread names are 1–100 characters. */
-const THREAD_NAME_MAX = 100;
-/** PUBLIC_THREAD: what a thread started from a message in a text channel is. */
-const PUBLIC_THREAD = 11;
 const DM_CHANNEL = 1;
 /** Interaction types: a slash command, a message component (button click). */
 const APPLICATION_COMMAND = 2;
@@ -97,6 +91,8 @@ const COMMAND_DESCRIPTIONS: Record<CommandKind, string> = {
 	usage: "토큰·비용 사용량 보기",
 	distill: "이 대화 세션에서 스킬 후보 리뷰",
 	btw: "진행 중인 작업에 섞지 않고 곁질문에만 답하기",
+	undo: "최근 변경 턴 되돌리기",
+	budget: "오늘 비용과 상한 보기·오늘 상한 끄기",
 };
 
 /**
@@ -340,7 +336,11 @@ export class DiscordAdapter implements ChannelAdapter {
 		return this.#processMessage(
 			{
 				id: input.messageId,
-				channel_id: input.threadId ?? input.conversationId,
+				// A DM has no threads: its `threadId` is the message the marker replied to, not a channel.
+				channel_id: input.kind === "dm" ? input.conversationId : (input.threadId ?? input.conversationId),
+				...(input.kind === "dm" && input.threadId !== undefined
+					? { message_reference: { message_id: input.threadId } }
+					: {}),
 				guild_id: inChannel ? conversation?.guildId : undefined,
 				author: { id: this.#owner },
 				content: `${inChannel && botUserId !== undefined ? `<@${botUserId}> ` : ""}${input.text}`,

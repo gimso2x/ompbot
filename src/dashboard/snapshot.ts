@@ -640,7 +640,7 @@ export interface DashboardSnapshot {
 }
 
 export type DashboardConfig = Partial<
-	Pick<OmpbotConfig, "agent" | "ompExecutable" | "offsite" | "herdr" | "dispatchHosts" | "herdrBoard">
+	Pick<OmpbotConfig, "agent" | "ompExecutable" | "offsite" | "herdr" | "dispatchHosts" | "herdrBoard" | "costCap">
 > &
 	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
 		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
@@ -1142,7 +1142,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}
 			if (report === undefined) {
 				needDb();
-				report = readStatusFromDb(dbPath, await deps.ompVersion(), config?.offsite !== undefined);
+				report = readStatusFromDb(
+					dbPath,
+					await deps.ompVersion(),
+					config?.offsite !== undefined,
+					config?.costCap?.dailyUsd,
+				);
 			}
 			const info: DaemonInfo = summarizeStatus(report);
 			const beat = readSweepHeartbeat(deps.homeDir);
@@ -1676,6 +1681,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					? { ompExecutable: config.ompExecutable }
 					: {}),
 				offsiteConfigured: config?.offsite !== undefined,
+				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
 			}).map((gate) => ({ ...gate, detail: redact(gate.detail) })),
 		}));
 

@@ -55,6 +55,18 @@ function spec(params: Record<string, unknown>): Record<string, unknown> {
 	}
 }
 
+/**
+ * A monitor without `channel` posts to the owner DM it was registered from: a Slack registration keeps no channel (the
+ * Slack owner DM is the stored default), another platform's stores its DM id, since the default would be Slack's.
+ */
+function withDefaultChannel(params: Record<string, unknown>, originKey: string): Record<string, unknown> {
+	const ref = parseChatOrigin(originKey);
+	if (ref === undefined || ref.platform === "slack" || (params.channel !== undefined && params.channel !== null)) {
+		return params;
+	}
+	return { ...params, channel: ref.conversationId };
+}
+
 /** `ompbot_monitor_add/list/remove`; empty for any origin that is not an owner-DM persona session. */
 export function buildMonitorTools(deps: MonitorToolDeps): HostToolDef[] {
 	if (!isPersonaOrigin(deps.originKey)) return [];
@@ -115,12 +127,12 @@ export function buildMonitorTools(deps: MonitorToolDeps): HostToolDef[] {
 					channel: {
 						type: "string",
 						description:
-							"Slack channel id (C…/G…) to post the result into as one top-level thread instead of the owner DM; the answer may mention the owner as <@U…>",
+							"Slack channel id (C…/G…) or Discord channel id (digits) to post the result into as one top-level thread instead of the owner DM this session runs in; the answer may mention the owner as <@U…>",
 					},
 					copyChannel: {
 						type: "string",
 						description:
-							"Slack channel id (C…/G…) that also gets a top-level copy of every run's result, including runs that stayed silent; the primary delivery is unchanged",
+							"Slack channel id (C…/G…) or Discord channel id (digits) that also gets a top-level copy of every run's result, including runs that stayed silent; the primary delivery is unchanged",
 					},
 					model: {
 						type: "string",
@@ -149,7 +161,12 @@ export function buildMonitorTools(deps: MonitorToolDeps): HostToolDef[] {
 				additionalProperties: false,
 			},
 			async execute(params) {
-				const parsed = parseMonitorSpec(spec(params), { scriptsRoot, watcherRoots, workspaceDir, webhook });
+				const parsed = parseMonitorSpec(withDefaultChannel(spec(params), originKey), {
+					scriptsRoot,
+					watcherRoots,
+					workspaceDir,
+					webhook,
+				});
 				let row: MonitorRow;
 				try {
 					row = ledger.addMonitor(parsed);

@@ -11,6 +11,7 @@ import { DiscordAdapter } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
 import { FakeDiscordTransport } from "../src/discord/fake-transport";
 import type { DiscordInteraction } from "../src/discord/transport";
+import { lanePauseActionId } from "../src/lanes/card";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
@@ -153,6 +154,26 @@ describe("owner clicks", () => {
 		release.resolve();
 		await handled;
 		expect(actions).toHaveLength(1);
+	});
+
+	test("a lane status button inside its thread: onAction gets the parent channel, not the thread id", async () => {
+		const { port } = await boot();
+		// A lane's status message: posted into the lane thread (thread id = root id) with the ⏸ button.
+		const status = await port.post(
+			{ conversationId: CH, threadId: THREAD },
+			{ text: "⏳ 레인 · 0분", buttons: [{ actionId: lanePauseActionId("lane"), label: "⏸ 멈춤" }] },
+		);
+		expect(transport.calls.find((c) => c.method === "createMessage")).toMatchObject({ channelId: THREAD });
+		await transport.emitInteraction(click(lanePauseActionId("lane"), { id: status.messageId, channelId: THREAD }));
+		expect(actions).toEqual([
+			{
+				actionId: lanePauseActionId("lane"),
+				value: undefined,
+				userId: OWNER,
+				channel: CH,
+				messageTs: status.messageId,
+			},
+		]);
 	});
 
 	test("a click in a DM: the channel is the DM itself", async () => {

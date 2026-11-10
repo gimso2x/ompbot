@@ -366,21 +366,16 @@ describe("a second platform beside Slack", () => {
 		]);
 	});
 
-	test("a second-platform origin gets file upload, approval and dispatch only — no work start, lane or monitor tools", async () => {
+	test("a Discord DM origin gets its own upload tool and the monitor tools, no Slack upload and no lane tools", async () => {
 		await bootTwo();
 		const names = daemon.hostToolsFor(`discord/dm/${DISCORD_DM}`).map((t) => t.name);
 		expect(names).toContain("discord_send_file");
 		expect(names).toContain("ompbot_request_approval");
-		for (const absent of [
-			"slack_send_file",
-			"ompbot_work_start",
-			"ompbot_lane_progress",
-			"ompbot_claim_done",
-			"ompbot_monitor_add",
-			"ompbot_monitor_list",
-			"ompbot_monitor_remove",
-		]) {
+		for (const absent of ["slack_send_file", "ompbot_work_start", "ompbot_lane_progress", "ompbot_claim_done"]) {
 			expect(names).not.toContain(absent);
+		}
+		for (const present of ["ompbot_monitor_add", "ompbot_monitor_list", "ompbot_monitor_remove"]) {
+			expect(names).toContain(present);
 		}
 		// The Slack origin keeps its full set.
 		const slackNames = daemon.hostToolsFor(ORIGIN).map((t) => t.name);

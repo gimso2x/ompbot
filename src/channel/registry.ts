@@ -16,6 +16,7 @@ function redactMessage(msg: OutboundMessage): OutboundMessage {
  * caller can skip it. Callers may redact on their own as well (masking is idempotent).
  */
 function redacting(port: ChannelPort): ChannelPort {
+	const openThread = port.openThread?.bind(port);
 	return {
 		platform: port.platform,
 		capabilities: port.capabilities,
@@ -30,6 +31,7 @@ function redacting(port: ChannelPort): ChannelPort {
 			}),
 		permalink: (ref) => port.permalink(ref),
 		mentionUser: (userId) => port.mentionUser(userId),
+		...(openThread === undefined ? {} : { openThread: (ref, name) => openThread(ref, redact(name)) }),
 	};
 }
 

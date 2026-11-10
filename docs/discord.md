@@ -2,7 +2,7 @@
 
 ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. 슬래시 명령은 Portal에서 만들지 않습니다. ompbot이 기동할 때 스스로 등록합니다(초대 URL에 `applications.commands`를 넣는 이유입니다).
 
-진행 상태: 대화 연결(DM·서버 채널·스레드, `!`·슬래시 명령, 👀·진행 표시, 2000자 분할, `!shutup` 뮤트, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부·👍/👎 피드백, 재시작 중 놓친 메시지 복구, `doctor` 점검)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다.
+진행 상태: 대화 연결(DM·서버 채널·스레드, `!`·슬래시 명령, 👀·진행 표시, 2000자 분할, `!shutup` 뮤트, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부·👍/👎 피드백, 재시작 중 놓친 메시지 복구, `doctor` 점검)과 운영 기능(DM 모니터, 서버 채널 스레드의 작업 레인과 그 버튼, `inject --origin discord/…`)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다. 데몬 수준 알림(게이트·한도·재시작)은 계속 Slack 오너 DM으로 갑니다.
 
 ## 요약 (이것만 맞으면 됩니다)
 
@@ -74,6 +74,7 @@ https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.c
 2. 내 프로필(이름)을 우클릭(휴대폰은 길게 누름) → **사용자 ID 복사**. 5절의 `ownerUserId`입니다. 이 사용자의 글만 명령으로 받습니다.
 3. 서버 아이콘 우클릭 → **서버 ID 복사**. 5절의 `guildIds`에 넣으면 그 서버의 글만 받습니다(선택).
 4. 멘션 없이 모든 글에 답할 채널이 있으면 채널 우클릭 → **채널 ID 복사**로 `mentionFreeChannels`에 넣습니다(선택).
+5. DM에서 `작업: …`으로 작업 레인을 열려면 레인 스레드를 만들 서버 텍스트 채널의 ID를 같은 방법으로 복사해 `laneChannelId`에 넣습니다(선택). 봇에게 그 채널의 Create Public Threads·Send Messages in Threads 권한이 있어야 합니다.
 
 ## 5. ompbot 설정 (`channels.discord`)
 
@@ -89,13 +90,15 @@ https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.c
       "applicationId": "<1절의 Application ID>",
       "guildIds": ["<4절의 서버 ID>"],
       "mentionFreeChannels": [],
-      "requireMention": false
+      "requireMention": false,
+      "laneChannelId": "<4절 5단계의 채널 ID>"
     }
   }
 }
 ```
 
 - `botTokenFile`은 ompbot 홈(`~/.ompbot`) 기준 상대경로입니다. 파일이 없으면 `secret_missing`, 권한이 0600이 아니면 `secret_permissions`로 기동하지 않습니다.
+- `laneChannelId`는 선택입니다. 없으면 DM 세션에는 `ompbot_work_start`가 없고, DM의 `작업: …`에는 이 설정이 필요하다는 답이 옵니다. 서버 채널·스레드에서 요청한 레인은 설정 없이 그 채널에 열립니다.
 - `guildIds`·`mentionFreeChannels`·`requireMention`은 선택입니다. `guildIds`를 비우면 봇이 들어간 모든 서버의 글을 받습니다(오너 글만 처리하는 건 같습니다).
 - 기존 `ownerSlackUserId` 키는 계속 읽히지만 경고가 납니다. `channels.slack.ownerUserId`로 옮기면 경고가 사라집니다.
 - `channels`는 재시작이 필요한 키입니다. `reload`로는 반영되지 않습니다.
@@ -116,6 +119,9 @@ bun src/main.ts apply --detach  # 재시작
 - 승인이 필요한 일을 시키면 버튼 카드가 오고, 누르면 결과 줄로 바뀝니다.
 - 같은 시간에 Slack DM도 정상으로 답합니다.
 - `/status-ompbot`이 나에게만 보이는 응답으로 답합니다.
+- DM에서 `1분 뒤에 물 마시라고 알려줘` → 모니터가 등록되고(`모니터 목록 보여줘`에 보임) 1분 뒤 결과가 그 DM에 새 글로 옵니다.
+- DM에서 `작업: 테스트 @/home/<user>/work/<repo>` → `laneChannelId` 채널에 `🔄 테스트` 루트와 레인 스레드가 생기고 DM에 그 스레드 링크가 옵니다. 스레드 안 ⏸ 버튼·`멈춰`·`계속`이 동작하고, 끝나면 머지·폐기 카드가 옵니다.
+- `bun src/main.ts inject --origin discord/dm/<DM 채널 ID> --as-owner --text '안녕'` → DM에 `🧪 inject` 마커와 답이 옵니다.
 - 데몬을 재시작하는 동안 DM을 보내 두면, 다시 뜬 뒤 그 DM에 답합니다.
 
 ## 문제가 생기면
@@ -127,5 +133,7 @@ bun src/main.ts apply --detach  # 재시작
 | DM을 보낼 수 없다고 나옴 | 봇과 같은 서버에 있지 않음. 3절 초대 |
 | 서버 채널에서 반응 없음 | 봇을 멘션하지 않았거나, `guildIds`에 그 서버가 없거나, 채널 권한에서 봇의 View Channels가 막힘 |
 | 스레드를 못 만듦 | 그 채널에서 봇의 Create Public Threads·Send Messages in Threads 권한이 꺼짐 |
+| 작업 레인 루트가 `❌ 제목`으로 바뀜 | 레인 채널에서 스레드를 못 만듦(위와 같은 권한). 권한을 켜고 다시 요청 |
+| DM `작업: …`에 `laneChannelId`가 필요하다는 답 | 5절에 `laneChannelId`를 넣고 재시작 |
 | Public Bot을 끌 때 "기본 승인 링크" 오류 | Installation 탭 Install Link가 Discord Provided Link임. None으로 바꾸고 저장한 뒤 다시 끔(1절 3단계) |
 | 슬래시 명령이 안 보임 | 초대 URL에 `applications.commands`가 빠짐(3절 URL로 다시 초대). `guildIds` 없이 전역 등록이면 퍼지는 데 시간이 걸릴 수 있음. 로그의 `discord_commands_register_failed` 확인 |

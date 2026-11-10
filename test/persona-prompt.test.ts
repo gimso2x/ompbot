@@ -198,9 +198,9 @@ describe("chat origin system prompt per platform", () => {
 		const discord = buildFloorsPrompt(BASE_SECRETS, "discord/dm/123456789012345678", false, false, true); // gitleaks:allow (fake snowflake)
 		expect(discord).not.toContain("slack_send_file");
 		expect(discord).toContain("discord_send_file");
-		// Discord sessions get no monitor tools (host tools give them the base set), so the prompt does not offer them.
+		// The owner DM on either platform registers monitors (doc/plans/discord-parity.md stage 1).
 		expect(slack).toContain("ompbot_monitor_add");
-		expect(discord).not.toContain("ompbot_monitor_add");
+		expect(discord).toContain("ompbot_monitor_add");
 	});
 
 	test("a Discord chat origin is told it runs on Discord, with Discord links and no ```card fence", () => {

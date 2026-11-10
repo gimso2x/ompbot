@@ -32,7 +32,7 @@ const EPOCH_FILE = /^e[1-9][0-9]*\//;
 const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
 
 /** The usage block of one session record, if it is a model call: an assistant message or a `model_usage` record. */
-function usageOf(record: unknown): UsageFields | undefined {
+export function usageOf(record: unknown): UsageFields | undefined {
 	if (typeof record !== "object" || record === null) return undefined;
 	const r = record as { type?: unknown; message?: { role?: unknown; usage?: unknown }; usage?: unknown };
 	const usage =

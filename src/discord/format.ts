@@ -2,7 +2,7 @@
 // (the model's markdown, which Discord mostly draws as is) becomes messages of at most 2000 characters
 // (`renderDiscordParts`), its valid ```card fences embeds of their own (`renderDiscordMessages`).
 import { splitCards, validateCard } from "../channel/card";
-import { chunkText, REDELIVERED_PREFIX } from "../channel/text";
+import { chunkText, escapeMrkdwn, REDELIVERED_PREFIX } from "../channel/text";
 import { cardToEmbed, type DiscordEmbed } from "./card";
 import { MESSAGE_CONTENT_LIMIT } from "./transport";
 
@@ -29,8 +29,9 @@ function convertPlain(text: string): string {
 			.replace(/<#([0-9]+)\|[^>]*>/g, "<#$1>")
 			.replace(/<((?:https?|mailto):[^|>\s]+)\|([^>]+)>/g, (_, url: string, label: string) => `[${label}](${url})`)
 			.replace(/<((?:https?|mailto):[^|>\s]+)>/g, "$1")
-			.replace(/(^|[^\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])/g, "$1**$2**")
-			.replace(/(^|[^\w~])~(?=\S)([^~\n]+?)(?<=\S)~(?![\w~])/g, "$1~~$2~~")
+			// A `\*` / `\~` (`escapeDiscordMarkdown`) is a literal character, never a delimiter.
+			.replace(/(^|[^\w*\\])\*(?=\S)([^*\n]+?)(?<=[^\s\\])\*(?![\w*])/g, "$1**$2**")
+			.replace(/(^|[^\w~\\])~(?=\S)([^~\n]+?)(?<=[^\s\\])~(?![\w~])/g, "$1~~$2~~")
 			// Slack's `&`/`<`/`>` escapes, undone last so a literal `<` never reads as a Slack token above.
 			.replace(/&lt;/g, "<")
 			.replace(/&gt;/g, ">")
@@ -44,6 +45,14 @@ function convertPlain(text: string): string {
  */
 export function mrkdwnToDiscord(text: string): string {
 	return outsideCode(text, convertPlain);
+}
+
+/**
+ * Owner text quoted into core text bound for Discord (an inject marker's preview): Discord's markdown characters are
+ * backslash-escaped so they show as typed, and `&`/`<`/`>` get the core text escapes `mrkdwnToDiscord` undoes.
+ */
+export function escapeDiscordMarkdown(text: string): string {
+	return escapeMrkdwn(text.replace(/[\\*_`~|>]/g, "\\$&"));
 }
 
 const TABLE_ROW = /^\s*\|.*\|\s*$/;

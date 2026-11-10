@@ -16,6 +16,7 @@ import {
 	SWEEP_STALLED_MS,
 } from "../src/ops/gates";
 import { HERDR_HEALTH_FILE, HERDR_HEALTH_STALE_MS, HerdrHealthProbe, readHerdrHealth } from "../src/ops/herdr-health";
+import { kstDay } from "../src/tasks/docs";
 import { TASK_SWEEP_MS } from "../src/tasks/sweeper";
 
 let home: string;
@@ -620,6 +621,47 @@ describe("collectGates", () => {
 		db.run("UPDATE deliveries SET created_at = ? WHERE op_ref = 'op3'", [now - 2 * 3_600_000]);
 		db.close();
 		expect(gateState("turns_failing")).toEqual({ state: "closed", detail: "recent=2" });
+	});
+
+	test("cost_cap exists only with a daily ceiling: open at the day's total, closed under it", () => {
+		const day = kstDay(now);
+		seedDb((db) => {
+			db.run(
+				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
+			);
+			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'slack/dm/D', 12.5, 3)", [day]);
+			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES ('20200101', 'slack/dm/D', 99, 1)");
+		});
+		const capGate = (dailyCapUsd: number | undefined) =>
+			collectGates({ homeDir: home, now, ...(dailyCapUsd === undefined ? {} : { dailyCapUsd }) }).find(
+				(g) => g.name === "cost_cap",
+			);
+		expect(capGate(undefined)).toBeUndefined();
+		expect(capGate(10)).toEqual({ name: "cost_cap", state: "open", detail: "today=12.50 cap=10.00" });
+		expect(capGate(12.5)?.state).toBe("open");
+		expect(capGate(12.51)).toMatchObject({ state: "closed", detail: "today=12.50 cap=12.51" });
+	});
+
+	test("cost_cap closes for a day the owner switched off with !budget off", () => {
+		const day = kstDay(now);
+		seedDb((db) => {
+			db.run(
+				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
+			);
+			db.run(
+				"CREATE TABLE slack_cursors (cursor_key TEXT PRIMARY KEY, last_ts TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+			);
+			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'slack/dm/D', 12.5, 3)", [day]);
+			db.run("INSERT INTO slack_cursors (cursor_key, last_ts, updated_at) VALUES (?, '0', 0)", [`cost-cap-off:${day}`]);
+		});
+		const gate = collectGates({ homeDir: home, now, dailyCapUsd: 10 }).find((g) => g.name === "cost_cap");
+		expect(gate).toEqual({ name: "cost_cap", state: "closed", detail: "today=12.50 cap=10.00 off=today" });
+	});
+
+	test("cost_cap reads zero spend on a ledger without usage_daily (an older bot) instead of judging unknown", () => {
+		seedDb(() => undefined);
+		const gate = collectGates({ homeDir: home, now, dailyCapUsd: 10 }).find((g) => g.name === "cost_cap");
+		expect(gate).toEqual({ name: "cost_cap", state: "closed", detail: "today=0.00 cap=10.00" });
 	});
 
 	test("no database file leaves the db gates unknown while backup_age still reports", () => {

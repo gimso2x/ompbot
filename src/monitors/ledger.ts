@@ -65,9 +65,9 @@ export interface MonitorRow {
 	instruction: string;
 	overlap: MonitorOverlap;
 	enabled: boolean;
-	/** Slack channel the answer goes to (top level); null = the owner DM. */
+	/** Slack or Discord channel the answer goes to (top level); null = the Slack owner DM. */
 	channel: string | null;
-	/** Slack channel that also gets a top-level copy of every settled event; null = no copy. */
+	/** Slack or Discord channel that also gets a top-level copy of every settled event; null = no copy. */
 	copyChannel: string | null;
 	/** omp model id pinned to this monitor's session; null = no pin. */
 	model: string | null;

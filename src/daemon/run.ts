@@ -8,6 +8,7 @@ import { DiscordSocketTransport } from "../discord/socket-transport";
 import { FileFakeDiscordTransport } from "../discord/test-transport";
 import type { DiscordTransport } from "../discord/transport";
 import { createLogger, type Logger } from "../log";
+import { AgyOmpDriver } from "../omp/agy-driver";
 import { ClaudeOmpDriver } from "../omp/claude-driver";
 import { RpcOmpDriver } from "../omp/rpc-driver";
 import { createAggregatingLogger, startServiceAlive } from "../ops/log-hygiene";
@@ -188,6 +189,8 @@ export async function runDaemon(
 	const model = splitModel(config.model);
 	// claude children take a bare model id; a `model` naming another provider is an omp-only setting.
 	const claudeModel = model.provider === undefined || model.provider === "claude" ? model.model : undefined;
+	// agy children take a bare agy model id (`agy/gemini-3.8-flash-high` → `gemini-3.8-flash-high`).
+	const agyModel = model.provider === undefined || model.provider === "agy" ? model.model : undefined;
 	const secretsDir = join(config.homeDir, "secrets");
 	const personaFiles = {
 		persona: join(config.homeDir, "workspace", "persona.md"),
@@ -243,43 +246,66 @@ export async function runDaemon(
 		crash: crashHook(env),
 		sweepMs: env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SWEEP_MS ? Number(env.OMPBOT_SWEEP_MS) : undefined,
 		driverFactory: (origin, sessionDir) =>
-			config.agent === "claude"
-				? new ClaudeOmpDriver({
-						claudeExecutable: config.claudeExecutable ?? "claude",
+			config.agent === "agy"
+				? new AgyOmpDriver({
+						agyExecutable: config.agyExecutable ?? "agy",
 						cwd: daemon.cwdFor(origin),
 						sessionDir,
-						...(claudeModel === undefined ? {} : { model: claudeModel }),
+						...(agyModel === undefined ? {} : { model: agyModel }),
 						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
-						secretsDir,
+						// No --append-system-prompt in agy: the driver prepends this to the first message of each child.
 						systemPrompt: floorsSystemPrompt(
 							secretsDir,
 							origin,
 							personaFiles,
 							onPersonaError,
 							config.herdr !== undefined,
+							false,
+							false,
+							daemon.floorsSurfaceFor(origin),
 						),
-						approval: daemon.requestApprovalFor(origin),
 					})
-				: new DaemonRpcDriver({
-						ompExecutable: config.ompExecutable,
-						cwd: daemon.cwdFor(origin),
-						sessionDir,
-						...model,
-						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
-						env: { OMP_WIKI_NOTE_DISABLE: "1" },
-						// `ask` is allowed only where the owner can answer it: the same answerer the driver gets below.
-						extraArgs: floorsArgs(
+				: config.agent === "claude"
+					? new ClaudeOmpDriver({
+							claudeExecutable: config.claudeExecutable ?? "claude",
+							cwd: daemon.cwdFor(origin),
+							sessionDir,
+							...(claudeModel === undefined ? {} : { model: claudeModel }),
+							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 							secretsDir,
-							origin,
-							personaFiles,
-							onPersonaError,
-							config.herdr !== undefined,
-							daemon.answerDialogsFor(origin) !== undefined,
-							daemon.peerTouched(origin),
-						),
-						hostTools: daemon.hostToolsFor(origin),
-						answerDialog: daemon.answerDialogsFor(origin),
-					}),
+							systemPrompt: floorsSystemPrompt(
+								secretsDir,
+								origin,
+								personaFiles,
+								onPersonaError,
+								config.herdr !== undefined,
+								false,
+								false,
+								daemon.floorsSurfaceFor(origin),
+							),
+							approval: daemon.requestApprovalFor(origin),
+						})
+					: new DaemonRpcDriver({
+							ompExecutable: config.ompExecutable,
+							cwd: daemon.cwdFor(origin),
+							sessionDir,
+							...model,
+							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
+							env: { OMP_WIKI_NOTE_DISABLE: "1" },
+							// `ask` is allowed only where the owner can answer it: the same answerer the driver gets below.
+							extraArgs: floorsArgs(
+								secretsDir,
+								origin,
+								personaFiles,
+								onPersonaError,
+								config.herdr !== undefined,
+								daemon.answerDialogsFor(origin) !== undefined,
+								daemon.peerTouched(origin),
+								daemon.floorsSurfaceFor(origin),
+							),
+							hostTools: daemon.hostToolsFor(origin),
+							answerDialog: daemon.answerDialogsFor(origin),
+						}),
 	});
 	claimSignals();
 	try {

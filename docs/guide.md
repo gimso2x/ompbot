@@ -5,7 +5,7 @@
 설치부터 운영까지 ompbot의 모든 동작을 정리한 레퍼런스입니다.
 
 - **시작하기:** [요구 사항](#요구-사항) · [코어와 설치본](#코어와-설치본) · [설치](#설치) · [설정 파일](#5-설정-파일-ompbotconfigjson) · [서비스 등록](#7-서비스-등록) · [AI 에이전트에게 설치 맡기기](#ai-에이전트에게-설치-맡기기)
-- **쓰기:** [대화](#대화) · [명령](#명령) · [승인](#승인) · [질문 카드](#질문-카드) · [답 피드백](#답-피드백) · [페르소나와 답변 형식](#페르소나와-답변-형식) · [claude 에이전트](#claude-에이전트) · [Discord](#discord선택)
+- **쓰기:** [대화](#대화) · [명령](#명령) · [턴 되돌리기](#턴-되돌리기undo) · [승인](#승인) · [질문 카드](#질문-카드) · [답 피드백](#답-피드백) · [페르소나와 답변 형식](#페르소나와-답변-형식) · [claude 에이전트](#claude-에이전트) · [agy 에이전트](#agy-에이전트) · [Discord](#discord선택)
 - **맡기기:** [작업 위임](#작업-위임) · [`[TASK]` 상태 문서](#task-상태-문서) · [`[TASK]` 자동 머지](#task-자동-머지) · [작업 레인](#작업-레인) · [모니터](#모니터)
 - **운영:** [CLI](#운영) · [현황판](#현황판) · [동결(킬스위치)](#동결킬스위치) · [재시작과 drain](#재시작과-drain) · [설정 반영](#재시작-없이-설정-반영) · [놓친 메시지 백필](#놓친-메시지-백필) · [건강 게이트](#건강-게이트와-자가-보고) · [캐시 감시·파일 겹침](#프롬프트-캐시-감시와-task-파일-겹침-알림) · [백업](#백업) · [스킬 리뷰](#스킬-리뷰)
 - **그 밖:** [보안 메모](#보안-메모) · [개발](#개발)
@@ -15,8 +15,10 @@
 | 영역 | 기능 | 자세히 |
 | --- | --- | --- |
 | 대화 | DM·채널·채널 스레드별 독립 대화, 일하는 중 끼워 넣기(steer)·`!followup`, 끝맺은 답의 턴 중간 전달, 첨부 받기·파일 올리기, Slack `markdown` 블록 답과 `card` 펜스(네이티브 카드·표·차트), 진행 상태 메시지, 같은 도구 반복 감지, 같은 대화 공간의 지난 대화 자동 회상, 전달·첨부 자료의 인젝션 경고 | [대화](#대화) |
-| Discord(선택) | 오너 한 명의 Discord DM·서버 채널 대화(멘션하면 스레드), `!` 명령·슬래시 명령·진행 표시·승인·질문·TASK 카드 버튼·카드(embed)·파일·👍/👎·놓친 메시지 백필·`doctor` 점검 | [Discord](#discord선택) |
-| 채팅 명령 | 모델·thinking 전환, 컨텍스트 압축, 옛 세션 이어가기, 대기열 보기·취소, 새 대화, 스레드 뮤트, 토큰·비용 사용량 | [명령](#명령) |
+| Discord(선택) | 오너 한 명의 Discord DM·서버 채널 대화(멘션하면 스레드), `!` 명령·슬래시 명령·진행 표시·승인·질문·TASK 카드 버튼·카드(embed)·파일·👍/👎·놓친 메시지 백필·`doctor` 점검, DM 모니터, 서버 채널 스레드의 작업 레인 | [Discord](#discord선택) |
+| 대화 에이전트 | omp(기본) 대신 Claude Code CLI(`"agent": "claude"`)나 Antigravity CLI(`"agent": "agy"`)로 대화를 구동 | [claude 에이전트](#claude-에이전트) · [agy 에이전트](#agy-에이전트) |
+| 채팅 명령 | 모델·thinking 전환, 컨텍스트 압축, 옛 세션 이어가기, 대기열 보기·취소, 새 대화, 스레드 뮤트, 토큰·비용 사용량, 오늘 비용과 상한(`!budget`), 턴 되돌리기(`!undo`) | [명령](#명령) · [턴 되돌리기](#턴-되돌리기undo) |
+| 비용 상한 | 턴 상한(마무리 지시 → 1.5배에서 중단)·하루 상한(모니터 정지·하루 1회 알림·`cost_cap` 게이트) | [설정](#5-설정-파일-ompbotconfigjson) `costCap` |
 | 승인 | 되돌릴 수 없거나 밖으로 나가는 작업 전 승인 버튼(구조화된 카드, 외부 공개 `🌐` 카드, 영속 장부, escalation 채널과 요청 스레드 사본, 다시 요청 버튼, 카드 스레드 답장) | [승인](#승인) |
 | 답 피드백 | 봇 답에 단 오너 👍/👎를 그 답을 낳은 턴에 기록, 현황판 배지·`feedback` CLI | [답 피드백](#답-피드백) |
 | 질문 카드 | omp의 질문 창(select·confirm·input·editor·`ask`)을 대화 스레드의 버튼·답장 카드로, 마감 시 omp와 같은 기본값 | [질문 카드](#질문-카드) |
@@ -46,6 +48,7 @@
 
   단독 실행 파일(컴파일된 바이너리) 형태의 omp는 ompbot이 RPC 자식으로 쓸 수 없어 `omp_launcher_standalone`으로 거부합니다. `readlink` 결과가 `dist/cli.js`가 아니면 위 명령으로 다시 설치하세요.
 - (선택) 대화 에이전트를 Claude Code CLI로 쓰려면(`"agent": "claude"`) [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)가 설치돼 있고 로그인돼 있어야 합니다(`claude --version`, `claude` 한 번 실행해 `/login` 완료 — 자격은 `~/.claude/` 아래에만 둡니다). omp는 여전히 설치돼 있어야 합니다(dispatch 등 일부 도구가 씁니다). 자세한 차이는 [claude 에이전트](#claude-에이전트) 참고
+- (선택) 대화 에이전트를 Antigravity CLI로 쓰려면(`"agent": "agy"`) `agy --version`이 응답하고 `agy`를 한 번 실행해 Google 로그인을 마쳐야 합니다. omp는 여전히 설치돼 있어야 합니다. 자세한 차이는 [agy 에이전트](#agy-에이전트) 참고
 - Slack 워크스페이스 관리자 권한(앱 생성용)
 - (선택) 장기 위임에는 herdr와 config `"herdr": {}`가, 원격 위임에는 대상 호스트로의 ssh(`BatchMode`)가 필요합니다. [herdr(선택)](#herdr선택) 참고.
 
@@ -123,13 +126,14 @@ chmod 600 ~/.ompbot/secrets/*
 | --- | --- | --- |
 | `schemaVersion` | 예 | 항상 `1` |
 | `channels.slack.ownerUserId` | 예 | 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
-| `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
+| `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
 | `slack.botTokenFile`, `slack.appTokenFile` | 예 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
 | `ompExecutable` | 예 | 절대경로(`command -v omp`) |
 | `workspaceDir` | 예 | 일반 대화에서 omp가 작업하는 디렉터리 |
-| `agent` | 아니요 | 대화를 구동할 자식 에이전트: `"omp"`(기본) 또는 `"claude"`. [claude 에이전트](#claude-에이전트) 참고 |
+| `agent` | 아니요 | 대화를 구동할 자식 에이전트: `"omp"`(기본), `"claude"`, `"agy"`. [claude 에이전트](#claude-에이전트), [agy 에이전트](#agy-에이전트) 참고 |
 | `claudeExecutable` | 아니요 | `agent`가 `"claude"`일 때 쓸 claude CLI 절대경로. 비우면 자식 PATH에서 `claude`를 찾습니다 |
-| `model`, `thinking` | 아니요 | 봇 세션에 쓸 모델·thinking 수준. 비우면 omp 기본값을 씁니다 (`agent`가 `"claude"`면 `model`은 `claude/<별칭>`에서 claude 별칭만 유효: `fable`·`opus`·`sonnet`·`haiku`) |
+| `agyExecutable` | 아니요 | `agent`가 `"agy"`일 때 쓸 Antigravity CLI 절대경로. 비우면 자식 PATH에서 `agy`를 찾습니다 |
+| `model`, `thinking` | 아니요 | 봇 세션에 쓸 모델·thinking 수준. 비우면 omp 기본값을 씁니다 (`agent`가 `"claude"`면 `model`은 `claude/<별칭>`에서 claude 별칭만 유효: `fable`·`opus`·`sonnet`·`haiku`, `"agy"`면 `agy/<agy models의 id>`) |
 | `sessionRetentionDays` | 아니요 | `ompbot gc`가 이전 대화 세션과 오래 쉰 채널 스레드 세션을 지우기까지의 일수(기본 30) |
 | `idleTimeoutMinutes` | 아니요 | 이 시간(분) 동안 쓰지 않은 omp 프로세스를 내립니다. 세션은 유지되고 다음 메시지에서 다시 띄웁니다(기본 30, `0`이면 끄기). 모니터 자식은 일이 끝나고 2분(이 값이 더 짧으면 이 값) 뒤 내리고, `0`이면 모니터도 내리지 않습니다 |
 | `skillReviewTurns` | 아니요 | 오너 DM 답변 턴 몇 회마다 백그라운드 스킬 리뷰를 돌릴지(0이면 끔, 기본 10 — 리뷰 1회는 모델 토큰 소모) |
@@ -146,6 +150,8 @@ chmod 600 ~/.ompbot/secrets/*
 | `taskAutoLand` | 아니요 | `herdr` 없이도 넣을 수 있습니다(작업 레인이 씀. `[TASK]` 스윕은 `herdr`가 있어야 돎). 조건을 채운 개인 저장소 `[TASK]`를 Outcome 도달 때, 작업 레인을 닫힐 때 봇이 스스로 머지. `{"repos": ["/절대경로/저장소", …], "maxRisk": "L2"}`(`repos`는 1개 이상의 절대경로, `maxRisk` 기본 `L2`). [`[TASK]` 자동 머지](#task-자동-머지)·[작업 레인](#작업-레인) 참고 |
 | `restartNotice` | 아니요 | `false`면 drain 재시작 알림을 보내지 않습니다(기본 `true`). [재시작과 drain](#재시작과-drain) 참고 |
 | `recallEnabled` | 아니요 | `false`면 새 턴 프롬프트에 지난 대화 회상을 붙이지 않습니다(기본 `true`). [대화](#대화)의 "지난 대화 회상" 참고 |
+| `costCap` | 아니요 | 비용 상한(omp 정가 환산, 실제 청구액 아님). `{"turnUsd": 20, "dailyUsd": 300}`처럼 양수만 받고 키가 없으면 그 상한은 꺼집니다. `turnUsd`에 닿으면 그 턴에 마무리 지시를 한 번 보내고, 1.5배를 넘으면 턴을 멈춥니다(하위 에이전트 비용은 이 누계에 없음). `dailyUsd`는 KST 하루 합계(하위 에이전트 포함)로, 넘으면 모니터 발화를 멈추고 오너에게 하루 한 번 알립니다. 오너 대화는 막지 않고 `!budget off`로 그날만 풀 수 있습니다. `reload`로 바로 반영 |
+| `turnSnapshot` | 아니요 | `{"repos": ["/절대경로/저장소", …]}`. 대화 턴마다 그 작업 트리를 턴 앞뒤로 스냅샷해 `!undo`로 되돌릴 수 있게 합니다. 항목마다 지금 git 작업 트리여야 하고(아니면 `config_invalid field=turnSnapshot.repos`), `reload`로 바로 반영. [턴 되돌리기](#턴-되돌리기undo) 참고 |
 | `watcherRoots` | 아니요 | 절대경로 배열. `watcher` 모니터 트리거가 감시할 수 있는 디렉터리의 상한입니다. 트리거의 `root`는 심볼릭 링크를 풀고 난 실제 경로가 이 중 하나 안에 있어야 하고, 비어 있으면 watcher 트리거를 만들 수 없습니다. 예: `["/home/<user>/work"]` ([모니터](#모니터) 참고) |
 | `webhook` | 아니요 | `{"port": 8123, "bind": "127.0.0.1"}`. `webhook` 모니터 트리거를 받는 loopback HTTP 리스너입니다. `bind`는 `127.0.0.1`(기본)·`::1`만 허용하고 그 밖의 값이나 범위(1~65535) 밖 포트는 설정 오류입니다. 없으면 서버를 띄우지 않고 webhook 트리거를 만들 수 없습니다. 데몬 시작 때만 읽습니다([모니터](#모니터) 참고) |
 | `dashboard` | 아니요 | `{"port": 7331, "bind": "127.0.0.1", "herdrWebUrl": "https://herdr.example.com/"}`. `ompbot dashboard` 현황판의 기본 포트·주소입니다(플래그 `--port`·`--bind`가 우선). `bind`는 `127.0.0.1`(기본)·`::1`만 허용하고 그 밖의 값이나 범위(1~65535) 밖 포트는 `config_invalid field=dashboard.…`입니다. `herdrWebUrl`(선택, http(s) 주소)은 에이전트 보드 카드의 "herdr에서 답하기" 링크가 여는 herdr-web-ui 주소이며, 없으면 링크를 그리지 않습니다. [현황판](#현황판) 참고 |
@@ -253,7 +259,10 @@ Install this repository (ompbot) into the systemd user session on this Linux mac
 | `!resume <번호\|세션 ID 앞 4자 이상>` | 그 세션을 이어갑니다. 대기 중이던 메시지는 버려지고, 이후 대화는 그 세션에 쌓입니다 |
 | `/queue-ompbot` · `!queue` | 진행 중인 작업과 대기열(끼워넣기 대기, 다음 작업)을 번호와 함께 보여 줍니다. 채널에서는 친 대화방의 것만 보이므로, 루트 작업의 대기열은 그 루트 스레드에 답글로 칩니다 |
 | `!queue drop <번호>` | 대기열에서 그 번호의 항목 하나만 취소합니다. 그 스레드의 ⏳ 상태 메시지는 `🚫 취소됨`으로 마무리됩니다 |
-| `/usage-ompbot` · `!usage` | 턴을 쓰지 않고 이 대화와 전체(보관 중인 omp 세션 파일)의 모델 호출 수·입력·출력·캐시 읽기 비율·비용을 답합니다. gc로 지운 옛 세션은 빠지고, `agent: "claude"`면 집계하지 않습니다 |
+| `/usage-ompbot` · `!usage` | 턴을 쓰지 않고 이 대화와 전체(보관 중인 omp 세션 파일)의 모델 호출 수·입력·출력·캐시 읽기 비율·비용을 답합니다. gc로 지운 옛 세션은 빠지고, `agent`가 `"claude"`·`"agy"`면 집계하지 않습니다 |
+| `/budget-ompbot` · `!budget` | 오늘(KST) 비용(omp 정가 환산)·상위 오리진·턴/하루 상한([`costCap`](#5-설정-파일-ompbotconfigjson))을 봅니다 |
+| `!budget off` · `!budget on` | `off`는 오늘만 하루 상한을 꺼 멈춘 모니터를 다시 돌립니다(KST 자정에 자동으로 다시 켜짐). `on`은 그날 일찍 다시 켭니다 |
+| `/undo-ompbot` · `!undo` | 이 대화의 가장 최근 변경 턴을 승인 카드 뒤에 되돌립니다([턴 되돌리기](#턴-되돌리기undo)). `turnSnapshot`이 없으면 안내만 합니다 |
 | `!distill` | 어느 대화(DM·채널·스레드)에서든 그 대화의 최근 세션 내용으로 [스킬 리뷰](#스킬-리뷰)를 지금 한 번 돌립니다. 제안이 있으면 같은 승인 카드가 오고, 이미 리뷰가 돌고 있으면 "이미 리뷰 중", 동결 중이면 "동결 중이라 하지 않았습니다"라고 답합니다. 세션 내용이 없는 대화방(예: 채널 최상위 — 채널 대화는 스레드마다 따로 세션)에서는 리뷰를 돌리지 않고 스레드 안에서 보내라고 답합니다. 슬랙 앱에 슬래시 명령으로는 등록하지 않았으니(`/distill-ompbot`은 매니페스트에 없음) 메시지로 보냅니다. 피어 봇 글에 든 `!distill`은 명령이 아닙니다 |
 | `/followup-ompbot` · `!followup <메시지>` | 같은 대화방의 진행 중인 작업에 끼워 넣지 않고, 끝난 뒤 별도 작업으로 보냅니다(답도 그 메시지 스레드에 옵니다). 채널 루트로 치면 채널 본문 대화방 작업 뒤에 줄을 서므로, 진행 중인 루트 작업 뒤에 이어 보내려면 그 루트 스레드에 답글로 칩니다 |
 | `!btw <질문>` | 곁질문. 같은 대화방의 진행 중인 작업에 끼워 넣지 않고 그 질문에만 바로 답합니다. 답은 지금까지의 대화 맥락으로 한 번 만들어 `💬 곁질문:`으로 시작하는 별도 글로 그 메시지 스레드에 오고, 진행 중인 작업과 대화 기록은 바뀌지 않습니다. 곁질문은 한 번에 하나만 돌고(도는 중에 또 보내면 실패 알림), 120초 안에 답이 없으면 취소하고 실패 알림을 남깁니다. 작업 중이 아니면 `!btw`를 뗀 질문이 일반 메시지로 처리되고, `agent: "claude"`처럼 곁질문을 지원하지 않는 에이전트면 안내만 합니다. 슬랙 앱에 슬래시 명령으로는 등록하지 않았으니(`/btw-ompbot`은 매니페스트에 없음) 메시지로 보냅니다 |
@@ -262,6 +271,20 @@ Install this repository (ompbot) into the systemd user session on this Linux mac
 | `!reopen` · `!reopen <지시>` | 작업 레인 스레드 전용. 닫히고 아직 머지·폐기되지 않은 레인을 같은 세션으로 다시 엽니다(🔄). 다른 메시지는 레인을 닫힌 채로 두고 답만 받습니다 |
 
 모델·thinking 선택은 대화방마다 저장되어 프로세스를 내렸다 다시 띄워도, 데몬을 재시작해도, `/new-ompbot` 뒤에도 유지됩니다. 세션 모델이 provider에서 사라졌으면 대화방에서 고른 모델, 그것도 없으면 config `model`로 바꿉니다(config `model`이 비어 있거나 없는 모델이면 바꾸지 못하고 `model_stale_no_fallback`만 남깁니다). 고른 값은 지우지 않으므로 모델이 돌아오면 다시 적용됩니다. omp 설정 파일(`~/.omp/agent`)은 바꾸지 않습니다.
+
+### 턴 되돌리기(`!undo`)
+
+`turnSnapshot.repos`에 저장소 절대경로를 넣으면 대화 턴마다 그 작업 트리 상태를 턴 앞뒤로 git 객체에 남기고, `!undo`(`/undo-ompbot`)로 이 대화의 가장 최근 변경 턴을 되돌립니다.
+
+```json
+"turnSnapshot": { "repos": ["/home/<user>/work/<repo>"] }
+```
+
+- 되돌릴 파일 목록을 담은 승인 카드가 먼저 오고, 승인해야 되돌립니다(거부·시간 초과면 그대로 둠). 승인 사이에 새 턴이 시작되면 되돌리지 않습니다. 턴이 도는 중에 보낸 `!undo`는 턴이 끝난 뒤 다시 보내라고 답합니다.
+- 대상은 그 턴이 바꾼 파일뿐입니다. 턴 뒤에 다른 손이 고친 파일은 충돌, 동시에 돈 다른 대화의 턴도 바꾼 파일은 겹침으로 남겨 건드리지 않습니다. 턴이 커밋했다면 파일은 그대로 두고 `git revert` 안내만 합니다.
+- 스냅샷은 저장소 밖 임시 인덱스로 찍어 실제 인덱스·작업 트리를 건드리지 않고, 5초를 넘기거나 실패한 저장소는 그 턴에서 빠질 뿐 턴을 막지 않습니다. 오리진마다 최근 20행만 남고 7일이 지난 행은 `ompbot gc`가 지웁니다.
+- `ompbot reload`로 바로 켜고 끕니다.
+- 운영 제약: 같은 체크아웃을 ompbot 대화 턴 밖(herdr 워커·사람)에서 고치면 그 변경은 그 턴의 몫으로 구분되지 않습니다. 워커는 자기 worktree를 쓰므로 섞이지 않습니다.
 
 ### 승인
 
@@ -308,7 +331,7 @@ omp가 오너에게 묻는 창(select·confirm·input·editor·`ask`)을 띄우�
   모니터 세션에서는 머리말에 "모니터 지시가 정한 답 형식(`NO_REPORT`·`[SILENT]`)이 이 지침보다 우선한다"가 붙습니다. 작업 레인·스킬 리뷰 세션에는 셋 다 붙지 않습니다. 상한을 넘는 부분은 잘립니다. 파일은 omp 자식을 띄울 때마다 다시 읽으므로, 고친 내용은 다음 새 자식(유휴 해제 뒤 다음 메시지, `/new-ompbot`)부터 적용됩니다. 파일이 없는 것은 정상이지만, 있는데 읽을 수 없으면(권한·디렉터리 등) 그 파일만 빼고 시작하고 경로와 함께 `persona_unreadable`을 로그에 남깁니다.
 - `owner.md`는 오너만 있는 채널에 그대로 보여도 괜찮은 내용만 씁니다. 피어 봇이 들어온 세션에도 실리므로, 다른 봇이나 인용 글이 그 내용을 채널에 옮기게 할 수 있습니다.
 - 슬랙 대화 세션(`slack/*`: DM·채널·스레드)에는 답변 형식 규율이 실립니다(가재웨이 허브·Hermes 보고 규칙을 따름): 첫 줄은 결론 한 문장, 길이는 질문 무게에 맞추고 끝난 일은 `바뀐 것`·`확인한 것`·`남은 것`만, 결정 요청은 `질문`·`추천`·`영향` 세 줄, herdr 위임 접수는 `맡았습니다`·`진행 보기`·`[목표]`·`[가정]`, 위임 결과는 `워커가 한 일`·`내가 한 일`·`오너가 할 일`(없으면 '없음'), 링크는 끝에 라벨 줄과 원본 URL 줄로 한 번. 모니터·작업 레인·스킬 리뷰 세션에는 실리지 않습니다(답 모양을 기계가 읽음).
-- 모니터 도구 안내는 오너 DM 세션에만 실립니다.
+- 모니터 도구 안내는 오너 DM 세션(Slack·Discord)에만 실립니다.
 - 모든 세션에는 구조·흐름·비교를 글 대신 mermaid·SVG·HTML 파일로 만들어 `slack_send_file`로 올리라는 권고가 실립니다.
 
 ### 피어 봇
@@ -352,6 +375,30 @@ omp 에이전트와의 차이(1차):
 - **호스트 도구**: `slack_send_file`, `ompbot_dispatch`, 모니터 도구는 omp 자식 전용이라 claude 세션에는 아직 없습니다. 즉 `agent: "claude"` 상태에서는 파일 업로드·작업 위임·모니터 등록을 할 수 없습니다(승인 카드는 됩니다).
 - 자식은 `--setting-sources user`로만 사용자 설정을 읽습니다. 작업 저장소의 `.claude/settings.json`이 권한을 몰래 열지 못하게 하기 위함입니다.
 
+### agy 에이전트
+
+`"agent": "agy"`를 넣으면 대화를 Antigravity CLI 자식 프로세스(`agy --input-format stream-json --output-format stream-json -p '' --dangerously-skip-permissions`)로 구동합니다. 모델은 `"model": "agy/<id>"`로 정합니다(`agy models`가 보여 주는 id, 예: `agy/gemini-3.8-flash-high`).
+
+```json
+{
+  "agent": "agy",
+  "agyExecutable": "/home/<user>/.local/bin/agy",
+  "model": "agy/gemini-3.8-flash-high"
+}
+```
+
+전제 조건: `agy --version`이 응답하고, `agy`를 한 번 실행해 Google 로그인을 마쳐 `~/.gemini/oauth_creds.json`이 있어야 합니다(`ompbot doctor`의 `agy`·`agy auth` 줄).
+
+omp 에이전트와의 차이:
+
+- **권한**: 헤드리스 agy는 확인이 필요한 도구를 자동 거부하고 허용 규칙이 접두 매칭뿐이라, 자식을 `--dangerously-skip-permissions`로 띄웁니다. 승인 카드 연동은 없고, 바닥 규칙은 시스템 프롬프트로만 전달됩니다.
+- **시스템 프롬프트**: agy에 `--append-system-prompt`가 없어 바닥 규칙·페르소나를 자식 프로세스마다 첫 메시지 앞에 붙여 보냅니다.
+- **세션 이어가기**: agy 대화 id를 `<세션 디렉터리>/agy-conversation.json`에 저장하고 다시 띄울 때 `--conversation`으로 잇습니다. `/new-ompbot`은 포인터를 지우고 새로 시작합니다.
+- **모델·thinking**: `/model-ompbot`은 `agy/<id>`를 받고 자식을 같은 대화로 다시 띄웁니다. `/thinking-ompbot`은 `low|medium|high`를 받아 모델 id 끝의 effort(`-low`/`-medium`/`-high`)를 바꿉니다.
+- **끼워넣기·중단**: 작업 중 보낸 메시지는 현재 답이 끝난 뒤 같은 턴에서 이어 처리합니다. 그 메시지를 agy에 보내지 못하면 턴은 실패(`steer 전송 실패: …`)로 끝나고, 첫 답이 실패해 쌓인 메시지를 보내지 못하면 실패 알림에 `steer N건 미전달`이 붙습니다. 중단은 자식을 끊고 다음 메시지에서 같은 대화로 다시 띄웁니다.
+- **자식 교체**: `/new-ompbot`·`/model-ompbot`·`/thinking-ompbot`·`/resume-ompbot`처럼 자식을 다시 띄우는 명령은 이전 agy 프로세스가 끝나기를 기다린 뒤 새로 띄워, 두 프로세스가 같은 대화를 동시에 열지 않습니다. 그때 돌던 턴은 중단(`agy restarted (<사유>)`)으로 마감됩니다.
+- **미지원**: `/compact-ompbot`(거절 안내), 사용량 집계(`!usage`), 곁질문(`!btw`), 호스트 도구(`slack_send_file`·`ompbot_dispatch`·모니터·`ask`).
+
 ### Discord(선택)
 
 Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 받습니다. 같은 데몬이 두 어댑터를 같이 돌리고, Slack은 계속 필수입니다. 봇 만들기·토큰·초대·문제 해결은 [Discord 봇 만들기](discord.md)에 있습니다.
@@ -366,15 +413,20 @@ Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 �
   | `guildIds` | 받을 서버 ID 목록(선택, 없으면 봇이 들어간 모든 서버) |
   | `mentionFreeChannels` | 멘션 없이도 답할 채널 ID 목록(선택) |
   | `requireMention` | 서버 채널에서 멘션만 받음(선택, 기본 false) |
+  | `laneChannelId` | Discord DM에서 요청한 작업 레인을 열 서버 텍스트 채널 ID(선택). 없으면 DM에서는 레인을 열지 않고 그 이유를 답합니다(서버 채널·스레드에서 요청한 레인은 그 채널에 열림) |
 
 - **인텐트**: Message Content Intent(`MESSAGE_CONTENT`)만 켭니다. 꺼져 있으면 Gateway가 4014로 끊고, 그때는 Discord만 멈추고 Slack은 계속 답합니다.
 - **대화**: DM은 하나의 대화입니다. 서버 채널에서 봇을 멘션하면 봇이 그 메시지로 스레드를 만들어 답하고, 같은 스레드는 멘션 없이 이어집니다. `!status` 같은 `!` 명령, 👀·⏳ 진행 표시, 2000자 분할, `!shutup` 뮤트가 Slack과 같게 동작합니다.
 - **점검**: `ompbot doctor`가 `ok discord …` 줄로 토큰 권한·`users/@me`·`gateway/bot`을 확인하고, 데몬 `daemon_ready` 로그에 discord 상태가 함께 찍힙니다.
 - **버튼**: 승인 카드(승인·거부·다시 요청), 질문 카드 선택지, TASK 카드의 `머지`·`추천대로`가 Discord 버튼(Action Row)으로 뜨고, 누르면 Slack 버튼과 같은 경로로 처리됩니다. 클릭한 사람은 그 카드가 있는 플랫폼의 오너인지로 확인하고, 오너가 아니면 본인에게만 보이는 거부 안내가 갑니다. 카드 스레드에 답장으로 답하는 방법도 그대로 됩니다.
 - **카드·파일·피드백**: 승인·TASK 카드와 답 속 `card` 펜스는 embed로 보입니다(Discord embed 상한에 맞춰 자름). 다만 Discord 세션의 프롬프트에는 카드 펜스 안내 줄이 없어 모델이 스스로 카드를 쓰는 일은 드뭅니다. 봇은 `discord_send_file`로 파일을 그 대화에 올리고(25 MiB 초과는 올리기 전에 거부), 오너가 보낸 이미지·문서를 내려받아 읽으며(메시지당 6개, 이미지 25 MiB·문서 20 MiB까지), 봇 답에 단 오너 👍/👎를 그 턴의 피드백으로 기록합니다.
-- **슬래시 명령**: 기동 때 `COMMAND_TEXT`의 11개(`/new-ompbot` … `/btw-ompbot`)를 봇이 스스로 등록합니다. `guildIds`가 없으면 전역(DM·모든 서버, 퍼지는 데 시간이 걸릴 수 있음), 있으면 그 서버들에만 바로 등록되어 DM에서는 `!` 형태를 씁니다. 결과는 나에게만 보이는 응답으로 오고, 결과가 따로 올라오는 명령은 그 응답이 지워집니다. 서버 스레드에서 친 명령은 그 스레드 대화방에 적용됩니다. 등록이 실패해도 경고 로그만 남고 `!` 명령은 그대로 됩니다.
+- **슬래시 명령**: 기동 때 `COMMAND_TEXT`의 13개(`/new-ompbot` … `/budget-ompbot`)를 봇이 스스로 등록합니다. `guildIds`가 없으면 전역(DM·모든 서버, 퍼지는 데 시간이 걸릴 수 있음), 있으면 그 서버들에만 바로 등록되어 DM에서는 `!` 형태를 씁니다. 결과는 나에게만 보이는 응답으로 오고, 결과가 따로 올라오는 명령은 그 응답이 지워집니다. 서버 스레드에서 친 명령은 그 스레드 대화방에 적용됩니다. 등록이 실패해도 경고 로그만 남고 `!` 명령은 그대로 됩니다.
 - **놓친 메시지**: 기동 때, Gateway가 새 세션으로 다시 붙을 때(resume이면 Discord가 다시 보내 줌), 받은 메시지 처리가 실패했을 때 Discord 대화가 있던 DM·채널·스레드를 `dc:<채널 ID>` 기준점 뒤로 100개씩 읽어 오너 글을 처리합니다. 이미 받은 글은 중복으로 걸러지고, 읽을 수 없는 채널은 재시작 전까지 건너뜁니다.
 - **스레드 맥락**: 봇 글에서 만든 서버 스레드의 첫 오너 답에는 그 봇 글이 맥락으로 붙습니다(Slack과 같은 주입 경고 포함).
+- **모니터**: Discord DM 세션도 모니터 도구(`ompbot_monitor_add/list/remove`)를 받고 프롬프트에 그 안내가 실립니다. `channel`을 정하지 않은 모니터는 등록한 Discord DM ID를 `channel`로 저장해 결과가 그 DM에 새 글로 옵니다(Slack DM 등록은 지금처럼 비워 두어 Slack 오너 DM). `channel`·`copyChannel`은 Slack 채널 ID(`C…`/`G…`)나 Discord 채널 ID(숫자 17~20자리)를 받습니다. 서버 스레드 세션에는 모니터 도구가 없습니다(Slack과 같음).
+- **작업 레인**: 레인은 서버 텍스트 채널의 Discord 스레드에서 돕니다. 부모 채널에 `🔄 제목` 루트를 올리고 그 루트로 스레드를 만든 뒤(스레드 ID = 루트 ID, 레인 `threadRef`는 `<부모 채널>:<루트 ID>`) 상태 메시지(⏸ 버튼)와 Outcome 카드(머지·폐기)를 스레드 안에 올립니다. 스레드를 만들지 못하면 루트를 `❌ 제목`으로 고치고 worktree·브랜치를 지웁니다. 스레드 안 오너 글은 멘션 없이 레인으로 가고 `멈춰`·`계속`·`머지해`·`폐기해`·`!reopen`·버튼이 Slack 레인과 같게 동작합니다. 서버 채널·스레드에서 요청하면 그 채널에, DM에서 요청하면 `laneChannelId` 채널에 열고 요청한 곳에 레인 스레드 링크를 답합니다. `laneChannelId`가 없으면 DM 세션에는 `ompbot_work_start`가 없고 프롬프트와 `작업: …` 답이 이 설정을 안내합니다. 레인 세션은 `discord_send_file`로 레인 스레드에 파일을 올립니다.
+- **inject**: `ompbot inject --origin discord/dm/<ID>|discord/ch/<ID> --as-owner --text …`가 그 대화에 `🧪 inject` 마커를 올리고 오너 글로 접수합니다(DM의 `--thread <메시지 ID>`는 그 메시지에 대한 답장, DM 대화로 접수). Discord 세션도 긴 작업의 자동 후속(`[자동 후속]`)에 이것을 씁니다.
+- **Slack에만 있는 것**: 게이트·한도·재시작 같은 데몬 수준 알림, `logChannel` 사본, `escalationChannel`, 피어 봇, App Home은 Slack에만 있습니다.
 - **현황판**: Discord DM은 `DM`, 서버 채널은 `Discord <채널 ID>`로 보이고, 시스템 보기에 Discord 게이트웨이 연결 카드가 생깁니다(Discord를 끈 설치에는 없음).
 
 ## 작업 위임
@@ -538,8 +590,8 @@ bun src/main.ts monitors apply --dir <디렉터리> [--prune] [--dry-run]  # 내
 | `name`, `instruction` | 이름, 지시(4000자 이하) |
 | `overlap` | `queue`(기본: 앞 실행이 끝나면 이어서) · `skip`(앞 실행 중이면 건너뜀). 같은 발사 시각(슬롯)은 두 번 실행되지 않습니다 |
 | `enabled` | 켜기·끄기 |
-| `channel` | `C…`/`G…` 채널 id. 결과를 오너 DM 대신 그 채널 최상위에 올립니다. 긴 답의 나머지는 그 메시지 스레드에 달리고, `<@U…>`는 실제 멘션이 됩니다 |
-| `copyChannel` | `C…`/`G…` 채널 id. 끝난 모든 실행의 사본을 그 채널 최상위에 더 올립니다. 조용히 넘어간 실행은 마커 줄을 뺀 답(남는 것이 없으면 `알릴 내용 없음`)으로 올리고, 실패 알림은 복사하지 않습니다 |
+| `channel` | `C…`/`G…` 채널 id 또는 Discord 채널 id(숫자 17~20자리). 결과를 오너 DM 대신 그 채널 최상위에 올립니다. 긴 답의 나머지는 그 메시지 스레드에 달리고, `<@U…>`는 실제 멘션이 됩니다 |
+| `copyChannel` | `C…`/`G…` 채널 id 또는 Discord 채널 id. 끝난 모든 실행의 사본을 그 채널 최상위에 더 올립니다. 조용히 넘어간 실행은 마커 줄을 뺀 답(남는 것이 없으면 `알릴 내용 없음`)으로 올리고, 실패 알림은 복사하지 않습니다 |
 | `model`, `thinking` | 이 모니터 세션의 모델(`provider/id`)·thinking(`off\|minimal\|low\|medium\|high\|xhigh\|max`)을 고정합니다. 필드별로 대화방 선택보다 우선합니다 |
 | `deliver` | `turn`(기본) · `verbatim`. 아래 참고 |
 | `procedureFiles` | 최대 5개 파일 경로(절대, 또는 workspaceDir 기준 상대). workspaceDir 또는 `~/.ompbot/scripts` 안의 일반 파일만 허용하며(심볼릭 링크는 실제 경로로 판정) 밖이면 거부합니다. 발사할 때마다 디스크에서 다시 읽어 파일별 `[절차 파일 <경로>]` 블록으로 지시 뒤에 붙입니다. 합계 64KiB까지이고 넘으면 잘림 표시, 못 읽는 파일은 `읽기 실패` 줄로 남기고 발사는 계속합니다. 긴 절차를 4000자 지시 밖에 두는 용도입니다. `monitors update`에서 `null`이면 해제 |
@@ -562,7 +614,7 @@ bun src/main.ts status [--json]   # 데몬이 꺼져 있으면 DB를 직접 읽�
 bun src/main.ts doctor            # home·secrets·omp·bun·Slack auth·백업 번들 점검, herdr 켜짐이면 herdr --version과 herdr omp 통합, 이어서 dispatchHosts마다 ssh 도달과 herdr omp 통합(`ok`/`fail <사유>`, 통합·호스트 줄은 실패해도 종료 코드는 그대로)
 bun src/main.ts offsite [--json]    # 최신 백업을 오프사이트(config offsite)로 다시 복제
 bun src/main.ts gates [--json] [--strict]   # 읽기 전용 건강 판정 — 게이트 하나라도 열리면 exit 1, --strict는 판정불가(unknown)도 exit 1
-bun src/main.ts gc [--dry-run]    # 보존 기간이 지난 이전 대화 세션, 오래 쉰 채널 스레드 세션, 삭제된 모니터의 세션 정리
+bun src/main.ts gc [--dry-run]    # 보존 기간이 지난 이전 대화 세션, 오래 쉰 채널 스레드 세션, 삭제된 모니터의 세션, 7일 지난 `!undo` 턴 스냅샷 정리
 bun src/main.ts backup [--keep N] [--max-bundle-bytes N]
 bun src/main.ts drain [--wait] [--timeout <분>] # 재시작 전 대기(--wait 없으면 걸기만 하고 바로 끝남)
 bun src/main.ts drain --cancel
@@ -574,9 +626,9 @@ bun src/main.ts unfreeze          # FROZEN 삭제
 bun src/main.ts reload            # 실행 중인 데몬이 config.json을 다시 읽음(SIGHUP과 같음)
 bun src/main.ts daemon            # 데몬 본체(systemd 서비스가 실행)
 bun src/main.ts skills rollback <이름>           # 스킬을 직전 개정으로 되돌림
-bun src/main.ts inject --origin slack/dm/<DM ID>|slack/ch/<채널ID> --as-owner --text "…" [--quoted "…"] [--thread <ts>]
-                                  # 로컬 소켓으로 오너 메시지를 주입(시험용, 답은 실제 Slack에 올라감)
-                                  # --thread: 표식과 오너 메시지를 그 스레드(루트 ts)의 답글로 올림
+bun src/main.ts inject --origin slack/dm/<DM ID>|slack/ch/<채널ID>|discord/dm/<ID>|discord/ch/<ID> --as-owner --text "…" [--quoted "…"] [--thread <ts|메시지 ID>]
+                                  # 로컬 소켓으로 오너 메시지를 주입(시험용·자동 후속, 답은 그 대화의 실제 Slack·Discord에 올라감)
+                                  # --thread: 표식과 오너 메시지를 그 스레드(루트 ts·Discord 스레드 ID)의 답글로 올림(Discord DM: 그 메시지에 대한 답장)
 bun src/main.ts tasks …           # [TASK] 상태 문서
 bun src/main.ts monitors …        # 모니터
 bun src/main.ts dashboard [--port N] [--bind 127.0.0.1|::1]   # 읽기 전용 현황판(루프백 HTTP)
@@ -680,8 +732,8 @@ systemd-run --user --on-active=90 --unit=ompbot-restart \
 
 `bun src/main.ts reload`나 `kill -HUP <데몬 pid>`를 보내면 실행 중인 데몬이 `config.json`을 다시 읽습니다. 결과는 `config_reloaded changed=… restart_required=… cli=…` 한 줄로 CLI 출력과 로그에 남습니다.
 
-- **바로 반영(`changed`)**: `mentionFreeChannels`, `logChannel`, `escalationChannel`, `skillReviewTurns`, `dispatchHosts`, `workerOmpArgs`, `herdrBoard`, `taskAutoLand`, `restartNotice`, `recallEnabled`, `peerBots`, `requireMention`, `peerHopLimit`. 다음 메시지·승인 카드·답·스윕부터 새 값을 씁니다. `dispatchHosts`·`workerOmpArgs`·`herdrBoard`는 이미 떠 있는 omp 자식의 도구에는 들어가지 않고 다음에 뜨는 자식부터 적용됩니다(스윕 알림의 보드 링크는 바로 반영).
-- **재시작 필요(`restart_required`)**: `channels`, `slack`, `ompExecutable`, `workspaceDir`, `model`, `thinking`, `idleTimeoutMinutes`, `watcherRoots`, `webhook`, `agent`, `claudeExecutable`, `herdr`(도구 스키마와 `[TASK]` 스윕을 시작 때 정함), `offsite`(데몬은 `offsite_age` 게이트를 둘지 판단하는 데만 읽고, 복제는 CLI가 실행할 때마다 config를 다시 읽습니다). 바뀐 것을 알려 주기만 하고 적용하지 않습니다.
+- **바로 반영(`changed`)**: `mentionFreeChannels`, `logChannel`, `escalationChannel`, `skillReviewTurns`, `dispatchHosts`, `workerOmpArgs`, `herdrBoard`, `taskAutoLand`, `restartNotice`, `recallEnabled`, `peerBots`, `requireMention`, `peerHopLimit`, `turnSnapshot`, `costCap`. 다음 메시지·승인 카드·답·스윕부터 새 값을 씁니다. `dispatchHosts`·`workerOmpArgs`·`herdrBoard`는 이미 떠 있는 omp 자식의 도구에는 들어가지 않고 다음에 뜨는 자식부터 적용됩니다(스윕 알림의 보드 링크는 바로 반영).
+- **재시작 필요(`restart_required`)**: `channels`, `slack`, `ompExecutable`, `workspaceDir`, `model`, `thinking`, `idleTimeoutMinutes`, `watcherRoots`, `webhook`, `agent`, `claudeExecutable`, `agyExecutable`, `herdr`(도구 스키마와 `[TASK]` 스윕을 시작 때 정함), `offsite`(데몬은 `offsite_age` 게이트를 둘지 판단하는 데만 읽고, 복제는 CLI가 실행할 때마다 config를 다시 읽습니다). 바뀐 것을 알려 주기만 하고 적용하지 않습니다.
 - **CLI 전용(`cli`)**: `sessionRetentionDays`, `maxBundleBytes`는 `gc`·`backup`이 실행할 때마다 직접 읽으므로 데몬과 무관합니다. `dashboard`는 현황판 서비스가 시작할 때 읽으므로 `systemctl --user restart ompbot-dashboard`로 반영합니다.
 - 파일이 없거나 JSON·검증 오류가 있으면 아무것도 바꾸지 않고 `config_reload_failed`를 남기며, `reload`는 1로 끝납니다.
 
@@ -724,6 +776,7 @@ systemd-run --user --on-active=90 --unit=ompbot-restart \
 | `monitors_stalled` | 켜진 모니터의 다음 발사 시각이 15분 넘게 지났음 — 모니터 틱이 발사하지 못하는 상태. drain 중이거나 하트비트가 구버전 데몬의 것이면 닫힘 |
 | `monitors_failed` | 최근 24시간 켜진 모니터의 `failed_no_retry` |
 | `turns_failing` | 최근 1시간 `[turn failed]` 알림 3건 이상 |
+| `cost_cap` | `costCap.dailyUsd`가 있을 때만 존재. 오늘(KST) `usage_daily` 합계가 그 상한 이상이고 `!budget off`로 끄지 않았음 — 모니터 발화가 멈춘 상태. detail은 `today=… cap=…`(끈 날은 `off=today`) |
 | `ledger_unreadable` | `ompbot.db`를 읽을 수 없음(테이블 없음·손상). 이때는 DB 게이트 대신 이 게이트 하나가 열립니다 |
 
 - 데몬은 매 스윕(기본 15초)마다 `~/.ompbot/sweep-heartbeat`을 원자적으로 갱신하고, `monitorEventLoopDelay`로 잰 최대 루프 지연을 함께 기록합니다(5초 초과 시 `event_loop_blocked` 경고). 스윕의 한 단계가 예외를 던지면 데몬은 죽지 않고 `sweep_failed`(error)를 남긴 채 그 스윕을 끝내며 하트비트를 갱신하지 않습니다. 실패가 이어지면 스탬프가 늙어 `sweep_stalled`가 열리고, 이것은 데몬 밖의 `ompbot gates`(ops-check 등)가 잡습니다.

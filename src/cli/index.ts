@@ -54,7 +54,7 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  frozen, herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
                                  disk_low, host_pressure, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
                                  monitors_failed, monitors_stalled, turns_failing, ledger_unreadable
-  inject --origin <slack/dm/ID|slack/ch/ID> --as-owner --text <t> [--quoted <q>] [--thread <ts>]
+  inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
 ${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${FEEDBACK_USAGE}`;
@@ -292,6 +292,7 @@ export function gatesCommand(args: string[], homeDir: string, deps: GatesCommand
 		homeDir,
 		now: (deps.now ?? Date.now)(),
 		offsiteConfigured: config?.offsite !== undefined,
+		...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
 		...omp,
 		...(deps.statfs === undefined ? {} : { statfs: deps.statfs }),
 		...(deps.hostLoad === undefined ? {} : { hostLoad: deps.hostLoad }),
@@ -335,6 +336,7 @@ async function statusCommand(args: string[], homeDir: string): Promise<number> {
 			dbPath,
 			await readVersion([config.ompExecutable, "--version"]),
 			config.offsite !== undefined,
+			config.costCap?.dailyUsd,
 		);
 	}
 	process.stdout.write(`${values.json ? JSON.stringify(report) : renderStatusText(report)}\n`);

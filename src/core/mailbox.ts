@@ -23,6 +23,25 @@ import {
 	cacheCallOf,
 	isColdCache,
 } from "../ops/cache-monitor";
+import {
+	COST_CAP_STOP_PREFIX,
+	ledgerDay,
+	messageCost,
+	sessionWindowCost,
+	TURN_STOP_RATIO,
+	turnCapSteerText,
+	turnCapStopReason,
+} from "../ops/cost-cap";
+import {
+	applyUndo,
+	captureTrees,
+	type GitRunner,
+	type PlannedFile,
+	planUndo,
+	type RepoPlan,
+	recordTurn,
+	type TurnSnapshotRow,
+} from "../ops/turn-snapshot";
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
 import type { InboundRow, OriginRow, Store } from "../store/db";
@@ -158,8 +177,18 @@ export interface MailboxDeps {
 	usageProvider?: (originKey: string) => Promise<string>;
 	/** `!distill` answer for an origin: starts a skill review of its session and says so (or why not); absent = not wired. */
 	distillProvider?: (originKey: string) => Promise<string>;
+	/**
+	 * `!budget` answer: today's ledger total, both ceilings and the day's off switch. The argument is the trimmed text
+	 * after the command (`""`, `off`, `on`); absent = not wired.
+	 */
+	budgetProvider?: (arg: string) => Promise<string>;
 	/** Read on every new turn: whether its prompt may carry channel-scoped recall. Absent = never. */
 	recallEnabled?: () => boolean;
+	/**
+	 * Live `costCap` from config, read per assistant call: `turnUsd` steers a turn at the ceiling and stops it at
+	 * 1.5x. Absent, or a key absent, = that ceiling is off. `dailyUsd` is not read here (`src/ops/cost-cap.ts`).
+	 */
+	costCap?: () => { turnUsd?: number; dailyUsd?: number } | undefined;
 	/**
 	 * Thread readers per platform, for the context a peer request or an owner's first reply to a bot post needs; a
 	 * platform without one (or no map) gets none.
@@ -233,6 +262,21 @@ export interface MailboxDeps {
 	onStuckLoop?: (info: StuckLoopInfo) => void;
 	/** omp dialogs (select/confirm/input/editor/ask cards) waiting on the owner; absent: messages never answer one. */
 	dialogs?: OpenDialogs;
+	/** Turn snapshots and `!undo`; absent = no snapshot is taken and `!undo` says it is not wired. */
+	turnUndo?: TurnUndoDeps;
+}
+
+/**
+ * What `!undo` needs from the daemon (doc/plans/turn-undo.md): the repositories to snapshot, the approval card and the
+ * git runner. The mailbox only decides *when* a snapshot, a card and a restore happen.
+ */
+export interface TurnUndoDeps {
+	/** Read on every turn and every `!undo`: a config reload changes it without a restart. */
+	repos: () => readonly string[];
+	/** The owner's answer to the undo card; only `approved` writes anything. */
+	approve: (info: { summary: string; threadRef: string }) => Promise<"approved" | "denied" | "timeout">;
+	/** Git runner (tests inject one that counts or fails); absent = the real git. */
+	run?: GitRunner;
 }
 
 /** The owner-facing omp dialogs of each origin (`ApprovalBroker.choose` cards), as the mailbox sees them. */
@@ -322,6 +366,15 @@ interface ActiveTurn {
 	/** Set when a peer bot's message started the turn: its failure notice goes back to that bot. */
 	peer: TurnPeer | undefined;
 	startedAt: number;
+	/** Priced cost of this turn's assistant calls so far (`costCap.turnUsd` reads it); sub-agents are not counted. */
+	costUsd: number;
+	/** The turn reached `turnUsd` and got the wrap-up steer: once per turn. */
+	costSoftSent: boolean;
+	/**
+	 * Set when the turn was aborted at 1.5x `turnUsd`: its own `aborted` final settles the turn with this reason
+	 * (`cost_cap: …`) and no failure count. No second abort, no steer.
+	 */
+	costStopReason: string | undefined;
 	/** Leaf read right before the prompt; the turn's answers are the entries after it. */
 	entryCursor: string | null;
 	/** Stalls of this turn (one per silence); the first logs `stall_alert`, the rest `stall_repeat`. */
@@ -345,9 +398,10 @@ interface ActiveTurn {
 	/** Texts this turn already sent as interim deliveries, in order (`<opRef>:interim:<index>`). */
 	interim: string[];
 	/**
-	 * A stop-ended answer not yet sent: it goes out as an interim delivery once the turn shows it goes on (the next
-	 * message or tool call); if the turn ends first, it is part of the turn-end answer instead.
+	 * The work trees captured right before the prompt (`!undo`): absent when the feature is off or this turn is not a
+	 * conversation turn. The after-state is taken in `#onFinal`.
 	 */
+	undoBefore?: { startedAt: number; before: ReadonlyMap<string, { head: string; tree: string }> };
 	pendingAnswer: string | undefined;
 }
 
@@ -608,6 +662,8 @@ export class OriginMailbox {
 	#driver: OmpSessionDriver | undefined;
 	#unsubscribe: Array<() => void> = [];
 	#turn: ActiveTurn | undefined;
+	/** Incremented when a turn starts: `!undo` compares it to refuse a restore after a new turn began. */
+	#turnGeneration = 0;
 	#lastActivityAt: number;
 	readonly #stallMs: number;
 	#lastEventAt = 0;
@@ -849,6 +905,94 @@ export class OriginMailbox {
 	}
 
 	/**
+	 * Adds one assistant call's price to the running turn and applies `costCap.turnUsd`: on reaching the ceiling the
+	 * turn gets one steer to wrap up, on reaching 1.5x it is aborted and settled as `cost_cap`. The total is kept even
+	 * when no turn ceiling is set: the daily ledger falls back to it when the session file cannot be read. Sub-agent
+	 * spend is not part of a turn's total (only the daily ledger counts it).
+	 */
+	#accrueTurnCost(turn: ActiveTurn, message: unknown): void {
+		turn.costUsd += messageCost(message);
+		const cap = this.#deps.costCap?.()?.turnUsd;
+		if (cap === undefined) return;
+		if (turn.costUsd <= 0 || turn.costStopReason !== undefined) return;
+		if (turn.costUsd >= cap * TURN_STOP_RATIO) {
+			// The reason is kept on the turn: the final this abort causes settles with it (`#onFinal`).
+			turn.costStopReason = turnCapStopReason(cap, turn.costUsd);
+			this.#background("cost_cap_stop_failed", () => this.#abortCostCap(turn, cap));
+			return;
+		}
+		if (turn.costSoftSent || turn.costUsd < cap) return;
+		turn.costSoftSent = true;
+		this.#deps.log.info("cost_cap_turn_soft", {
+			origin: this.#deps.originKey,
+			opRef: turn.opRef,
+			cost: turn.costUsd,
+			cap,
+		});
+		this.#background("cost_cap_steer_failed", async () => {
+			// Real omp starts a run when steered while idle: only steer the turn that is still running.
+			if (this.#turn !== turn || !this.#driver) return;
+			await this.#driver.steer(turnCapSteerText(cap));
+		});
+	}
+
+	/**
+	 * Adds the finished turn's priced cost (its own session after the start cursor plus in-window sub-agent transcripts)
+	 * to `usage_daily`. The turn's live `costUsd` is the fallback when the session file cannot be read — that total
+	 * misses sub-agents, so the miss is logged as `usage_daily_failed`. A missing `sessionFile` (no session yet) is not
+	 * an error: there is no transcript to read and nothing was spent.
+	 */
+	async #recordDailyCost(driver: OmpSessionDriver, turn: ActiveTurn): Promise<void> {
+		const { store, originKey, log, clock } = this.#deps;
+		let file: string | undefined;
+		try {
+			file = (await driver.state()).sessionFile;
+		} catch (error) {
+			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+			store.addDailyUsage({ day: ledgerDay(clock.now()), originKey, cost: turn.costUsd, calls: 1 });
+			return;
+		}
+		if (file === undefined || file === "") return;
+		let cost: number;
+		let calls: number;
+		try {
+			const window = await sessionWindowCost({
+				sessionFile: file,
+				afterEntryId: turn.entryCursor,
+				from: turn.startedAt,
+				to: clock.now(),
+			});
+			cost = window.cost;
+			calls = window.calls;
+		} catch (error) {
+			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, file, error: String(error) });
+			cost = turn.costUsd;
+			calls = 1;
+		}
+		store.addDailyUsage({ day: ledgerDay(clock.now()), originKey, cost, calls });
+	}
+
+	/**
+	 * Aborts a turn that passed 1.5x its ceiling and settles it through the normal final path with the `cost_cap`
+	 * reason (a failure notice to the thread, but no failure count: `#onFinal` skips `#noteTurnFailure`). A final that
+	 * settled the turn first wins; this then does nothing.
+	 */
+	async #abortCostCap(turn: ActiveTurn, cap: number): Promise<void> {
+		const driver = this.#driver;
+		if (!driver || this.#turn !== turn) return;
+		const { originKey, log } = this.#deps;
+		const reason = turn.costStopReason ?? turnCapStopReason(cap, turn.costUsd);
+		log.warn("cost_cap_turn_stop", { origin: originKey, opRef: turn.opRef, cost: turn.costUsd, cap });
+		try {
+			await driver.abort();
+		} catch (error) {
+			log.warn("cost_cap_abort_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+		}
+		if (this.#turn !== turn || this.#driver !== driver) return;
+		await this.#onFinal(driver, { opRef: turn.opRef, status: "aborted", text: "", error: reason });
+	}
+
+	/**
 	 * Feeds a tool event to the turn's loop detector. Only `tool_execution_end` carries the result, so the claude
 	 * driver (it reports `tool_execution_start` only) never trips it — a known limit of that driver.
 	 */
@@ -938,6 +1082,7 @@ export class OriginMailbox {
 		if (this.#onRetryEvent(event)) return;
 		if (event.type === "auto_compaction_end") this.#cache.markCompacted();
 		if (event.type === "message_end") this.#observeCache(event.message);
+		if (event.type === "message_end" && this.#turn) this.#accrueTurnCost(this.#turn, event.message);
 		if (this.#turn && (event.type === "tool_execution_start" || event.type === "tool_execution_end")) {
 			this.#observeTool(this.#turn, event);
 		}
@@ -1306,6 +1451,48 @@ export class OriginMailbox {
 		return true;
 	}
 
+	/**
+	 * The work trees as they are before this turn's prompt. Only conversation origins of a chat platform and only the
+	 * configured repositories: a monitor turn or a lane turn (its own worktree and branch) has nothing to undo here, and
+	 * without `turnUndo` no git is ever started.
+	 */
+	async #captureUndoBefore(originKey: string): Promise<ActiveTurn["undoBefore"]> {
+		const turnUndo = this.#deps.turnUndo;
+		if (turnUndo === undefined || parseChatOrigin(originKey) === undefined) return undefined;
+		const repos = turnUndo.repos();
+		if (repos.length === 0) return undefined;
+		const before = await captureTrees(repos, { run: turnUndo.run, log: this.#deps.log });
+		if (before.size === 0) return undefined;
+		return { startedAt: this.#deps.clock.now(), before };
+	}
+
+	/**
+	 * The after-state of a settled turn, recorded as one ledger row per changed repository so `!undo` can put exactly
+	 * those files back. Runs after the answer is stored: a slow or failing git never costs the owner the answer.
+	 */
+	async #recordUndoAfter(turn: ActiveTurn): Promise<void> {
+		const captured = turn.undoBefore;
+		const turnUndo = this.#deps.turnUndo;
+		if (captured === undefined || turnUndo === undefined) return;
+		const { store, originKey, log } = this.#deps;
+		try {
+			// Only the repositories captured before are compared: a reload in between must not invent a before-state.
+			const live = turnUndo.repos().filter((repo) => captured.before.has(repo));
+			if (live.length === 0) return;
+			const after = await captureTrees(live, { run: turnUndo.run, log });
+			const capture = {
+				startedAt: captured.startedAt,
+				endedAt: this.#deps.clock.now(),
+				before: captured.before,
+				after,
+			};
+			const written = await recordTurn({ store, originKey, opRef: turn.opRef, capture, run: turnUndo.run, log });
+			if (written > 0) log.info("turn_snapshot", { origin: originKey, opRef: turn.opRef, repos: written });
+		} catch (error) {
+			log.warn("turn_snapshot_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+		}
+	}
+
 	/** Opens the origin's session in a driver and starts one turn for the row; nothing is recorded on failure. */
 	async #startTurn(row: InboundRow, text: string): Promise<void> {
 		const { store, log, originKey } = this.#deps;
@@ -1319,13 +1506,19 @@ export class OriginMailbox {
 		this.#warnColdCache(row.threadRef);
 		// Read the cursor right before the prompt: extensions append entries after open.
 		const entryCursor = await driver.leafId();
+		// Before the prompt, not after: the first tool call would otherwise race the capture and land in no turn's diff.
+		const undoBefore = await this.#captureUndoBefore(originKey);
 		const opRef = await driver.prompt(await this.#firstTurnPrompt(row, text));
 		store.markDispatched(row.platformMessageId, { opRef, entryCursor });
+		this.#turnGeneration += 1;
 		this.#turn = {
 			opRef,
 			threadRef: row.threadRef,
 			peer: turnPeerOf(row),
 			startedAt: this.#deps.clock.now(),
+			costUsd: 0,
+			costSoftSent: false,
+			costStopReason: undefined,
 			entryCursor,
 			stallCount: 0,
 			stallSilentMs: 0,
@@ -1337,6 +1530,7 @@ export class OriginMailbox {
 			progress: { tools: 0, recentTools: [], steers: 0, retries: 0 },
 			live: new LiveTurn(this.#deps.clock, row.platformMessageId),
 			interim: [],
+			...(undoBefore === undefined ? {} : { undoBefore }),
 			pendingAnswer: undefined,
 		};
 		this.#lastEventAt = this.#deps.clock.now();
@@ -1668,6 +1862,7 @@ export class OriginMailbox {
 		}
 		this.#turn = undefined;
 		this.#lastActivityAt = this.#deps.clock.now();
+		await this.#recordDailyCost(driver, turn);
 		const base = { originKey, opRef: turn.opRef, threadRef: turn.threadRef };
 		if (final.status === "completed") {
 			const answer = await this.#turnAnswer(driver, turn, final.text);
@@ -1679,6 +1874,12 @@ export class OriginMailbox {
 				...base,
 				parts: ["⏸ 이 턴은 오너 멈춤 요청으로 중단됐습니다(레인 일시정지). 재개는 오너만 합니다."],
 			});
+		} else if ((final.error ?? "").startsWith(COST_CAP_STOP_PREFIX)) {
+			// A spend brake, not a breakage: the notice carries the reason, the failure run stays as it was.
+			store.recordTurnFailure({
+				...base,
+				notice: failedNotice(final.error ?? final.status, turn.peer, this.#threadSource()),
+			});
 		} else {
 			store.recordTurnFailure({
 				...base,
@@ -1687,6 +1888,9 @@ export class OriginMailbox {
 			await this.#noteTurnFailure(turn.threadRef, final.error ?? final.status);
 		}
 		if (stopFirst) await this.#stopDriver();
+		// After the answer is stored and before the next row starts: the drain below may open the next turn, and its
+		// before-state must already include this turn's files.
+		await this.#recordUndoAfter(turn);
 		await this.#drain();
 		if (this.#stopAfterTurn && !this.#turn) {
 			this.#stopAfterTurn = false;
@@ -1753,6 +1957,11 @@ export class OriginMailbox {
 			this.#askBtw(this.#driver.btw(command.arg), opRef, threadRef);
 			return;
 		}
+		if (command.kind === "undo") {
+			// The card waits minutes: it must not hold the serial chain, or the next inbound could not start a turn.
+			this.#startUndo(opRef, threadRef);
+			return;
+		}
 		let text: string;
 		try {
 			text = await this.#commandReply(command, opRef, threadRef);
@@ -1788,6 +1997,140 @@ export class OriginMailbox {
 			});
 	}
 
+	/**
+	 * `!undo` (doc/plans/turn-undo.md §E): the origin's newest turn that changed a repository, put back after the owner
+	 * approves. Runs outside the serial chain (the card waits minutes) and re-enters it for the write, where the plan is
+	 * recomputed: files that changed meanwhile become conflicts, and a turn that started meanwhile cancels the undo.
+	 */
+	#startUndo(opRef: string, threadRef: string): void {
+		const { store, originKey, log } = this.#deps;
+		const reply = (text: string): void => {
+			store.recordAnswer({ originKey, opRef, threadRef, parts: [text] });
+		};
+		const turnUndo = this.#deps.turnUndo;
+		if (turnUndo === undefined) {
+			reply("턴 되돌리기가 설정되지 않았습니다(turnSnapshot).");
+			return;
+		}
+		if (this.#turn) {
+			reply("턴이 끝난 뒤 다시 시도하세요. 되돌리기는 턴이 끝난 뒤에만 됩니다.");
+			return;
+		}
+		const rows = store.latestUndoableTurn(originKey);
+		if (rows.length === 0) {
+			reply("되돌릴 턴 변경이 없습니다.");
+			return;
+		}
+		const generation = this.#turnGeneration;
+		this.#planUndoCard(rows, { run: turnUndo.run })
+			.then(async (planned) => {
+				if (planned.plans.every((plan) => plan.files.length === 0 && plan.commit === undefined)) {
+					reply(planned.nothing);
+					return;
+				}
+				const outcome = await turnUndo.approve({ summary: planned.summary, threadRef });
+				if (outcome !== "approved") {
+					reply(outcome === "timeout" ? "승인 시간이 지나 되돌리지 않았습니다." : "승인하지 않아 되돌리지 않았습니다.");
+					return;
+				}
+				const answer = await this.#serial(() => this.#applyUndoPlan(rows, planned.plans, generation));
+				reply(answer);
+			})
+			.catch((error: unknown) => {
+				log.error("undo_failed", { origin: originKey, opRef, error: String(error) });
+				reply(`되돌리지 못했습니다: ${redact(String(error))}`);
+			});
+	}
+
+	/**
+	 * The card text and the per-repository plans of one turn. A turn that committed only advises a `git revert`; the
+	 * other repositories list their files by kind, the first ten of each.
+	 */
+	async #planUndoCard(
+		rows: readonly TurnSnapshotRow[],
+		options: { run?: GitRunner },
+	): Promise<{ plans: RepoPlan[]; summary: string; nothing: string }> {
+		const others = this.#deps.store.listTurnSnapshots({ originKey: this.#deps.originKey });
+		const plans = await Promise.all(rows.map((row) => planUndo({ row, others, run: options.run })));
+		const lines: string[] = ["이 대화의 최근 변경 턴을 되돌릴까요?"];
+		let totalRevert = 0;
+		for (const plan of plans) {
+			const count = (kind: PlannedFile["kind"]): number => plan.files.filter((file) => file.kind === kind).length;
+			totalRevert += count("revert");
+			if (plan.commit !== undefined) {
+				lines.push(`· ${plan.repo}: 턴이 커밋했습니다 — 파일은 그대로 두고 ${plan.commit.advice}`);
+				continue;
+			}
+			lines.push(
+				`· ${plan.repo}: 되돌림 ${count("revert")}개, 충돌 ${count("conflict")}개, 겹침 ${count("overlap")}개`,
+			);
+			for (const kind of ["revert", "conflict", "overlap"] as const) {
+				const paths = plan.files.filter((file) => file.kind === kind).map((file) => file.path);
+				if (paths.length === 0) continue;
+				const shown = paths.slice(0, 10).join(", ");
+				lines.push(`  ${kind}: ${shown}${paths.length > 10 ? ` … 외 ${paths.length - 10}개` : ""}`);
+			}
+		}
+		const summary = lines.join("\n");
+		const nothing = totalRevert === 0 ? `${summary}\n되돌릴 파일이 없습니다(모두 충돌·겹침이거나 커밋된 턴).` : summary;
+		return { plans, summary, nothing };
+	}
+
+	/**
+	 * Re-checks a plan right before writing (the card waited, and the serial chain was free meanwhile): a turn started in
+	 * between cancels the undo, and any file whose classification changed is left alone. Files that are still `revert`
+	 * go back to their before-tree.
+	 */
+	async #applyUndoPlan(
+		rows: readonly TurnSnapshotRow[],
+		planned: readonly RepoPlan[],
+		generation: number,
+	): Promise<string> {
+		const { store, originKey, log } = this.#deps;
+		const turnUndo = this.#deps.turnUndo;
+		if (turnUndo === undefined) return "턴 되돌리기가 설정되지 않았습니다(turnSnapshot).";
+		if (this.#turn !== undefined || this.#turnGeneration !== generation) {
+			return "승인 사이에 새 턴이 시작돼 되돌리지 않았습니다.";
+		}
+		const others = store.listTurnSnapshots({ originKey });
+		const fresh = await Promise.all(rows.map((row) => planUndo({ row, others, run: turnUndo.run })));
+		const lines: string[] = [];
+		const changed: string[] = [];
+		for (const [index, plan] of fresh.entries()) {
+			const before = planned[index];
+			if (plan.commit !== undefined) {
+				lines.push(plan.commit.advice);
+				continue;
+			}
+			const allowed = new Set((before?.files ?? []).filter((file) => file.kind === "revert").map((file) => file.path));
+			const writable: RepoPlan = {
+				...plan,
+				files: plan.files.filter((file) => file.kind === "revert" && allowed.has(file.path)),
+			};
+			for (const file of plan.files) {
+				if (file.kind === "revert" && !allowed.has(file.path)) changed.push(file.path);
+			}
+			if (writable.files.length === 0) continue;
+			await applyUndo(writable, { run: turnUndo.run });
+			const counts = new Map<string, number>();
+			for (const file of plan.files) counts.set(file.kind, (counts.get(file.kind) ?? 0) + 1);
+			lines.push(
+				`되돌림: ${plan.repo} 파일 ${writable.files.length}개, 충돌 ${counts.get("conflict") ?? 0}개, 겹침 ${counts.get("overlap") ?? 0}개`,
+			);
+		}
+		if (changed.length > 0) {
+			lines.push(`승인 사이에 내용이 바뀌어 남겨 둔 파일 ${changed.length}개: ${changed.slice(0, 10).join(", ")}`);
+		}
+		const opRefs = [...new Set(rows.map((row) => row.opRef))];
+		if (lines.length > 0) {
+			for (const opRef of opRefs) store.markTurnReverted(originKey, opRef, this.#deps.clock.now());
+			const refs = rows.map((row) => `${row.repo}@refs/ompbot/turns/${row.id}/after`);
+			lines.push(`되돌리기 전 상태는 git ref에 남아 있습니다: ${refs.join(", ")}`);
+			log.info("undo_applied", { origin: originKey, opRef: opRefs.join(","), files: changed.length });
+		}
+		return lines.length === 0 ? "되돌리지 못했습니다: 되돌릴 파일이 남지 않았습니다." : lines.join("\n");
+	}
+
 	/** Answer text of a command; throws when omp refuses it (the caller turns that into a `[turn failed]` notice). */
 	async #commandReply({ kind, arg }: ParsedCommand, opRef: string, threadRef: string): Promise<string> {
 		const busyText = `⏳ 작업 중에는 쓸 수 없습니다. 끝난 뒤 다시 보내거나 \`${COMMAND_TEXT.queue}\`로 확인하세요.`;
@@ -1800,6 +2143,9 @@ export class OriginMailbox {
 			case "distill":
 				if (this.#deps.distillProvider === undefined) return "스킬 리뷰가 연결되지 않았습니다";
 				return await this.#deps.distillProvider(this.#deps.originKey);
+			case "budget":
+				if (this.#deps.budgetProvider === undefined) return "비용 장부가 연결되지 않았습니다";
+				return await this.#deps.budgetProvider(arg);
 			case "btw":
 				// A question with a turn and a capable driver was started by `#runCommand`; without a turn it never
 				// reaches here (it becomes a plain message).
@@ -1823,6 +2169,8 @@ export class OriginMailbox {
 				return await this.#resumeCommand(arg, threadRef);
 			case "new":
 				throw new Error("unreachable: /new is handled by #newEpoch");
+			case "undo":
+				throw new Error("unreachable: undo is handled by #startUndo");
 		}
 	}
 

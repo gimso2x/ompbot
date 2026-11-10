@@ -212,6 +212,84 @@ export const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
 	updated_at INTEGER NOT NULL
 );`;
 
+/**
+ * Turn snapshot ledger for `!undo` (doc/plans/turn-undo.md §D): one row per repository a conversation turn changed, with
+ * the git trees before and after it. `reverted_at` marks a turn already put back (NULL = still undoable).
+ */
+export const TURN_SNAPSHOTS_DDL = `CREATE TABLE IF NOT EXISTS turn_snapshots (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	origin_key TEXT NOT NULL,
+	op_ref TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	head_before TEXT NOT NULL,
+	tree_before TEXT NOT NULL,
+	head_after TEXT NOT NULL,
+	tree_after TEXT NOT NULL,
+	started_at INTEGER NOT NULL,
+	ended_at INTEGER NOT NULL,
+	reverted_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS turn_snapshots_origin ON turn_snapshots(origin_key, id);
+CREATE INDEX IF NOT EXISTS turn_snapshots_ended ON turn_snapshots(ended_at);`;
+
+export interface TurnSnapshotRow {
+	id: number;
+	originKey: string;
+	opRef: string;
+	repo: string;
+	headBefore: string;
+	treeBefore: string;
+	headAfter: string;
+	treeAfter: string;
+	startedAt: number;
+	endedAt: number;
+	/** Undo happened at this time; NULL while the turn is still undoable. */
+	revertedAt: number | null;
+}
+
+export interface TurnSnapshotInput {
+	originKey: string;
+	opRef: string;
+	repo: string;
+	headBefore: string;
+	treeBefore: string;
+	headAfter: string;
+	treeAfter: string;
+	startedAt: number;
+	endedAt: number;
+}
+
+interface TurnSnapshotSql {
+	id: number;
+	origin_key: string;
+	op_ref: string;
+	repo: string;
+	head_before: string;
+	tree_before: string;
+	head_after: string;
+	tree_after: string;
+	started_at: number;
+	ended_at: number;
+	reverted_at: number | null;
+}
+
+const toTurnSnapshot = (r: TurnSnapshotSql): TurnSnapshotRow => ({
+	id: r.id,
+	originKey: r.origin_key,
+	opRef: r.op_ref,
+	repo: r.repo,
+	headBefore: r.head_before,
+	treeBefore: r.tree_before,
+	headAfter: r.head_after,
+	treeAfter: r.tree_after,
+	startedAt: r.started_at,
+	endedAt: r.ended_at,
+	revertedAt: r.reverted_at,
+});
+
+/** Rows kept per origin: an old turn's `!undo` target stops being reachable long before `gc` runs. */
+export const TURN_SNAPSHOT_ROWS_KEPT = 20;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS origins (
 	origin_key TEXT PRIMARY KEY,
@@ -281,7 +359,15 @@ CREATE TABLE IF NOT EXISTS thread_mutes (
 	thread_ref TEXT PRIMARY KEY,
 	muted_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage_daily (
+	day TEXT NOT NULL,
+	origin_key TEXT NOT NULL,
+	cost REAL NOT NULL,
+	calls INTEGER NOT NULL,
+	PRIMARY KEY(day, origin_key)
+);
 ${FEEDBACK_DDL}
+${TURN_SNAPSHOTS_DDL}
 `;
 
 interface LaneSql {
@@ -1302,6 +1388,38 @@ export class Store {
 		})();
 	}
 
+	// ---- daily cost ledger (`costCap`, src/ops/cost-cap.ts) ----
+
+	/** Adds one finished turn's priced cost to the KST day's row of its origin. */
+	addDailyUsage(input: { day: string; originKey: string; cost: number; calls: number }): void {
+		this.db
+			.query(
+				`INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, ?, ?, ?)
+				 ON CONFLICT(day, origin_key) DO UPDATE SET cost = cost + excluded.cost, calls = calls + excluded.calls`,
+			)
+			.run(input.day, input.originKey, input.cost, input.calls);
+	}
+
+	/** The day's total cost, or the sum of its rows when `originKey` is given. */
+	dailyCost(day: string, originKey?: string): number {
+		const row = (
+			originKey === undefined
+				? this.db.query("SELECT COALESCE(SUM(cost), 0) AS cost FROM usage_daily WHERE day = ?").get(day)
+				: this.db
+						.query("SELECT COALESCE(SUM(cost), 0) AS cost FROM usage_daily WHERE day = ? AND origin_key = ?")
+						.get(day, originKey)
+		) as { cost: number } | null;
+		return row?.cost ?? 0;
+	}
+
+	/** The day's biggest spenders, largest first. */
+	topDailyOrigins(day: string, limit: number): Array<{ originKey: string; cost: number }> {
+		const rows = this.db
+			.query("SELECT origin_key, cost FROM usage_daily WHERE day = ? ORDER BY cost DESC, origin_key LIMIT ?")
+			.all(day, limit) as Array<{ origin_key: string; cost: number }>;
+		return rows.map((row) => ({ originKey: row.origin_key, cost: row.cost }));
+	}
+
 	// ---- alert incidents (owner-notice repeat suppression) ----
 
 	/**
@@ -1337,6 +1455,90 @@ export class Store {
 		} else {
 			this.db.query("DELETE FROM thread_mutes WHERE thread_ref = ?").run(threadRef);
 		}
+	}
+
+	// ---- turn snapshots (`!undo`) ----
+
+	/**
+	 * Appends one turn snapshot and keeps only the newest `TURN_SNAPSHOT_ROWS_KEPT` rows of that origin. The rows dropped
+	 * by that bound come back as `pruned` so the caller can delete their refs.
+	 */
+	recordTurnSnapshot(input: TurnSnapshotInput): { id: number; pruned: TurnSnapshotRow[] } {
+		const inserted = this.db
+			.query(
+				`INSERT INTO turn_snapshots (origin_key, op_ref, repo, head_before, tree_before, head_after, tree_after, started_at, ended_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				input.originKey,
+				input.opRef,
+				input.repo,
+				input.headBefore,
+				input.treeBefore,
+				input.headAfter,
+				input.treeAfter,
+				input.startedAt,
+				input.endedAt,
+			);
+		const id = Number(inserted.lastInsertRowid);
+		const overflow = this.db
+			.query(
+				`SELECT * FROM turn_snapshots WHERE origin_key = ?
+				 ORDER BY id DESC LIMIT -1 OFFSET ?`,
+			)
+			.all(input.originKey, TURN_SNAPSHOT_ROWS_KEPT) as TurnSnapshotSql[];
+		const pruned = overflow.map(toTurnSnapshot);
+		const drop = this.db.query("DELETE FROM turn_snapshots WHERE id = ?");
+		for (const row of pruned) drop.run(row.id);
+		return { id, pruned };
+	}
+
+	/** Rows newest first; every filter is optional and compared literally. */
+	listTurnSnapshots(
+		filter: { originKey?: string; repo?: string; opRef?: string; undoable?: boolean } = {},
+	): TurnSnapshotRow[] {
+		const rows = this.db
+			.query(
+				`SELECT * FROM turn_snapshots
+				 WHERE (?1 IS NULL OR origin_key = ?1) AND (?2 IS NULL OR repo = ?2) AND (?3 IS NULL OR op_ref = ?3)
+				   AND (?4 = 0 OR reverted_at IS NULL)
+				 ORDER BY id DESC`,
+			)
+			.all(
+				filter.originKey ?? null,
+				filter.repo ?? null,
+				filter.opRef ?? null,
+				filter.undoable === true ? 1 : 0,
+			) as TurnSnapshotSql[];
+		return rows.map(toTurnSnapshot);
+	}
+
+	/**
+	 * The origin's most recent turn that can still be undone: its newest `op_ref` among rows with no `reverted_at`.
+	 * Returns every repository row of that turn (oldest first), or `[]` when nothing changed or all was undone.
+	 */
+	latestUndoableTurn(originKey: string): TurnSnapshotRow[] {
+		const newest = this.listTurnSnapshots({ originKey, undoable: true })[0];
+		if (newest === undefined) return [];
+		const rows = this.listTurnSnapshots({ originKey, opRef: newest.opRef, undoable: true });
+		return rows.reverse();
+	}
+
+	/** Marks a turn's rows as undone at `at`; returns how many rows changed. */
+	markTurnReverted(originKey: string, opRef: string, at: number): number {
+		return this.db
+			.query("UPDATE turn_snapshots SET reverted_at = ? WHERE origin_key = ? AND op_ref = ? AND reverted_at IS NULL")
+			.run(at, originKey, opRef).changes;
+	}
+
+	/** Deletes the rows older than `cutoff` (by `ended_at`) and returns them, so `ompbot gc` can drop their refs. */
+	deleteTurnSnapshotsBefore(cutoff: number): TurnSnapshotRow[] {
+		const rows = this.db
+			.query("SELECT * FROM turn_snapshots WHERE ended_at < ? ORDER BY id")
+			.all(cutoff) as TurnSnapshotSql[];
+		if (rows.length === 0) return [];
+		this.db.query("DELETE FROM turn_snapshots WHERE ended_at < ?").run(cutoff);
+		return rows.map(toTurnSnapshot);
 	}
 
 	// ---- deliveries ----

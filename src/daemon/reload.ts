@@ -22,6 +22,8 @@ export const LIVE_FIELDS = [
 	"peerBots",
 	"requireMention",
 	"peerHopLimit",
+	"turnSnapshot",
+	"costCap",
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /** Bound when the daemon starts (tokens, socket, omp children, scheduler). */
@@ -33,6 +35,7 @@ export const RESTART_FIELDS = [
 	"workspaceDir",
 	"agent",
 	"claudeExecutable",
+	"agyExecutable",
 	"model",
 	"thinking",
 	"idleTimeoutMinutes",

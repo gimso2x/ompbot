@@ -45,6 +45,21 @@ export interface MonitorSchedulerDeps {
 	 * do not run, and a due one-shot `at` monitor is held (not claimed, still enabled) so it fires once after unfreeze.
 	 */
 	frozen?: (() => FreezeState | undefined) | undefined;
+	/**
+	 * Daily cost ceiling (`costCap.dailyUsd`). While it returns a value no monitor fires and no watched or admitted
+	 * event is dispatched: due slots are recorded as skipped events with reason `budget` and queued events are skipped,
+	 * so the day's ceiling lifting at midnight never replays a burst. Script checks do not run either (a check that
+	 * fires would start a turn). Unlike `frozen` a due one-shot `at` monitor is not held: the day's spend is not a
+	 * temporary stop the owner can lift for it, and keeping it pending for a day would fire it late anyway.
+	 */
+	budgetExceeded?: (() => BudgetBreach | undefined) | undefined;
+}
+
+/** The daily ceiling and what the ledger counts for it; only rendered into logs, the scheduler reads the fact. */
+export interface BudgetBreach {
+	day: string;
+	cost: number;
+	cap: number;
 }
 
 export interface TickSummary {
@@ -53,11 +68,16 @@ export interface TickSummary {
 	skippedCatchUp: number;
 	/** Fires recorded as skipped (`frozen`) instead of claimed while the freeze switch is on. */
 	skippedFrozen: number;
+	/** Fires recorded as skipped (`budget`) instead of claimed while the day's cost ceiling stands. */
+	skippedBudget: number;
 	dispatched: number;
 }
 
 /** Reason prefix of events a frozen tick records instead of firing. */
 const FROZEN_SKIP = "frozen";
+
+/** Reason prefix of events a tick over the daily cost ceiling records instead of firing. */
+const BUDGET_SKIP = "budget";
 
 /**
  * The procedure files of one fire, read from disk now (an edit between fires applies to the next one): one block per
@@ -205,21 +225,30 @@ export class MonitorScheduler {
 	#tick(): TickSummary {
 		const { store, clock } = this.#deps;
 		const now = clock.now();
-		const summary: TickSummary = { claimed: 0, skippedOverlap: 0, skippedCatchUp: 0, skippedFrozen: 0, dispatched: 0 };
+		const summary: TickSummary = {
+			claimed: 0,
+			skippedOverlap: 0,
+			skippedCatchUp: 0,
+			skippedFrozen: 0,
+			skippedBudget: 0,
+			dispatched: 0,
+		};
 		store.monitors.reconcileDeliveries();
 		const monitors = store.monitors.listMonitors();
-		const frozen = this.#deps.frozen?.() !== undefined;
-		if (!frozen) this.#heldAt.clear();
+		// The freeze names its reason `frozen`; the day's ceiling `budget`. Both only skip, never replay.
+		const skip = this.#skipReason();
+		if (skip !== FROZEN_SKIP) this.#heldAt.clear();
 		// The CLI edits the ledger from another process: watches follow the rows, not an in-process registry.
 		this.#watchers.reconcile(monitors);
 		for (const monitor of monitors) {
 			if (!monitor.enabled) continue;
 			try {
-				if (monitor.trigger.kind === "cron") this.#claimCron(monitor, monitor.trigger, now, summary, frozen);
-				else if (monitor.trigger.kind === "at") this.#claimAt(monitor, monitor.trigger.at, now, summary, frozen);
+				if (monitor.trigger.kind === "cron") this.#claimCron(monitor, monitor.trigger, now, summary, skip);
+				else if (monitor.trigger.kind === "at") this.#claimAt(monitor, monitor.trigger.at, now, summary, skip);
 				else if (monitor.trigger.kind === "watcher")
-					this.#claimWatcher(monitor, monitor.trigger.debounceMs, now, summary, frozen);
-				else if (monitor.trigger.kind === "script" && !frozen) this.#kickScript(monitor, monitor.trigger, now);
+					this.#claimWatcher(monitor, monitor.trigger.debounceMs, now, summary, skip);
+				else if (monitor.trigger.kind === "script" && skip === undefined)
+					this.#kickScript(monitor, monitor.trigger, now);
 				// webhook events are admitted by the listener (monitors/webhook), not claimed on a schedule.
 			} catch (error) {
 				this.#deps.log.error("monitor_tick_failed", { monitor: monitor.id, error: String(error) });
@@ -229,10 +258,21 @@ export class MonitorScheduler {
 		return summary;
 	}
 
-	/** A claim made while frozen is a forced skip (`frozen`), so it counts as held back, not as claimed. */
-	#count(claim: ClaimResult, summary: TickSummary, frozen: boolean): void {
-		if (frozen) {
-			if (claim.status === "skipped_overlap") summary.skippedFrozen += 1;
+	/**
+	 * Why this tick fires nothing at all: `frozen` (the freeze switch) takes precedence over `budget` (the day's cost
+	 * ceiling), so a frozen tick keeps its own skip reason. `undefined` means nothing is holding the monitors.
+	 */
+	#skipReason(): string | undefined {
+		if (this.#deps.frozen?.() !== undefined) return FROZEN_SKIP;
+		return this.#deps.budgetExceeded?.() === undefined ? undefined : BUDGET_SKIP;
+	}
+
+	/** A claim made while held is a forced skip (`frozen`/`budget`), so it counts as held back, not as claimed. */
+	#count(claim: ClaimResult, summary: TickSummary, skip: string | undefined): void {
+		if (skip !== undefined) {
+			if (claim.status !== "skipped_overlap") return;
+			if (skip === FROZEN_SKIP) summary.skippedFrozen += 1;
+			else summary.skippedBudget += 1;
 		} else if (claim.status === "admitted") summary.claimed += 1;
 		else if (claim.status === "skipped_overlap") summary.skippedOverlap += 1;
 	}
@@ -242,7 +282,7 @@ export class MonitorScheduler {
 		trigger: { schedule: string; timezone: string },
 		now: number,
 		summary: TickSummary,
-		frozen: boolean,
+		skip: string | undefined,
 	): void {
 		const { store, log } = this.#deps;
 		const cron = store.monitors.cron(trigger.schedule);
@@ -264,10 +304,10 @@ export class MonitorScheduler {
 				store.monitors.claimSlot({
 					monitorId: monitor.id,
 					slotAt: slot,
-					...(frozen ? { forceSkipReason: FROZEN_SKIP } : {}),
+					...(skip === undefined ? {} : { forceSkipReason: skip }),
 				}),
 				summary,
-				frozen,
+				skip,
 			);
 		}
 		store.monitors.setCursor(monitor.id, now);
@@ -278,11 +318,11 @@ export class MonitorScheduler {
 		}
 	}
 
-	#claimAt(monitor: MonitorRow, at: string, now: number, summary: TickSummary, frozen: boolean): void {
+	#claimAt(monitor: MonitorRow, at: string, now: number, summary: TickSummary, skip: string | undefined): void {
 		const { store, log } = this.#deps;
 		const slotAt = parseAt(at);
 		if (slotAt > now) return;
-		if (frozen && now - slotAt <= CATCHUP_MAX_AGE_MS) {
+		if (skip === FROZEN_SKIP && now - slotAt <= CATCHUP_MAX_AGE_MS) {
 			// Not claimed and not disabled: a claimed slot could never fire again, and the one-shot would be lost.
 			summary.skippedFrozen += 1;
 			if (!this.#heldAt.has(monitor.id)) {
@@ -296,14 +336,28 @@ export class MonitorScheduler {
 			summary.skippedCatchUp += 1;
 			log.warn("monitor_slots_skipped", { monitor: monitor.id, count: 1, replayed: 0 });
 		} else {
-			this.#count(store.monitors.claimSlot({ monitorId: monitor.id, slotAt }), summary, false);
+			this.#count(
+				store.monitors.claimSlot({
+					monitorId: monitor.id,
+					slotAt,
+					...(skip === undefined ? {} : { forceSkipReason: skip }),
+				}),
+				summary,
+				skip,
+			);
 		}
 		// One-shot: done whether it ran or was too late.
 		store.monitors.setEnabled(monitor.id, false);
 	}
 
 	/** Turns the changes a quiet watch has gathered into one event whose payload is the changed paths. */
-	#claimWatcher(monitor: MonitorRow, debounceMs: number, now: number, summary: TickSummary, frozen: boolean): void {
+	#claimWatcher(
+		monitor: MonitorRow,
+		debounceMs: number,
+		now: number,
+		summary: TickSummary,
+		skip: string | undefined,
+	): void {
 		const payload = this.#watchers.take(monitor.id, debounceMs, now);
 		if (payload === undefined) return;
 		for (let slotAt = now; ; slotAt += 1) {
@@ -311,10 +365,10 @@ export class MonitorScheduler {
 				monitorId: monitor.id,
 				slotAt,
 				payload,
-				...(frozen ? { forceSkipReason: FROZEN_SKIP } : {}),
+				...(skip === undefined ? {} : { forceSkipReason: skip }),
 			});
 			if (claim.status === "duplicate") continue;
-			this.#count(claim, summary, frozen);
+			this.#count(claim, summary, skip);
 			return;
 		}
 	}
@@ -397,14 +451,17 @@ export class MonitorScheduler {
 		const { store, router, clock, log } = this.#deps;
 		let dispatched = 0;
 		let settledVerbatim = false;
-		const frozen = this.#deps.frozen?.() !== undefined;
+		const skip = this.#skipReason();
 		for (const event of store.monitors.dispatchable(clock.now())) {
 			const monitor = store.monitors.getMonitor(event.monitorId);
 			if (!monitor) continue;
-			if (frozen) {
-				// Held back for good: an event kept queued would fire as a burst the moment the freeze is lifted.
-				if (store.monitors.skipEvent(event.eventId, FROZEN_SKIP)) {
-					log.info("monitor_frozen_skip", { monitor: monitor.id, event: event.eventId });
+			if (skip !== undefined) {
+				// Held back for good: an event kept queued would fire as a burst the moment the hold is lifted.
+				if (store.monitors.skipEvent(event.eventId, skip)) {
+					log.info(skip === FROZEN_SKIP ? "monitor_frozen_skip" : "monitor_budget_skip", {
+						monitor: monitor.id,
+						event: event.eventId,
+					});
 					settledVerbatim = true;
 				}
 				continue;

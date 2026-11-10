@@ -4,7 +4,8 @@ import type { ActionButton } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { formatElapsed } from "../channel/text";
 import type { PauseCheck } from "../core/mailbox";
-import { parseThreadRef } from "../core/normalize";
+import { parseThreadRef, platformOfThreadRef } from "../core/normalize";
+import type { IdPlatform } from "../core/origin-key";
 import type { InboundRecord, MailboxClock } from "../core/types";
 import type { Logger } from "../log";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
@@ -153,8 +154,8 @@ export interface LaneManagerDeps {
 	repoMatches?: (path: string, repos: readonly string[]) => Promise<boolean>;
 	/** Lands a closed lane (test seam; default `createLaneLander` over real git and `hostOps.removeWorktree`). */
 	land?: LandLane;
-	/** Mentioned on cards that need the owner's decision. */
-	ownerUserId?: string;
+	/** Mentioned on cards that need the owner's decision: one id, or the owner's id on the lane's platform. */
+	ownerUserId?: string | ((platform: IdPlatform) => string | undefined);
 	/**
 	 * Whether the lane's session is in a turn right now (the one that made the claim still writes its closing report).
 	 * A landing or discard removes the worktree that turn runs in, so it waits for the turn to end. Default: never busy.
@@ -286,6 +287,21 @@ export class LaneManager {
 			mkdirSync(laneCwd, { recursive: true });
 			const port = channels.portFor(input.channel);
 			const root = await port.post({ conversationId: input.channel }, { text: `🔄 ${title}` });
+			// Discord: the lane thread is started from the root (its id is the root's), so the status goes inside it.
+			if (port.openThread !== undefined) {
+				const rootRef = { platform: port.platform, conversationId: input.channel, messageId: root.messageId };
+				try {
+					await port.openThread(rootRef, title);
+				} catch (error) {
+					// The root stays in the channel and says the lane never started.
+					await port
+						.edit(rootRef, { text: `❌ ${title}` })
+						.catch((editError: unknown) =>
+							log.warn("lane_root_edit_failed", { channel: input.channel, error: String(editError) }),
+						);
+					throw error;
+				}
+			}
 			// No await between picking the name and reserving it (like the lane id above).
 			const name = this.#uniqueName(slugify(title));
 			this.#reservedNames.add(name);
@@ -451,7 +467,7 @@ export class LaneManager {
 				if (withdrawn && cardTs !== undefined) {
 					await this.#editCard(held, cardTs, {
 						kind: "ask",
-						ownerUserId: this.#deps.ownerUserId,
+						ownerUserId: this.#ownerOf(held),
 						skipped: [OWNER_PAUSE_HELD],
 					});
 				}
@@ -798,7 +814,7 @@ export class LaneManager {
 			const auto = skipped !== undefined && skipped.length === 0;
 			const cardTs = await this.#postCard(
 				lane,
-				auto ? { kind: "auto" } : { kind: "ask", ownerUserId: this.#deps.ownerUserId, skipped },
+				auto ? { kind: "auto" } : { kind: "ask", ownerUserId: this.#ownerOf(lane), skipped },
 			);
 			if (cardTs === undefined) return;
 			// The owner may have reopened the lane while the card went up: then the card is already stale.
@@ -812,7 +828,7 @@ export class LaneManager {
 			// card that promised an auto-merge asks instead.
 			const held = current.meta.land?.autoLandHeld;
 			if (held === undefined) await this.requestLand(name, "auto");
-			else await this.#editCard(current, cardTs, { kind: "ask", ownerUserId: this.#deps.ownerUserId, skipped: [held] });
+			else await this.#editCard(current, cardTs, { kind: "ask", ownerUserId: this.#ownerOf(current), skipped: [held] });
 		} finally {
 			this.#announcing.delete(name);
 		}
@@ -1068,6 +1084,35 @@ export class LaneManager {
 		}
 	}
 
+	/** The owner to mention on the lane's cards: the one configured for the platform of the lane's thread. */
+	#ownerOf(lane: LaneRow): string | undefined {
+		const owner = this.#deps.ownerUserId;
+		if (typeof owner !== "function") return owner;
+		const platform = platformOfThreadRef(lane.threadRef);
+		return platform === undefined ? undefined : owner(platform);
+	}
+
+	/**
+	 * Link to the lane's thread where it is not the conversation the lane was asked from (a platform whose threads are
+	 * opened apart, Discord); `undefined` on Slack or when the lookup fails (logged).
+	 */
+	async threadLink(lane: LaneRow): Promise<string | undefined> {
+		const parsed = parseThreadRef(lane.threadRef);
+		const route = parsed === undefined ? undefined : this.#deps.channels.forConversation(parsed.channel);
+		if (parsed === undefined || route?.port.openThread === undefined) return undefined;
+		try {
+			return await route.port.permalink({
+				platform: route.port.platform,
+				conversationId: parsed.channel,
+				messageId: parsed.threadTs,
+				threadId: parsed.threadTs,
+			});
+		} catch (error) {
+			this.#deps.log.warn("lane_permalink_failed", { lane: lane.name, error: String(error) });
+			return undefined;
+		}
+	}
+
 	/** Posts a card into the lane's thread; the message id, or `undefined` when the post failed (logged). */
 	async #postCard(lane: LaneRow, view: LaneCardView): Promise<string | undefined> {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
@@ -1088,7 +1133,12 @@ export class LaneManager {
 		try {
 			const card = buildLaneOutcomeCard(lane, view);
 			await route.port.edit(
-				{ platform: route.port.platform, conversationId: route.target.conversationId, messageId: cardTs },
+				{
+					platform: route.port.platform,
+					conversationId: route.target.conversationId,
+					messageId: cardTs,
+					...(route.target.threadId === undefined ? {} : { threadId: route.target.threadId }),
+				},
 				cardMessage({ ...card, buttons: card.buttons ?? [] }, route.port),
 			);
 		} catch (error) {
@@ -1101,7 +1151,7 @@ export class LaneManager {
 	 * card (a notification, with the owner mention) when `fresh` — the old card then only points to the new one.
 	 */
 	async #showResult(lane: LaneRow, fresh: boolean): Promise<void> {
-		const view: LaneCardView = { kind: "result", ownerUserId: this.#deps.ownerUserId };
+		const view: LaneCardView = { kind: "result", ownerUserId: this.#ownerOf(lane) };
 		const old = lane.meta.land?.cardTs;
 		if (old !== undefined && !fresh) return this.#editCard(lane, old, view);
 		const cardTs = await this.#postCard(lane, view);
@@ -1243,8 +1293,10 @@ export class LaneManager {
 				patch.renderedRoot = rootText;
 			}
 			if (lane.meta.statusTs !== undefined && statusDue) {
+				// The status is inside the lane thread: on Discord the thread id tells the port where, even after a
+				// restart emptied its message cache.
 				await port.edit(
-					{ platform: port.platform, conversationId: channel, messageId: lane.meta.statusTs },
+					{ platform: port.platform, conversationId: channel, messageId: lane.meta.statusTs, threadId: rootTs },
 					{ text: statusText, buttons: statusButtons },
 				);
 				patch.renderedStatus = statusText;

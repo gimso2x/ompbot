@@ -205,11 +205,13 @@ describe("floors prompt answer format", () => {
 		}
 	});
 
-	test("Slack chat sessions are told to run long jobs detached and resume through an inject into this conversation", () => {
+	test("Slack and Discord chat sessions are told to run long jobs detached and resume through an inject into this conversation", () => {
 		const cases = [
 			["slack/ch/C1/t/100.1", "--origin slack/ch/C1 --thread 100.1 --as-owner"],
 			["slack/dm/D1", "--origin slack/dm/D1 --as-owner"],
 			["slack/dm/D1/t/200.2", "--origin slack/dm/D1 --thread 200.2 --as-owner"],
+			["discord/ch/1/t/2", "--origin discord/ch/1 --thread 2 --as-owner"],
+			["discord/dm/3", "--origin discord/dm/3 --as-owner"],
 		] as const;
 		for (const [originKey, target] of cases) {
 			const line = backgroundResumeLine(originKey);
@@ -217,8 +219,8 @@ describe("floors prompt answer format", () => {
 			expect(buildFloorsPrompt("/s", originKey)).toContain(line as string);
 		}
 		expect(OMPBOT_MAIN).toBe(join(import.meta.dir, "..", "src", "main.ts"));
-		// `inject` addresses Slack conversations only: no line where it could not reach (Discord, monitors, lanes).
-		for (const originKey of ["discord/ch/1/t/2", "monitor/3", "ompbot/work/lane1", "slack/thread/C1:1.2"]) {
+		// `inject` addresses Slack and Discord conversations only: no line where it could not reach (monitors, lanes).
+		for (const originKey of ["telegram/dm/1", "monitor/3", "ompbot/work/lane1", "slack/thread/C1:1.2"]) {
 			expect(backgroundResumeLine(originKey)).toBeUndefined();
 			expect(buildFloorsPrompt("/s", originKey)).not.toContain("[자동 후속]");
 		}

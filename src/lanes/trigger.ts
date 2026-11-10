@@ -20,6 +20,10 @@ export function parseLaneTrigger(text: string): LaneTrigger | undefined {
 	return { title, cwd, brief: (match?.[3] ?? "").trim() };
 }
 
+/** Why a Discord DM opens no lane: a lane lives in a server-channel thread, and the DM has none to name. */
+export const DISCORD_LANE_CHANNEL_MISSING =
+	"Discord DM에서 레인을 열려면 config `channels.discord.laneChannelId`(레인을 열 서버 텍스트 채널 id)가 필요합니다. 서버 채널·스레드에서 요청하면 그 채널에 열립니다.";
+
 /** `!reopen` alone or followed by an instruction: the only owner message that reopens a closed lane. */
 export function isReopenCommand(text: string): boolean {
 	return /^!reopen(?:\s|$)/.test(text.trim());

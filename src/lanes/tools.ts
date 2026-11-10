@@ -8,13 +8,16 @@ function stringParam(params: Record<string, unknown>, key: string): string {
 	return value;
 }
 
-/** Offered to the owner-DM session: starts a work lane (same as the `작업: <제목> @<경로>` message). */
+/**
+ * Offered to chat sessions: starts a work lane in `channel` (same as the `작업: <제목> @<경로>` message). On Slack the
+ * lane thread is in that conversation; on Discord it is a thread of that server channel.
+ */
 export function buildWorkStartTool(manager: LaneManager, channel: string): HostToolDef {
 	return {
 		name: "ompbot_work_start",
 		label: "Start work lane",
 		description:
-			"Start a long task as its own work lane: a new Slack thread in the owner DM and a separate omp session working in its own git worktree and branch (`lane/L-YYYYMMDD-NN`) of the repository that contains `cwd`. Use it for tasks that take long or touch another project. Returns the lane name.",
+			"Start a long task as its own work lane: a new chat thread and a separate omp session working in its own git worktree and branch (`lane/L-YYYYMMDD-NN`) of the repository that contains `cwd`. Use it for tasks that take long or touch another project. Returns the lane name.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -46,7 +49,9 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 				acceptance: params.acceptance,
 				risk: params.risk,
 			});
-			return `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;
+			const link = await manager.threadLink(lane);
+			const started = `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;
+			return link === undefined ? started : `${started}; tell the owner the lane thread link: ${link}`;
 		},
 	};
 }
@@ -57,7 +62,8 @@ export function buildLaneTools(manager: LaneManager, originKey: string): HostToo
 		{
 			name: "ompbot_lane_progress",
 			label: "Report lane milestone",
-			description: "Report a milestone of this work lane in one line; it is shown in the lane's Slack status message.",
+			description:
+				"Report a milestone of this work lane in one line; it is shown in the lane's status message in its chat thread.",
 			parameters: {
 				type: "object",
 				properties: { text: { type: "string", description: "One-line milestone" } },

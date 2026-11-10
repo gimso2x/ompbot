@@ -37,6 +37,10 @@ export interface OriginRouterDeps {
 	distillProvider?: MailboxDeps["distillProvider"];
 	/** Passed to every mailbox: whether a turn prompt may carry channel-scoped recall; see `MailboxDeps`. */
 	recallEnabled?: MailboxDeps["recallEnabled"];
+	/** Passed to every mailbox: live `costCap` for the per-turn brake; see `MailboxDeps.costCap`. */
+	costCap?: MailboxDeps["costCap"];
+	/** Passed to every mailbox: the `!budget` answer; see `MailboxDeps.budgetProvider`. */
+	budgetProvider?: MailboxDeps["budgetProvider"];
 	/** Passed to every mailbox: Slack thread reader for turn context; see `MailboxDeps.threadSource`. */
 	threadSource?: MailboxDeps["threadSource"];
 	log: Logger;
@@ -70,6 +74,8 @@ export interface OriginRouterDeps {
 	onStuckLoop?: MailboxDeps["onStuckLoop"];
 	/** Owner dialogs a plain message may answer; see `MailboxDeps.dialogs`. */
 	dialogs?: MailboxDeps["dialogs"];
+	/** Turn snapshots and `!undo`; passed to every mailbox (`MailboxDeps.turnUndo`). */
+	turnUndo?: MailboxDeps["turnUndo"];
 	/** Whether an origin's work is held (a paused lane); passed per mailbox (`MailboxDeps.isHeld`). */
 	isHeld?: (originKey: string) => boolean;
 	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */
