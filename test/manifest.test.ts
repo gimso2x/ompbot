@@ -15,8 +15,9 @@ const REACTION_EVENTS = ["reaction_added", "reaction_removed"];
 function checkManifest(manifest: SlackManifest): string[] {
 	const problems: string[] = [];
 	const declared = new Set(manifest.features.slash_commands.map((c) => c.command));
-	// `!distill` is typed text only: the Slack app manifests do not register its slash name.
-	const wanted = new Set(Object.values(COMMAND_TEXT).filter((command) => command !== COMMAND_TEXT.distill));
+	// `!distill` and `!btw` are typed text only: the Slack app manifests do not register their slash names.
+	const unregistered = new Set([COMMAND_TEXT.distill, COMMAND_TEXT.btw]);
+	const wanted = new Set(Object.values(COMMAND_TEXT).filter((command) => !unregistered.has(command)));
 	for (const command of wanted) if (!declared.has(command)) problems.push(`missing slash command ${command}`);
 	for (const command of declared) if (!wanted.has(command)) problems.push(`unknown slash command ${command}`);
 	for (const event of manifest.settings.event_subscriptions.bot_events) {

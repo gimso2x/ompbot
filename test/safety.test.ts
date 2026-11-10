@@ -24,10 +24,19 @@ import {
 	UPLOAD_SCAN_CARRY_CHARS,
 	UPLOAD_SCAN_CHUNK_BYTES,
 } from "../src/safety/host-tools";
-import { buildFloorsPrompt, floorsArgs, floorsSystemPrompt, WAIT_INTERIM_LINE } from "../src/safety/prompt";
+import {
+	backgroundResumeLine,
+	buildFloorsPrompt,
+	floorsArgs,
+	floorsSystemPrompt,
+	OMPBOT_MAIN,
+	WAIT_INTERIM_LINE,
+} from "../src/safety/prompt";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 
 const CHANNEL = "D1";
 const ORIGIN = `slack/dm/${CHANNEL}`;
@@ -196,21 +205,42 @@ describe("floors prompt answer format", () => {
 		}
 	});
 
+	test("Slack chat sessions are told to run long jobs detached and resume through an inject into this conversation", () => {
+		const cases = [
+			["slack/ch/C1/t/100.1", "--origin slack/ch/C1 --thread 100.1 --as-owner"],
+			["slack/dm/D1", "--origin slack/dm/D1 --as-owner"],
+			["slack/dm/D1/t/200.2", "--origin slack/dm/D1 --thread 200.2 --as-owner"],
+		] as const;
+		for (const [originKey, target] of cases) {
+			const line = backgroundResumeLine(originKey);
+			expect(line).toContain(`bun ${OMPBOT_MAIN} inject ${target} --text '[자동 후속]`);
+			expect(buildFloorsPrompt("/s", originKey)).toContain(line as string);
+		}
+		expect(OMPBOT_MAIN).toBe(join(import.meta.dir, "..", "src", "main.ts"));
+		// `inject` addresses Slack conversations only: no line where it could not reach (Discord, monitors, lanes).
+		for (const originKey of ["discord/ch/1/t/2", "monitor/3", "ompbot/work/lane1", "slack/thread/C1:1.2"]) {
+			expect(backgroundResumeLine(originKey)).toBeUndefined();
+			expect(buildFloorsPrompt("/s", originKey)).not.toContain("[자동 후속]");
+		}
+	});
+
 	test("herdr off: no chat prompt mentions herdr; herdr on: byte-identical to base 1ad1bbc", () => {
 		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "herdr-on-base.json"), "utf8")) as {
 			prompts: Record<string, string>;
 		};
+		// The fixture keeps the checkout-dependent CLI path as a placeholder.
+		const fixed = (prompt: string): string => prompt.replaceAll(OMPBOT_MAIN, "<ompbot>/src/main.ts");
 		const origins = Object.keys(base.prompts);
 		expect(origins.length).toBe(3);
 		for (const originKey of origins) {
 			expect(buildFloorsPrompt("/h/secrets", originKey)).not.toContain("herdr");
 			expect(floorsSystemPrompt("/h/secrets", originKey)).not.toContain("herdr");
 			expect(floorsArgs("/h/secrets", originKey)[1]).not.toContain("herdr");
-			expect(buildFloorsPrompt("/h/secrets", originKey, true)).toBe(base.prompts[originKey] as string);
-			expect(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true)).toBe(
+			expect(fixed(buildFloorsPrompt("/h/secrets", originKey, true))).toBe(base.prompts[originKey] as string);
+			expect(fixed(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true))).toBe(
 				base.prompts[originKey] as string,
 			);
-			expect(floorsArgs("/h/secrets", originKey, undefined, undefined, true)[1]).toBe(
+			expect(fixed(floorsArgs("/h/secrets", originKey, undefined, undefined, true)[1] as string)).toBe(
 				base.prompts[originKey] as string,
 			);
 		}
@@ -273,7 +303,7 @@ describe("ApprovalBroker", () => {
 
 	const make = (extra: Partial<ApprovalBrokerOptions> = {}) =>
 		new ApprovalBroker({
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -519,9 +549,9 @@ describe("host tools", () => {
 	function build(originKey = ORIGIN, extra: Partial<Parameters<typeof buildHostTools>[0]> = {}): HostToolDef[] {
 		return buildHostTools({
 			originKey,
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			broker: new ApprovalBroker({
-				port: new SlackChannel(transport),
+				channels: registryOf(new SlackChannel(transport)),
 				ownerUserId: OWNER,
 				log: quietLog(),
 				timers,
@@ -549,6 +579,28 @@ describe("host tools", () => {
 		tools = build();
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+	test("a Slack origin's upload and approval tools are the base commit's definitions byte for byte", () => {
+		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "slack-prompt-base.json"), "utf8")) as {
+			tools: Array<{ name: string; label: string; description: string; parameters: unknown }>;
+		};
+		const shown = (name: string) => {
+			const found = tool(name);
+			return { name: found.name, label: found.label, description: found.description, parameters: found.parameters };
+		};
+		expect(base.tools.map((t) => t.name)).toEqual(["slack_send_file", "ompbot_request_approval"]);
+		for (const expected of base.tools) expect(JSON.stringify(shown(expected.name))).toBe(JSON.stringify(expected));
+	});
+
+	test("a Discord origin's upload tool is discord_send_file with the platform named in its description", () => {
+		tools = build("discord/dm/123456789012345678");
+		const names = tools.map((t) => t.name);
+		expect(names).toContain("discord_send_file");
+		expect(names).not.toContain("slack_send_file");
+		expect(tool("discord_send_file").description).toContain("owner's Discord");
+		const slackUpload = build().find((t) => t.name === "slack_send_file");
+		expect(tool("discord_send_file").parameters).toEqual(slackUpload?.parameters ?? {});
+	});
 
 	test("host tools are registered with object schemas (dispatch, upload, approval)", () => {
 		expect(tools.map((t) => t.name)).toEqual(["ompbot_dispatch", "slack_send_file", "ompbot_request_approval"]);
@@ -730,7 +782,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval returns approved / denied / denied (timeout) from the buttons", async () => {
 		const broker = new ApprovalBroker({
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -738,7 +790,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -759,7 +811,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval forwards the optional sections; unfilled ones never appear", async () => {
 		const broker = new ApprovalBroker({
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -767,7 +819,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -815,7 +867,7 @@ describe("approval through the daemon (adapter owner gate, logs)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -863,7 +915,7 @@ describe("file upload thread routing (daemon)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: quietLog(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -914,7 +966,7 @@ describe("file upload thread routing (daemon)", () => {
 		const drivers: FakeOmpDriver[] = [];
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: quietLog(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

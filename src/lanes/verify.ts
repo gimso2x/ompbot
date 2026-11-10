@@ -37,27 +37,32 @@ function gitEnv(): Record<string, string> {
 	return buildChildEnv({ GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" }, inherited);
 }
 
-export const defaultGit: GitRunner = async (args) => {
-	try {
-		const proc = Bun.spawn(["git", "-c", "core.fsmonitor=false", ...args], {
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-			timeout: GIT_TIMEOUT_MS,
-			// `git status` must not rewrite the index of a repository somebody is working in.
-			env: gitEnv(),
-		});
-		const [stdout, stderr, code] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		if (proc.signalCode !== null) throw new Error(`git killed by ${proc.signalCode}`);
-		return { code, stdout, stderr };
-	} catch (error) {
-		throw new VerifyUnavailableError(error instanceof Error ? error.message : String(error));
-	}
-};
+/** A `GitRunner` that gives each git call `timeoutMs` (a push to a remote needs longer than a local query). */
+export const gitRunner =
+	(timeoutMs: number): GitRunner =>
+	async (args) => {
+		try {
+			const proc = Bun.spawn(["git", "-c", "core.fsmonitor=false", ...args], {
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: timeoutMs,
+				// `git status` must not rewrite the index of a repository somebody is working in.
+				env: gitEnv(),
+			});
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			if (proc.signalCode !== null) throw new Error(`git killed by ${proc.signalCode}`);
+			return { code, stdout, stderr };
+		} catch (error) {
+			throw new VerifyUnavailableError(error instanceof Error ? error.message : String(error));
+		}
+	};
+
+export const defaultGit: GitRunner = gitRunner(GIT_TIMEOUT_MS);
 
 const SHA_PATTERN = /^[0-9a-f]{40,64}$/;
 

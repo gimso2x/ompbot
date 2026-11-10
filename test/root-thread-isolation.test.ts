@@ -17,10 +17,13 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { gcSessions } from "../src/ops/gc";
 import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { SlackCallError, type SlackTransport } from "../src/slack/transport";
 import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { makeRepo } from "./helpers/git-fixtures";
+import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 const CH = "C0ROOTS01";
 const CHANNEL_ORIGIN = `slack/ch/${CH}`;
@@ -113,7 +116,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 		const clock = { now: () => Date.now() };
 		daemon = new Daemon({
 			config: { ...home.config, mentionFreeChannels: [CH], herdr: {} },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -302,7 +305,8 @@ describe("daemon: channel roots are isolated sessions", () => {
 		const slash = daemon.store.listInbound().find((row) => row.platformMessageId.startsWith(`slash:${CH}:`));
 		expect(slash).toMatchObject({ originKey: CHANNEL_ORIGIN, threadRef: `${CH}:-` });
 
-		const repo = mkdtempSync(join(tmpdir(), "ompbot-root-iso-lane-"));
+		// A lane starts only inside a git repository (it works in its own worktree beside it).
+		const repo = makeRepo([], "ompbot-root-iso-lane-");
 		try {
 			const lane = channelMessage(tsAt(20), `작업: 루트 격리 레인 @${repo}`);
 			await transport.emitMessage(lane);
@@ -318,7 +322,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 					expect(driver.calls.some((c) => c.includes("작업: 루트 격리 레인"))).toBe(false);
 			}
 		} finally {
-			rmSync(repo, { recursive: true, force: true });
+			removeRepoAndWorktrees(repo);
 		}
 	});
 

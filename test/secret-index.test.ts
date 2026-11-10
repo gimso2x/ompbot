@@ -91,6 +91,7 @@ describe("indexRuntimeSecrets", () => {
 		return {
 			homeDir: home,
 			slack: { botTokenFile, appTokenFile },
+			channels: { slack: { ownerUserId: "UOWNER" } },
 		} as unknown as OmpbotConfig;
 	}
 

@@ -252,6 +252,29 @@ describe("dashboard jobs section", () => {
 			expect(turnsNav(stale)).toEqual({ count: 0, warn: true });
 		});
 
+		test("a stopped job reads ok, folds with the finished ones, warns nothing and leaves after 24 hours", async () => {
+			writeJob("halted.json", {
+				state: "stopped",
+				updatedAt: iso(NOW - MINUTE),
+				pid: 9999,
+				done: 2800,
+				total: 17803,
+				detail: "중단: 오너 지시",
+			});
+			writeJob("old-halted.json", { state: "stopped", updatedAt: iso(NOW - 25 * 60 * MINUTE) });
+			const snapshot = await buildSnapshot(deps());
+			const jobs = await jobsOf();
+			expect(jobs.map((job) => [job.name, job.state, job.health])).toEqual([["halted", "stopped", "ok"]]);
+			const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+			expect(html).toContain(">중단<");
+			expect(html).not.toContain(">파일 오류<");
+			expect(html).not.toContain('id="jobs"');
+			expect(html).toContain("끝난 백그라운드 작업");
+			expect(turnsNav(html)).toEqual({ count: 0, warn: false });
+			expect(clientRender(snapshot)(snapshot, undefined, NOW, { view: "turns" })).toBe(html);
+			expect(renderItemDetail(snapshot, "turns", "job:halted")).toContain("중단 · stopped");
+		});
+
 		test("a jobs section that failed shows under its heading and leaves the turn list as it was", async () => {
 			writeFileSync(join(home, "jobs"), "not a directory");
 			const snapshot = await buildSnapshot(deps());

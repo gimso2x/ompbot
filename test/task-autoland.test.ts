@@ -9,6 +9,7 @@ import { dispatchEnv } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { SlackCallError } from "../src/slack/transport";
 import { acceptanceItems } from "../src/tasks/docs";
@@ -31,7 +32,7 @@ beforeEach(async () => {
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",

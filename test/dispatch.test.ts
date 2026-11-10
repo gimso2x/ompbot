@@ -34,7 +34,7 @@ describe("dispatchEnv", () => {
 			GIT_DIR: "/x",
 			HOME: "/home/u",
 		});
-		expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/u", LC_ALL: "C.UTF-8" });
+		expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/u", LC_ALL: "C.UTF-8", OMP_NONINTERACTIVE: "1" });
 	});
 });
 
@@ -58,6 +58,7 @@ describe("runOmpPrint (simple mode)", () => {
 		expect(seen[1]).toBe("-p");
 		expect(seen[2]).toBe("빌드 상태 요약");
 		expect(seen).toContain("FLOORS");
+		expect(seen).toContain("--no-session");
 		expect(result.ok).toBe(true);
 		expect(result.output.length).toBeLessThanOrEqual(8_000);
 	});
@@ -675,5 +676,77 @@ describe("herdr optional (config herdr)", () => {
 		expect(words.some((line) => line.includes("'agent' 'prompt' 'worker-1' '다음 단계 진행'"))).toBe(true);
 		// None of herdrRemoteStart's steps after its name check ran.
 		expect(words.some((line) => /'(workspace|tab)'|'agent' 'start'/.test(line))).toBe(false);
+	});
+});
+
+describe("worker omp arguments (agentArgs)", () => {
+	/** Records every argv; workspace/tab creates answer with ids, everything else with `{}`. */
+	function recorder() {
+		const seen: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			seen.push(cmd);
+			const created = { workspace: { workspace_id: "W1" }, tab: { tab_id: "T1" }, root_pane: { pane_id: "P1" } };
+			const isCreate = cmd.some((word) => word === "create" || word === "'create'");
+			return { code: 0, stdout: JSON.stringify(isCreate ? { result: created } : {}), timedOut: false };
+		};
+		return { seen, run };
+	}
+	const SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--"];
+	const LOCAL_START = ["herdr", "agent", "start", "w-1", "--kind", "omp", "--pane", "P1", "--timeout", "60000"];
+	const REMOTE_START = [...SSH, ...LOCAL_START.map(remoteShellQuote)];
+	const local = (agentArgs?: string[]) => {
+		const r = recorder();
+		const extra = agentArgs === undefined ? {} : { agentArgs };
+		return herdrStartAgent({ name: "w-1", task: "t", cwd: "/ws", ...extra, options: { run: r.run } }).then(
+			() => r.seen,
+		);
+	};
+	const remote = (agentArgs?: string[]) => {
+		const r = recorder();
+		const extra = agentArgs === undefined ? {} : { agentArgs };
+		return herdrRemoteStart({
+			sshTarget: "wsl",
+			name: "w-1",
+			task: "t",
+			cwd: "/r",
+			...extra,
+			options: { run: r.run },
+		}).then(() => r.seen);
+	};
+
+	test("without agentArgs (or with none) every argv is exactly today's", async () => {
+		for (const args of [undefined, []]) {
+			expect(await local(args)).toEqual([
+				["herdr", "workspace", "create", "--cwd", "/ws", "--label", "ompbot · w-1", "--no-focus"],
+				LOCAL_START,
+				["herdr", "agent", "prompt", "w-1", "t"],
+			]);
+			expect(await remote(args)).toEqual(
+				[
+					["agent", "list"],
+					["workspace", "list"],
+					["workspace", "create", "--label", "ompbot-owners", "--cwd", "/r", "--no-focus"],
+					["tab", "rename", "T1", "w-1"],
+					LOCAL_START.slice(1),
+					["agent", "prompt", "w-1", "t"],
+				].map((words) => [...SSH, ...["herdr", ...words].map(remoteShellQuote)]),
+			);
+		}
+		const r = recorder();
+		await runOmpPrint({ task: "t", cwd: "/ws", systemPromptAppendix: "F", ompBin: "/bin/omp", run: r.run });
+		expect(r.seen).toEqual([["/bin/omp", "-p", "t", "--no-session", "--append-system-prompt", "F"]]);
+	});
+
+	test("local agentArgs end the agent start argv after `--`; nothing else changes", async () => {
+		const seen = await local(["--prewalk"]);
+		expect(seen[1]).toEqual([...LOCAL_START, "--", "--prewalk"]);
+		expect(seen.filter((cmd) => cmd.includes("--prewalk"))).toHaveLength(1);
+	});
+
+	test("remote agentArgs go over ssh quoted like every other word: '--' '--prewalk'", async () => {
+		const seen = await remote(["--prewalk", "--model=it's"]);
+		const start = seen.find((cmd) => cmd.includes("'start'"));
+		expect(start).toEqual([...REMOTE_START, "'--'", "'--prewalk'", "'--model=it'\\''s'"]);
+		expect(seen.filter((cmd) => cmd.includes("'--prewalk'"))).toHaveLength(1);
 	});
 });

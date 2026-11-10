@@ -68,7 +68,23 @@ interface RpcClientLike {
 	getAvailableThinkingLevels(): Promise<string[]>;
 	setThinkingLevel(level: string): Promise<void>;
 	compact(customInstructions?: string): Promise<{ summary: string; tokensBefore: number }>;
+	/** Starts a side question; resolves with its `running` record. The outcome arrives through `onBtwRecord`. */
+	btw(question: string): Promise<BtwRecordLike>;
+	/** Cancels the running (or still starting) side question; with an id only when it is that record. */
+	cancelBtw(recordId?: string): Promise<boolean>;
+	onBtwRecord(listener: (record: BtwRecordLike) => void): () => void;
 }
+
+/** A side question's record (`RpcBtwHistoryRecord`; only the fields ompbot reads). */
+interface BtwRecordLike {
+	id: string;
+	status: "running" | "complete" | "cancelled" | "error" | "interrupted";
+	answer: string;
+	error?: string;
+}
+
+/** How long a side question may take, counted from the `btw` command. */
+export const BTW_TIMEOUT_MS = 120_000;
 
 /**
  * RpcClient methods ompbot calls. Checked on every start so an omp upgrade that renames or drops one fails fast with
@@ -168,6 +184,8 @@ export interface RpcOmpDriverOptions {
 	 * `ask` dialog (`set_ask_dialog enabled:true`); without it every dialog is cancelled at once.
 	 */
 	answerDialog?: OmpDialogAnswerer;
+	/** Side question deadline (tests); default `BTW_TIMEOUT_MS`. */
+	btwTimeoutMs?: number;
 }
 
 /**
@@ -617,6 +635,50 @@ export class RpcOmpDriver implements OmpSessionDriver {
 
 	entriesSince(since?: string): Promise<OmpEntries> {
 		return this.#call((client) => client.getEntries(since));
+	}
+
+	/**
+	 * One side question (`btw`): subscribes to `btw_record` first, then asks. omp writes the `running` frame before the
+	 * command's response, so frames seen before the id is known are kept and matched once it is; only a non-running
+	 * record of that id settles. A deadline (from the command) cancels the question — by id when known, else whatever
+	 * is running or starting.
+	 */
+	async btw(question: string): Promise<string> {
+		const client = this.#require();
+		const done = Promise.withResolvers<string>();
+		let id: string | undefined;
+		const early: BtwRecordLike[] = [];
+		const settle = (record: BtwRecordLike): void => {
+			if (record.id !== id || record.status === "running") return;
+			if (record.status === "complete") {
+				done.resolve(record.answer.trim() || "(빈 답)");
+				return;
+			}
+			const reason = record.error === undefined ? record.status : `${record.status}: ${record.error}`;
+			done.reject(new OmpDriverError("rpc_error", `btw ${reason}`));
+		};
+		const off = client.onBtwRecord((record) => {
+			if (id === undefined) early.push(record);
+			else settle(record);
+		});
+		const timer = setTimeout(() => {
+			done.reject(new OmpDriverError("rpc_error", "btw timeout"));
+			// Best effort: the caller already gets the timeout, and a cancel that fails leaves nothing to undo here.
+			void (id === undefined ? client.cancelBtw() : client.cancelBtw(id)).catch(() => undefined);
+		}, this.#options.btwTimeoutMs ?? BTW_TIMEOUT_MS);
+		client.btw(question).then(
+			(record) => {
+				id = record.id;
+				for (const seen of early) settle(seen);
+			},
+			(error: unknown) => done.reject(toDriverError(error)),
+		);
+		try {
+			return await done.promise;
+		} finally {
+			clearTimeout(timer);
+			off();
+		}
 	}
 
 	onFinal(listener: (final: OmpFinal) => void): () => void {

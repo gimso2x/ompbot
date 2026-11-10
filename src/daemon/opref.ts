@@ -15,10 +15,15 @@ import type {
  * answer. This wrapper prefixes every opRef with an id that is unique per driver instance.
  */
 export class NamespacedDriver implements OmpSessionDriver {
+	/** Side question, defined only when the wrapped driver supports it (absent = unsupported, like the inner driver). */
+	readonly btw?: (question: string) => Promise<string>;
+
 	constructor(
 		private readonly inner: OmpSessionDriver,
 		private readonly prefix: string,
-	) {}
+	) {
+		if (inner.btw !== undefined) this.btw = inner.btw.bind(inner);
+	}
 
 	/** Pid of the omp child when the wrapped driver exposes one (`RpcOmpDriver`). */
 	get pid(): number | undefined {

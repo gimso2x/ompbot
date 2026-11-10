@@ -18,11 +18,12 @@ export type CommandKind =
 	| "queue"
 	| "followup"
 	| "usage"
-	| "distill";
+	| "distill"
+	| "btw";
 
 /**
- * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` is typed as
- * `!distill` only: its slash name is not in the Slack app manifests.
+ * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` and `btw` are typed
+ * as `!distill` / `!btw` only: their slash names are not in the Slack app manifests.
  */
 export const COMMAND_TEXT: Record<CommandKind, string> = {
 	new: "/new-ompbot",
@@ -35,13 +36,24 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
 	followup: "/followup-ompbot",
 	usage: "/usage-ompbot",
 	distill: "/distill-ompbot",
+	btw: "/btw-ompbot",
 };
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
-export const COMMAND_OP_REF = new RegExp(`^(failed|lane|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`);
+export const COMMAND_OP_REF = new RegExp(
+	`^(failed|lane|task|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
+);
 
 /** Kinds that take an argument after the command word; the others only count when they are the whole message. */
-const TAKES_ARG: ReadonlySet<CommandKind> = new Set(["model", "thinking", "compact", "resume", "queue", "followup"]);
+export const TAKES_ARG: ReadonlySet<CommandKind> = new Set([
+	"model",
+	"thinking",
+	"compact",
+	"resume",
+	"queue",
+	"followup",
+	"btw",
+]);
 
 export interface ParsedCommand {
 	kind: CommandKind;
@@ -67,10 +79,13 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 	return undefined;
 }
 
-/** Text omp receives for a ledger row: a `followup` command's argument, the message itself otherwise. */
+/**
+ * Text omp receives for a ledger row: the argument of a `followup` command or of a `btw` that started a turn (no turn
+ * was running), the message itself otherwise.
+ */
 export function promptTextOf(text: string): string {
 	const command = parseCommand(text);
-	return command?.kind === "followup" ? command.arg : text;
+	return command?.kind === "followup" || command?.kind === "btw" ? command.arg : text;
 }
 
 /** Where the request itself starts in a turn prompt that carries context blocks (thread context, recall). */

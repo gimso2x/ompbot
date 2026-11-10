@@ -12,6 +12,7 @@ import { createLogger } from "../src/log";
 import type { OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import type { Store } from "../src/store/db";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -295,7 +296,7 @@ describe("daemon live op", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			log: createLogger({
 				sink: (line) => {
 					if (line.includes("event=turn_start")) started.resolve();

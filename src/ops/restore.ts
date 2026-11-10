@@ -1,19 +1,8 @@
 import { Database } from "bun:sqlite";
-import {
-	chmodSync,
-	closeSync,
-	copyFileSync,
-	existsSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	renameSync,
-	rmSync,
-	statSync,
-} from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { acquireLock, LockHeldError } from "../daemon/lock";
-import { BACKUP_FILE_PATTERN, backupStamp } from "./backup";
+import { BACKUP_FILE_PATTERN, backupStamp, fsyncPath } from "./backup";
 
 export type RestoreErrorCode = "bad_source" | "daemon_running" | "integrity_check_failed" | "restore_failed";
 
@@ -54,15 +43,6 @@ export interface RestoreResult {
 }
 
 const SIDECARS = ["", "-wal", "-shm"] as const;
-
-function fsyncPath(path: string): void {
-	const fd = openSync(path, "r");
-	try {
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-}
 
 /** Maps the CLI argument to the backup file: a daily name (or `backups/<name>`) inside the home, or an absolute file. */
 export function resolveRestoreSource(homeDir: string, source: string): string {

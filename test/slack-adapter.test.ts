@@ -2,26 +2,17 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CHUNK_LIMIT, chunkText, DENIED_TEXT, REDELIVERED_PREFIX, STALL_STATUS_TEXT } from "../src/channel/text";
+import type { CoreSink, DeliveryItem, DeliverySource } from "../src/channel/types";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
-import {
-	type CoreSink,
-	DENIED_TEXT,
-	type DeliveryItem,
-	type DeliverySource,
-	SlackAdapter,
-	type SlackAdapterOptions,
-} from "../src/slack/adapter";
+import { SlackAdapter, type SlackAdapterOptions } from "../src/slack/adapter";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import {
-	CHUNK_LIMIT,
-	chunkText,
 	MARKDOWN_CHUNK_LIMIT,
 	type MarkdownPart,
-	REDELIVERED_PREFIX,
 	renderMarkdownParts,
 	renderParts,
-	STALL_STATUS_TEXT,
 	toMrkdwn,
 } from "../src/slack/format";
 import { mapWebApiError } from "../src/slack/socket-transport";

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tasksCommand } from "../src/cli/tasks";
-import { taskFlowStatus } from "../src/flow/task-flow";
+import { taskFlowStatus, taskStage } from "../src/flow/task-flow";
 import { type NewTask, openTaskLedger, type TaskActor, type TaskStatus } from "../src/tasks/ledger";
 
 const T0 = Date.parse("2026-11-08T00:00:00Z");
@@ -122,6 +122,70 @@ describe("taskFlowStatus", () => {
 		expect(n.build).toStartWith("running");
 		expect(n.agent).toBe("fail 에이전트 없음");
 		expect(n.progress).toBe("pass 2시간 무갱신");
+	});
+});
+
+/** `taskStage` of one task whose history is `moves` after registration (progress at minute 1, KST = T0 + 9h). */
+function stageOf(status: TaskStatus, notices: Record<string, number>, moves: Move[], closedAt: number | null = null) {
+	const transitions = [[null, "working", "bot", "registered", 0] as Move, ...moves].map(
+		([fromStatus, toStatus, actor, reason, m]) => ({ taskId: "T-1", fromStatus, toStatus, actor, reason, at: min(m) }),
+	);
+	const task = { taskId: "T-1", status, createdAt: min(0), progressAt: min(1), notices, closedAt };
+	// A status line of another task must not leak into this one's stage.
+	const other = taskFlowStatus(
+		[{ taskId: "T-2", status: "blocked", createdAt: min(0), progressAt: null, notices: { "unmet:x": min(1) } }],
+		[],
+	);
+	return taskStage(task, [...other, ...taskFlowStatus([task], transitions)]);
+}
+
+describe("taskStage", () => {
+	test("done: 완료 with the close time in KST", () => {
+		const stage = stageOf(
+			"done",
+			{ "reached:a": min(5) },
+			[
+				["working", "review", "bot", "reached", 5],
+				["review", "done", "human", "close --as done", 9],
+			],
+			min(9),
+		);
+		expect(stage).toEqual({ label: "완료", msg: "close 11-08 09:09", tone: "done" });
+	});
+
+	test("cancelled: 취소, off", () => {
+		const stage = stageOf("cancelled", {}, [["working", "cancelled", "human", "close --as cancelled", 3]], min(3));
+		expect(stage).toEqual({ label: "취소", msg: "", tone: "off" });
+	});
+
+	test("review: 오너 리뷰 차례, wait", () => {
+		const stage = stageOf("review", { "reached:a": min(3) }, [["working", "review", "bot", "reached", 3]]);
+		expect(stage).toEqual({ label: "오너 리뷰 차례", msg: "Outcome 도달 · 머지 대기", tone: "wait" });
+	});
+
+	test("working with a running node: <node> 중 with the progress time", () => {
+		expect(stageOf("working", {}, [])).toEqual({ label: "구현 중", msg: "진행 기록 11-08 09:01", tone: "run" });
+	});
+
+	test("blocked on an integrity reason: 무결성에서 막힘 with the reason", () => {
+		const stage = stageOf("blocked", { [`blocked:91:${LONG}`]: min(4) }, [["working", "blocked", "bot", LONG, 4]]);
+		expect(stage).toEqual({ label: "무결성에서 막힘", msg: LONG.slice(0, 120), tone: "fail" });
+	});
+
+	test("two unresolved failures: the one earlier in the flow wins", () => {
+		const stage = stageOf("blocked", { "unmet:1": min(2), [`blocked:91:${LONG}`]: min(4) }, [
+			["working", "blocked", "bot", LONG, 4],
+		]);
+		expect(stage.label).toBe("수락기준에서 막힘");
+		expect(stage.tone).toBe("fail");
+	});
+
+	test("blocked then resumed: the fixed node is no block; past a judged node no node runs, so 진행 중", () => {
+		const stage = stageOf("working", { [`blocked:91:${LONG}`]: min(4), "resume:1": min(5) }, [
+			["working", "blocked", "bot", LONG, 4],
+			["blocked", "working", "bot", "resume dispatch", 5],
+		]);
+		expect(stage).toEqual({ label: "진행 중", msg: "진행 기록 11-08 09:01", tone: "run" });
 	});
 });
 

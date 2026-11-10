@@ -1,5 +1,6 @@
 import { dirname } from "node:path";
-import type { ChannelPort } from "../channel/port";
+import type { ChannelRegistry } from "../channel/registry";
+import type { DispatchHostConfig } from "../config";
 import { parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
 import type { BoardLinkResolver } from "../dispatch/board";
 import {
@@ -16,6 +17,8 @@ import {
 	acceptanceItems,
 	docsDirOf,
 	type NewTaskSpec,
+	type ParsedProgress,
+	parseProgress,
 	renderContext,
 	renderOutcome,
 	renderProgress,
@@ -23,12 +26,13 @@ import {
 	type TaskDocsMeta,
 } from "./docs";
 import { evaluateTask } from "./evaluate";
-import { resolveTaskHost, type TaskHostOps } from "./host";
+import { type HostResult, resolveTaskHost, type TaskHostOps, type TaskResumeOps } from "./host";
 import type { TaskLedger, TaskRow } from "./ledger";
 import { buildAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
-import { buildTaskPrompt } from "./prompt";
+import { buildTaskPrompt, resumeCheckLines } from "./prompt";
+import { checkResume, type ResumeCheck, restatedHash } from "./resume-check";
 
-type HostEntry = { ssh: string; workDir?: string; herdrBin?: string };
+type HostEntry = DispatchHostConfig;
 
 export interface TaskDispatchDeps {
 	ledger: TaskLedger;
@@ -37,13 +41,15 @@ export interface TaskDispatchDeps {
 	threadRef(): string | undefined;
 	/** The [TASK] root message text, from the inbound ledger. */
 	rootText(threadRef: string): string | undefined;
-	port: ChannelPort;
+	channels: ChannelRegistry;
 	now(): number;
 	workspaceDir: string;
 	dispatchHosts?: Record<string, HostEntry>;
+	/** Config `workerOmpArgs`: extra omp arguments of a local task agent (a remote one takes its host's `ompArgs`). */
+	workerOmpArgs?: string[];
 	run?: ProcessRunner;
 	/** Test seam: host ops override. */
-	hostOps?: (host: string | null) => TaskHostOps;
+	hostOps?: (host: string | null) => TaskHostOps & TaskResumeOps;
 	/** Test seam: free space of the filesystem holding a path (default `statfsSync`); local starts only. */
 	diskHeadroom?: (path: string) => DiskView;
 	/** herdr board card link of a started agent (`config.herdrBoard`); absent → the card carries no link. */
@@ -61,7 +67,7 @@ function hostEntryOf(deps: TaskDispatchDeps, host: string | null): HostEntry | u
 	return entry;
 }
 
-function opsFor(deps: TaskDispatchDeps, host: string | null): TaskHostOps {
+function opsFor(deps: TaskDispatchDeps, host: string | null): TaskHostOps & TaskResumeOps {
 	if (deps.hostOps !== undefined) return deps.hostOps(host);
 	return resolveTaskHost(host, deps.dispatchHosts, deps.run === undefined ? {} : { run: deps.run });
 }
@@ -83,10 +89,10 @@ async function startAgent(
 ): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
 	const entry = hostEntryOf(deps, row.host);
 	const options = herdrOptionsFor(deps, entry);
+	const agentArgs = entry === undefined ? deps.workerOmpArgs : entry.ompArgs;
+	const base = { name: row.agent, task: prompt, cwd: row.worktree, options, ...(agentArgs ? { agentArgs } : {}) };
 	const started =
-		entry === undefined
-			? await herdrStartAgent({ name: row.agent, task: prompt, cwd: row.worktree, options })
-			: await herdrRemoteStart({ sshTarget: entry.ssh, name: row.agent, task: prompt, cwd: row.worktree, options });
+		entry === undefined ? await herdrStartAgent(base) : await herdrRemoteStart({ ...base, sshTarget: entry.ssh });
 	return started.ok ? { ok: true, paneId: started.paneId } : { ok: false, error: started.error };
 }
 
@@ -96,10 +102,11 @@ async function cardLink(deps: TaskDispatchDeps, row: TaskRow, paneId: string): P
 }
 
 /** Permalink of the task thread root; the bare thread ref when the platform cannot resolve it. */
-async function threadLink(port: ChannelPort, log: TaskSlackLog, threadRef: string): Promise<string> {
+async function threadLink(channels: ChannelRegistry, log: TaskSlackLog, threadRef: string): Promise<string> {
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return threadRef;
 	try {
+		const port = channels.portFor(target.channel);
 		const root = { platform: port.platform, conversationId: target.channel, messageId: target.threadTs };
 		return (await port.permalink(root)) ?? threadRef;
 	} catch (error) {
@@ -169,7 +176,7 @@ export async function startTask(
 			worktree: row.worktree,
 			branch: row.branch,
 			agent: row.agent,
-			threadLink: await threadLink(deps.port, deps.log, threadRef),
+			threadLink: await threadLink(deps.channels, deps.log, threadRef),
 			registeredAt: row.createdAt,
 		};
 		const dir = docsDirOf(row.worktree, row.taskId);
@@ -202,8 +209,8 @@ export async function startTask(
 
 	deps.log.info("task_started", { task: row.taskId, host: row.host, agent: row.agent });
 	const link = await cardLink(deps, row, paneId);
-	const posted = await postToThread(deps.port, deps.log, threadRef, buildAcceptedCard(row, spec, link));
-	await setStatusReaction(deps.port, deps.log, threadRef, "working", []);
+	const posted = await postToThread(deps.channels, deps.log, threadRef, buildAcceptedCard(row, spec, link));
+	await setStatusReaction(deps.channels, deps.log, threadRef, "working", []);
 	const where = `${row.host ?? "local"}:${row.worktree}`;
 	return [
 		`${row.taskId} 등록·시작했습니다 (워크트리 ${where}, branch ${row.branch}, 에이전트 ${row.agent}, 기준 문서 ${docsDirOf(row.worktree, row.taskId)}).`,
@@ -215,7 +222,37 @@ export async function startTask(
 	].join("\n");
 }
 
-/** Resume: a live agent gets the PROGRESS-based prompt, a missing one is started again in the same worktree. */
+/** A host read that throws (unsafe input, ssh spawn) is a failed read like any other. */
+async function settled<T>(read: () => Promise<HostResult<T>>): Promise<HostResult<T>> {
+	try {
+		return await read();
+	} catch (error) {
+		return { ok: false, error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/**
+ * The pre-resume check (`checkResume` over PROGRESS.md and `progressLag`) and the `restated` value PROGRESS.md had
+ * at this resume (`undefined` when it could not be read). Never throws: a failed read becomes a note.
+ */
+async function readResumeCheck(
+	ops: TaskHostOps & TaskResumeOps,
+	row: TaskRow,
+): Promise<{ check: ResumeCheck; restated: string | undefined }> {
+	const file = await settled(() => ops.readFile(`${docsDirOf(row.worktree, row.taskId)}/PROGRESS.md`));
+	const progress: HostResult<ParsedProgress> = !file.ok
+		? file
+		: file.value === undefined
+			? { ok: false, error: "PROGRESS.md 없음" }
+			: { ok: true, value: parseProgress(file.value) };
+	const lag = await settled(() => ops.progressLag({ worktree: row.worktree, taskId: row.taskId }));
+	return { check: checkResume(progress, lag), restated: progress.ok ? progress.value.restated : undefined };
+}
+
+/**
+ * Resume: a live agent gets the PROGRESS-based prompt, a missing one is started again in the same worktree. The
+ * pre-resume check goes into the prompt and the result but never refuses the resume.
+ */
 export async function resumeTask(
 	deps: TaskDispatchDeps,
 	input: { id: string; task: string | undefined; host: string | null | undefined },
@@ -229,12 +266,17 @@ export async function resumeTask(
 	}
 	const entry = hostEntryOf(deps, row.host);
 	const options = herdrOptionsFor(deps, entry);
+	const ops = opsFor(deps, row.host);
+	const { check, restated } = await readResumeCheck(ops, row);
+	deps.log.info("task_resume_check", { task: row.taskId, findings: check.findings.length, notes: check.notes.length });
 	const prompt = buildTaskPrompt({
 		mode: "resume",
 		taskId: row.taskId,
 		worktree: row.worktree,
 		branch: row.branch,
 		...(input.task === undefined || input.task === "" ? {} : { instruction: input.task }),
+		resumeFindings: check.findings,
+		resumeNotes: check.notes,
 	});
 	const alive = await herdrAgentExists(row.agent, options);
 	if (!alive.ok) return `재개 실패: ${alive.error}`;
@@ -248,7 +290,7 @@ export async function resumeTask(
 			? "살아 있는 에이전트에 재개 프롬프트를 보냈습니다"
 			: "살아 있는 에이전트에 재개 프롬프트를 보냈습니다(시작 확인 안 됨)";
 	} else {
-		const present = await opsFor(deps, row.host).pathExists(row.worktree);
+		const present = await ops.pathExists(row.worktree);
 		if (!present.ok) return `재개 실패: ${present.error}`;
 		if (!present.value) return `재개 실패: 워크트리가 없습니다: ${row.worktree}`;
 		const started = await startAgent(deps, row, prompt);
@@ -258,15 +300,20 @@ export async function resumeTask(
 	}
 	if (row.status !== "working") {
 		deps.ledger.transition(row.taskId, "working", "bot", "resume dispatch");
-		await setStatusReaction(deps.port, deps.log, row.threadRef, "working");
+		await setStatusReaction(deps.channels, deps.log, row.threadRef, "working");
 	}
 	// A resumed task gets a fresh staleness baseline: the agent has not had a chance to update PROGRESS.md yet.
 	const now = deps.now();
 	deps.ledger.setProgressAt(row.taskId, now);
 	// ... and a fresh nudge count (the sweep counts unmet nudges since the latest mark).
 	deps.ledger.recordNotice(row.taskId, `resume:${now}`);
+	// What `restated` said before this resume: the sweep warns when the agent goes on without writing a new one.
+	if (restated !== undefined) deps.ledger.recordNotice(row.taskId, `restated-before:${now}:${restatedHash(restated)}`);
 	deps.log.info("task_resumed", { task: row.taskId, alive: alive.exists });
-	return `${row.taskId}: ${how} (${row.status} → working).${link === undefined ? "" : ` 진행 보기: ${link}.`} 진행 확인: ompbot_dispatch ${row.host === null ? '{mode:"herdr"' : `{host:"${row.host}"`}, name:"${row.agent}"}`;
+	return [
+		`${row.taskId}: ${how} (${row.status} → working).${link === undefined ? "" : ` 진행 보기: ${link}.`} 진행 확인: ompbot_dispatch ${row.host === null ? '{mode:"herdr"' : `{host:"${row.host}"`}, name:"${row.agent}"}`,
+		...resumeCheckLines(check.findings, check.notes),
+	].join("\n");
 }
 
 /** The one-line judgement summary appended to an output read of an agent bound to a task; `undefined` when unbound. */

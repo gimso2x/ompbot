@@ -1,13 +1,14 @@
 import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import type { ChannelPort } from "../channel/port";
-import { parseChatOrigin } from "../core/origin-key";
+import type { ChannelRegistry } from "../channel/registry";
+import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { buildDispatchTool, type DispatchToolDeps } from "../dispatch/tool";
 import type { Logger } from "../log";
 import { maskKnownFragments, redact, secretShapes } from "../redact";
 import type { ApprovalBroker, ApprovalDetail } from "./approval";
 import { isInside } from "./inside";
+import { sendFileToolName } from "./prompt";
 
 /** A tool the host (ompbot) executes for the omp child; mirrors omp's `RpcClientCustomTool`. */
 export interface HostToolDef {
@@ -39,9 +40,13 @@ export function hasUploadSecret(text: string): boolean {
 	return UPLOAD_SECRET_PATTERN.test(text) || maskKnownFragments(text) !== text;
 }
 
+/** How a tool description names each platform. */
+const PLATFORM_NAMES: Record<ChatPlatform, string> = { slack: "Slack", discord: "Discord", telegram: "Telegram" };
+
 export interface HostToolDeps {
 	originKey: string;
-	port: ChannelPort;
+	/** Uploads go out on the port of the target conversation's platform. */
+	channels: ChannelRegistry;
 	broker: ApprovalBroker;
 	log: Logger;
 	/** The bot home; its `secrets` directory can never be uploaded. */
@@ -61,6 +66,8 @@ export interface HostToolDeps {
 	userHome?: string;
 	/** Remote dispatch targets (config `dispatchHosts`) for the dispatch tool. */
 	dispatchHosts?: DispatchToolDeps["dispatchHosts"];
+	/** Local herdr worker omp extra arguments (config `workerOmpArgs`) for the dispatch tool. */
+	workerOmpArgs?: DispatchToolDeps["workerOmpArgs"];
 	/** herdr task board (config `herdrBoard`) for the dispatch tool's card links. */
 	herdrBoard?: DispatchToolDeps["herdrBoard"];
 	/** [TASK] state docs for the dispatch tool's `taskSpec`. */
@@ -141,6 +148,10 @@ function stringParam(params: Record<string, unknown>, key: string): string | und
 export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	const chatOrigin = parseChatOrigin(deps.originKey);
 	const channel = deps.channel ?? chatOrigin?.conversationId;
+	// The origin's own platform, else the lane's channel's; a tool without either refuses at run time (`needChannel`).
+	const platform =
+		chatOrigin?.platform ?? (channel === undefined ? undefined : platformOfConversationId(channel)) ?? "slack";
+	const platformName = PLATFORM_NAMES[platform];
 	const needChannel = (): string => {
 		if (channel === undefined) throw new Error(`origin is not a Slack conversation: ${deps.originKey}`);
 		return channel;
@@ -166,10 +177,9 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	return [
 		...(dispatch === undefined ? [] : [dispatch]),
 		{
-			name: "slack_send_file",
+			name: sendFileToolName(platform),
 			label: "Send file to owner",
-			description:
-				"Upload a local file into the current conversation thread in the owner's Slack (the channel's main view when there is no thread). Files in secret directories or containing tokens are refused.",
+			description: `Upload a local file into the current conversation thread in the owner's ${platformName} (the channel's main view when there is no thread). Files in secret directories or containing tokens are refused.`,
 			parameters: {
 				type: "object",
 				properties: {
@@ -188,7 +198,7 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 				const comment = stringParam(params, "comment");
 				const title = stringParam(params, "title");
 				const threadTs = deps.threadTs?.();
-				const { fileId } = await deps.port.uploadFile(
+				const { fileId } = await deps.channels.portFor(target).uploadFile(
 					{ conversationId: target, ...(threadTs === undefined ? {} : { threadId: threadTs }) },
 					{
 						path: real,

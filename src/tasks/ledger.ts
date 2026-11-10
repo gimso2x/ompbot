@@ -205,6 +205,25 @@ const toTask = (r: TaskSql): TaskRow => {
 	};
 };
 
+/** The latest `<kind>:<ms>` mark of a task's notices; `0` without one. */
+function latestMark(row: TaskRow, kind: "pause" | "unpause"): number {
+	const prefix = `${kind}:`;
+	const marks = Object.keys(row.notices)
+		.filter((key) => key.startsWith(prefix))
+		.map((key) => Number(key.slice(prefix.length)))
+		.filter((at) => Number.isFinite(at));
+	return Math.max(0, ...marks);
+}
+
+/**
+ * When the current owner pause began (its `pause:<ms>` mark), `undefined` for a task that is not paused. The key of
+ * everything told once per pause.
+ */
+export function taskPausedAt(row: TaskRow): number | undefined {
+	const paused = latestMark(row, "pause");
+	return paused > latestMark(row, "unpause") ? paused : undefined;
+}
+
 /** `T-YYYYMMDD-` (11 characters), then the day's number as an integer: `-100` follows `-99`, not `-10`. */
 const TASK_ORDER = "substr(task_id, 1, 11), CAST(substr(task_id, 12) AS INTEGER), task_id";
 
@@ -295,6 +314,50 @@ export class TaskLedger {
 	/** Whether a Slack thread root (`<channel>:<ts>`) carries a registered task. */
 	isTaskRoot(threadRef: string): boolean {
 		return this.#db.query("SELECT 1 FROM tasks WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
+	}
+
+	/** Every task registered in a thread (`<channel>:<ts>`), in id order; a thread may carry more than one. */
+	getByThread(threadRef: string): TaskRow[] {
+		return (
+			this.#db.query(`SELECT * FROM tasks WHERE thread_ref = ? ORDER BY ${TASK_ORDER}`).all(threadRef) as TaskSql[]
+		).map(toTask);
+	}
+
+	/** Whether the owner paused the task: its latest `pause:` mark is later than its latest `unpause:` mark. */
+	isPaused(row: TaskRow): boolean {
+		return taskPausedAt(row) !== undefined;
+	}
+
+	/**
+	 * Owner pause of a working or blocked task: a `pause:<ms>` notice mark, never a status move, so the sweep's
+	 * judging and every transition stay as they are. Pausing a paused task keeps its first mark.
+	 */
+	pauseTask(taskId: string): TaskRow {
+		return this.#db.transaction(() => {
+			const row = this.require(taskId);
+			if (row.status !== "working" && row.status !== "blocked") {
+				throw new TaskTransitionError(`${taskId}: ${row.status} 작업은 멈출 수 없습니다(working·blocked만)`);
+			}
+			if (this.isPaused(row)) return row;
+			return this.#writePauseMark(row, "pause", "unpause");
+		})();
+	}
+
+	/** Lifts the owner pause (an `unpause:<ms>` mark); a task that is not paused is returned as it is. */
+	unpauseTask(taskId: string): TaskRow {
+		return this.#db.transaction(() => {
+			const row = this.require(taskId);
+			if (!this.isPaused(row)) return row;
+			return this.#writePauseMark(row, "unpause", "pause");
+		})();
+	}
+
+	/** One `<kind>:<ms>` mark, strictly later than every `<opposite>:` mark even within one clock millisecond. */
+	#writePauseMark(row: TaskRow, kind: "pause" | "unpause", opposite: "pause" | "unpause"): TaskRow {
+		const at = Math.max(this.#clock.now(), latestMark(row, opposite) + 1);
+		const notices = { ...row.notices, [`${kind}:${at}`]: at };
+		this.#db.query("UPDATE tasks SET notices_json = ? WHERE task_id = ?").run(JSON.stringify(notices), row.taskId);
+		return this.require(row.taskId);
 	}
 
 	/**

@@ -117,7 +117,8 @@ function fsyncFile(path: string): void {
 	}
 }
 
-function fsyncDir(path: string): void {
+/** fsync through a read-only handle: works for a directory and for a file alike. */
+export function fsyncPath(path: string): void {
 	const fd = openSync(path, "r");
 	try {
 		fsyncSync(fd);
@@ -275,7 +276,7 @@ export function runBackup(options: BackupOptions): BackupResult {
 		);
 		renameSync(tmp, target);
 		if (bundle !== undefined) renameSync(bundle.tmp, bundle.target);
-		fsyncDir(backupsDir);
+		fsyncPath(backupsDir);
 	} catch (error) {
 		rmSync(tmp, { force: true });
 		rmSync(`${tmp}-wal`, { force: true });

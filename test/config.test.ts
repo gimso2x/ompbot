@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, loadConfig, readSlackTokens } from "../src/config";
-import { LIVE_FIELDS } from "../src/daemon/reload";
+import { ConfigError, loadConfig, readDiscordToken, readSlackTokens } from "../src/config";
+import { LIVE_FIELDS, RESTART_FIELDS } from "../src/daemon/reload";
 
 let home: string;
 
@@ -17,7 +17,7 @@ function writeSecret(rel: string, content: string, mode = 0o600): string {
 function baseConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
 		schemaVersion: 1,
-		ownerSlackUserId: "UOWNER0",
+		channels: { slack: { ownerUserId: "UOWNER0" } },
 		slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
 		ompExecutable: "/usr/local/bin/omp",
 		workspaceDir: "workspace",
@@ -54,7 +54,7 @@ describe("loadConfig", () => {
 		const cfg = loadConfig(home);
 		expect(cfg).toMatchObject({
 			schemaVersion: 1,
-			ownerSlackUserId: "UOWNER0",
+			channels: { slack: { ownerUserId: "UOWNER0" } },
 			ompExecutable: "/usr/local/bin/omp",
 			workspaceDir: join(home, "workspace"),
 			slack: { botTokenFile: join(home, "secrets/bot.token"), appTokenFile: join(home, "secrets/app.token") },
@@ -261,6 +261,194 @@ describe("loadConfig", () => {
 	});
 });
 
+describe("channels.slack.ownerUserId", () => {
+	const legacy = (owner: unknown, extra: Record<string, unknown> = {}) => {
+		const { channels: _, ...rest } = baseConfig(extra);
+		return { ...rest, ownerSlackUserId: owner };
+	};
+
+	test("the new key alone is accepted and nothing is deprecated", () => {
+		const cfg = loadConfig(home);
+		expect(cfg.channels).toEqual({ slack: { ownerUserId: "UOWNER0" } });
+		expect(cfg.deprecated ?? []).toEqual([]);
+		expect("ownerSlackUserId" in cfg).toBe(false);
+	});
+
+	test("the old ownerSlackUserId alone is read as the Slack owner and reported as deprecated", () => {
+		writeConfig(legacy("UOWNER0"));
+		const cfg = loadConfig(home);
+		expect(cfg.channels.slack.ownerUserId).toBe("UOWNER0");
+		expect(cfg.deprecated).toEqual(["ownerSlackUserId"]);
+	});
+
+	test("both keys with the same value are accepted; different values are rejected under the new key", () => {
+		writeConfig(baseConfig({ ownerSlackUserId: "UOWNER0" }));
+		expect(loadConfig(home).channels.slack.ownerUserId).toBe("UOWNER0");
+		writeConfig(baseConfig({ ownerSlackUserId: "UOTHER00" }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("field=channels.slack.ownerUserId");
+	});
+
+	test.each([
+		["neither key", legacy(undefined), "field=channels.slack.ownerUserId"],
+		["an empty new key", baseConfig({ channels: { slack: { ownerUserId: "" } } }), "field=channels.slack.ownerUserId"],
+		[
+			"a non-string new key",
+			baseConfig({ channels: { slack: { ownerUserId: 7 } } }),
+			"field=channels.slack.ownerUserId",
+		],
+		["an empty old key alone", legacy(""), "field=ownerSlackUserId"],
+		["channels not an object", baseConfig({ channels: ["slack"] }), "field=channels"],
+		["channels.slack not an object", baseConfig({ channels: { slack: "UOWNER0" } }), "field=channels.slack"],
+		[
+			"an unknown platform key",
+			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, matrix: {} } }),
+			"field=channels.matrix",
+		],
+		[
+			"an unknown key under slack",
+			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0", botTokenFile: "x" } } }),
+			"field=channels.slack.botTokenFile",
+		],
+	])("%s is config_invalid", (_name, cfg, field) => {
+		writeConfig(cfg);
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("the owner can never be a peer bot, whichever key names it", () => {
+		writeConfig(legacy("UOWNER0", { peerBots: [{ userId: "UOWNER0", name: "떡" }] }));
+		expect(catchError(() => loadConfig(home)).message).toContain("field=peerBots.0.userId");
+	});
+});
+
+describe("channels.discord", () => {
+	const OWNER_ID = "123456789012345678";
+	const APP_ID = "234567890123456789";
+	// Not a real token: assembled at runtime so no token-shaped literal sits in the repo.
+	const TOKEN = ["TEST", "discord", "token"].join("-");
+	const discord = (overrides: Record<string, unknown> = {}) => ({
+		ownerUserId: OWNER_ID,
+		botTokenFile: "secrets/discord.token",
+		applicationId: APP_ID,
+		...overrides,
+	});
+	const withDiscord = (overrides: Record<string, unknown> = {}) =>
+		baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: discord(overrides) } });
+	const without = (key: string) => {
+		const full: Record<string, unknown> = discord();
+		const { [key]: _, ...rest } = full;
+		return baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: rest } });
+	};
+
+	beforeEach(() => {
+		writeSecret("secrets/discord.token", `${TOKEN}\n`);
+	});
+
+	test("absent: Discord is off", () => {
+		expect(loadConfig(home).channels.discord).toBeUndefined();
+	});
+
+	test("present: owner, application, absolute token path and the optional policy keys; never the token value", () => {
+		writeConfig(
+			withDiscord({
+				guildIds: ["345678901234567890"],
+				mentionFreeChannels: ["456789012345678901"],
+				requireMention: true,
+			}),
+		);
+		const cfg = loadConfig(home);
+		expect(cfg.channels.discord).toEqual({
+			ownerUserId: OWNER_ID,
+			botTokenFile: join(home, "secrets/discord.token"),
+			applicationId: APP_ID,
+			guildIds: ["345678901234567890"],
+			mentionFreeChannels: ["456789012345678901"],
+			requireMention: true,
+		});
+		expect(JSON.stringify(cfg)).not.toContain(TOKEN);
+		writeConfig(withDiscord());
+		expect(loadConfig(home).channels.discord).toEqual({
+			ownerUserId: OWNER_ID,
+			botTokenFile: join(home, "secrets/discord.token"),
+			applicationId: APP_ID,
+		});
+	});
+
+	test("readDiscordToken returns the one-line value", () => {
+		writeConfig(withDiscord());
+		expect(readDiscordToken(loadConfig(home))).toBe(TOKEN);
+	});
+
+	test.each([
+		["no ownerUserId", without("ownerUserId"), "field=channels.discord.ownerUserId"],
+		["no botTokenFile", without("botTokenFile"), "field=channels.discord.botTokenFile"],
+		["no applicationId", without("applicationId"), "field=channels.discord.applicationId"],
+		["a short ownerUserId", withDiscord({ ownerUserId: "1234" }), "field=channels.discord.ownerUserId"],
+		["a Slack-style ownerUserId", withDiscord({ ownerUserId: "UOWNER0" }), "field=channels.discord.ownerUserId"],
+		["a numeric ownerUserId", withDiscord({ ownerUserId: 12345678901234 }), "field=channels.discord.ownerUserId"],
+		[
+			"a 21-digit applicationId",
+			withDiscord({ applicationId: "123456789012345678901" }),
+			"field=channels.discord.applicationId",
+		],
+		["an empty botTokenFile", withDiscord({ botTokenFile: "" }), "field=channels.discord.botTokenFile"],
+		["guildIds not an array", withDiscord({ guildIds: "345678901234567890" }), "field=channels.discord.guildIds"],
+		["guildIds with a non-number", withDiscord({ guildIds: ["C0123ABCD"] }), "field=channels.discord.guildIds"],
+		[
+			"mentionFreeChannels with a number value",
+			withDiscord({ mentionFreeChannels: [45678901234567] }),
+			"field=channels.discord.mentionFreeChannels",
+		],
+		["requireMention not a boolean", withDiscord({ requireMention: "yes" }), "field=channels.discord.requireMention"],
+		["an unknown key", withDiscord({ botToken: "x" }), "field=channels.discord.botToken"],
+		[
+			"discord not an object",
+			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: true } }),
+			"field=channels.discord",
+		],
+	])("%s is config_invalid", (_name, cfg, field) => {
+		writeConfig(cfg);
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+		expect(err.message).not.toContain(TOKEN);
+	});
+
+	test("token file: missing → secret_missing, not 0600 → secret_permissions", () => {
+		writeConfig(withDiscord({ botTokenFile: "secrets/none.token" }));
+		expect(catchError(() => loadConfig(home)).code).toBe("secret_missing");
+		writeSecret("secrets/discord.token", `${TOKEN}\n`, 0o644);
+		writeConfig(withDiscord());
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("secret_permissions");
+		expect(err.message).not.toContain(TOKEN);
+	});
+
+	test.each([
+		["empty", "\n"],
+		["two lines", `${TOKEN}\n${TOKEN}\n`],
+	])("token file %s → config_invalid without the value", (_name, content) => {
+		writeSecret("secrets/discord.token", content);
+		writeConfig(withDiscord());
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("field=channels.discord.botTokenFile");
+		expect(err.message).not.toContain(TOKEN);
+	});
+
+	test("checkTokens: false skips the token file", () => {
+		writeConfig(withDiscord({ botTokenFile: "secrets/none.token" }));
+		expect(loadConfig(home, { checkTokens: false }).channels.discord?.applicationId).toBe(APP_ID);
+	});
+
+	test("channels needs a restart on reload", () => {
+		expect(RESTART_FIELDS as readonly string[]).toContain("channels");
+	});
+});
+
 describe("offsite", () => {
 	test("is optional; ssh alias / user@host and absolute or ~/ remoteDir are accepted, keep defaults off", () => {
 		expect(loadConfig(home).offsite).toBeUndefined();
@@ -316,6 +504,40 @@ describe("herdr", () => {
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
 	});
+
+	test("workerOmpArgs and dispatchHosts.<h>.ompArgs load as given; absent stays absent", () => {
+		writeConfig(baseConfig({ herdr: {}, dispatchHosts: hosts }));
+		const plain = loadConfig(home);
+		expect(plain.workerOmpArgs).toBeUndefined();
+		expect(plain.dispatchHosts?.wsl).toEqual({ ssh: "wsl" });
+		const withArgs = { wsl: { ssh: "wsl", ompArgs: ["--prewalk", "--thinking", "high"] } };
+		writeConfig(baseConfig({ herdr: {}, dispatchHosts: withArgs, workerOmpArgs: ["--prewalk"] }));
+		const cfg = loadConfig(home);
+		expect(cfg.workerOmpArgs).toEqual(["--prewalk"]);
+		expect(cfg.dispatchHosts).toEqual(withArgs);
+	});
+
+	test.each([
+		["a string workerOmpArgs", { workerOmpArgs: "--prewalk" }, "(field=workerOmpArgs)"],
+		["an empty-string workerOmpArgs element", { workerOmpArgs: ["--prewalk", ""] }, "(field=workerOmpArgs)"],
+		["a blank workerOmpArgs element", { workerOmpArgs: ["  "] }, "(field=workerOmpArgs)"],
+		["a non-string workerOmpArgs element", { workerOmpArgs: [1] }, "(field=workerOmpArgs)"],
+		[
+			"an object ompArgs",
+			{ dispatchHosts: { wsl: { ssh: "wsl", ompArgs: { a: 1 } } } },
+			"(field=dispatchHosts.wsl.ompArgs)",
+		],
+		[
+			"an empty-string ompArgs element",
+			{ dispatchHosts: { wsl: { ssh: "wsl", ompArgs: [""] } } },
+			"(field=dispatchHosts.wsl.ompArgs)",
+		],
+	])("%s is rejected naming the key", (_name, extra, field) => {
+		writeConfig(baseConfig({ herdr: {}, ...extra }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
 });
 
 describe("taskAutoLand", () => {
@@ -341,12 +563,28 @@ describe("taskAutoLand", () => {
 		["a lower-case maxRisk", withHerdr({ repos: ["/srv/a"], maxRisk: "l2" }), "(field=taskAutoLand.maxRisk)"],
 		["an undefined key", withHerdr({ repos: ["/srv/a"], hosts: ["wsl"] }), "(field=taskAutoLand.hosts)"],
 		["a non-object", withHerdr(["/srv/a"]), "(field=taskAutoLand)"],
-		["taskAutoLand without herdr", baseConfig({ taskAutoLand: { repos: ["/srv/a"] } }), "(field=herdr)"],
 	])("AC-5: %s is rejected", (_name, cfg, field) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
+	});
+
+	test("lane parity AC-15: taskAutoLand alone is accepted without herdr (work lanes land without it)", () => {
+		writeConfig(baseConfig({ taskAutoLand: { repos: ["/srv/a/"], maxRisk: "L1" } }));
+		const cfg = loadConfig(home);
+		expect(cfg.herdr).toBeUndefined();
+		expect(cfg.taskAutoLand).toEqual({ repos: ["/srv/a"], maxRisk: "L1" });
+	});
+
+	test.each([
+		["dispatchHosts", { dispatchHosts: { wsl: { ssh: "wsl" } } }],
+		["herdrBoard", { herdrBoard: { url: "https://board.example.com/task/" } }],
+	])("lane parity AC-15: %s beside taskAutoLand still needs herdr (field=herdr)", (_name, extra) => {
+		writeConfig(baseConfig({ taskAutoLand: { repos: ["/srv/a"] }, ...extra }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("(field=herdr)");
 	});
 
 	test("AC-5: taskAutoLand is a live field (ompbot reload applies it without a restart)", () => {
@@ -383,6 +621,6 @@ describe("dashboard", () => {
 	test("checkTokens: false loads a config whose token files are missing", () => {
 		rmSync(join(home, "secrets"), { recursive: true, force: true });
 		expect(catchError(() => loadConfig(home)).code).toBe("secret_missing");
-		expect(loadConfig(home, { checkTokens: false }).ownerSlackUserId).toBe("UOWNER0");
+		expect(loadConfig(home, { checkTokens: false }).channels.slack.ownerUserId).toBe("UOWNER0");
 	});
 });

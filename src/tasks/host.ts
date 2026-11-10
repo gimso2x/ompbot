@@ -64,6 +64,30 @@ export interface TaskHostOps {
 	headOf(worktree: string): Promise<{ sha: string; clean: boolean }>;
 }
 
+/**
+ * Resume-time reads of a task worktree (`resumeTask` only), apart from `TaskHostOps` so its read-only fakes elsewhere
+ * (the dashboard's) need not answer them.
+ */
+export interface TaskResumeOps {
+	/**
+	 * Where PROGRESS.md was last committed and what came after it: `git log -1 -- docs/tasks/<id>/PROGRESS.md`, the
+	 * commits since then outside `docs/tasks/`, and `git status --porcelain`. Any git or host failure is `ok: false`.
+	 */
+	progressLag(input: { worktree: string; taskId: string }): Promise<HostResult<ProgressLag>>;
+}
+
+/** How far PROGRESS.md trails the worktree, measured from its last commit (`progressLag`). */
+export interface ProgressLag {
+	/** Short hash of the last commit touching `docs/tasks/<id>/PROGRESS.md`; `""` when it was never committed. */
+	progressCommit: string;
+	/** Commits in `progressCommit..HEAD` touching anything outside `docs/tasks/`; 0 without a `progressCommit`. */
+	codeCommitsSince: number;
+	/** PROGRESS.md has uncommitted changes. */
+	progressDirty: boolean;
+	/** Other uncommitted paths (`git status --porcelain` entries besides PROGRESS.md). */
+	otherDirty: number;
+}
+
 export interface CheckRun {
 	code: number | null;
 	output: string;
@@ -85,8 +109,9 @@ function assertPath(path: string): void {
 	if (!TASK_PATH_PATTERN.test(path)) throw new Error(`unsafe path: ${path}`);
 }
 
+/** A task branch (`task/T-YYYYMMDD-NN`) or a work lane's branch (`lane/L-YYYYMMDD-NN`); nothing else reaches git. */
 function assertBranch(branch: string): void {
-	if (!/^task\/T-\d{8}-\d{2,}$/.test(branch)) throw new Error(`unsafe branch: ${branch}`);
+	if (!/^(?:task\/T|lane\/L)-\d{8}-\d{2,}$/.test(branch)) throw new Error(`unsafe branch: ${branch}`);
 }
 
 const fail = (error: unknown): { ok: false; error: string } => ({
@@ -94,7 +119,7 @@ const fail = (error: unknown): { ok: false; error: string } => ({
 	error: error instanceof Error ? error.message : String(error),
 });
 
-export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
+export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & TaskResumeOps {
 	const run = options.run ?? realProcessRunner;
 	const { sshTarget } = options;
 	const env = dispatchEnv(options.inheritedEnv ?? process.env);
@@ -321,6 +346,47 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps {
 			if (!FULL_HASH.test(sha)) throw new Error(`cannot read HEAD of ${worktree}: ${sha.slice(0, 80)}`);
 			return { sha, clean: (await git("status", "--porcelain")) === "" };
 		},
+
+		async progressLag({ worktree, taskId }) {
+			assertPath(worktree);
+			if (!TASK_ID.test(taskId)) throw new Error(`unsafe task id: ${taskId}`);
+			const progressPath = `docs/tasks/${taskId}/PROGRESS.md`;
+			const git = async (...args: string[]): Promise<HostResult<string>> => {
+				const result = await exec(["git", "-C", worktree, ...args], GIT_TIMEOUT_MS);
+				if (unreachable(result)) return { ok: false, error: `host unreachable: ${unreachableReason(result)}` };
+				if (result.code !== 0)
+					return { ok: false, error: `git ${args[0]} failed: ${result.stdout.trim().slice(0, 160)}` };
+				return { ok: true, value: result.stdout };
+			};
+			const log = await git("log", "-1", "--format=%h", "--", progressPath);
+			if (!log.ok) return log;
+			const progressCommit = log.value.trim();
+			if (progressCommit !== "" && !HEX_HASH.test(progressCommit))
+				return { ok: false, error: `git log: ${progressCommit.slice(0, 80)}` };
+			let codeCommitsSince = 0;
+			if (progressCommit !== "") {
+				// Every task's documents are left out, not only this one's: a docs-only commit is never a code commit.
+				// `:!` rather than `:(exclude)`: the argv crosses a remote shell unquoted over ssh.
+				const count = await git("rev-list", "--count", `${progressCommit}..HEAD`, "--", ".", ":!docs/tasks");
+				if (!count.ok) return count;
+				codeCommitsSince = Number.parseInt(count.value.trim(), 10);
+				if (!Number.isInteger(codeCommitsSince))
+					return { ok: false, error: `git rev-list: ${count.value.trim().slice(0, 80)}` };
+			}
+			const status = await git("status", "--porcelain");
+			if (!status.ok) return status;
+			const entries = status.value.split("\n").filter((line) => line.trim() !== "");
+			const progressDirty = entries.some((line) => line.slice(3) === progressPath);
+			return {
+				ok: true,
+				value: {
+					progressCommit,
+					codeCommitsSince,
+					progressDirty,
+					otherDirty: entries.length - (progressDirty ? 1 : 0),
+				},
+			};
+		},
 	};
 }
 
@@ -329,7 +395,7 @@ export function resolveTaskHost(
 	host: string | null,
 	dispatchHosts: Record<string, { ssh: string }> | undefined,
 	options: Omit<TaskHostOptions, "sshTarget"> = {},
-): TaskHostOps {
+): TaskHostOps & TaskResumeOps {
 	if (host === null) return createTaskHostOps(options);
 	const entry = dispatchHosts?.[host];
 	if (entry === undefined) throw new Error(`알 수 없는 호스트: ${host}`);

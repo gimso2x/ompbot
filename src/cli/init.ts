@@ -52,7 +52,7 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 	mkdirSync(workspaceDir, { recursive: true });
 	const config = {
 		schemaVersion: 1,
-		ownerSlackUserId: values.owner,
+		channels: { slack: { ownerUserId: values.owner } },
 		slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 		ompExecutable: omp,
 		workspaceDir,

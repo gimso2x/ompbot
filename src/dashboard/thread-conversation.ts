@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { newestSessionFile } from "../omp/session-heal";
 import { isRecord } from "../omp/type-guards";
 import { redact } from "../redact";
+import { readJsonlRecords } from "./trace-transcript";
 
 /**
  * One conversation's omp session for the dashboard's 대화 tab, in the shape `renderConversation` draws: the user's
@@ -36,22 +37,6 @@ export type ThreadConversation =
 	| { ok: false; error: ConversationError };
 
 type Json = Record<string, unknown>;
-
-function records(file: string): Json[] {
-	const out: Json[] = [];
-	for (const line of readFileSync(file, "utf8").split("\n")) {
-		if (line === "") continue;
-		try {
-			const entry: unknown = JSON.parse(line);
-			if (isRecord(entry)) out.push(entry);
-		} catch (error) {
-			// The line omp is writing right now; the next read has it whole.
-			if (error instanceof SyntaxError) continue;
-			throw error;
-		}
-	}
-	return out;
-}
 
 const timeOf = (entry: Json): number => Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "");
 const messageOf = (entry: Json): Json | undefined =>
@@ -98,7 +83,7 @@ function subAgentAnswers(stem: string, calls: TaskCall[]): Map<string, Array<{ n
 		if (!file.endsWith(".jsonl")) continue;
 		const name = file.slice(0, -".jsonl".length);
 		if (!named.has(name)) continue;
-		const entries = records(join(stem, file));
+		const entries = readJsonlRecords(join(stem, file));
 		const start = entries.map(timeOf).find((at) => !Number.isNaN(at));
 		if (start === undefined) continue;
 		let owner: TaskCall | undefined;
@@ -134,7 +119,7 @@ interface Dialog {
 
 /** One session file as dialog turns, a page of {@link CONVERSATION_PAGE} ending before entry `before` (or at the end). */
 export function readSessionConversation(file: string, before?: string): Extract<ThreadConversation, { ok: true }> {
-	const entries = records(file);
+	const entries = readJsonlRecords(file);
 	const dialogs: Dialog[] = [];
 	const results = new Map<string, Json>();
 	const calls: TaskCall[] = [];

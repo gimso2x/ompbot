@@ -8,8 +8,9 @@ import type { HostToolDef } from "../src/safety/host-tools";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
-import type { HostResult, TaskHostOps } from "../src/tasks/host";
+import type { HostResult, ProgressLag, TaskHostOps, TaskResumeOps } from "../src/tasks/host";
 import { TaskLedger } from "../src/tasks/ledger";
+import { registryOf } from "./helpers/channels";
 
 const NOW = Date.parse("2026-10-26T06:00:00Z");
 const noop = { info() {}, warn() {} };
@@ -29,12 +30,16 @@ function unquoteRemote(word: string): string {
 	return word.startsWith("'") && word.endsWith("'") ? word.slice(1, -1).replaceAll("'\\''", "'") : word;
 }
 
-interface FakeHost extends TaskHostOps {
+interface FakeHost extends TaskHostOps, TaskResumeOps {
 	files: Map<string, string>;
 	existing: Set<string>;
 	calls: string[];
 	failCreate?: string;
 	failCommit?: string;
+	/** A PROGRESS.md read answers this failure. */
+	failProgressRead?: string;
+	/** What `progressLag` answers; an Error is thrown. */
+	lag: HostResult<ProgressLag> | Error;
 }
 
 function fakeHost(): FakeHost {
@@ -42,6 +47,7 @@ function fakeHost(): FakeHost {
 		files: new Map(),
 		existing: new Set(),
 		calls: [],
+		lag: { ok: true, value: { progressCommit: "abc1234", codeCommitsSince: 0, progressDirty: false, otherDirty: 0 } },
 		async pathExists(path): Promise<HostResult<boolean>> {
 			return { ok: true, value: host.existing.has(path) };
 		},
@@ -60,7 +66,13 @@ function fakeHost(): FakeHost {
 			return { ok: true, value: null };
 		},
 		async readFile(path) {
+			if (host.failProgressRead !== undefined && path.endsWith("/PROGRESS.md"))
+				return { ok: false, error: host.failProgressRead };
 			return { ok: true, value: host.files.get(path) };
+		},
+		async progressLag() {
+			if (host.lag instanceof Error) throw host.lag;
+			return host.lag;
 		},
 		async commitOnTaskBranch() {
 			return "ok" as const;
@@ -105,6 +117,10 @@ function harness(
 		approval?: ApprovalResult;
 		/** Free space the start sees under the repo's parent; absent → the real filesystem (`/r` does not exist). */
 		disk?: { freeBytes: number; totalBytes: number; asked: string[] };
+		/** Config `workerOmpArgs`. */
+		workerOmpArgs?: string[];
+		/** Config `dispatchHosts.wsl.ompArgs`. */
+		wslOmpArgs?: string[];
 	} = {},
 ): Harness {
 	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => NOW } });
@@ -148,7 +164,14 @@ function harness(
 		homeDir: "/home",
 		workspaceDir: "/ws",
 		herdr: {},
-		dispatchHosts: { wsl: { ssh: "wsl-ssh", workDir: "/r" } },
+		dispatchHosts: {
+			wsl: {
+				ssh: "wsl-ssh",
+				workDir: "/r",
+				...(options.wslOmpArgs === undefined ? {} : { ompArgs: options.wslOmpArgs }),
+			},
+		},
+		...(options.workerOmpArgs === undefined ? {} : { workerOmpArgs: options.workerOmpArgs }),
 		run,
 		log: noop,
 		...(options.board === undefined ? {} : { herdrBoard: options.board }),
@@ -167,7 +190,7 @@ function harness(
 						ledger,
 						threadRef: () => ("threadRef" in options ? options.threadRef : "C1:100.1"),
 						rootText: () => "[TASK] L2 로그 회전\n목표: 회전",
-						port: new SlackChannel(transport),
+						channels: registryOf(new SlackChannel(transport)),
 						now: () => NOW,
 						hostOps: () => host,
 						...(options.disk === undefined
@@ -450,6 +473,95 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		expect(await call(h, { taskSpec: { id: "T-20261026-01" } })).toContain("워크트리가 없습니다");
 	});
 
+	const lagOf = (over: Partial<ProgressLag>): HostResult<ProgressLag> => ({
+		ok: true,
+		value: { progressCommit: "abc1234", codeCommitsSince: 0, progressDirty: false, otherDirty: 0, ...over },
+	});
+	const resumePrompt = (h: Harness): string => h.herdr.find((cmd) => cmd[2] === "prompt")?.[4] ?? "";
+
+	test("code commits past PROGRESS's last commit: the prompt and the result say so and tell the agent to fix it first", async () => {
+		const h = await started();
+		h.host.lag = lagOf({ codeCommitsSince: 1 });
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" }, task: "이어서 해" });
+		const finding =
+			"재개 전 점검: PROGRESS.md 마지막 커밋(abc1234) 뒤 코드 커밋 1개가 PROGRESS에 반영되지 않음. 저장소 상태를 믿고 PROGRESS.md를 먼저 고친 뒤 잇는다.";
+		const prompt = resumePrompt(h);
+		expect(prompt.split("\n")).toContain(finding);
+		expect(prompt.indexOf(finding)).toBeLessThan(prompt.indexOf("이어서 해"));
+		expect(out.split("\n")).toContain(finding);
+		expect(prompt).not.toContain("참고:");
+		expect(out).not.toContain("참고:");
+	});
+
+	test("uncommitted changes alone are a note without an instruction", async () => {
+		const h = await started();
+		h.host.lag = lagOf({ otherDirty: 2 });
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" } });
+		const note = "참고: 미커밋 변경 2개(중간 단계에서 멈춘 상태).";
+		expect(resumePrompt(h).split("\n")).toContain(note);
+		expect(out.split("\n")).toContain(note);
+		for (const text of [resumePrompt(h), out]) {
+			expect(text).not.toContain("재개 전 점검");
+			expect(text).not.toContain("먼저 고친 뒤");
+		}
+	});
+
+	test("nothing found: neither line is added", async () => {
+		const h = await started();
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" } });
+		for (const text of [resumePrompt(h), out]) {
+			expect(text).not.toContain("재개 전 점검");
+			expect(text).not.toContain("참고:");
+		}
+		expect(out).toContain("살아 있는 에이전트에 재개 프롬프트를 보냈습니다");
+	});
+
+	test("an unreadable PROGRESS.md or a failing lag never stops the resume; the failure is noted", async () => {
+		const h = await started();
+		h.host.failProgressRead = "host unreachable: no route";
+		h.host.lag = { ok: false, error: "host unreachable: no route" };
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" } });
+		expect(out).toContain("살아 있는 에이전트에 재개 프롬프트를 보냈습니다");
+		expect(resumePrompt(h)).toContain("점검 읽기 실패");
+		expect(out).toContain("점검 읽기 실패");
+		expect(h.ledger.require("T-20261026-01").status).toBe("working");
+
+		const thrown = await started();
+		thrown.host.lag = new Error("unsafe path: /x;y");
+		thrown.agents.clear();
+		const restarted = await call(thrown, { taskSpec: { id: "T-20261026-01" } });
+		expect(restarted).toContain("같은 워크트리에서 새 에이전트를 시작했습니다");
+		expect(restarted).toContain("점검 읽기 실패: unsafe path: /x;y");
+	});
+
+	test("the resume prompt asks for the restated line first; a new task's prompt does not", async () => {
+		const h = harness();
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		const fresh = resumePrompt(h);
+		h.herdr.length = 0;
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		const resumed = resumePrompt(h);
+		const rule =
+			"재개하면 다른 일보다 먼저 PROGRESS.md `restated`에 `과제 / 첫 next / 완료 조건`을 한 줄로 쓰고 `updated`를 고친다. 못 쓰면 `status: blocked`로 바꾸고 `blocked_reason`에 PROGRESS.md에서 빠진 것을 적는다.";
+		expect(resumed).toContain(rule);
+		expect(fresh).not.toContain("restated");
+	});
+
+	test("the restated value read at resume is kept beside the resume mark", async () => {
+		const h = await started();
+		const path = `${docsDirOf("/r/repo-t-20261026-01", "T-20261026-01")}/PROGRESS.md`;
+		h.host.files.set(path, (h.host.files.get(path) ?? "").replace("restated:", "restated: 회전 / S2 / 테스트"));
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		const keys = Object.keys(h.ledger.require("T-20261026-01").notices);
+		expect(keys).toContain(`resume:${NOW}`);
+		expect(keys.filter((key) => key.startsWith("restated-before:"))).toEqual([`restated-before:${NOW}:ee6c31d6`]);
+
+		const empty = await started();
+		await call(empty, { taskSpec: { id: "T-20261026-01" } });
+		const emptyKeys = Object.keys(empty.ledger.require("T-20261026-01").notices);
+		expect(emptyKeys.filter((key) => key.startsWith("restated-before:"))).toEqual([`restated-before:${NOW}:`]);
+	});
+
 	test("unknown, closed and host-mismatched ids are refused", async () => {
 		const h = await started();
 		await expect(call(h, { taskSpec: { id: "T-19990101-01" } })).rejects.toThrow("등록된 작업이 아닙니다");
@@ -571,5 +683,89 @@ describe("ompbot_dispatch handoff risk scan", () => {
 		expect(delivered(h, "하지 않는다")).toBe(true);
 		expect(out.split("\n").at(-1)).toBe("위험 검사: advisory (package_install, service_control)");
 		expect(h.approvals).toEqual([]);
+	});
+});
+
+describe("worker omp arguments (workerOmpArgs, dispatchHosts.<h>.ompArgs)", () => {
+	/** The herdr words of a recorded call (after the ssh `--` for a remote one; the harness unquotes those). */
+	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 1) : cmd);
+	const starts = (h: Harness): string[][] =>
+		h.herdr.map(words).filter((args) => args[1] === "agent" && args[2] === "start");
+	const BASE_START = [
+		"herdr",
+		"agent",
+		"start",
+		"t-20261026-01",
+		"--kind",
+		"omp",
+		"--pane",
+		"P1",
+		"--timeout",
+		"60000",
+	];
+	const PREWALK = ["--prewalk"];
+
+	test("no keys: every start path sends the plain agent start, no `--`", async () => {
+		const h = harness();
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		h.agents.clear();
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		await call(h, { host: "wsl", name: "remote1", task: "원격 일" });
+		expect(starts(h)).toEqual([BASE_START, BASE_START, [...BASE_START.slice(0, 3), "remote1", ...BASE_START.slice(4)]]);
+	});
+
+	test("[TASK] local start: workerOmpArgs go after `--` at the end of agent start", async () => {
+		const h = harness({ workerOmpArgs: PREWALK });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(starts(h)).toEqual([[...BASE_START, "--", "--prewalk"]]);
+	});
+
+	test("[TASK] resume of a dead local agent restarts it with workerOmpArgs", async () => {
+		const h = harness({ workerOmpArgs: PREWALK });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		h.herdr.length = 0;
+		h.agents.clear();
+		expect(await call(h, { taskSpec: { id: "T-20261026-01" } })).toContain(
+			"같은 워크트리에서 새 에이전트를 시작했습니다",
+		);
+		expect(starts(h)).toEqual([[...BASE_START, "--", "--prewalk"]]);
+	});
+
+	test("remote starts never inherit workerOmpArgs (TASK start, TASK resume, ompbot_dispatch host)", async () => {
+		const h = harness({ workerOmpArgs: PREWALK });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
+		h.agents.clear();
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		await call(h, { host: "wsl", name: "remote1", task: "원격 일" });
+		const remote = h.herdr.filter((cmd) => cmd[0] === "ssh").map(words);
+		expect(starts(h)).toHaveLength(3);
+		expect(starts(h).every((args) => args.at(-1) === "60000")).toBe(true);
+		expect(remote.some((args) => args.includes("--prewalk") || args.includes("--"))).toBe(false);
+	});
+
+	test("the host's ompArgs reach its remote starts (TASK start, TASK resume, ompbot_dispatch host)", async () => {
+		const h = harness({ wslOmpArgs: PREWALK });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
+		h.agents.clear();
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		await call(h, { host: "wsl", name: "remote1", task: "원격 일" });
+		const remote = [...BASE_START, "--", "--prewalk"];
+		expect(starts(h)).toEqual([remote, remote, [...remote.slice(0, 3), "remote1", ...remote.slice(4)]]);
+		expect(h.herdr.filter((cmd) => cmd[0] === "ssh" && words(cmd)[2] === "start")).toHaveLength(3);
+	});
+
+	test("a host's ompArgs stay on that host: a local start then gets none", async () => {
+		const h = harness({ wslOmpArgs: PREWALK });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(starts(h)).toEqual([BASE_START]);
+	});
+
+	test("simple dispatch (`omp -p`) never gets either key", async () => {
+		const h = harness({ workerOmpArgs: PREWALK, wslOmpArgs: PREWALK });
+		await call(h, { task: "빌드 상태 요약" });
+		const omp = h.herdr.filter((cmd) => cmd[0] === "omp");
+		expect(omp).toHaveLength(1);
+		expect(omp[0]?.slice(0, 4)).toEqual(["omp", "-p", "빌드 상태 요약", "--no-session"]);
+		expect(omp[0]).not.toContain("--prewalk");
 	});
 });

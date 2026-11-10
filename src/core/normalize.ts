@@ -2,7 +2,7 @@
 // `ompbot inject` (todo 7) both call normalizeInbound, so owner gating and quoted-content fencing cannot diverge.
 import { randomBytes } from "node:crypto";
 import { injectionWarning, scanForInjection } from "../safety/injection";
-import { chatOriginKey, parseChatOrigin } from "./origin-key";
+import { chatOriginKey, type IdPlatform, parseChatOrigin, platformOfConversationId } from "./origin-key";
 import { parseCommand } from "./types";
 
 export interface NormalizeInput {
@@ -18,6 +18,8 @@ export interface NormalizeInput {
 	subtype?: string | undefined;
 	/** Slack `channel_type`: `im` (the default) is the owner DM; anything else is a channel conversation. */
 	channelType?: string | undefined;
+	/** Platform of `channel` (the origin key namespace). Default Slack. */
+	platform?: IdPlatform | undefined;
 	/** Test seam: returns the 16-hex fence id. Defaults to crypto randomness, fresh per message. */
 	fenceId?: () => string;
 }
@@ -42,9 +44,9 @@ export function isOwner(userId: string | undefined, ownerUserId: string): boolea
 	return userId !== undefined && userId !== "" && userId === ownerUserId;
 }
 
-/** `slack/dm/<D…>` for the owner DM, `slack/ch/<C…|G…>` for a channel (one conversation per channel). */
-export function originKeyForChannel(channel: string, channelType = "im"): string {
-	return chatOriginKey({ platform: "slack", kind: channelType === "im" ? "dm" : "ch", conversationId: channel });
+/** `slack/dm/<D…>` for the owner DM, `slack/ch/<C…|G…>` for a channel (one conversation per channel); `discord/…` alike. */
+export function originKeyForChannel(channel: string, channelType = "im", platform: IdPlatform = "slack"): string {
+	return chatOriginKey({ platform, kind: channelType === "im" ? "dm" : "ch", conversationId: channel });
 }
 
 /**
@@ -61,11 +63,12 @@ export function originKeyForMessage(
 	ts: string,
 	threadTs: string | undefined,
 	text: string,
+	platform: IdPlatform = "slack",
 ): string {
-	if (channelType === undefined || channelType === "im") return originKeyForChannel(channel, channelType);
+	if (channelType === undefined || channelType === "im") return originKeyForChannel(channel, channelType, platform);
 	const root = threadTs === undefined || threadTs === "" || threadTs === ts;
-	if (root && parseCommand(text) !== undefined) return originKeyForChannel(channel, channelType);
-	return `${originKeyForChannel(channel, channelType)}/t/${root ? ts : threadTs}`;
+	if (root && parseCommand(text) !== undefined) return originKeyForChannel(channel, channelType, platform);
+	return `${originKeyForChannel(channel, channelType, platform)}/t/${root ? ts : threadTs}`;
 }
 
 /** Thread ref (`<channel>:<rootTs>`) a thread-session origin serves; undefined for every other origin kind. */
@@ -93,6 +96,12 @@ export function parseThreadRef(threadRef: string): { channel: string; threadTs: 
 	const at = threadRef.indexOf(":");
 	if (at <= 0 || at === threadRef.length - 1) return undefined;
 	return { channel: threadRef.slice(0, at), threadTs: threadRef.slice(at + 1) };
+}
+
+/** Platform a thread ref (`<conversationId>:<threadId|->`) posts to, read from its conversation id. */
+export function platformOfThreadRef(threadRef: string): IdPlatform | undefined {
+	const ref = parseThreadRef(threadRef);
+	return ref === undefined ? undefined : platformOfConversationId(ref.channel);
 }
 
 /** Slack escapes only &, < and > in message text. */
@@ -181,7 +190,12 @@ export function normalizeInbound(input: NormalizeInput): NormalizeResult {
 
 	const fence = (input.fenceId ?? (() => randomBytes(8).toString("hex")))();
 	const body = input.text.trim();
-	const quotedBlock = wrapQuoted(input.quoted, fence, "전달·인용된 Slack 글");
+	const platform = input.platform ?? "slack";
+	const quotedBlock = wrapQuoted(
+		input.quoted,
+		fence,
+		platform === "slack" ? "전달·인용된 Slack 글" : "전달·인용된 Discord 글",
+	);
 	if (body === "" && quotedBlock === "") return { accept: false, reason: "empty" };
 	// The origin reads the exact text the mailbox parses, so a root stays on the channel origin iff it runs as a command.
 	const text = [body, quotedBlock].filter((part) => part !== "").join("\n\n");
@@ -190,7 +204,7 @@ export function normalizeInbound(input: NormalizeInput): NormalizeResult {
 		accept: true,
 		inbound: {
 			platformMessageId: `${input.channel}:${input.ts}`,
-			originKey: originKeyForMessage(input.channel, input.channelType, input.ts, input.threadTs, text),
+			originKey: originKeyForMessage(input.channel, input.channelType, input.ts, input.threadTs, text, platform),
 			ownerVerified: true,
 			text,
 			threadRef: threadRefOf(input.channel, input.threadTs ?? input.ts),

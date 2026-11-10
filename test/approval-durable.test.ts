@@ -11,6 +11,7 @@ import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackTransport } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
 import { hasButtons } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 
 let dir: string;
 let store: Store;
@@ -62,7 +63,7 @@ class ManualTimers implements ApprovalTimers {
 
 function makeBroker(transport: SlackTransport, timers: ApprovalTimers, now: () => number): ApprovalBroker {
 	return new ApprovalBroker({
-		port: new SlackChannel(transport),
+		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: store as unknown as ApprovalStore,

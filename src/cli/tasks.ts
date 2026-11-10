@@ -12,6 +12,8 @@ export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
   tasks show <id>                registry row, transition history and the current Outcome judgement
   tasks check <id>               judge now; the running daemon posts/reacts like its sweep does
   tasks close <id> --as done|cancelled   human-only completion (the bot can never do this); worktree and branch stay
+  tasks pause <id>               owner pause: the sweep holds prompts, stale notice and auto-merge; the worker gets an Esc
+  tasks resume <id>              lifts the pause (sweep hold only; the worker is not prompted)
   tasks flow --out <dir> [--watch <s>]   flow viewer html + status.json from a read-only database; --watch rewrites status.json
 `;
 
@@ -46,8 +48,16 @@ async function askDaemon(
 /** `ompbot tasks ...` against the ledger file directly; Slack side effects go through the running daemon. */
 export async function tasksCommand(args: string[], homeDir: string): Promise<number> {
 	const [sub, ...rest] = args;
-	if (sub !== "list" && sub !== "show" && sub !== "check" && sub !== "close" && sub !== "flow") {
-		process.stderr.write(`usage: ompbot tasks <list|show|check|close|flow>\n${TASKS_USAGE}`);
+	if (
+		sub !== "list" &&
+		sub !== "show" &&
+		sub !== "check" &&
+		sub !== "close" &&
+		sub !== "pause" &&
+		sub !== "resume" &&
+		sub !== "flow"
+	) {
+		process.stderr.write(`usage: ompbot tasks <list|show|check|close|pause|resume|flow>\n${TASKS_USAGE}`);
 		return 2;
 	}
 	const { values, positionals } = parseArgs({
@@ -95,6 +105,22 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
 			if (synced?.ok !== true) process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
+			return 0;
+		}
+		if (sub === "pause" || sub === "resume") {
+			const answered = await askDaemon(homeDir, {
+				op: sub === "pause" ? "tasks_pause" : "tasks_resume",
+				id: row.taskId,
+			});
+			if (answered !== undefined) {
+				out(answered);
+				return answered.ok === true ? 0 : 1;
+			}
+			// No daemon: the ledger mark alone holds the next sweep; the worker gets no Esc.
+			const marked = sub === "pause" ? ledger.pauseTask(row.taskId) : ledger.unpauseTask(row.taskId);
+			out({ ok: true, task: marked.taskId, paused: ledger.isPaused(marked) });
+			if (sub === "pause")
+				process.stderr.write("tasks pause: daemon not reachable — paused in the ledger, no Esc sent\n");
 			return 0;
 		}
 		if (sub === "check" && (row.status === "working" || row.status === "blocked")) {

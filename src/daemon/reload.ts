@@ -14,6 +14,7 @@ export const LIVE_FIELDS = [
 	"escalationChannel",
 	"skillReviewTurns",
 	"dispatchHosts",
+	"workerOmpArgs",
 	"herdrBoard",
 	"taskAutoLand",
 	"restartNotice",
@@ -25,7 +26,8 @@ export const LIVE_FIELDS = [
 
 /** Bound when the daemon starts (tokens, socket, omp children, scheduler). */
 export const RESTART_FIELDS = [
-	"ownerSlackUserId",
+	// The owner of each platform: the adapters and the approval broker take it when they start.
+	"channels",
 	"slack",
 	"ompExecutable",
 	"workspaceDir",
@@ -52,7 +54,8 @@ export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "dashboard"
 
 /**
  * Compile-time guard: a new config field must land in one of the three lists, or `reload` never reports it.
- * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, not from a setting in it.
+ * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, and `deprecated` from which key
+ * names it uses, not from a setting in it.
  */
 type UnclassifiedField = Exclude<
 	keyof OmpbotConfig,
@@ -62,6 +65,7 @@ type UnclassifiedField = Exclude<
 	| "schemaVersion"
 	| "homeDir"
 	| "configPath"
+	| "deprecated"
 >;
 const _everyFieldClassified: [UnclassifiedField] extends [never] ? true : never = true;
 

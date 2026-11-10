@@ -13,6 +13,7 @@ const SNAPSHOT_KEYS = [
 	"turns",
 	"feedback",
 	"tasks",
+	"flows",
 	"lanes",
 	"herdr",
 	"approvals",
@@ -21,6 +22,7 @@ const SNAPSHOT_KEYS = [
 	"gates",
 	"backup",
 	"jobs",
+	"slackTeam",
 ];
 
 let home: TestHome;

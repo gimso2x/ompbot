@@ -5,6 +5,7 @@ import {
 	type OutboundMessage,
 	renderMentions,
 } from "../channel/port";
+import type { ChannelRegistry } from "../channel/registry";
 import { parseThreadRef } from "../core/normalize";
 import { redact } from "../redact";
 import type { TaskJudgement } from "./checker";
@@ -32,7 +33,7 @@ export interface TaskSlackLog {
  * reaction is not an error), then adds `to`. Slack failures are logged — a reaction never fails a task.
  */
 export async function setStatusReaction(
-	port: ChannelPort,
+	channels: ChannelRegistry,
 	log: TaskSlackLog,
 	threadRef: string,
 	to: TaskStatus,
@@ -40,6 +41,11 @@ export async function setStatusReaction(
 ): Promise<void> {
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return;
+	const port = channels.forConversation(target.channel)?.port;
+	if (port === undefined) {
+		log.warn("task_reaction_failed", { thread: threadRef, error: "no channel for this conversation" });
+		return;
+	}
 	const root = { platform: port.platform, conversationId: target.channel, messageId: target.threadTs };
 	for (const status of remove) {
 		await port.react(root, STATUS_REACTIONS[status], false).catch(() => undefined);
@@ -84,7 +90,7 @@ export function cardMessage(card: TaskCard | string, port: Pick<ChannelPort, "me
 
 /** Posts into the task thread (owner mentions rendered for the port); failures are logged and reported as `false`. */
 export async function postToThread(
-	port: ChannelPort,
+	channels: ChannelRegistry,
 	log: TaskSlackLog,
 	threadRef: string,
 	card: TaskCard | string,
@@ -92,6 +98,7 @@ export async function postToThread(
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return false;
 	try {
+		const port = channels.portFor(target.channel);
 		await port.post({ conversationId: target.channel, threadId: target.threadTs }, cardMessage(card, port));
 		return true;
 	} catch (error) {
@@ -198,12 +205,6 @@ export function buildAcceptedCard(
 	};
 }
 
-export const formatAcceptedCard = (
-	row: TaskRow,
-	spec: { goal: string; assumptions?: string | undefined },
-	link: string | undefined,
-): string => buildAcceptedCard(row, spec, link).text;
-
 const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 const MAX_SUMMARY_LINES = 3;
@@ -266,6 +267,11 @@ export function autoLandBlockers(
 	else if (failed > 0) blockers.push(`재실행 검사 실패 ${failed}/${judgement.checks.length}`);
 	if (judgement.integrityWarnings.length > 0) blockers.push(`무결성 경고 ${judgement.integrityWarnings.length}건`);
 	if (sharedCommitWarnings(row, judgement).length > 0) blockers.push("공유 커밋 증거 경고");
+	const unfinished = (judgement.steps ?? []).filter((step) => !step.done);
+	if (unfinished.length > 0) {
+		const names = unfinished.map((s) => s.id).join(", ");
+		blockers.push(`PROGRESS 미완료 단계 ${unfinished.length}개(${names})`);
+	}
 	return blockers;
 }
 
@@ -462,9 +468,6 @@ export function buildLostCard(row: TaskRow, ownerUserId: string, link?: string):
 	};
 }
 
-export const formatLostNotice = (row: TaskRow, ownerUserId: string, link?: string): string =>
-	buildLostCard(row, ownerUserId, link).text;
-
 /** Screen lines a wait notice carries (the last non-empty ones), and the length each is cut to. */
 const WAIT_SCREEN_LINES = 12;
 const WAIT_SCREEN_LINE_MAX = 200;
@@ -554,13 +557,6 @@ export function buildNudgeLimitCard(
 	};
 }
 
-export const formatNudgeLimitNotice = (
-	row: TaskRow,
-	problems: readonly string[],
-	ownerUserId: string,
-	link?: string,
-): string => buildNudgeLimitCard(row, problems, ownerUserId, link).text;
-
 /** A task left in review: the owner hears it again every 24 hours until it is closed or resumed. */
 export function buildReviewWaitingCard(row: TaskRow, hours: number, ownerUserId: string, link?: string): TaskCard {
 	const howTo = `*답하는 법*: "머지해"라고 답하거나 고칠 점을 적어 주세요. 그만두려면 \`tasks close ${row.taskId} --as cancelled\`.`;
@@ -578,9 +574,6 @@ export function buildReviewWaitingCard(row: TaskRow, hours: number, ownerUserId:
 		...(note === undefined ? {} : { note }),
 	};
 }
-
-export const formatReviewWaitingNotice = (row: TaskRow, hours: number, ownerUserId: string, link?: string): string =>
-	buildReviewWaitingCard(row, hours, ownerUserId, link).text;
 
 export const formatReadFailureNotice = (row: TaskRow, failures: number, error: string): string =>
 	`⚠️ ${row.taskId} 상태 문서를 ${failures}회 연속 읽지 못했습니다 (${hostLabelOf(row)}): ${error.slice(0, 160)}`;

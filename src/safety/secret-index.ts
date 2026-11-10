@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { OmpbotConfig } from "../config";
-import { readSlackTokens } from "../config";
+import { readDiscordToken, readSlackTokens } from "../config";
 import type { Logger } from "../log";
 import { indexSecretValue } from "../redact";
 
@@ -78,6 +78,13 @@ export function indexRuntimeSecrets(
 		index(tokens.appToken);
 	} catch {
 		// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
+	}
+	if (config.channels.discord !== undefined) {
+		try {
+			index(readDiscordToken(config));
+		} catch {
+			// Same as above: doctor reports it.
+		}
 	}
 
 	known += indexEnvSecrets(env);

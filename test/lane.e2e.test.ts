@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaneHistoryEntry, LaneMeta, LaneStatus } from "../src/lanes/status";
+import { kstDay } from "../src/tasks/docs";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import {
 	expectNoProcessesMentioning,
@@ -18,7 +19,7 @@ import { pickE2eModel } from "./helpers/omp-model";
 
 /**
  * Work-lane E2E: a REAL omp lane behind the real daemon process, file-backed fake Slack, temp OMPBOT_HOME with FAKE
- * tokens and a throwaway git repository. Costs tokens: OMPBOT_E2E_OMP=1 only. Judged by the registry, git and the
+ * tokens and a throwaway git repository (the lane works in its own worktree beside it). Costs tokens: OMPBOT_E2E_OMP=1 only. Judged by the registry, git and the
  * delivered Slack calls; waits are on daemon log events and file changes, never fixed sleeps.
  */
 const enabled = process.env.OMPBOT_E2E_OMP === "1";
@@ -78,6 +79,9 @@ async function makeRepo(blockCommits: boolean): Promise<string> {
 }
 
 const realRepoPath = (path: string): string => Bun.spawnSync(["realpath", path]).stdout.toString().trim();
+
+/** The worktree the first lane of a fresh bot home gets beside `repo` (`<repo>-l-<today KST>-01`). */
+const firstLaneWorktree = (repo: string): string => `${repo}-l-${kstDay(Date.now())}-01`;
 
 function newHome(): TestHome {
 	const made = makeHome("ompbot-e2e-lane-", REAL);
@@ -197,27 +201,32 @@ describe.skipIf(!enabled || REAL === undefined)("work lane with a real omp", () 
 		async () => {
 			home = newHome();
 			const repo = await makeRepo(false);
+			const worktree = firstLaneWorktree(repo);
 			const lane = await startLane(
 				"readme-line",
 				repo,
 				[
-					`Work only in ${repo}. Append exactly one line "lane was here" to README.md, then run`,
+					`Work only in ${worktree}. Append exactly one line "lane was here" to README.md, then run`,
 					'`git add README.md` and `git commit -m "add lane line"` (never use `git add -A`, `git add .` or `git commit -a`).',
-					`Then call the host tool ompbot_claim_done with repo=${repo}, commit=<the sha printed by \`git rev-parse HEAD\`> and a one-line summary.`,
+					`Then call the host tool ompbot_claim_done with repo=${worktree}, commit=<the sha printed by \`git rev-parse HEAD\`> and a one-line summary.`,
 				].join("\n"),
 			);
 			await lane.daemon.waitLog(/event=lane_closed lane=readme-line\b/, EVENT_TIMEOUT_MS);
 			await lane.daemon.waitLog(/event=lane_rendered lane=readme-line root="✅/, EVENT_TIMEOUT_MS);
 			await lane.stop();
 
-			const head = await git(repo, "rev-parse", "HEAD");
+			const head = await git(worktree, "rev-parse", "HEAD");
 			const snapshot = readLane(home.dir, "readme-line");
 			expect(snapshot.status).toBe("closed");
+			expect(snapshot.meta.worktree).toBe(worktree);
 			const closed = snapshot.history.filter((entry) => entry.event === "closed");
 			expect(closed.map((entry) => entry.sha)).toEqual([head]);
 			expect(snapshot.meta.sha).toBe(head);
+			expect(await git(worktree, "status", "--porcelain")).toBe("");
+			expect(readFileSync(join(worktree, "README.md"), "utf8")).toContain("lane was here");
+			// The repository's own checkout is untouched: the work is on the lane branch only.
 			expect(await git(repo, "status", "--porcelain")).toBe("");
-			expect(readFileSync(join(repo, "README.md"), "utf8")).toContain("lane was here");
+			expect(readFileSync(join(repo, "README.md"), "utf8")).not.toContain("lane was here");
 
 			const rootTs = snapshot.threadRef.slice(snapshot.threadRef.indexOf(":") + 1);
 			const texts = rootTexts(lane.log, rootTs);
@@ -233,12 +242,13 @@ describe.skipIf(!enabled || REAL === undefined)("work lane with a real omp", () 
 			home = newHome();
 			// Commits are refused by a hook, so the lane cannot repair the claim and close itself while the test looks.
 			const repo = await makeRepo(true);
+			const worktree = firstLaneWorktree(repo);
 			const lane = await startLane(
 				"readme-dirty",
 				repo,
 				[
-					`Work only in ${repo}. Append exactly one line "dirty line" to README.md. Do NOT commit anything.`,
-					`Then immediately call the host tool ompbot_claim_done with repo=${repo}, commit=<the sha printed by \`git rev-parse HEAD\`> and the summary "edited README".`,
+					`Work only in ${worktree}. Append exactly one line "dirty line" to README.md. Do NOT commit anything.`,
+					`Then immediately call the host tool ompbot_claim_done with repo=${worktree}, commit=<the sha printed by \`git rev-parse HEAD\`> and the summary "edited README".`,
 					"If the claim is rejected, do not change anything else: just report the rejection.",
 				].join("\n"),
 			);
@@ -255,7 +265,7 @@ describe.skipIf(!enabled || REAL === undefined)("work lane with a real omp", () 
 			const rejected = snapshot.history.filter((entry) => entry.event === "not_done");
 			expect(rejected.length).toBeGreaterThanOrEqual(1);
 			expect(rejected[0]?.detail?.length ?? 0).toBeGreaterThan(0);
-			expect(await git(repo, "status", "--porcelain")).toContain("README.md");
+			expect(await git(worktree, "status", "--porcelain")).toContain("README.md");
 
 			const rootTs = snapshot.threadRef.slice(snapshot.threadRef.indexOf(":") + 1);
 			const texts = rootTexts(lane.log, rootTs);

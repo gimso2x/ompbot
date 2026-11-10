@@ -98,6 +98,8 @@ export interface TaskJudgement {
 	/** The decision request written beside `status: blocked` (each part `""` when not written). */
 	decision: { question: string; recommend: string; impact: string };
 	current: string;
+	/** PROGRESS.md `restated` as written (`""` when absent); posted once per value, never part of the judgement. */
+	restated: string;
 	/** Per-AC evidence lines (`commit …`, `test …`, `file …`) as written, for the report. */
 	evidence: Record<string, string[]>;
 	/** outcome.md `## 요약` lines as parsed (`[]` without the file); shown on the card, never part of the judgement. */
@@ -250,6 +252,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 			impact: progress?.impact ?? "",
 		},
 		current: progress?.current ?? "",
+		restated: progress?.restated ?? "",
 		evidence,
 		summary: outcome?.summary ?? [],
 		checks: checkRun?.results ?? [],

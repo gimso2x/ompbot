@@ -1,5 +1,59 @@
 import { describe, expect, test } from "bun:test";
-import { type ChatOriginRef, chatOriginKey, chatPlatformOf, parseChatOrigin } from "../src/core/origin-key";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { platformOfThreadRef } from "../src/core/normalize";
+import {
+	type ChatOriginRef,
+	chatOriginKey,
+	chatPlatformOf,
+	GRAMMAR,
+	parseChatOrigin,
+	platformOfConversationId,
+} from "../src/core/origin-key";
+
+describe("platformOfConversationId / platformOfThreadRef", () => {
+	test.each([
+		["C0ESCALATE1", "slack"],
+		["D1", "slack"],
+		["G0123", "slack"],
+		["U1", "slack"],
+		["123456789012345678", "discord"],
+		["", undefined],
+		["-1001", undefined],
+		["c1", undefined],
+		["C-1", undefined],
+	])("%p → %p", (id, platform) => {
+		expect(platformOfConversationId(id)).toBe(platform as "slack" | "discord" | undefined);
+	});
+
+	test("a thread ref's conversation decides its platform; a ref without a colon has none", () => {
+		expect(platformOfThreadRef("C1:1.2")).toBe("slack");
+		expect(platformOfThreadRef("D1:-")).toBe("slack");
+		expect(platformOfThreadRef("111:222")).toBe("discord");
+		expect(platformOfThreadRef("nocolon")).toBeUndefined();
+	});
+
+	test("a Slack origin whose conversation starts with a digit is not a Slack key", () => {
+		expect(parseChatOrigin("slack/ch/123")).toBeUndefined();
+		expect(parseChatOrigin("slack/dm/1D")).toBeUndefined();
+	});
+
+	test("the platform answer is GRAMMAR's conversation pattern itself, so parseChatOrigin and it never disagree", () => {
+		for (const id of ["C0ESCALATE1", "D1", "U1", "123456789012345678", "", "-1001", "c1", "C-1", "1D"]) {
+			const platform = platformOfConversationId(id);
+			expect(GRAMMAR.slack.conversation.test(id)).toBe(platform === "slack");
+			expect(GRAMMAR.discord.conversation.test(id)).toBe(platform === "discord");
+			if (platform !== undefined) expect(parseChatOrigin(`${platform}/dm/${id}`)?.platform).toBe(platform);
+		}
+	});
+
+	test("no file in src defines its own Slack conversation-id pattern", () => {
+		const root = join(import.meta.dir, "..", "src");
+		const files = (readdirSync(root, { recursive: true }) as string[]).filter((file) => file.endsWith(".ts"));
+		const owners = files.filter((file) => readFileSync(join(root, file), "utf8").includes("/^[A-Z][A-Z0-9]+$/"));
+		expect(owners).toEqual(["core/origin-key.ts"]);
+	});
+});
 
 describe("parseChatOrigin / chatOriginKey", () => {
 	const valid: Array<[string, ChatOriginRef]> = [

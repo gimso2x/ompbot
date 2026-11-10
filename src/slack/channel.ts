@@ -1,17 +1,11 @@
 import type { ActionButton, ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../channel/port";
+import { cutCodePointSafe } from "../channel/text";
 import type { SlackTransport } from "./transport";
 
 /** Slack caps a `header` at 150 characters, a section field at 2,000 and a section at 10 fields. */
 const HEADER_LIMIT = 150;
 const FIELD_LIMIT = 2_000;
 const MAX_FIELDS = 10;
-
-/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
-function cut(text: string, limit: number): string {
-	if (text.length <= limit) return text;
-	const last = text.charCodeAt(limit - 1);
-	return text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit);
-}
 
 function actionsBlock(buttons: readonly ActionButton[]): unknown {
 	return {
@@ -44,7 +38,12 @@ function blocksOf(msg: OutboundMessage): readonly unknown[] | undefined {
 	return [
 		...(msg.title === undefined
 			? []
-			: [{ type: "header", text: { type: "plain_text", text: cut(msg.title, HEADER_LIMIT), emoji: true } }]),
+			: [
+					{
+						type: "header",
+						text: { type: "plain_text", text: cutCodePointSafe(msg.title, HEADER_LIMIT), emoji: true },
+					},
+				]),
 		{ type: "section", text: { type: "mrkdwn", text: msg.body ?? msg.text } },
 		...(fields.length === 0
 			? []
@@ -53,7 +52,7 @@ function blocksOf(msg: OutboundMessage): readonly unknown[] | undefined {
 						type: "section",
 						fields: fields.map((field) => ({
 							type: "mrkdwn",
-							text: cut(`*${field.label}*\n${field.value}`, FIELD_LIMIT),
+							text: cutCodePointSafe(`*${field.label}*\n${field.value}`, FIELD_LIMIT),
 						})),
 					},
 				]),

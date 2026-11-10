@@ -8,6 +8,7 @@ import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import type { HistoryMessage, SlackMessageEvent } from "../src/slack/transport";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -34,7 +35,7 @@ describe("daemon: Slack thread context", () => {
 				mentionFreeChannels: [CH],
 				peerBots: [{ userId: PEER, name: "떡" }],
 			},
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({
 				sink: (line) => {

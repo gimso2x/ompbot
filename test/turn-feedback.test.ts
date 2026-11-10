@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DeliverySource } from "../src/channel/types";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { type DeliverySource, SlackAdapter } from "../src/slack/adapter";
+import { SlackAdapter } from "../src/slack/adapter";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackReactionEvent } from "../src/slack/transport";
@@ -44,7 +46,7 @@ describe("owner reaction on a bot answer → turn feedback (daemon)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log,
 			ompVersion: "omp-test 0",
 			bootId: "kernel-boot-id",

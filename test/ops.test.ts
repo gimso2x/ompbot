@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { STALL_STATUS_TEXT } from "../src/channel/text";
 import { doctorCommand } from "../src/cli/index";
 import {
 	isProviderLimit,
@@ -46,8 +47,8 @@ import { collectGates, INBOUND_STARVATION_MS, SWEEP_STALLED_MS, TURNS_FAILING_WI
 import { gcSessions } from "../src/ops/gc";
 import { LOG_FILES, LOG_MAX_BYTES, LogDirError, openLogSink, rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { STALL_STATUS_TEXT } from "../src/slack/format";
 import type { SlackTransport } from "../src/slack/transport";
 import { ALERT_INCIDENT_REPEAT_MS, type Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -725,7 +726,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -914,7 +915,7 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		const failPrompts = options.failPrompts ?? 0;
 		daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -1221,7 +1222,7 @@ describe("ompbot doctor claude agent checks", () => {
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				ownerSlackUserId: "UOWNER0",
+				channels: { slack: { ownerUserId: "UOWNER0" } },
 				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 				ompExecutable: process.execPath,
 				workspaceDir: "workspace",
@@ -1289,7 +1290,7 @@ describe("ompbot doctor omp runtime check", () => {
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				ownerSlackUserId: "UOWNER0",
+				channels: { slack: { ownerUserId: "UOWNER0" } },
 				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 				ompExecutable,
 				workspaceDir: "workspace",
@@ -1322,7 +1323,7 @@ describe("ompbot doctor omp runtime check", () => {
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				ownerSlackUserId: "UOWNER0",
+				channels: { slack: { ownerUserId: "UOWNER0" } },
 				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 				ompExecutable: folder,
 				workspaceDir: "workspace",
@@ -1569,7 +1570,7 @@ describe("ompbot backup bundle size cap (config maxBundleBytes + --max-bundle-by
 			join(home.dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				ownerSlackUserId: OWNER,
+				channels: { slack: { ownerUserId: OWNER } },
 				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 				ompExecutable: join(home.dir, "fake-omp"),
 				workspaceDir: "workspace",
@@ -1599,7 +1600,7 @@ describe("ompbot backup bundle size cap (config maxBundleBytes + --max-bundle-by
 			join(home.dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				ownerSlackUserId: OWNER,
+				channels: { slack: { ownerUserId: OWNER } },
 				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 				ompExecutable: join(home.dir, "fake-omp"),
 				workspaceDir: "workspace",

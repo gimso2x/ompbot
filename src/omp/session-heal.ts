@@ -34,21 +34,6 @@ export function newestSessionFile(sessionDir: string): string | undefined {
 	return newest?.file;
 }
 
-/** The model of the last `model_change` record of a session file: the value omp's session restore resolves first. */
-export function lastModelChange(file: string): string | undefined {
-	let model: string | undefined;
-	for (const line of readFileSync(file, "utf8").split("\n")) {
-		if (line === "") continue;
-		try {
-			const record = JSON.parse(line) as { type?: unknown; model?: unknown } | null;
-			if (record?.type === "model_change" && typeof record.model === "string") model = record.model;
-		} catch {
-			// a torn trailing line: omp skips unparsable records too
-		}
-	}
-	return model;
-}
-
 /** `line` with its `"model"` value swapped; a full re-stringify only when the exact needle is not unique. */
 function rewriteModel(line: string, from: string, to: string): string {
 	const needle = `"model":${JSON.stringify(from)}`;

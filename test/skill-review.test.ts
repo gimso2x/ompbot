@@ -33,6 +33,7 @@ import {
 	savePendingProposals,
 	skillDirOf,
 } from "../src/review/skills";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
@@ -496,7 +497,7 @@ describe("!distill (daemon)", () => {
 		const clock = { now: () => Date.now() };
 		const started = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({
 				sink: (line) => {

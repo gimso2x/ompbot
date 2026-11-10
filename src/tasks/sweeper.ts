@@ -1,10 +1,11 @@
-import type { ChannelPort as SlackTransport } from "../channel/port";
-import type { HerdrAgentStatusResult } from "../dispatch/omp";
+import { createHash } from "node:crypto";
+import type { ChannelRegistry } from "../channel/registry";
+import { dispatchEnv, HERDR_INTERRUPT_WAIT_MS, type HerdrAgentStatusResult, type ProcessRunner } from "../dispatch/omp";
 import type { FreezeState } from "../ops/freeze";
 import type { TaskJudgement } from "./checker";
 import { digest, summarizeJudgement } from "./checker";
 import type { TaskCheckCache, TaskEvaluation } from "./evaluate";
-import type { TaskLedger, TaskRow } from "./ledger";
+import { type TaskLedger, type TaskRow, type TaskTransitionRow, taskPausedAt } from "./ledger";
 import {
 	type AutoLandPolicy,
 	autoLandBlockers,
@@ -25,6 +26,7 @@ import {
 	type TaskSlackLog,
 	unmetLines,
 } from "./notify";
+import { restatedHash } from "./resume-check";
 
 /** Sweep cadence of the daemon. */
 export const TASK_SWEEP_MS = 5 * 60_000;
@@ -39,6 +41,55 @@ export const READ_FAILURE_NOTICE_AFTER = 3;
 const NUDGE_HEAD =
 	"Outcome 판정이 아직 미도달입니다. 아래를 채우거나, 진행할 수 없으면 PROGRESS.md status를 blocked로 바꾸고 사유를 적으세요.";
 
+/** A task's own docs never count as a file overlap: every task writes its own `docs/tasks/<ID>/`. */
+const TASK_DOCS_PREFIX = "docs/tasks/";
+/** Shared paths an overlap notice names before it counts the rest. */
+const OVERLAP_PATHS_SHOWN = 5;
+
+/**
+ * Files a local task worktree changes against its base: the branch diff since the merge base plus uncommitted and
+ * untracked files, `docs/tasks/**` left out, sorted. The base is `origin/HEAD`, else `main`, else `master`.
+ */
+export async function taskChangedPaths(
+	worktree: string,
+	run: ProcessRunner,
+): Promise<{ ok: true; paths: string[] } | { ok: false; reason: string }> {
+	const git = async (...args: string[]): Promise<string | undefined> => {
+		const result = await run(["git", "-C", worktree, ...args], {
+			timeoutMs: 10_000,
+			stdoutCap: 1_000_000,
+			env: dispatchEnv(process.env),
+		});
+		return result.code === 0 && !result.timedOut ? result.stdout : undefined;
+	};
+	let base = (await git("symbolic-ref", "--short", "refs/remotes/origin/HEAD"))?.trim();
+	for (const candidate of ["main", "master"]) {
+		if (base !== undefined) break;
+		if ((await git("rev-parse", "--verify", "--quiet", `${candidate}^{commit}`)) !== undefined) base = candidate;
+	}
+	if (base === undefined) return { ok: false, reason: "no_base_branch" };
+	const mergeBase = (await git("merge-base", base, "HEAD"))?.trim();
+	if (mergeBase === undefined) return { ok: false, reason: "merge_base_failed" };
+	const diff = await git("diff", "--name-only", "-z", mergeBase);
+	if (diff === undefined) return { ok: false, reason: "diff_failed" };
+	const status = await git("status", "--porcelain", "-z", "--untracked-files=all");
+	if (status === undefined) return { ok: false, reason: "status_failed" };
+	const paths = new Set(diff.split("\0").filter((path) => path !== ""));
+	// `XY path` records; a rename or copy is followed by its source path as its own record.
+	const records = status.split("\0");
+	for (let i = 0; i < records.length; i++) {
+		const record = records[i] ?? "";
+		if (record === "") continue;
+		paths.add(record.slice(3));
+		if (record[0] === "R" || record[0] === "C") {
+			i += 1;
+			const source = records[i];
+			if (source) paths.add(source);
+		}
+	}
+	return { ok: true, paths: [...paths].filter((path) => !path.startsWith(TASK_DOCS_PREFIX)).sort() };
+}
+
 /** Where the nudge count starts: the latest `resume:<ms>` mark of `resumeTask`, else the registration. */
 function nudgeBase(row: TaskRow): number {
 	const resumes = Object.keys(row.notices)
@@ -46,6 +97,21 @@ function nudgeBase(row: TaskRow): number {
 		.map((key) => Number(key.slice("resume:".length)))
 		.filter((at) => Number.isFinite(at));
 	return Math.max(row.createdAt, ...resumes);
+}
+
+/**
+ * When the task was last resumed: the latest `resume:<ms>` mark of `resumeTask`, or a `resume dispatch` transition of
+ * the ledger (resumes marked before the marks existed); `undefined` for a task never resumed.
+ */
+function lastResumeAt(row: TaskRow, history: readonly TaskTransitionRow[]): number | undefined {
+	const resumes = [
+		...Object.keys(row.notices)
+			.filter((key) => key.startsWith("resume:"))
+			.map((key) => Number(key.slice("resume:".length)))
+			.filter((at) => Number.isFinite(at)),
+		...history.filter((entry) => entry.reason === "resume dispatch").map((entry) => entry.at),
+	];
+	return resumes.length === 0 ? undefined : Math.max(...resumes);
 }
 
 /** Unmet-condition nudges recorded since `nudgeBase`. */
@@ -69,13 +135,18 @@ export interface TaskSweepDeps {
 	agentStatus(row: TaskRow): Promise<HerdrAgentStatusResult>;
 	/** The agent's screen tail (`herdr agent read`), read only for a wait notice that is about to be posted. */
 	readAgent(row: TaskRow): Promise<{ ok: boolean; output?: string; error?: string }>;
-	transport: SlackTransport;
+	channels: ChannelRegistry;
 	/** The task's herdr board card link for the reached/blocked/stale notices; absent → no board footer. */
 	boardLink?(row: TaskRow): Promise<string | undefined>;
 	/** Live `taskAutoLand` (maxRisk defaulted); `undefined` (or absent) → every reached task gets the 머지 question. */
 	autoLandPolicy?(): AutoLandPolicy | undefined;
 	/** Whether a local task's repository shares its git common directory with one of `repos`. Never asked for a remote task. */
 	repoMatches?(row: TaskRow, repos: readonly string[]): Promise<boolean>;
+	/**
+	 * Files a local task changes (`taskChangedPaths`), for the overlap check between active tasks of one repository;
+	 * `undefined` leaves the task out of this sweep's check. Never asked for a remote task. Absent = no overlap check.
+	 */
+	changedPaths?(row: TaskRow): Promise<string[] | undefined>;
 	/** Puts "머지해" into the task thread as the owner; true = it went in. */
 	autoLand?(row: TaskRow): Promise<boolean>;
 	ownerUserId: string;
@@ -108,6 +179,8 @@ export class TaskSweeper {
 	readonly #seenUpdated = new Map<string, number>();
 	/** Tasks whose held reminder was already logged during the current freeze (one `task_remind_frozen` per freeze). */
 	readonly #remindHeld = new Set<string>();
+	/** `<task>:<pausedAt>` of the owner pauses already logged as holding a prompt (one `task_remind_paused` per pause). */
+	readonly #pauseLogged = new Set<string>();
 	/** `[check: …]` results per task HEAD (in memory: a restart runs the checks again). */
 	readonly #checks: TaskCheckCache = new Map();
 	/**
@@ -115,6 +188,10 @@ export class TaskSweeper {
 	 * owner once more about a wait that is still going on). The wait notice is keyed by it.
 	 */
 	readonly #waitingSince = new Map<string, number>();
+	/** Tasks whose agent was sent a prompt in the current sweep: at most one prompt per agent per sweep. */
+	readonly #prompted = new Set<string>();
+	/** herdr status read for each task in the current sweep, shared by the reminder and the overlap prompt. */
+	readonly #sweepAgents = new Map<string, HerdrAgentStatusResult>();
 
 	constructor(deps: TaskSweepDeps) {
 		this.#deps = deps;
@@ -127,6 +204,8 @@ export class TaskSweeper {
 	async sweep(): Promise<TaskCheckResult[]> {
 		const results: TaskCheckResult[] = [];
 		const judged = new Set<string>();
+		this.#prompted.clear();
+		this.#sweepAgents.clear();
 		for (const row of this.#deps.ledger.listActive()) {
 			judged.add(row.taskId);
 			try {
@@ -134,6 +213,11 @@ export class TaskSweeper {
 			} catch (error) {
 				this.#deps.log.warn("task_sweep_failed", { task: row.taskId, error: String(error) });
 			}
+		}
+		try {
+			await this.#overlaps();
+		} catch (error) {
+			this.#deps.log.warn("task_overlap_failed", { error: String(error) });
 		}
 		for (const row of this.#deps.ledger.listInReview()) {
 			if (judged.has(row.taskId)) continue; // reached in this very pass
@@ -169,7 +253,7 @@ export class TaskSweeper {
 	async syncReaction(taskId: string): Promise<boolean> {
 		const row = this.#deps.ledger.get(taskId);
 		if (row === undefined) return false;
-		await setStatusReaction(this.#deps.transport, this.#deps.log, row.threadRef, row.status);
+		await setStatusReaction(this.#deps.channels, this.#deps.log, row.threadRef, row.status);
 		return true;
 	}
 
@@ -218,6 +302,7 @@ export class TaskSweeper {
 			}
 			if (progressAt > (row.progressAt ?? 0)) ledger.setProgressAt(row.taskId, progressAt);
 		}
+		await this.#restated(row, judgement, actions);
 		if (judgement.specChanged && ledger.recordNotice(row.taskId, `spec:${judgement.specKey}`)) {
 			await this.#post(row, formatSpecChangedNotice(row));
 			actions.push("spec-change warning");
@@ -228,7 +313,7 @@ export class TaskSweeper {
 			if (status === "working") {
 				ledger.transition(row.taskId, "blocked", "bot", judgement.blockedReason || "PROGRESS status: blocked");
 				status = "blocked";
-				await setStatusReaction(this.#deps.transport, log, row.threadRef, "blocked");
+				await setStatusReaction(this.#deps.channels, log, row.threadRef, "blocked");
 				actions.push("working → blocked, 🚧");
 			}
 			// Keyed by the block itself (its working → blocked transition): a resume and a new block report again,
@@ -243,14 +328,14 @@ export class TaskSweeper {
 		if (status === "blocked") {
 			ledger.transition(row.taskId, "working", "bot", "PROGRESS status: working");
 			status = "working";
-			await setStatusReaction(this.#deps.transport, log, row.threadRef, "working");
+			await setStatusReaction(this.#deps.channels, log, row.threadRef, "working");
 			actions.push("blocked → working, ⏳");
 		}
 
 		if (judgement.reached) {
 			ledger.transition(row.taskId, "review", "bot", `outcome reached AC ${judgement.acChecked}/${judgement.acTotal}`);
 			status = "review";
-			await setStatusReaction(this.#deps.transport, log, row.threadRef, "review");
+			await setStatusReaction(this.#deps.channels, log, row.threadRef, "review");
 			actions.push("working → review, 🔍");
 			if (ledger.recordNotice(row.taskId, `reached:${judgement.reachKey}`)) {
 				await this.#reachedNotice(row, judgement, actions);
@@ -260,6 +345,38 @@ export class TaskSweeper {
 
 		await this.#staleness(row, now, actions, judgement);
 		return this.#result(row, status, judgement, actions);
+	}
+
+	/**
+	 * The agent's `restated` line (task / first next / done condition, written first on a resume) goes to the thread
+	 * once per value. Unlike the other notices it is recorded only after the post went out, so a failed post is tried
+	 * again on the next sweep. A resume after which PROGRESS.md moved on with `restated` empty or as it was before the
+	 * resume (`restated-before:<resume ms>:<hash>`, kept by `resumeTask`) is told once.
+	 */
+	async #restated(row: TaskRow, judgement: TaskJudgement, actions: string[]): Promise<void> {
+		const { ledger, log } = this.#deps;
+		const { restated } = judgement;
+		const posted = `restated:${restatedHash(restated)}`;
+		if (restated !== "" && !(posted in ledger.require(row.taskId).notices)) {
+			if (await this.#post(row, `🔁 재개 이해: ${restated}`)) {
+				ledger.recordNotice(row.taskId, posted);
+				actions.push("restated posted");
+			} else {
+				log.warn("task_restated_post_failed", { task: row.taskId, error: "post failed (see task_post_failed)" });
+			}
+		}
+		const fresh = ledger.require(row.taskId);
+		const resumedAt = lastResumeAt(fresh, ledger.history(row.taskId));
+		if (resumedAt === undefined || judgement.updatedAtMs === undefined || judgement.updatedAtMs <= resumedAt) return;
+		const beforePrefix = `restated-before:${resumedAt}:`;
+		const before = Object.keys(fresh.notices)
+			.find((key) => key.startsWith(beforePrefix))
+			?.slice(beforePrefix.length);
+		const unchanged = restated === "" || before === restatedHash(restated);
+		if (unchanged && ledger.recordNotice(row.taskId, `restated-missing:${resumedAt}`)) {
+			await this.#post(row, "⚠️ 재개 뒤 PROGRESS는 갱신됐지만 재개 이해(restated)가 없습니다");
+			actions.push("restated missing notice");
+		}
 	}
 
 	/**
@@ -278,9 +395,12 @@ export class TaskSweeper {
 		}
 		// A remote task's repo path means nothing to the local git, so it is never looked up.
 		const repoMatched = row.host === null && (await this.#repoMatches(row, policy.repos));
-		// A freeze stops every autonomous action, and merging unasked is one: the owner is asked instead.
+		// A freeze stops every autonomous action, and merging unasked is one: the owner is asked instead. So does an
+		// owner pause of this one task.
 		const blockers = [
 			...(this.#deps.frozen?.() === undefined ? [] : ["동결 중"]),
+			// Re-read: the owner may have paused it while this sweep judged (the checks can take minutes).
+			...(this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId)) ? ["멈춤 중"] : []),
 			...autoLandBlockers(row, judgement, policy, repoMatched),
 		];
 		if (blockers.length > 0) {
@@ -326,8 +446,12 @@ export class TaskSweeper {
 		const age = now - base;
 		// A frozen bot sends the agent nothing and does not mark the task reminded: the reminder follows the unfreeze.
 		const frozen = this.#deps.frozen?.() !== undefined;
+		// An owner pause of this task holds the same prompts plus the stale notice, until the unpause.
+		const pausedAt = taskPausedAt(fresh);
+		const held = frozen || pausedAt !== undefined;
 		// One herdr question per working task per sweep, shared by the LOST check and the reminder below.
 		const agent = await this.#agentStatus(row);
+		this.#sweepAgents.set(row.taskId, agent);
 		const status = agent.ok ? agent.status : undefined;
 		// The LOST notice is for the owner, not the agent, so a freeze does not hold it. A resume moves the base.
 		if (status === "gone" && ledger.recordNotice(row.taskId, `lost:${base}`)) {
@@ -347,12 +471,30 @@ export class TaskSweeper {
 		} else if (agent.ok) {
 			this.#waitingSince.delete(row.taskId);
 		}
+		// The worker of a paused task is herdr-working: the Esc did not hold (or it started again). Told once per pause,
+		// and not while the pause's own Esc may still be waiting for the agent to stop.
+		if (
+			pausedAt !== undefined &&
+			now - pausedAt > HERDR_INTERRUPT_WAIT_MS &&
+			status === "working" &&
+			ledger.recordNotice(row.taskId, `pausework:${pausedAt}`)
+		) {
+			await this.#post(
+				row,
+				`⚠️ 멈춘 TASK ${row.taskId}의 워커가 작업 중입니다(herdr working) — Esc가 듣지 않았을 수 있습니다. 스레드에 \`멈춰\`라고 다시 쓰거나 \`ompbot tasks pause ${row.taskId}\`로 Esc를 다시 보내세요.`,
+			);
+			actions.push("working-while-paused notice");
+		}
 		const stale = age >= STALE_REMIND_MS && (fresh.remindedAt === null || now - fresh.remindedAt >= STALE_REMIND_MS);
-		const due = !frozen && stale;
+		const due = !held && stale;
 		if (!frozen) this.#remindHeld.delete(row.taskId);
 		else if (stale && status !== "gone" && !this.#remindHeld.has(row.taskId)) {
 			this.#remindHeld.add(row.taskId);
 			this.#deps.log.info("task_remind_frozen", { task: row.taskId });
+		}
+		if (pausedAt !== undefined && !this.#pauseLogged.has(`${row.taskId}:${pausedAt}`)) {
+			this.#pauseLogged.add(`${row.taskId}:${pausedAt}`);
+			this.#deps.log.info("task_remind_paused", { task: row.taskId, pausedAt });
 		}
 		// An agent that ended its turn short of the outcome hears why at once, once per distinct set of unmet conditions.
 		// It takes the place of the 30-minute reminder in that sweep: at most one prompt per sweep reaches the agent.
@@ -368,7 +510,7 @@ export class TaskSweeper {
 			);
 			actions.push("nudge limit notice");
 		}
-		const nudge = !frozen && wantsNudge && !capped;
+		const nudge = !held && wantsNudge && !capped;
 		if (nudge) {
 			if (await this.#remind(row, [NUDGE_HEAD, ...unmetLines(judgement.problems)].join("\n"))) {
 				ledger.recordNotice(row.taskId, unmetKey);
@@ -390,10 +532,92 @@ export class TaskSweeper {
 				actions.push("stale reminder to agent");
 			}
 		}
-		if (age >= STALE_NOTICE_MS && ledger.recordNotice(row.taskId, `stale2h:${base}`)) {
+		if (pausedAt === undefined && age >= STALE_NOTICE_MS && ledger.recordNotice(row.taskId, `stale2h:${base}`)) {
 			await this.#post(row, formatStaleNotice(row, Math.floor(age / 60_000), await this.#boardLink(row)));
 			actions.push("stale notice");
 		}
+	}
+
+	/**
+	 * File overlap between the active local tasks of one repository (same path or git common dir). Each pair sharing a
+	 * file outside `docs/tasks/**` tells both task threads once per set of shared paths (frozen or not: it is for the
+	 * owner) and both agents once, recorded only after the prompt went out.
+	 */
+	async #overlaps(): Promise<void> {
+		const { changedPaths, ledger, log } = this.#deps;
+		if (changedPaths === undefined) return;
+		// A remote task's worktree is on another machine: never read here.
+		const local = ledger.listActive().filter((row) => row.host === null);
+		const pairs: Array<[TaskRow, TaskRow]> = [];
+		for (const [i, a] of local.entries()) {
+			for (const b of local.slice(i + 1)) {
+				if (a.repo === b.repo || (await this.#repoMatches(a, [b.repo]))) pairs.push([a, b]);
+			}
+		}
+		const paths = new Map<string, ReadonlySet<string> | undefined>();
+		const pathsOf = async (row: TaskRow): Promise<ReadonlySet<string> | undefined> => {
+			if (!paths.has(row.taskId)) {
+				let read: string[] | undefined;
+				try {
+					read = await changedPaths(row);
+				} catch (error) {
+					log.warn("task_changed_paths_failed", { task: row.taskId, error: String(error) });
+				}
+				paths.set(row.taskId, read === undefined ? undefined : new Set(read));
+			}
+			return paths.get(row.taskId);
+		};
+		for (const [a, b] of pairs) {
+			const ofA = await pathsOf(a);
+			const ofB = await pathsOf(b);
+			if (ofA === undefined || ofB === undefined) continue;
+			const shared = [...ofA].filter((path) => ofB.has(path) && !path.startsWith(TASK_DOCS_PREFIX)).sort();
+			if (shared.length > 0) await this.#overlapNotice(a, b, shared);
+		}
+	}
+
+	async #overlapNotice(a: TaskRow, b: TaskRow, shared: string[]): Promise<void> {
+		const { ledger, log } = this.#deps;
+		const hash = createHash("sha1").update(shared.join("\n")).digest("hex").slice(0, 8);
+		const rest = shared.length - OVERLAP_PATHS_SHOWN;
+		const shown = `${shared.slice(0, OVERLAP_PATHS_SHOWN).join(", ")}${rest > 0 ? ` 외 ${rest}개` : ""}`;
+		const pair: Array<[TaskRow, TaskRow]> = [
+			[a, b],
+			[b, a],
+		];
+		for (const [own, other] of pair) {
+			if (!ledger.recordNotice(own.taskId, `overlap:${other.taskId}:${hash}`)) continue;
+			log.info("task_overlap", { task: own.taskId, other: other.taskId, paths: shared.length });
+			await this.#post(
+				own,
+				`⚠️ 파일 겹침: ${a.taskId}와 ${b.taskId}가 ${shown}를 함께 고칩니다. 먼저 끝나는 쪽을 랜딩한 뒤 다른 쪽을 rebase하세요.`,
+			);
+		}
+		for (const [own, other] of pair) {
+			const key = `overlapworker:${other.taskId}:${hash}`;
+			if (key in ledger.require(own.taskId).notices) continue;
+			const deferred = await this.#overlapPrompt(
+				own,
+				`다른 TASK ${other.taskId}가 같은 파일(${shown})을 고치고 있습니다. 그 파일 변경은 범위 안에서 최소로 하고, 겹치는 함수·절을 PROGRESS.md 메모에 적으세요.`,
+			);
+			if (deferred === undefined) ledger.recordNotice(own.taskId, key);
+			else log.info("task_overlap_remind_deferred", { task: own.taskId, other: other.taskId, reason: deferred });
+		}
+	}
+
+	/**
+	 * Sends the overlap prompt unless the bot is frozen, the owner paused the task, the agent already got a prompt this
+	 * sweep, or herdr says it is busy, waiting or gone; returns why it did not go out (`undefined` = sent).
+	 */
+	async #overlapPrompt(row: TaskRow, text: string): Promise<string | undefined> {
+		if (this.#deps.frozen?.() !== undefined) return "frozen";
+		if (this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId))) return "paused";
+		if (this.#prompted.has(row.taskId)) return "prompted";
+		const agent = this.#sweepAgents.get(row.taskId) ?? (await this.#agentStatus(row));
+		this.#sweepAgents.set(row.taskId, agent);
+		const status = agent.ok ? agent.status : undefined;
+		if (status === "working" || status === "blocked" || status === "gone") return status;
+		return (await this.#remind(row, text)) ? undefined : "send_failed";
 	}
 
 	/**
@@ -402,9 +626,13 @@ export class TaskSweeper {
 	 */
 	async #remind(row: TaskRow, text: string): Promise<boolean> {
 		const sent = await this.#deps.remind(row, text);
-		if (sent.ok) return true;
+		if (sent.ok) {
+			this.#prompted.add(row.taskId);
+			return true;
+		}
 		if (sent.unconfirmed === true) {
 			this.#deps.log.warn("task_remind_unconfirmed", { task: row.taskId, error: sent.error ?? "unknown" });
+			this.#prompted.add(row.taskId);
 			return true;
 		}
 		this.#deps.log.warn("task_remind_failed", { task: row.taskId, error: sent.error ?? "unknown" });
@@ -443,7 +671,7 @@ export class TaskSweeper {
 	}
 
 	#post(row: TaskRow, card: TaskCard | string): Promise<boolean> {
-		return postToThread(this.#deps.transport, this.#deps.log, row.threadRef, card);
+		return postToThread(this.#deps.channels, this.#deps.log, row.threadRef, card);
 	}
 
 	#result(row: TaskRow, status: TaskRow["status"], judgement: TaskJudgement, actions: string[]): TaskCheckResult {

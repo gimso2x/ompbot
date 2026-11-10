@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GatesCommandDeps, gatesCommand } from "../src/cli/index";
-import { readSweepHeartbeat } from "../src/daemon/heartbeat";
+import { readSweepHeartbeat, SweepHeartbeatWriter } from "../src/daemon/heartbeat";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { STAMP_FILE } from "../src/ops/backup";
 import {
@@ -288,6 +288,26 @@ describe("collectGates", () => {
 		writeHeartbeat(0);
 		expect(readSweepHeartbeat(home)?.socket).toBeUndefined();
 		expect(readSweepHeartbeat(home)?.draining).toBeUndefined();
+	});
+
+	test("heartbeat round-trip: the Discord gateway state is written beside Slack's and only when given", () => {
+		const writer = new SweepHeartbeatWriter(home);
+		try {
+			writer.beat(now, {
+				socket: { state: "up", since: now - 9_000 },
+				discord: { state: "down", since: now - 4_000 },
+				draining: false,
+			});
+			expect(readSweepHeartbeat(home)).toMatchObject({
+				socket: { state: "up", since: new Date(now - 9_000) },
+				discord: { state: "down", since: new Date(now - 4_000) },
+				draining: false,
+			});
+			writer.beat(now, { socket: { state: "up", since: now }, draining: false });
+			expect(readSweepHeartbeat(home)?.discord).toBeUndefined();
+		} finally {
+			writer.stop();
+		}
 	});
 
 	test("slack_disconnected: exactly 10 minutes down opens, 1 ms less is closed; up and an old stamp are closed; no stamp is unknown", () => {

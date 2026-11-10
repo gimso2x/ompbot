@@ -11,6 +11,7 @@ import { buildMonitorTools } from "../src/monitors/tools";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { buildFloorsPrompt } from "../src/safety/prompt";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -199,7 +200,7 @@ describe("who gets the tools", () => {
 		const sessions = new FakeSessionStore();
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			log,
 			ompVersion: "omp-test 0",
 			bootId: "boot",

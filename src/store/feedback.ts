@@ -103,6 +103,13 @@ export class FeedbackLedger {
 			.run(post.channel, post.ts, post.deliveryId, post.part, this.#clock.now());
 	}
 
+	/** Whether a delivery posted the message `channel`/`ts`. */
+	isPost(post: { channel: string; ts: string }): boolean {
+		return (
+			this.#db.query("SELECT 1 FROM delivery_posts WHERE channel = ? AND ts = ?").get(post.channel, post.ts) !== null
+		);
+	}
+
 	/**
 	 * One verdict per message, newest event wins: an event at or before the row's `last_event_ts` changes nothing.
 	 * Added: the row takes the verdict (live). Removed: the matching verdict is marked removed, a different one only

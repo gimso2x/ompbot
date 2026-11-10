@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
-import { planReload } from "../src/daemon/reload";
+import { planReload, RESTART_FIELDS } from "../src/daemon/reload";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
@@ -58,6 +59,19 @@ describe("planReload", () => {
 		expect(plan.next.herdr).toBeUndefined();
 	});
 
+	test("channels is restart-bound and the old ownerSlackUserId is no field of its own", () => {
+		expect(RESTART_FIELDS).toContain("channels");
+		expect(RESTART_FIELDS as readonly string[]).not.toContain("ownerSlackUserId");
+		const moved = planReload({ ...home.config, deprecated: ["ownerSlackUserId"] }, { ...home.config });
+		expect(moved.restartRequired).toEqual([]);
+		const changed = planReload(
+			{ ...home.config },
+			{ ...home.config, channels: { slack: { ownerUserId: "UNEW0000" } } },
+		);
+		expect(changed.restartRequired).toEqual(["channels"]);
+		expect(changed.next.channels.slack.ownerUserId).toBe(OWNER);
+	});
+
 	test("recallEnabled applies live", () => {
 		const plan = planReload({ ...home.config }, { ...home.config, recallEnabled: false });
 		expect(plan.changed).toEqual(["recallEnabled"]);
@@ -72,7 +86,7 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -84,7 +98,9 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	});
 	await daemon.start();
 	// boot: daemon_ready recorded the config it started with
-	expect(JSON.parse(readFileSync(join(home.dir, "config.json.last-good"), "utf8")).ownerSlackUserId).toBe(OWNER);
+	expect(JSON.parse(readFileSync(join(home.dir, "config.json.last-good"), "utf8")).channels.slack.ownerUserId).toBe(
+		OWNER,
+	);
 	const plain = (ts: string) =>
 		transport.emitMessage({ type: "message", channel: CHANNEL, channel_type: "channel", user: OWNER, text: "hi", ts });
 
@@ -149,7 +165,7 @@ describe("peer bot policy reload", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: { ...home.config, mentionFreeChannels: [CHANNEL] },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
@@ -207,7 +223,7 @@ test("reloading a config that turns herdr on answers restartRequired with herdr"
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(new WaitingTransport()),
+		channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -231,7 +247,7 @@ describe("boot last-good", () => {
 		daemon = new Daemon({
 			config: home.config,
 			bootConfigText,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -256,6 +272,18 @@ describe("boot last-good", () => {
 		writeFileSync(join(home.dir, "config.json"), loaded, { mode: 0o600 });
 		await boot(loaded);
 		expect(readFileSync(lastGood(), "utf8")).toBe(loaded);
+	});
+
+	test("a config still on ownerSlackUserId logs config_deprecated_key once at boot; the new key logs nothing", async () => {
+		const deprecatedLines = (lines: string[]) => lines.filter((l) => l.includes("event=config_deprecated_key"));
+		const current = await boot(readFileSync(join(home.dir, "config.json"), "utf8"));
+		expect(deprecatedLines(current)).toEqual([]);
+		await daemon?.stop();
+		home.config = { ...home.config, deprecated: ["ownerSlackUserId"] };
+		const legacy = deprecatedLines(await boot(undefined));
+		expect(legacy).toHaveLength(1);
+		expect(legacy[0]).toContain("key=ownerSlackUserId");
+		expect(legacy[0]).toContain("use=channels.slack.ownerUserId");
 	});
 
 	test("without the text loadConfig read the reason is config_unreadable and nothing is recorded", async () => {

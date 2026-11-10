@@ -3,6 +3,7 @@ import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -115,7 +116,7 @@ async function boot(
 	const { sweepMs, ...driverExtra } = extra;
 	const d = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",

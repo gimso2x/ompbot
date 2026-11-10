@@ -1,6 +1,12 @@
 import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { type OmpbotConfig, readSlackTokens } from "../config";
+import type { ChannelBinding } from "../channel/adapter";
+import { type OmpbotConfig, readDiscordToken, readSlackTokens } from "../config";
+import { DiscordBinding } from "../discord/binding";
+import { DiscordChannel } from "../discord/channel";
+import { DiscordSocketTransport } from "../discord/socket-transport";
+import { FileFakeDiscordTransport } from "../discord/test-transport";
+import type { DiscordTransport } from "../discord/transport";
 import { createLogger, type Logger } from "../log";
 import { ClaudeOmpDriver } from "../omp/claude-driver";
 import { RpcOmpDriver } from "../omp/rpc-driver";
@@ -9,6 +15,7 @@ import { LogDirError, openLogSink } from "../ops/logfile";
 import { redact } from "../redact";
 import { floorsArgs, floorsSystemPrompt } from "../safety/prompt";
 import { indexRuntimeSecrets } from "../safety/secret-index";
+import { SlackBinding } from "../slack/binding";
 import { SlackChannel } from "../slack/channel";
 import { SocketModeTransport } from "../slack/socket-transport";
 import { FileFakeTransport } from "../slack/test-transport";
@@ -36,6 +43,31 @@ function pickTransport(config: OmpbotConfig, env: Record<string, string | undefi
 			else log.warn("slack_socket_error", { error: event.detail });
 		},
 	});
+}
+
+/**
+ * The Discord binding when `channels.discord` is set: the real gateway + REST, or the file-logging fake for test
+ * runs (`OMPBOT_TEST_DISCORD_TRANSPORT`). A non-retryable gateway close stops Discord alone and is logged.
+ */
+function discordBindings(config: OmpbotConfig, env: Record<string, string | undefined>, log: Logger): ChannelBinding[] {
+	const discord = config.channels.discord;
+	if (discord === undefined) return [];
+	const transport: DiscordTransport =
+		env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_TEST_DISCORD_TRANSPORT
+			? new FileFakeDiscordTransport(env.OMPBOT_TEST_DISCORD_TRANSPORT)
+			: new DiscordSocketTransport(
+					{ botToken: readDiscordToken(config) },
+					{
+						onLifecycle: (event) => {
+							if (event.type === "connected") log.info("discord_gateway_connected", { detail: event.detail });
+							else if (event.type === "reconnecting")
+								log.warn("discord_gateway_reconnecting", { reason: event.detail });
+							else log.warn("discord_gateway_error", { error: event.detail });
+						},
+						onFatal: (error) => log.error("discord_gateway_fatal", { code: error.code, error: error.message }),
+					},
+				);
+	return [new DiscordBinding(new DiscordChannel(transport, { ownerUserId: discord.ownerUserId }))];
 }
 
 /** Logs the omp version on every start and warns when it differs from the one recorded by the previous start. */
@@ -204,7 +236,10 @@ export async function runDaemon(
 		clock,
 		bootId: lock.info.bootId,
 		ompVersion: await checkOmpVersion(config, log),
-		slack: new SlackChannel(pickTransport(config, env, log)),
+		channels: [
+			new SlackBinding(new SlackChannel(pickTransport(config, env, log))),
+			...discordBindings(config, env, log),
+		],
 		crash: crashHook(env),
 		sweepMs: env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SWEEP_MS ? Number(env.OMPBOT_SWEEP_MS) : undefined,
 		driverFactory: (origin, sessionDir) =>

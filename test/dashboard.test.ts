@@ -432,6 +432,10 @@ describe("dashboard snapshot", () => {
 				manual: false,
 			},
 			scheduledRun: true,
+			originKey: "monitor/mon1",
+			running: false,
+			failStreak: 0,
+			stats: { days: 30, delivered: 1, quiet: 0, failed: 0, skipped: 0, medianMs: 0 },
 		});
 		expect(snapshot.lanes.ok && snapshot.lanes.items.map((lane) => lane.name)).toEqual(["lane-a"]);
 		expect(snapshot.alerts.ok && snapshot.alerts.items).toEqual([

@@ -45,6 +45,19 @@ describe("redact", () => {
 	test("text without secrets is unchanged", () => {
 		expect(redact("plain text 한글")).toBe("plain text 한글");
 	});
+
+	// Not a real token: the bot-token shape (base64url id . 6-char stamp . HMAC) assembled at runtime.
+	const discordToken = [`MTA${"x".repeat(21)}`, "Gh_9-k", `${"Ab-_9".repeat(7)}z`].join(".");
+
+	test("a Discord bot token shape is replaced", () => {
+		expect(redact(`토큰 ${discordToken} 끝`)).toBe(`토큰 ${REDACTED} 끝`);
+		expect(redact(`Bot ${discordToken}`)).toBe(`Bot ${REDACTED}`);
+	});
+
+	test("dotted words, versions, hosts and JWT-like headers are not Discord tokens", () => {
+		const plain = "v1.2.3 api.discord.com a.b.c ompbot.config.json eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abc";
+		expect(redact(plain)).toBe(plain);
+	});
 });
 
 describe("byte budget", () => {

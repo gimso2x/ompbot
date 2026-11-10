@@ -54,7 +54,8 @@ export interface Transcript {
 	truncated: boolean;
 }
 
-function lines(file: string): Json[] {
+/** The object records of a session `.jsonl`, skipping the torn line omp may be writing. */
+export function readJsonlRecords(file: string): Json[] {
 	const out: Json[] = [];
 	for (const line of readFileSync(file, "utf8").split("\n")) {
 		if (line === "") continue;
@@ -113,7 +114,7 @@ export function readTranscript(
 	let tail: "model" | "other" = "other";
 	/** The last message inside the window: where an unanswered tool call stops and the next model call starts. */
 	let lastIn: number | undefined;
-	for (const entry of lines(file)) {
+	for (const entry of readJsonlRecords(file)) {
 		const at = Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "");
 		if (Number.isNaN(at)) continue;
 		result.first ??= at;

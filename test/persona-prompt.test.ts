@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	buildFloorsPrompt,
 	floorsArgs,
+	OMPBOT_MAIN,
 	OWNER_NOTES_MAX_BYTES,
 	PERSONA_MAX_BYTES,
 	type PersonaFiles,
@@ -165,5 +167,52 @@ describe("floorsArgs soul and owner notes", () => {
 			floorsArgs(SECRETS, "monitor/m1")[1],
 		);
 		expect(errors).toHaveLength(0);
+	});
+});
+
+describe("chat origin system prompt per platform", () => {
+	const BASE_SECRETS = "/home/owner/.ompbot/secrets";
+	const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "slack-prompt-base.json"), "utf8")) as {
+		prompts: Record<string, string>;
+	};
+
+	test("Slack chat origins keep the base commit's prompt byte for byte (every herdr/dialog/peer variant)", () => {
+		const keys = Object.keys(base.prompts);
+		expect(keys).toHaveLength(16);
+		for (const key of keys) {
+			const [origin = "", herdr, dialogs, peer] = key.split("|");
+			const actual = buildFloorsPrompt(
+				BASE_SECRETS,
+				origin,
+				herdr === "herdr=true",
+				dialogs === "dialogs=true",
+				peer === "peer=true",
+			);
+			// The fixture keeps the checkout-dependent CLI path of the background-resume line as a placeholder.
+			expect(actual.replaceAll(OMPBOT_MAIN, "<ompbot>/src/main.ts")).toBe(base.prompts[key] ?? "");
+		}
+	});
+
+	test("a Discord chat origin names its own upload tool where Slack names slack_send_file", () => {
+		const slack = buildFloorsPrompt(BASE_SECRETS, "slack/dm/D1", false, false, true);
+		const discord = buildFloorsPrompt(BASE_SECRETS, "discord/dm/123456789012345678", false, false, true); // gitleaks:allow (fake snowflake)
+		expect(discord).not.toContain("slack_send_file");
+		expect(discord).toContain("discord_send_file");
+		// Discord sessions get no monitor tools (host tools give them the base set), so the prompt does not offer them.
+		expect(slack).toContain("ompbot_monitor_add");
+		expect(discord).not.toContain("ompbot_monitor_add");
+	});
+
+	test("a Discord chat origin is told it runs on Discord, with Discord links and no ```card fence", () => {
+		for (const dialogs of [false, true]) {
+			const discord = buildFloorsPrompt(BASE_SECRETS, "discord/ch/111111111111111111/t/2", false, dialogs);
+			const firstLine = discord.split("\n")[1] ?? "";
+			expect(firstLine).toContain("owner's Discord");
+			expect(firstLine).not.toContain("Slack");
+			expect(discord).toContain("`[표시명](URL)`");
+			expect(discord).not.toContain("<URL|표시명>");
+			expect(discord).not.toContain("```card");
+			expect(discord).toContain("디스코드 스레드");
+		}
 	});
 });

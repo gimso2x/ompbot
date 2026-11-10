@@ -23,6 +23,7 @@ import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { openStore, type Store } from "../src/store/db";
 import { hasButtons } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 
 const OWNER = "UOWNER";
 const T0 = Date.UTC(2026, 5, 1, 0, 0, 0);
@@ -53,7 +54,7 @@ beforeEach(() => {
 	mkdirSync(join(dir, "workspace"));
 	clock = new FakeClock();
 	const log = createLogger({ sink: () => undefined, clock, redact });
-	store = openStore({ path: dbPath(), clock, redact, ownerSlackUserId: OWNER });
+	store = openStore({ path: dbPath(), clock, redact, slackOwnerUserId: OWNER });
 	// The router only has to accept the hand-off: events stay `dispatched`, so stages show what the ledger decided.
 	scheduler = new MonitorScheduler({
 		store,
@@ -571,7 +572,7 @@ function makeBroker(
 	timeoutMs?: number,
 ): ApprovalBroker {
 	return new ApprovalBroker({
-		port: new SlackChannel(transport),
+		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: approvalStore,

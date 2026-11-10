@@ -49,8 +49,26 @@ export interface OmpEntry {
 	id: string;
 	parentId?: string | null;
 	type: string;
-	message?: { role?: string; content?: unknown; stopReason?: string };
+	message?: {
+		role?: string;
+		content?: unknown;
+		stopReason?: string;
+		/** Assistant messages: the call's token counts and cost, as omp reports them. */
+		usage?: OmpUsage;
+		/** Assistant messages: the provider and model that answered. */
+		provider?: string;
+		model?: string;
+	};
 	[key: string]: unknown;
+}
+
+/** Token counts (and cost in dollars) of one assistant call (omp `Usage`; only the fields ompbot reads are typed). */
+export interface OmpUsage {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cost?: { cacheWrite?: number; total?: number };
 }
 
 export interface OmpEntries {
@@ -183,4 +201,9 @@ export interface OmpSessionDriver {
 	onEvent(listener: (event: OmpEvent) => void): () => void;
 	onExit(listener: (info: OmpExitInfo) => void): () => void;
 	stop(): Promise<void>;
+	/**
+	 * Ask a side question against the current conversation without touching the running turn or the session
+	 * history; resolves with the answer text. Absent on drivers that cannot (the mailbox then says so).
+	 */
+	btw?(question: string): Promise<string>;
 }

@@ -32,6 +32,7 @@ export function dispatchEnv(inherited: Record<string, string | undefined>): Reco
 		env[key] = value;
 	}
 	env.LC_ALL = env.LC_ALL ?? "C.UTF-8";
+	env.OMP_NONINTERACTIVE = "1";
 	return env;
 }
 
@@ -99,7 +100,7 @@ export interface OmpPrintOptions {
 export async function runOmpPrint(options: OmpPrintOptions): Promise<{ ok: boolean; output: string }> {
 	const maxChars = options.maxChars ?? 8_000;
 	const result = await (options.run ?? realProcessRunner)(
-		[options.ompBin, "-p", options.task, "--append-system-prompt", options.systemPromptAppendix],
+		[options.ompBin, "-p", options.task, "--no-session", "--append-system-prompt", options.systemPromptAppendix],
 		{
 			cwd: options.cwd,
 			timeoutMs: options.timeoutMs ?? 600_000,
@@ -211,6 +212,12 @@ export async function herdrCreateWorkspace(
 		: { error: "workspace create returned no root pane" };
 }
 
+/** `herdr agent start … --kind omp`; non-empty `agentArgs` go to omp after `--` (herdr's `[-- [AGENT_ARG]...]`). */
+function agentStartArgs(name: string, paneId: string, agentArgs: string[] | undefined): string[] {
+	const args = ["agent", "start", name, "--kind", "omp", "--pane", paneId, "--timeout", "60000"];
+	return agentArgs === undefined || agentArgs.length === 0 ? args : [...args, "--", ...agentArgs];
+}
+
 /**
  * Starts a herdr-managed omp agent in a fresh workspace and hands it the task. The agent keeps running in its
  * pane after this returns — progress lives in the pane, readable with `herdr agent read <name>`.
@@ -219,6 +226,8 @@ export async function herdrStartAgent(input: {
 	name: string;
 	task: string;
 	cwd: string;
+	/** Extra omp arguments (config `workerOmpArgs`), passed after `--`; empty/absent → none. */
+	agentArgs?: string[];
 	options?: HerdrRunnerOptions;
 }): Promise<{ ok: true; agentName: string; paneId: string } | { ok: false; error: string }> {
 	const { name, task, cwd } = input;
@@ -226,10 +235,7 @@ export async function herdrStartAgent(input: {
 	const label = `ompbot · ${name}`;
 	const ws = await herdrCreateWorkspace(cwd, label, options);
 	if ("error" in ws) return { ok: false, error: ws.error };
-	const started = await herdrRun(
-		["agent", "start", name, "--kind", "omp", "--pane", ws.paneId, "--timeout", "60000"],
-		options,
-	);
+	const started = await herdrRun(agentStartArgs(name, ws.paneId, input.agentArgs), options);
 	if (started.code !== 0) {
 		// Like the remote start: close only the workspace this call created. A failed prompt leaves the agent up.
 		if (ws.workspaceId !== undefined) await herdrRun(["workspace", "close", ws.workspaceId], options);
@@ -247,6 +253,8 @@ export interface RemoteHerdrStartInput {
 	cwd: string;
 	/** Shared owners-workspace label per host (hub fleet OWNER_WS_LABEL pattern). Default "ompbot-owners". */
 	workspacesLabel?: string;
+	/** Extra omp arguments (that host's `dispatchHosts.<h>.ompArgs`), passed after `--`; empty/absent → none. */
+	agentArgs?: string[];
 	options?: HerdrRunnerOptions;
 }
 
@@ -319,10 +327,7 @@ export async function herdrRemoteStart(
 	}
 
 	await herdrRun(["tab", "rename", tabId, name], runner);
-	const start = await herdrRun(
-		["agent", "start", name, "--kind", "omp", "--pane", paneId, "--timeout", "60000"],
-		runner,
-	);
+	const start = await herdrRun(agentStartArgs(name, paneId, input.agentArgs), runner);
 	if (start.code !== 0) {
 		// Hub fleet cleanup: close only what this call created above.
 		await herdrRun(createdWorkspace ? ["workspace", "close", workspaceId] : ["tab", "close", tabId], runner);
@@ -383,6 +388,71 @@ export async function herdrAgentStatus(
 	const agent = parsed.result?.agents?.find((entry) => entry.name === name);
 	if (agent === undefined) return { ok: true, status: "gone" };
 	return { ok: true, status: isReportedStatus(agent.agent_status) ? agent.agent_status : "unknown" };
+}
+
+/** How long an interrupt waits for herdr to see the agent stop after the Esc. */
+export const HERDR_INTERRUPT_WAIT_MS = 15_000;
+
+/** herdr states that count as a stopped agent after an Esc. */
+const STOPPED_STATUSES: Partial<Record<HerdrAgentStatus, true>> = { idle: true, done: true, blocked: true };
+
+export interface HerdrInterruptResult {
+	/** True only when the re-read state after the Esc is idle, done or blocked. */
+	confirmed: boolean;
+	/** The re-read state; absent when the Esc was refused or the re-read failed. */
+	status?: HerdrAgentStatus;
+	/** The owner-facing line: confirmed, or what kept it from being confirmed. */
+	text: string;
+}
+
+/**
+ * Stops a herdr agent's turn as far as the herdr CLI allows (it has no pause command): `agent send-keys <name> esc`,
+ * a bounded `agent wait` for idle/done/blocked, then one re-read of the state. Only the re-read decides; a timed-out
+ * wait is not a failure by itself. Never prompts the agent.
+ */
+export async function herdrInterruptAgent(
+	name: string,
+	options: HerdrRunnerOptions = {},
+): Promise<HerdrInterruptResult> {
+	const sent = await herdrRun(["agent", "send-keys", name, "esc"], options);
+	if (sent.code !== 0) {
+		return { confirmed: false, text: `Esc를 보내지 못해 멈춤을 확인하지 못했습니다(${herdrFailure(sent)})` };
+	}
+	await herdrRun(
+		[
+			"agent",
+			"wait",
+			name,
+			"--until",
+			"idle",
+			"--until",
+			"done",
+			"--until",
+			"blocked",
+			"--timeout",
+			String(HERDR_INTERRUPT_WAIT_MS),
+		],
+		options,
+	);
+	const reread = await herdrAgentStatus(name, options);
+	if (!reread.ok) {
+		return {
+			confirmed: false,
+			text: `Esc는 보냈지만 멈춤을 확인하지 못했습니다(herdr 상태: 읽기 실패 — ${reread.error})`,
+		};
+	}
+	if (STOPPED_STATUSES[reread.status] === true) {
+		return {
+			confirmed: true,
+			status: reread.status,
+			text: `Esc를 보냈고 멈춤을 확인했습니다(herdr 상태: ${reread.status})`,
+		};
+	}
+	return {
+		confirmed: false,
+		status: reread.status,
+		text: `Esc는 보냈지만 멈춤을 확인하지 못했습니다(herdr 상태: ${reread.status})`,
+	};
 }
 
 /** How long a follow-up waits for herdr to see the agent start (working) or stop on a question (blocked). */

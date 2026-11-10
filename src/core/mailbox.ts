@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { mentionToken, renderMentions } from "../channel/port";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { alreadySent, closingAnswer, interimOf, NO_ANSWER, turnAnswerParts } from "../omp/answers";
@@ -13,12 +14,21 @@ import {
 	type OmpSessionDriver,
 } from "../omp/driver";
 import { type HealedSessionModel, healSessionModelFile, newestSessionFile } from "../omp/session-heal";
+import {
+	CACHE_MISS_NOTIFY_MS,
+	CACHE_MISS_NOTIFY_TOKENS,
+	type CacheBaseline,
+	type CacheMiss,
+	CacheMonitor,
+	cacheCallOf,
+	isColdCache,
+} from "../ops/cache-monitor";
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
 import type { InboundRow, OriginRow, Store } from "../store/db";
 import { LiveTurn, type LiveView } from "./live-turn";
 import { parseThreadRef, TOP_LEVEL_TS, threadRefOfOrigin, wrapQuoted } from "./normalize";
-import { parseChatOrigin } from "./origin-key";
+import { type ChatPlatform, parseChatOrigin } from "./origin-key";
 import { buildRecallBlock } from "./recall";
 import { epochDirIsFresh, listSavedSessions, pickSession } from "./sessions";
 import { createStuckDetector, type StuckDetector, stuckCancelReason, stuckSteerText } from "./stuck";
@@ -71,6 +81,26 @@ export interface ProviderLimitInfo {
 	maxAttempts: number;
 	/** Raw provider error text; redact before it reaches Slack. */
 	errorMessage: string;
+}
+
+/** A large prompt cache miss of a conversation turn (`src/ops/cache-monitor.ts`). */
+export interface CacheMissInfo extends CacheMiss {
+	originKey: string;
+	/** Thread of the turn whose call missed. */
+	threadRef: string;
+	model: string;
+}
+
+/** A conversation resumed after its cache expired: what the new turn will likely rewrite. */
+export interface ColdCacheInfo {
+	originKey: string;
+	/** Thread of the new turn. */
+	threadRef: string;
+	prefixTokens: number;
+	/** Time since the baseline call. */
+	idleMs: number;
+	/** Dollars to rewrite the prefix at the last known cache write price; absent when the price is unknown. */
+	estimatedCost?: number;
 }
 
 /** Retry causes that are a provider usage limit (429, rate/usage limit, quota), not a timeout or a dropped stream. */
@@ -130,8 +160,11 @@ export interface MailboxDeps {
 	distillProvider?: (originKey: string) => Promise<string>;
 	/** Read on every new turn: whether its prompt may carry channel-scoped recall. Absent = never. */
 	recallEnabled?: () => boolean;
-	/** Slack thread reader for the context a peer request or an owner's first reply to a bot post needs; absent = none. */
-	threadSource?: ThreadSource;
+	/**
+	 * Thread readers per platform, for the context a peer request or an owner's first reply to a bot post needs; a
+	 * platform without one (or no map) gets none.
+	 */
+	threadSource?: ReadonlyMap<ChatPlatform, ThreadSource>;
 	log: Logger;
 	/** Session directory for an origin epoch; epoch 1 is used when the origin is first created. */
 	sessionDirFor: (originKey: string, epoch: number) => string;
@@ -171,8 +204,26 @@ export interface MailboxDeps {
 	onEscalate?: (info: TurnFailureEscalation) => void;
 	/** A turn's omp retry reported a provider usage limit; once per turn, on the actor chain (never await Slack). */
 	onProviderLimit?: (info: ProviderLimitInfo) => void;
+	/**
+	 * A `child_restart`/`unexplained` prompt cache miss of `CACHE_MISS_NOTIFY_TOKENS`+ in a conversation turn; at most
+	 * once per origin per `CACHE_MISS_NOTIFY_MS` (memory only), never for a monitor. On the actor chain: never await Slack.
+	 */
+	onCacheMiss?: (info: CacheMissInfo) => void;
+	/** A new conversation turn starts on a cold cache (`isColdCache`); once per baseline, never for a monitor. */
+	onColdCache?: (info: ColdCacheInfo) => void;
 	/** True while a restart drain runs: messages are recorded `pending` only — no new turn, no steer, no command. */
 	isDraining?: () => boolean;
+	/**
+	 * True while this origin's work is held (a paused lane; the registry row is the single source). Like a drain:
+	 * pending rows wait — no new turn, no steer — until the hold lifts (`!` commands still run). `resumePending`
+	 * re-runs them.
+	 */
+	isHeld?: () => boolean;
+	/**
+	 * The held origin's driver started working on its own (a queued message omp began without the mailbox: a
+	 * `tool_execution_start` outside any turn). Once per pause is the caller's (the lane warns and re-aborts).
+	 */
+	onHeldWork?: (info: { originKey: string }) => void;
 	/** A child opened another session file than the one to resume; once per (origin, epoch), never blocks the turn. */
 	onSessionMismatch?: (info: SessionMismatchInfo) => void;
 	/**
@@ -384,6 +435,14 @@ export interface MailboxState {
 	threadRef?: string;
 }
 
+/** What `pauseTurn` re-read after stopping the turn: each false item is named in the owner's answer. */
+export interface PauseCheck {
+	/** The mailbox still had a turn when the check ran. */
+	busy: boolean;
+	/** The driver (when one is running) reported no streaming and no queued message left (`OmpState.settled`). */
+	settled: boolean;
+}
+
 /**
  * Both halves of a peer failure notice (`failedNotice` with a peer). A peer turn opened by a text that carries both
  * never mentions back when it fails too: a failure notice answers a peer once, never in a loop.
@@ -411,12 +470,15 @@ function turnPeerOf(row: InboundRow): TurnPeer | undefined {
  * and a peer turn opened by a peer failure notice, keep the plain `[turn failed]` line. `botUserId` unknown (not yet
  * connected): the second mention is left out.
  */
-function failedNotice(reason: string, peer?: TurnPeer, botUserId?: string): string {
+function failedNotice(reason: string, peer?: TurnPeer, source?: ThreadSource): string {
 	if (peer === undefined || peer.fromFailureNotice) return `[turn failed] ${reason} — 다시 보내 주세요`;
 	const chars = [...redact(reason).replace(/\s+/g, " ").trim()];
 	const short = chars.length > PEER_REASON_MAX ? `${chars.slice(0, PEER_REASON_MAX - 1).join("")}…` : chars.join("");
-	const self = botUserId === undefined ? "" : ` <@${botUserId}>`;
-	return `<@${peer.userId}>${self} ${PEER_FAILURE_MARK}${short}) — 다시 요청하거나 ${PEER_FAILURE_TAIL}`;
+	const botUserId = source?.botUserId();
+	const self = botUserId === undefined ? "" : ` ${mentionToken(botUserId)}`;
+	const notice = `${mentionToken(peer.userId)}${self} ${PEER_FAILURE_MARK}${short}) — 다시 요청하거나 ${PEER_FAILURE_TAIL}`;
+	// Rendered here, in the platform's own syntax: the peer reads the posted text, and the ledger keeps it as posted.
+	return source === undefined ? notice : renderMentions(notice, source);
 }
 
 /** Header of the injected thread context; it re-states that quoted fences inside are data, not instructions. */
@@ -465,6 +527,8 @@ export interface SlackThreadMessage {
 	/** Slack user id of the author (this bot's own posts carry its bot user id). */
 	user?: string | undefined;
 	botId?: string | undefined;
+	/** When it was posted (epoch ms), for a platform whose `ts` is no time (a Discord id); absent: `ts` is Slack seconds. */
+	at?: number | undefined;
 }
 
 /** Read-only view of a Slack thread, supplied by the daemon: the mailbox itself never talks to Slack. */
@@ -475,6 +539,8 @@ export interface ThreadSource {
 	replies(channel: string, threadTs: string, limit?: number): Promise<SlackThreadMessage[]>;
 	/** How long a turn waits for `replies` before going on without context. Default `THREAD_CONTEXT_TIMEOUT_MS`. */
 	timeoutMs?: number;
+	/** The platform's mention syntax: a failed peer turn's notice addresses the peer bot (and this bot) with it. */
+	mentionUser(userId: string): string;
 }
 
 /** Peer-input thread context: the root plus this much of what followed the bot's last post (oldest cut first). */
@@ -506,8 +572,8 @@ export function peerThreadContextBlock(
 	);
 	const render = (m: SlackThreadMessage): string => {
 		const who = m.user === selfUserId ? "이 봇" : (m.user ?? m.botId ?? "알 수 없음").replace(/[^A-Za-z0-9_]/g, "");
-		const secs = Number(m.ts);
-		const when = Number.isFinite(secs) ? new Date(secs * 1000).toISOString() : m.ts;
+		const ms = m.at ?? Number(m.ts) * 1000;
+		const when = Number.isFinite(ms) ? new Date(ms).toISOString() : m.ts;
 		return `[${who} ${when}]\n${truncateUtf8(redact(m.text), PEER_CONTEXT_MESSAGE_CHARS)}`;
 	};
 	let entries = picked.map(render);
@@ -520,8 +586,8 @@ export function peerThreadContextBlock(
 
 /** Context line of an owner reply's thread whose root is this bot's own post; starts with `THREAD_ANSWER_LINE` so it is scanned. */
 export function ownerThreadRootBlock(root: SlackThreadMessage, threadRef: string): string {
-	const secs = Number(root.ts);
-	const when = Number.isFinite(secs) ? new Date(secs * 1000).toISOString() : root.ts;
+	const ms = root.at ?? Number(root.ts) * 1000;
+	const when = Number.isFinite(ms) ? new Date(ms).toISOString() : root.ts;
 	const preview = truncateUtf8(redact(root.text), MAX_THREAD_ROOT_CHARS).replace(/\s+/g, " ").trim();
 	return [
 		THREAD_CONTEXT_HEADER,
@@ -562,6 +628,15 @@ export class OriginMailbox {
 	#consecFailures = 0;
 	/** Epochs whose session mismatch was already passed to `onSessionMismatch` (memory only: a restart may tell again). */
 	readonly #mismatchNoticed = new Set<number>();
+	/**
+	 * Prompt cache state of this origin's session (re-seeded from the session after a restart); a session change
+	 * (`/new`, `/resume`, a monitor fire's new epoch) starts a fresh one, so its first call is not judged on the old prefix.
+	 */
+	#cache = new CacheMonitor();
+	/** When `onCacheMiss` last fired (memory only: a restart may tell once more). */
+	#cacheNoticedAt: number | undefined;
+	/** The baseline the cold-cache warning was last given for (memory only). */
+	#coldWarned: CacheBaseline | undefined;
 
 	constructor(deps: MailboxDeps) {
 		this.#deps = deps;
@@ -588,6 +663,37 @@ export class OriginMailbox {
 	/** Record the message (idempotent on platformMessageId) and dispatch it. Resolves when it has been handled. */
 	enqueue(record: InboundRecord): Promise<void> {
 		return this.#serial(() => this.#handle(record));
+	}
+
+	/**
+	 * Stops the origin's running turn for an owner hold (a paused lane): the child is aborted and the turn settles
+	 * through the normal final path with `error: "lane_paused"` (no failure notice, no failure count). Safe to call
+	 * again — a turn that survived the first abort or a queued message omp started on its own is aborted once more.
+	 * Resolves with the re-read state, which is all the owner is told on.
+	 */
+	pauseTurn(): Promise<PauseCheck> {
+		return this.#serial(async () => {
+			const { originKey, log } = this.#deps;
+			const driver = this.#driver;
+			if (driver !== undefined) {
+				const turn = this.#turn;
+				try {
+					await driver.abort();
+				} catch (error) {
+					log.warn("pause_abort_failed", { origin: originKey, opRef: turn?.opRef, error: String(error) });
+				}
+				if (turn !== undefined && this.#turn === turn && this.#driver === driver) {
+					await this.#onFinal(driver, {
+						opRef: turn.opRef,
+						status: "aborted",
+						text: "",
+						error: "lane_paused",
+					});
+				}
+			}
+			const settled = this.#driver === undefined || (await this.#driver.state()).settled !== false;
+			return { busy: this.#turn !== undefined, settled };
+		});
 	}
 
 	/**
@@ -830,6 +936,8 @@ export class OriginMailbox {
 	#onDriverEvent(event: OmpEvent): void {
 		this.#turn?.live.feed(event);
 		if (this.#onRetryEvent(event)) return;
+		if (event.type === "auto_compaction_end") this.#cache.markCompacted();
+		if (event.type === "message_end") this.#observeCache(event.message);
 		if (this.#turn && (event.type === "tool_execution_start" || event.type === "tool_execution_end")) {
 			this.#observeTool(this.#turn, event);
 		}
@@ -837,6 +945,11 @@ export class OriginMailbox {
 		if (event.type === "tool_execution_start") {
 			const tool = typeof event.toolName === "string" ? event.toolName : undefined;
 			this.#deps.log.info("tool_start", { origin: this.#deps.originKey, tool });
+			// Held (a paused lane) and no turn of ours: a queued message omp started on its own — work while paused.
+			if (tool !== undefined && this.#turn === undefined && this.#deps.isHeld?.()) {
+				this.#deps.onHeldWork?.({ originKey: this.#deps.originKey });
+				return;
+			}
 			const turn = this.#turn;
 			if (tool !== undefined && turn) {
 				turn.progress.tools += 1;
@@ -872,6 +985,73 @@ export class OriginMailbox {
 			silentMs,
 			opRef: turn.opRef,
 			count: turn.stallCount,
+		});
+	}
+
+	/**
+	 * Classifies one assistant call's prompt cache use. Every miss is logged; a large restart-caused or unexplained miss
+	 * of a conversation turn is told to the owner once per origin per `CACHE_MISS_NOTIFY_MS`.
+	 */
+	#observeCache(message: unknown): void {
+		const { originKey, log, clock } = this.#deps;
+		const call = cacheCallOf(message, clock.now());
+		if (call === undefined) return;
+		const miss = this.#cache.observe(call);
+		if (miss === undefined) return;
+		log.info("cache_miss", {
+			origin: originKey,
+			reason: miss.reason,
+			missed: miss.missedTokens,
+			cacheWrite: miss.cacheWrite,
+			costCacheWrite: miss.costCacheWrite,
+			gapSec: Math.round(miss.gapMs / 1000),
+			model: call.model,
+		});
+		const turn = this.#turn;
+		if (
+			turn === undefined ||
+			originKey.startsWith(MONITOR_ORIGIN_PREFIX) ||
+			(miss.reason !== "child_restart" && miss.reason !== "unexplained") ||
+			miss.missedTokens < CACHE_MISS_NOTIFY_TOKENS ||
+			(this.#cacheNoticedAt !== undefined && call.at - this.#cacheNoticedAt < CACHE_MISS_NOTIFY_MS)
+		) {
+			return;
+		}
+		this.#cacheNoticedAt = call.at;
+		this.#deps.onCacheMiss?.({ ...miss, originKey, threadRef: turn.threadRef, model: call.model });
+	}
+
+	/** Seeds an empty cache baseline from the session's last assistant entry (a new mailbox after a daemon restart). */
+	async #seedCache(driver: OmpSessionDriver): Promise<void> {
+		if (this.#cache.baseline !== undefined) return;
+		try {
+			const last = (await driver.entriesSince()).entries.findLast((entry) => entry.message?.role === "assistant");
+			const stamp = last?.timestamp;
+			const at = typeof stamp === "string" ? Date.parse(stamp) : typeof stamp === "number" ? stamp : Number.NaN;
+			const call = Number.isNaN(at) ? undefined : cacheCallOf(last?.message, at);
+			if (call !== undefined) this.#cache.seed(call);
+		} catch (error) {
+			this.#deps.log.warn("cache_seed_failed", { origin: this.#deps.originKey, error: String(error) });
+		}
+	}
+
+	/** One line to the new turn's thread when it resumes a large conversation whose cache has expired. */
+	#warnColdCache(threadRef: string): void {
+		const { originKey, clock, log } = this.#deps;
+		if (originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
+		const baseline = this.#cache.baseline;
+		const now = clock.now();
+		if (baseline === undefined || baseline === this.#coldWarned || !isColdCache(baseline, now)) return;
+		this.#coldWarned = baseline;
+		const price = this.#cache.writeCostPerToken;
+		const idleMs = now - baseline.at;
+		log.info("cold_cache_warned", { origin: originKey, prefix: baseline.prefix, idleSec: Math.round(idleMs / 1000) });
+		this.#deps.onColdCache?.({
+			originKey,
+			threadRef,
+			prefixTokens: baseline.prefix,
+			idleMs,
+			...(price === undefined ? {} : { estimatedCost: price * baseline.prefix }),
 		});
 	}
 
@@ -981,7 +1161,9 @@ export class OriginMailbox {
 			return;
 		}
 		const command = parseCommand(record.text);
-		if (command && command.kind !== "followup") await this.#runCommand(row, command);
+		// A `btw` with no turn to ask beside is a plain message: it stays pending and the drain starts a turn with it.
+		const viaDrain = command?.kind === "followup" || (command?.kind === "btw" && command.arg !== "" && !this.#turn);
+		if (command && !viaDrain) await this.#runCommand(row, command);
 		else await this.#drain();
 	}
 
@@ -1025,6 +1207,7 @@ export class OriginMailbox {
 	async #drain(): Promise<void> {
 		const { store, originKey } = this.#deps;
 		if (this.#deps.isDraining?.()) return; // a restart drain: rows wait for the next process (or the cancel)
+		if (this.#deps.isHeld?.()) return; // a paused lane: rows wait for the owner's resume
 		for (const listed of store.listInbound({ originKey, state: "pending" })) {
 			// Checked per row so a drain already mid-loop stops too when shutdown flips the flag.
 			if (!this.#acceptingDispatch) return;
@@ -1043,6 +1226,11 @@ export class OriginMailbox {
 				if (!(await this.#dispatch(row, command.arg))) break;
 				continue;
 			}
+			if (command?.kind === "btw" && command.arg !== "" && !this.#turn) {
+				// No turn to ask beside: the question itself (without the command word) starts a turn.
+				if (!(await this.#dispatch(row, command.arg))) break;
+				continue;
+			}
 			if (command) {
 				await this.#runCommand(row, command);
 				continue;
@@ -1058,6 +1246,7 @@ export class OriginMailbox {
 	/** Returns false when the row was left pending (steer failed). */
 	async #dispatch(row: InboundRow, text: string = row.textRef): Promise<boolean> {
 		const { store, log, originKey } = this.#deps;
+		if (this.#deps.isHeld?.()) return false; // a paused lane: the row stays pending for the resume
 		const turn = this.#turn;
 		if (turn && this.#driver) {
 			// The owner's first reply in a thread opened by this bot carries that root even when it is steered: the
@@ -1111,7 +1300,7 @@ export class OriginMailbox {
 			originKey,
 			opRef,
 			threadRef: row.threadRef,
-			notice: failedNotice(code, turnPeerOf(row), this.#deps.threadSource?.botUserId()),
+			notice: failedNotice(code, turnPeerOf(row), this.#threadSource()),
 		});
 		await this.#noteTurnFailure(row.threadRef, failureSign(failure));
 		return true;
@@ -1127,6 +1316,7 @@ export class OriginMailbox {
 			await this.#stopDriver();
 		}
 		const driver = await this.#ensureDriver(row.threadRef);
+		this.#warnColdCache(row.threadRef);
 		// Read the cursor right before the prompt: extensions append entries after open.
 		const entryCursor = await driver.leafId();
 		const opRef = await driver.prompt(await this.#firstTurnPrompt(row, text));
@@ -1211,6 +1401,12 @@ export class OriginMailbox {
 		return `${warning}\n${block}`;
 	}
 
+	/** The thread reader of this origin's chat platform; none for other origins or a platform without one. */
+	#threadSource(): ThreadSource | undefined {
+		const platform = parseChatOrigin(this.#deps.originKey)?.platform;
+		return platform === undefined ? undefined : this.#deps.threadSource?.get(platform);
+	}
+
 	/** The Slack thread context of `row` ready to prepend (injection-scanned), or null. */
 	async #slackContextBlock(row: InboundRow): Promise<string | null> {
 		const context = await this.#slackThreadContext(row);
@@ -1226,8 +1422,9 @@ export class OriginMailbox {
 	 * `THREAD_CONTEXT_TIMEOUT_MS` is logged and the turn goes on without context.
 	 */
 	async #slackThreadContext(row: InboundRow): Promise<string | null> {
-		const { store, originKey, log, threadSource } = this.#deps;
-		if (threadSource === undefined || parseChatOrigin(originKey)?.platform !== "slack") return null;
+		const { store, originKey, log } = this.#deps;
+		const threadSource = this.#threadSource();
+		if (threadSource === undefined) return null;
 		const ref = parseThreadRef(row.threadRef);
 		if (ref === undefined || ref.threadTs === TOP_LEVEL_TS || row.threadRef === row.platformMessageId) return null;
 		const peer = row.peerUserId !== null;
@@ -1318,6 +1515,8 @@ export class OriginMailbox {
 			}
 		}
 		await this.#applySettings(driver, origin);
+		await this.#seedCache(driver);
+		this.#cache.markChildRestart();
 		this.#unsubscribe = [
 			driver.onFinal((final) => this.#background("final_failed", () => this.#onFinal(driver, final))),
 			driver.onExit((info) => this.#background("exit_failed", () => this.#onExit(driver, info))),
@@ -1474,10 +1673,16 @@ export class OriginMailbox {
 			const answer = await this.#turnAnswer(driver, turn, final.text);
 			store.recordAnswer({ ...base, parts: [answer.body], answer: answer.whole });
 			this.#consecFailures = 0;
+		} else if (final.error === "lane_paused") {
+			// The owner's own hold, not a failure: no notice, no failure count — one short line in the thread.
+			store.recordAnswer({
+				...base,
+				parts: ["⏸ 이 턴은 오너 멈춤 요청으로 중단됐습니다(레인 일시정지). 재개는 오너만 합니다."],
+			});
 		} else {
 			store.recordTurnFailure({
 				...base,
-				notice: failedNotice(final.error ?? final.status, turn.peer, this.#deps.threadSource?.botUserId()),
+				notice: failedNotice(final.error ?? final.status, turn.peer, this.#threadSource()),
 			});
 			await this.#noteTurnFailure(turn.threadRef, final.error ?? final.status);
 		}
@@ -1527,7 +1732,7 @@ export class OriginMailbox {
 				originKey,
 				opRef: turn.opRef,
 				threadRef: turn.threadRef,
-				notice: failedNotice(`omp_exited code=${info.code ?? "null"}`, turn.peer, this.#deps.threadSource?.botUserId()),
+				notice: failedNotice(`omp_exited code=${info.code ?? "null"}`, turn.peer, this.#threadSource()),
 			});
 			await this.#noteTurnFailure(turn.threadRef, `omp_exited code=${info.code ?? "null"}`);
 		}
@@ -1544,6 +1749,10 @@ export class OriginMailbox {
 		}
 		// Mark first so a failing command can never leave its text pending for a later prompt.
 		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		if (command.kind === "btw" && command.arg !== "" && this.#driver?.btw !== undefined) {
+			this.#askBtw(this.#driver.btw(command.arg), opRef, threadRef);
+			return;
+		}
 		let text: string;
 		try {
 			text = await this.#commandReply(command, opRef, threadRef);
@@ -1554,6 +1763,29 @@ export class OriginMailbox {
 			return;
 		}
 		store.recordAnswer({ originKey, opRef, threadRef, parts: [text] });
+	}
+
+	/**
+	 * Records a side question's outcome when it settles. Deliberately NOT on the serial chain (`#serial`,
+	 * `#background`): the wait can last minutes, and inbound messages, `#onFinal` and `#onExit` must not queue behind
+	 * it. The store writes are synchronous, so recording from outside the chain is safe.
+	 */
+	#askBtw(pending: Promise<string>, opRef: string, threadRef: string): void {
+		const { store, originKey, log } = this.#deps;
+		pending
+			.then(
+				(answer) => {
+					store.recordAnswer({ originKey, opRef, threadRef, parts: [`💬 곁질문: ${answer}`] });
+				},
+				(error: unknown) => {
+					const reason = error instanceof OmpDriverError ? error.message : String(error);
+					log.error("command_failed", { origin: originKey, command: "btw", error: reason });
+					store.recordTurnFailure({ originKey, opRef, threadRef, notice: failedNotice(`btw: ${reason}`) });
+				},
+			)
+			.catch((error: unknown) => {
+				log.error("btw_settle_failed", { origin: originKey, opRef, error: String(error) });
+			});
 	}
 
 	/** Answer text of a command; throws when omp refuses it (the caller turns that into a `[turn failed]` notice). */
@@ -1568,6 +1800,11 @@ export class OriginMailbox {
 			case "distill":
 				if (this.#deps.distillProvider === undefined) return "스킬 리뷰가 연결되지 않았습니다";
 				return await this.#deps.distillProvider(this.#deps.originKey);
+			case "btw":
+				// A question with a turn and a capable driver was started by `#runCommand`; without a turn it never
+				// reaches here (it becomes a plain message).
+				if (arg !== "") return "이 대화의 에이전트는 곁질문을 지원하지 않습니다.";
+				return "사용법: `!btw <질문>` — 진행 중인 작업에 끼워 넣지 않고 그 질문에만 바로 답합니다. 작업 중이 아니면 일반 메시지로 보냅니다.";
 			case "queue":
 				return await this.#queueCommand(arg, opRef);
 			case "followup":
@@ -1652,6 +1889,7 @@ export class OriginMailbox {
 			}
 			throw error;
 		}
+		this.#cache.markCompacted();
 		this.#deps.log.info("compacted", { origin: this.#deps.originKey, tokens_before: result.tokensBefore });
 		const summary = preview(result.summary);
 		return `🗜 컨텍스트를 압축했습니다 (압축 전 약 ${result.tokensBefore.toLocaleString("en-US")} 토큰).${summary === "" ? "" : `\n요약: ${summary}`}`;
@@ -1675,6 +1913,7 @@ export class OriginMailbox {
 		if (picked.file === current) return `이미 이 세션입니다: ${picked.id.slice(0, 8)}`;
 		await this.#stopDriver();
 		store.newEpoch(originKey, dirname(picked.file), undefined, picked.file);
+		this.#cache = new CacheMonitor();
 		log.info("session_resumed", { origin: originKey, session: picked.id });
 		await this.#ensureDriver(threadRef);
 		return `▶️ 세션 ${picked.id.slice(0, 8)}을(를) 이어갑니다. ${picked.preview}`;
@@ -1750,6 +1989,7 @@ export class OriginMailbox {
 			if (this.#driver) await this.#stopDriver();
 			const epoch = origin.epoch + 1;
 			store.newEpoch(originKey, this.#deps.sessionDirFor(originKey, epoch));
+			this.#cache = new CacheMonitor();
 			this.#deps.log.info("epoch_new", { origin: originKey, epoch, reason: "monitor_fire" });
 			return true;
 		});
@@ -1768,6 +2008,7 @@ export class OriginMailbox {
 		if (!origin) throw new OmpDriverError("not_started", `unknown origin ${originKey}`);
 		const epoch = origin.epoch + 1;
 		store.newEpoch(originKey, this.#deps.sessionDirFor(originKey, epoch), opRef);
+		this.#cache = new CacheMonitor();
 		// Rows dispatched into the aborted turn belong to the old epoch: their output must never be delivered.
 		// They are linked to the command op so the command's delivery also finishes their status messages.
 		for (const dispatched of store.listInbound({ originKey, state: "dispatched" })) {

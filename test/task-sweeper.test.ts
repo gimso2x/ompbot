@@ -4,10 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
-import { type HerdrAgentStatusResult, setLocalHerdrBin } from "../src/dispatch/omp";
+import { type HerdrAgentStatusResult, realProcessRunner, setLocalHerdrBin } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
 import type { TaskJudgement } from "../src/tasks/checker";
@@ -24,16 +25,21 @@ import {
 import type { TaskEvaluation } from "../src/tasks/evaluate";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { formatAgentWaitingNotice, NUDGE_MAX } from "../src/tasks/notify";
+import { restatedHash } from "../src/tasks/resume-check";
 import {
 	READ_FAILURE_NOTICE_AFTER,
 	REVIEW_REALERT_MS,
 	STALE_NOTICE_MS,
 	STALE_REMIND_MS,
+	TASK_SWEEP_MS,
 	type TaskSweepDeps,
 	TaskSweeper,
+	taskChangedPaths,
 } from "../src/tasks/sweeper";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 import { killSpawned, runMain } from "./helpers/daemon-process";
+import { git as gitFixture } from "./helpers/git-fixtures";
 
 const T0 = Date.parse("2026-10-26T06:00:00Z");
 const MIN = 60_000;
@@ -55,6 +61,7 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		blockedReason: "",
 		decision: { question: "", recommend: "", impact: "" },
 		current: "S1",
+		restated: "",
 		evidence: {},
 		summary: [],
 		checks: [],
@@ -150,7 +157,7 @@ function rig(
 			readCalls.count += 1;
 			return screen.value;
 		},
-		transport: new SlackChannel(transport),
+		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: "UOWN",
 		now: () => clock.ms,
 		log: noop,
@@ -553,7 +560,7 @@ describe("TaskSweeper", () => {
 			remind: async () => ({ ok: true }),
 			agentStatus: async () => ({ ok: true, status: "idle" }),
 			readAgent: async () => ({ ok: true, output: "" }),
-			transport: new SlackChannel(r.transport),
+			channels: registryOf(new SlackChannel(r.transport)),
 			ownerUserId: "UOWN",
 			now: () => r.clock.ms,
 			log: noop,
@@ -946,7 +953,7 @@ describe("TaskSweeper", () => {
 			originKey: "slack/ch/C1/t/100.1",
 			threadRef: () => "C1:100.1",
 			rootText: () => undefined,
-			port: new SlackChannel(r.transport),
+			channels: registryOf(new SlackChannel(r.transport)),
 			now: () => r.clock.ms,
 			workspaceDir: "/ws",
 			run: async (cmd) => {
@@ -1198,6 +1205,19 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 			{ checks: PASSED, evidence: { "AC-1": ["commit abc1234 feat"], "AC-2": ["commit abc1234 feat"] } },
 			"공유 커밋",
 		],
+		[
+			"⑧ an unfinished PROGRESS step",
+			{},
+			{},
+			{
+				checks: PASSED,
+				steps: [
+					{ id: "S1", text: "step 1", done: true },
+					{ id: "S9", text: "review-work", done: false },
+				],
+			},
+			"PROGRESS 미완료 단계",
+		],
 		["(freeze) the bot is frozen", { frozen: true }, {}, { checks: PASSED }, "동결 중"],
 	])("AC-3 %s: no autoLand, one 머지 card with the '자동 머지 안 함' line", async (_name, opts, task, over, reason) => {
 		const { r, calls } = autoRig(opts, task);
@@ -1289,7 +1309,7 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 				return { code: 0, stdout: JSON.stringify({ result: { agents } }), timedOut: false };
 			},
 			config: { ...home.config, herdr: {} },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
@@ -1434,7 +1454,7 @@ describe("daemon: herdr off (config without herdr)", () => {
 				return { code: 0, stdout: JSON.stringify({ result: { agents: [] } }), timedOut: false };
 			},
 			config,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -1525,5 +1545,381 @@ describe("daemon: herdr off (config without herdr)", () => {
 		const tool = started.hostToolsFor("slack/dm/D0123456789").find((t) => t.name === "ompbot_dispatch");
 		await tool?.execute({ mode: "herdr", name: "x" }, { signal: new AbortController().signal });
 		expect(await Bun.file(argvFile).text()).toBe("agent read x\n");
+	});
+});
+
+describe("TaskSweeper: file overlap between active tasks of one repository", () => {
+	interface OverlapRig {
+		sweeper: TaskSweeper;
+		ledger: TaskLedger;
+		transport: FakeSlackTransport;
+		clock: { ms: number };
+		a: TaskRow;
+		b: TaskRow;
+		/** Paths each task's `changedPaths` answers (by task id). */
+		paths: Map<string, string[]>;
+		/** Task ids `changedPaths` was asked for, in order. */
+		asked: string[];
+		/** `<taskId>: <text>` of every prompt that reached an agent. */
+		reminders: string[];
+		/** herdr status per task id (idle when unset). */
+		agents: Map<string, HerdrAgentStatusResult>;
+		remindOk: { value: boolean };
+		next: { value: TaskEvaluation };
+		logs: string[];
+	}
+
+	function overlapRig(): OverlapRig {
+		const clock = { ms: T0 };
+		const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => clock.ms } });
+		const register = (threadTs: string, host: string | null = null) =>
+			ledger.register({
+				title: `작업 ${threadTs}`,
+				risk: "L2",
+				originKey: `slack/ch/C1/t/${threadTs}`,
+				threadRef: `C1:${threadTs}`,
+				host,
+				repo: "/r/repo",
+				acceptance: acceptanceItems(["하나"]),
+			});
+		const a = register("100.1");
+		const b = register("200.1");
+		const transport = new FakeSlackTransport();
+		const paths = new Map<string, string[]>();
+		const asked: string[] = [];
+		const reminders: string[] = [];
+		const agents = new Map<string, HerdrAgentStatusResult>();
+		const remindOk = { value: true };
+		const next: { value: TaskEvaluation } = { value: { ok: true, judgement: judgement() } };
+		const logs: string[] = [];
+		const sweeper = new TaskSweeper({
+			ledger,
+			evaluate: async () => next.value,
+			remind: async (row, text) => {
+				if (!remindOk.value) return { ok: false, error: "no agent" };
+				reminders.push(`${row.taskId}: ${text}`);
+				return { ok: true };
+			},
+			agentStatus: async (row) => agents.get(row.taskId) ?? { ok: true, status: "idle" },
+			readAgent: async () => ({ ok: true, output: "" }),
+			changedPaths: async (row) => {
+				asked.push(row.taskId);
+				return paths.get(row.taskId);
+			},
+			channels: registryOf(new SlackChannel(transport)),
+			ownerUserId: "UOWN",
+			now: () => clock.ms,
+			log: { info: (event) => logs.push(event), warn: (event) => logs.push(event) },
+		});
+		return { sweeper, ledger, transport, clock, a, b, paths, asked, reminders, agents, remindOk, next, logs };
+	}
+
+	const threadPosts = (r: OverlapRig) =>
+		r.transport.calls.flatMap((c) => (c.method === "postMessage" ? [{ threadTs: c.threadTs, text: c.text }] : []));
+
+	test("AC-4: a shared src file tells both threads and both idle agents once; the next sweep sends nothing", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts", "README.md"]);
+		r.paths.set(r.b.taskId, ["src/tasks/sweeper.ts", "src/daemon/daemon.ts"]);
+		await r.sweeper.sweep();
+		const posts = threadPosts(r);
+		expect(posts.map((p) => p.threadTs).sort()).toEqual(["100.1", "200.1"]);
+		for (const post of posts) {
+			expect(post.text).toBe(
+				`⚠️ 파일 겹침: ${r.a.taskId}와 ${r.b.taskId}가 src/daemon/daemon.ts를 함께 고칩니다. 먼저 끝나는 쪽을 랜딩한 뒤 다른 쪽을 rebase하세요.`,
+			);
+		}
+		expect(r.reminders.sort()).toEqual(
+			[
+				`${r.a.taskId}: 다른 TASK ${r.b.taskId}가 같은 파일(src/daemon/daemon.ts)을 고치고 있습니다. 그 파일 변경은 범위 안에서 최소로 하고, 겹치는 함수·절을 PROGRESS.md 메모에 적으세요.`,
+				`${r.b.taskId}: 다른 TASK ${r.a.taskId}가 같은 파일(src/daemon/daemon.ts)을 고치고 있습니다. 그 파일 변경은 범위 안에서 최소로 하고, 겹치는 함수·절을 PROGRESS.md 메모에 적으세요.`,
+			].sort(),
+		);
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders).toHaveLength(2);
+	});
+
+	test("AC-4: more than five shared paths are cut to five plus a count", async () => {
+		const r = overlapRig();
+		const shared = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts"];
+		r.paths.set(r.a.taskId, shared);
+		r.paths.set(r.b.taskId, [...shared].reverse());
+		await r.sweeper.sweep();
+		expect(threadPosts(r)[0]?.text).toContain("a.ts, b.ts, c.ts, d.ts, e.ts 외 2개를 함께 고칩니다");
+	});
+
+	test("AC-4: an intersection of docs/tasks/** only, or none, sends nothing", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["docs/tasks/T-1/PROGRESS.md", "src/a.ts"]);
+		r.paths.set(r.b.taskId, ["docs/tasks/T-1/PROGRESS.md", "src/b.ts"]);
+		await r.sweeper.sweep();
+		r.paths.set(r.b.taskId, []);
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(0);
+		expect(r.reminders).toHaveLength(0);
+	});
+
+	test("AC-4: a remote task is never asked for its changed paths", async () => {
+		const r = overlapRig();
+		const remote = r.ledger.register({
+			title: "원격",
+			risk: "L2",
+			originKey: "slack/ch/C1/t/300.1",
+			threadRef: "C1:300.1",
+			host: "remote1",
+			repo: "/r/repo",
+			acceptance: acceptanceItems(["하나"]),
+		});
+		r.paths.set(remote.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		await r.sweeper.sweep();
+		expect(r.asked).not.toContain(remote.taskId);
+		expect(threadPosts(r)).toHaveLength(0);
+	});
+
+	test("AC-4b: a working agent is not prompted (key not recorded) while the threads hear it once; it is prompted once idle", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.b.taskId, ["src/daemon/daemon.ts"]);
+		r.agents.set(r.a.taskId, { ok: true, status: "working" });
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders.map((line) => line.split(":")[0])).toEqual([r.b.taskId]);
+		expect(Object.keys(r.ledger.require(r.a.taskId).notices).some((key) => key.startsWith("overlapworker:"))).toBe(
+			false,
+		);
+		expect(r.logs).toContain("task_overlap_remind_deferred");
+		r.agents.set(r.a.taskId, { ok: true, status: "idle" });
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders.map((line) => line.split(":")[0])).toEqual([r.b.taskId, r.a.taskId]);
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(2);
+	});
+
+	test("AC-4b: a failed prompt records nothing and is sent on the next sweep that succeeds", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.b.taskId, ["src/daemon/daemon.ts"]);
+		r.remindOk.value = false;
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders).toHaveLength(0);
+		r.remindOk.value = true;
+		await r.sweeper.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders).toHaveLength(2);
+	});
+
+	test("AC-4b: an agent that got the stale reminder in this sweep hears of the overlap on the next one", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.b.taskId, ["src/daemon/daemon.ts"]);
+		r.clock.ms = T0 + STALE_REMIND_MS;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 }) };
+		await r.sweeper.sweep();
+		// Both agents got the 30-minute reminder: one prompt per sweep, so the overlap waits.
+		expect(r.reminders).toHaveLength(2);
+		expect(r.reminders.every((line) => line.includes("PROGRESS.md가"))).toBe(true);
+		expect(threadPosts(r).filter((p) => p.text.startsWith("⚠️ 파일 겹침"))).toHaveLength(2);
+		r.clock.ms += TASK_SWEEP_MS;
+		await r.sweeper.sweep();
+		expect(r.reminders.filter((line) => line.includes("다른 TASK"))).toHaveLength(2);
+	});
+
+	test("AC-4b: a frozen bot prompts no agent and records nothing", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.b.taskId, ["src/daemon/daemon.ts"]);
+		const frozen = new TaskSweeper({
+			ledger: r.ledger,
+			evaluate: async () => r.next.value,
+			remind: async (row, text) => {
+				r.reminders.push(`${row.taskId}: ${text}`);
+				return { ok: true };
+			},
+			agentStatus: async () => ({ ok: true, status: "idle" }),
+			readAgent: async () => ({ ok: true, output: "" }),
+			changedPaths: async (row) => r.paths.get(row.taskId),
+			frozen: () => ({ since: new Date(T0).toISOString(), reason: "test", by: "cli" }),
+			channels: registryOf(new SlackChannel(r.transport)),
+			ownerUserId: "UOWN",
+			now: () => r.clock.ms,
+			log: noop,
+		});
+		await frozen.sweep();
+		expect(threadPosts(r)).toHaveLength(2);
+		expect(r.reminders).toHaveLength(0);
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(2);
+	});
+});
+
+describe("taskChangedPaths", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	function repoOn(branch: string): string {
+		const repo = mkdtempSync(join(tmpdir(), "ompbot-overlap-"));
+		roots.push(repo);
+		gitFixture(repo, "init", "-q", "-b", branch);
+		writeFileSync(join(repo, "README.md"), "hello\n");
+		gitFixture(repo, "add", "README.md");
+		gitFixture(repo, "commit", "-q", "-m", "init");
+		return repo;
+	}
+
+	/** On a task branch: one committed file, one modified tracked file, one untracked file, one docs/tasks file. */
+	function work(repo: string): void {
+		gitFixture(repo, "checkout", "-q", "-b", "task/T-1");
+		mkdirSync(join(repo, "src"));
+		writeFileSync(join(repo, "src", "a.ts"), "a\n");
+		gitFixture(repo, "add", "src/a.ts");
+		gitFixture(repo, "commit", "-q", "-m", "a");
+		writeFileSync(join(repo, "README.md"), "changed\n");
+		writeFileSync(join(repo, "new file.txt"), "n\n");
+		mkdirSync(join(repo, "docs", "tasks", "T-1"), { recursive: true });
+		writeFileSync(join(repo, "docs", "tasks", "T-1", "PROGRESS.md"), "p\n");
+	}
+
+	test("AC-4b: a repository without main falls back to master", async () => {
+		const repo = repoOn("master");
+		work(repo);
+		expect(await taskChangedPaths(repo, realProcessRunner)).toEqual({
+			ok: true,
+			paths: ["README.md", "new file.txt", "src/a.ts"],
+		});
+	});
+
+	test("AC-4b: a clone uses origin/HEAD before main or master", async () => {
+		const upstream = repoOn("trunk");
+		const clone = mkdtempSync(join(tmpdir(), "ompbot-overlap-clone-"));
+		roots.push(clone);
+		rmSync(clone, { recursive: true, force: true });
+		gitFixture(tmpdir(), "clone", "-q", upstream, clone);
+		work(clone);
+		expect(await taskChangedPaths(clone, realProcessRunner)).toEqual({
+			ok: true,
+			paths: ["README.md", "new file.txt", "src/a.ts"],
+		});
+	});
+
+	test("AC-4b: no base branch at all is a failure with a reason", async () => {
+		const repo = repoOn("trunk");
+		work(repo);
+		const result = await taskChangedPaths(repo, realProcessRunner);
+		expect(result.ok).toBe(false);
+		expect(result.ok === false && result.reason).toBe("no_base_branch");
+	});
+});
+
+describe("TaskSweeper: the resumed agent's restated line", () => {
+	const RESTATED = "로그 회전 / S2 회전 구현 / bun test 통과";
+	const MISSING = "⚠️ 재개 뒤 PROGRESS는 갱신됐지만 재개 이해(restated)가 없습니다";
+	const texts = (r: Rig): string[] => posts(r).map((post) => ("text" in post ? post.text : ""));
+	/** Marks a resume at `at` the way `resumeTask` does, with the `restated` value PROGRESS.md had then. */
+	const resumeAt = (r: Rig, at: number, before: string): void => {
+		r.ledger.recordNotice(r.row.taskId, `resume:${at}`);
+		r.ledger.recordNotice(r.row.taskId, `restated-before:${at}:${restatedHash(before)}`);
+	};
+
+	test("a new value is posted once; the same value never again; a changed one once more", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ restated: RESTATED }) };
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([`🔁 재개 이해: ${RESTATED}`]);
+		expect(r.ledger.require(r.row.taskId).notices).toHaveProperty(`restated:${restatedHash(RESTATED)}`);
+		await r.sweeper.sweep();
+		expect(texts(r)).toHaveLength(1);
+		r.next.value = { ok: true, judgement: judgement({ restated: "로그 회전 / S3 문서 / guide.md 두 줄" }) };
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([`🔁 재개 이해: ${RESTATED}`, "🔁 재개 이해: 로그 회전 / S3 문서 / guide.md 두 줄"]);
+	});
+
+	test("a failed post records nothing and the next sweep posts it", async () => {
+		const warns: Array<[string, Record<string, unknown> | undefined]> = [];
+		const r = rig({ log: { info() {}, warn: (event, fields) => warns.push([event, fields]) } });
+		r.next.value = { ok: true, judgement: judgement({ restated: RESTATED }) };
+		r.transport.failNext.postMessage = [new Error("rate_limited")];
+		const attempts = () => texts(r).filter((text) => text === `🔁 재개 이해: ${RESTATED}`).length;
+		await r.sweeper.sweep();
+		expect(attempts()).toBe(1); // the fake records the call it then fails
+		expect(Object.keys(r.ledger.require(r.row.taskId).notices).some((key) => key.startsWith("restated:"))).toBe(false);
+		expect(
+			warns.some(([event, fields]) => event === "task_restated_post_failed" && fields?.task === r.row.taskId),
+		).toBe(true);
+		await r.sweeper.sweep();
+		expect(attempts()).toBe(2);
+		expect(r.ledger.require(r.row.taskId).notices).toHaveProperty(`restated:${restatedHash(RESTATED)}`);
+		await r.sweeper.sweep();
+		expect(attempts()).toBe(2);
+	});
+
+	test("PROGRESS updated after a resume without a restated line: one warning per resume", async () => {
+		const r = rig();
+		const resumed = T0 + 10 * MIN;
+		resumeAt(r, resumed, "");
+		r.clock.ms = T0 + 20 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 15 * MIN }) };
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([MISSING]);
+		expect(r.ledger.require(r.row.taskId).notices).toHaveProperty(`restated-missing:${resumed}`);
+		// The next resume is a new chance to write it, and a new warning when it is skipped again.
+		const again = T0 + 30 * MIN;
+		resumeAt(r, again, "");
+		r.clock.ms = T0 + 40 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 35 * MIN }) };
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([MISSING, MISSING]);
+	});
+
+	test("restated left as it was before the resume is missing too; a new one is not", async () => {
+		const r = rig();
+		const OLD = "로그 회전 / S1 / 테스트";
+		r.ledger.recordNotice(r.row.taskId, `restated:${restatedHash(OLD)}`); // posted before the resume
+		resumeAt(r, T0 + 10 * MIN, OLD);
+		r.clock.ms = T0 + 20 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 15 * MIN, restated: OLD }) };
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([MISSING]);
+
+		const fresh = rig();
+		resumeAt(fresh, T0 + 10 * MIN, OLD);
+		fresh.clock.ms = T0 + 20 * MIN;
+		fresh.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 15 * MIN, restated: RESTATED }) };
+		await fresh.sweeper.sweep();
+		expect(texts(fresh)).toEqual([`🔁 재개 이해: ${RESTATED}`]);
+	});
+
+	test("no warning before PROGRESS moves past the resume, or without any resume", async () => {
+		const r = rig();
+		resumeAt(r, T0 + 10 * MIN, "");
+		r.clock.ms = T0 + 20 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 10 * MIN }) };
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([]);
+
+		const never = rig();
+		never.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 15 * MIN }) };
+		never.clock.ms = T0 + 20 * MIN;
+		await never.sweeper.sweep();
+		expect(texts(never)).toEqual([]);
+	});
+
+	test("a resume known only from the ledger's resume dispatch transition counts too", async () => {
+		const r = rig();
+		r.ledger.transition(r.row.taskId, "blocked", "bot", "PROGRESS status: blocked");
+		r.clock.ms = T0 + 10 * MIN;
+		r.ledger.transition(r.row.taskId, "working", "bot", "resume dispatch");
+		r.clock.ms = T0 + 20 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 15 * MIN }) };
+		await r.sweeper.sweep();
+		expect(texts(r)).toEqual([MISSING]);
+		expect(r.ledger.require(r.row.taskId).notices).toHaveProperty(`restated-missing:${T0 + 10 * MIN}`);
 	});
 });

@@ -1,4 +1,7 @@
 import type { ActionButton, ChannelPort, MessageRef, OutboundMessage } from "../channel/port";
+import type { ChannelRegistry } from "../channel/registry";
+import { cutCodePointSafe } from "../channel/text";
+import { type ChatPlatform, platformOfConversationId } from "../core/origin-key";
 import type { Logger } from "../log";
 import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import { redact } from "../redact";
@@ -221,8 +224,11 @@ export interface ApprovalStore {
 }
 
 export interface ApprovalBrokerOptions {
-	port: ChannelPort;
+	/** Each card goes out on the port of its conversation's platform. */
+	channels: ChannelRegistry;
 	ownerUserId: string;
+	/** The owner on each platform, for clicks on that platform's cards; a platform not listed uses `ownerUserId`. */
+	platformOwners?: Partial<Record<ChatPlatform, string>> | undefined;
 	/** Slack channel that receives the cards of requests that carry an origin (`ask` with `origin`); absent: the origin's own channel. */
 	escalationChannel?: string | undefined;
 	log: Logger;
@@ -295,13 +301,6 @@ const CHOICE_HEADS = ["❓", "🔒"];
 /** Slack: at most 75 characters per button label. */
 const BUTTON_LABEL_LIMIT = 75;
 
-/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
-function cutCodePointSafe(text: string, limit: number): string {
-	if (text.length <= limit) return text;
-	const last = text.charCodeAt(limit - 1);
-	return text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit);
-}
-
 /** One short line of the owner's reply for the settled card. */
 function replyLine(text: string): string {
 	return cutCodePointSafe(redact(text).replace(/\s+/g, " ").trim(), 200);
@@ -371,7 +370,7 @@ export class ApprovalBroker {
 	/** Best-effort link to one message; a failed lookup is logged and reads as no link. */
 	async #permalink(channel: string, ts: string): Promise<string | undefined> {
 		try {
-			return await this.#options.port.permalink(this.#ref(channel, ts));
+			return await this.#port(channel).permalink(this.#ref(channel, ts));
 		} catch (error) {
 			this.#options.log.warn("approval_permalink_failed", { channel, error: String(error) });
 			return undefined;
@@ -393,10 +392,16 @@ export class ApprovalBroker {
 		} = {},
 	): Promise<ApprovalResult> {
 		const { signal, detail, origin } = options;
-		const { port, log, store } = this.#options;
+		const { log, store } = this.#options;
 		const escalation = this.#options.escalationChannel;
-		const escalated = origin !== undefined && escalation !== undefined && escalation !== requestChannel;
+		// The escalation channel is one platform's value: a request from another platform's conversation stays there.
+		const escalated =
+			origin !== undefined &&
+			escalation !== undefined &&
+			escalation !== requestChannel &&
+			platformOfConversationId(escalation) === platformOfConversationId(requestChannel);
 		const channel = escalated ? escalation : requestChannel;
+		const port = this.#port(channel);
 		// Computed once: the card header and the ledger summary (and sections) must show the exact same text.
 		const shown = cutCodePointSafe(redact(summary), SUMMARY_LIMIT);
 		const sections = shownDetail(withExposure(summary, detail));
@@ -562,7 +567,8 @@ export class ApprovalBroker {
 		options: { signal?: AbortSignal | undefined } = {},
 	): Promise<ChoiceCardHandle> {
 		const { signal } = options;
-		const { port, log, store } = this.#options;
+		const { log, store } = this.#options;
+		const port = this.#port(origin.channel);
 		const now = this.#clock.now();
 		const timeoutMs = card.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
 		let body = cutCodePointSafe(redact(card.text), CARD_LIMIT);
@@ -731,7 +737,7 @@ export class ApprovalBroker {
 	 */
 	async #postMirror(channel: string, threadTs: string, card: OutboundMessage): Promise<MessageRef | undefined> {
 		try {
-			return await this.#options.port.post({ conversationId: channel, threadId: threadTs }, card);
+			return await this.#port(channel).post({ conversationId: channel, threadId: threadTs }, card);
 		} catch (error) {
 			this.#options.log.warn("approval_mirror_failed", { channel, error: String(error) });
 			return undefined;
@@ -754,8 +760,9 @@ export class ApprovalBroker {
 		cardUrl: string | undefined,
 		shown: string,
 	): Promise<void> {
-		const { port, log } = this.#options;
+		const { log } = this.#options;
 		try {
+			const port = this.#port(origin.channel);
 			const link = cardUrl === undefined ? "" : ` (<${cardUrl}|카드 보기>)`;
 			const firstLine = cutCodePointSafe(shown.split("\n")[0] ?? "", 200);
 			await port.post(
@@ -805,7 +812,7 @@ export class ApprovalBroker {
 	 * the process) and rewrites their cards to say so, instead of leaving buttons that resolve to nothing.
 	 */
 	async expireStale(due = true): Promise<number> {
-		const { store, port, log } = this.#options;
+		const { store, log } = this.#options;
 		const expired = store.expirePendingApprovals(this.#clock.now(), due);
 		for (const row of expired) {
 			// A choice card's ledger summary is its own body, which always opens with its ❓/🔒 head (`choose`);
@@ -824,7 +831,7 @@ export class ApprovalBroker {
 			for (const ref of [`${row.channel}:${row.messageTs}`, ...(row.mirrorRef === null ? [] : [row.mirrorRef])]) {
 				const [channel = "", ts = ""] = ref.split(":");
 				try {
-					await port.edit(this.#ref(channel, ts), message);
+					await this.#port(channel).edit(this.#ref(channel, ts), message);
 				} catch (error) {
 					log.warn("approval_expire_card_failed", { channel, ts, error: String(error) });
 				}
@@ -839,7 +846,7 @@ export class ApprovalBroker {
 	 * are known.
 	 */
 	async redrawCards(approvalId: string, note: string, clicked?: { channel: string; ts: string }): Promise<void> {
-		const { store, port, log } = this.#options;
+		const { store, log } = this.#options;
 		const row = store.getApproval(approvalId);
 		const message =
 			row === undefined
@@ -856,24 +863,35 @@ export class ApprovalBroker {
 		for (const ref of refs) {
 			const [channel = "", ts = ""] = ref.split(":");
 			try {
-				await port.edit(this.#ref(channel, ts), message);
+				await this.#port(channel).edit(this.#ref(channel, ts), message);
 			} catch (error) {
 				log.warn("approval_redraw_failed", { channel, ts, error: String(error) });
 			}
 		}
 	}
 
-	/** A message of the approval conversation (card or asking thread) on the broker's port. */
+	/** A message of the approval conversation (card or asking thread) on its platform's port. */
 	#ref(conversationId: string, messageId: string): MessageRef {
-		return { platform: this.#options.port.platform, conversationId, messageId };
+		return { platform: this.#port(conversationId).platform, conversationId, messageId };
+	}
+
+	/** The port of a conversation's platform; throws for a conversation no registered platform owns. */
+	#port(conversationId: string): ChannelPort {
+		return this.#options.channels.portFor(conversationId);
+	}
+
+	/** The owner who may click a card in `conversationId`: that platform's owner. */
+	#ownerOf(conversationId: string): string {
+		const platform = platformOfConversationId(conversationId);
+		return (platform === undefined ? undefined : this.#options.platformOwners?.[platform]) ?? this.#options.ownerUserId;
 	}
 
 	/** Returns true when the click settled a pending request (or was taken by an open choice card). */
 	handleAction(action: { actionId: string; userId: string }): boolean {
-		const { log, ownerUserId } = this.#options;
+		const { log } = this.#options;
 		const choice = parseChoiceActionId(action.actionId);
 		if (choice !== undefined) {
-			if (action.userId !== ownerUserId) {
+			if (action.userId !== this.#ownerOf(choice.channel)) {
 				log.warn("choice_click_ignored", { user: action.userId, reason: "not_owner" });
 				return false;
 			}
@@ -892,7 +910,7 @@ export class ApprovalBroker {
 		const parsed = parseApprovalActionId(action.actionId);
 		// `다시 요청` belongs to the daemon (it feeds the asking thread), not to a pending request.
 		if (!parsed || parsed.decision === "retry") return false;
-		if (action.userId !== ownerUserId) {
+		if (action.userId !== this.#ownerOf(parsed.channel)) {
 			log.warn("approval_click_ignored", { user: action.userId, reason: "not_owner" });
 			return false;
 		}

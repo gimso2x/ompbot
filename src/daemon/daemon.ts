@@ -1,29 +1,34 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { ChannelPort } from "../channel/port";
+import type { ChannelAdapter, ChannelBinding } from "../channel/adapter";
 import { ChannelRegistry } from "../channel/registry";
-import { loadConfig, type OmpbotConfig } from "../config";
-import type { DriverFactory, ProviderLimitInfo, SlackThreadMessage, TurnFailureEscalation } from "../core/mailbox";
-import { parseThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { escapeMrkdwn } from "../channel/text";
+import type { CoreSink, DeliverySource, IngestOutcome } from "../channel/types";
+import { DEPRECATED_KEYS, loadConfig, type OmpbotConfig } from "../config";
+import type { DriverFactory, ProviderLimitInfo, ThreadSource, TurnFailureEscalation } from "../core/mailbox";
+import { parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
-import { parseChatOrigin } from "../core/origin-key";
+import { type ChatPlatform, type IdPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { stuckStopText } from "../core/stuck";
 import { COMMAND_OP_REF, COMMAND_TEXT, type MailboxClock } from "../core/types";
 import { createDispatchAudit, installProcessAudit } from "../dispatch/audit";
 import { boardCardLink } from "../dispatch/board";
 import {
-	dispatchEnv,
 	herdrAgentPane,
 	herdrAgentStatus,
+	herdrInterruptAgent,
 	herdrPromptExisting,
 	herdrReadAgent,
 	type ProcessRunner,
 	realProcessRunner,
 	setLocalHerdrBin,
 } from "../dispatch/omp";
+import { parseLaneActionId } from "../lanes/card";
+import { classifyLaneControl } from "../lanes/control";
+import type { LandLane } from "../lanes/land";
 import { LaneInputError, LaneManager } from "../lanes/manager";
-import { isLaneOrigin } from "../lanes/status";
+import { isLaneOrigin, type LaneRow } from "../lanes/status";
 import { buildLaneTools, buildWorkStartTool } from "../lanes/tools";
 import {
 	buildClosedLaneQuestion,
@@ -41,6 +46,7 @@ import { WebhookServer } from "../monitors/webhook";
 import type { ClaudeApprovalHook } from "../omp/claude-driver";
 import type { OmpDialogAnswerer, OmpSessionDriver } from "../omp/driver";
 import { readConfigText, recordLastGoodConfig } from "../ops/apply";
+import { formatCacheMissNotice, formatColdCacheNotice } from "../ops/cache-monitor";
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
@@ -58,14 +64,12 @@ import {
 import { ApprovalBroker, parseApprovalRetryActionId } from "../safety/approval";
 import { answerDialogOnSlack } from "../safety/choice";
 import { buildHostTools, type HostToolDef } from "../safety/host-tools";
-import { type CoreSink, type DeliverySource, type IngestOutcome, SlackAdapter } from "../slack/adapter";
-import { type BackfillDeps, BackfillRunner, type ChannelTarget, channelCursorKey } from "../slack/backfill";
-import type { SlackChannel } from "../slack/channel";
 import { type DeliveryRow, INTERIM_INFIX, type InboundRow, LOG_COPY_SUFFIX, Store } from "../store/db";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
 import type { TaskRow } from "../tasks/ledger";
 import {
+	type AutoLandPolicy,
 	buildBlockedSettledCard,
 	buildMergeSettledCard,
 	cardMessage,
@@ -74,7 +78,8 @@ import {
 	RECOMMEND_VALUE_MAX,
 	type TaskCard,
 } from "../tasks/notify";
-import { TASK_SWEEP_MS, TaskSweeper } from "../tasks/sweeper";
+import { repoMatchesCommonDir } from "../tasks/repo-match";
+import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
 import type { CrashPoint } from "./crash";
 import { DEFAULT_SWEEP_MS, EVENT_LOOP_WARN_MS, SweepHeartbeatWriter } from "./heartbeat";
 import { type IpcServer, startIpcServer } from "./ipc";
@@ -109,8 +114,6 @@ import {
 } from "./status";
 
 const MEDIA_SWEEP_INTERVAL_MS = 60 * 60_000;
-/** Pages (200 messages each) of one thread read for turn context. */
-const THREAD_CONTEXT_MAX_PAGES = 5;
 
 /** KV-cursor prefixes (like `mute:`) of a thread's peer hop cap: the last owner message and the notice already posted. */
 const PEER_HOP_RESET_CURSOR = "peerhop-reset:";
@@ -167,10 +170,10 @@ export interface DaemonOptions {
 	 */
 	bootConfigText?: string | undefined;
 	/**
-	 * The Slack side: its port carries every core-authored post (through the redacting registry), its `transport` the
-	 * adapter's inbound socket, backfill and delivery pump.
+	 * The chat platforms, one binding each: a binding's port carries the core-authored posts of its platform (through
+	 * the redacting registry), its adapter the inbound path and delivery pump.
 	 */
-	slack: SlackChannel;
+	channels: readonly ChannelBinding[];
 	/** Builds the raw driver for (origin, sessionDir); the daemon namespaces its opRefs. */
 	driverFactory: DriverFactory;
 	log: Logger;
@@ -205,6 +208,8 @@ export interface DaemonOptions {
 	threadContextTimeoutMs?: number;
 	/** Test seam for done-claim verification; default checks the real git repository. */
 	verifyClaim?: (evidence: ClaimEvidence, cwd: string) => Promise<VerifyResult>;
+	/** Test seam for landing a closed work lane; default merges, pushes and cleans up with real git. */
+	landLane?: LandLane;
 	/** Test seam for the [TASK] sweep's herdr calls (remind, agent status, board pane); default runs the real herdr. */
 	herdrRun?: ProcessRunner;
 }
@@ -239,8 +244,11 @@ const RECOMMEND_REJECTED_NOTE = '⚠️ 추천을 넣지 못함 — 스레드에
 const AUTO_LAND_TEXT = "머지해 (자동: Outcome 도달·재실행 검사 통과)";
 const AUTO_LAND_MARKER = "🤖 자동 머지";
 
-/** Slack escapes only &, < and > in text; the adapter unescapes, so injected text is escaped to survive the round trip. */
-const escapeSlack = (text: string): string => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+/**
+ * Whether the bot answers a daemon-put owner message in `channel` as in a DM or as in a channel (where the bot mention
+ * leads the text). Slack DM ids start with `D`; every other conversation counts as a channel.
+ */
+const conversationKind = (channel: string): "dm" | "ch" => (channel.startsWith("D") ? "dm" : "ch");
 
 /** Sweep-retry state of one origin with stranded pending rows (see `#sweepPendingDispatch`). */
 interface PendingRetryState {
@@ -262,14 +270,14 @@ class DaemonStore extends Store {
 		private readonly crash: (point: CrashPoint) => void,
 		private readonly nudge: () => void,
 		log: Logger,
-		ownerSlackUserId: string,
+		slackOwnerUserId: string,
 		logChannel: string | undefined,
 	) {
 		super({
 			path,
 			clock,
 			redact,
-			ownerSlackUserId,
+			slackOwnerUserId,
 			logChannel,
 			hooks: {
 				afterInboundAnswered: () => crash("after_final_before_answered"),
@@ -311,7 +319,7 @@ class DaemonStore extends Store {
 	}
 }
 
-/** Wires store, origin router, Slack adapter, unix socket and timers; owns recovery on start and graceful stop. */
+/** Wires store, origin router, channel adapters, unix socket and timers; owns recovery on start and graceful stop. */
 export class Daemon {
 	readonly #options: DaemonOptions;
 	readonly #clock: MailboxClock;
@@ -324,7 +332,8 @@ export class Daemon {
 	#router: OriginRouter | undefined;
 	#monitors: MonitorScheduler | undefined;
 	#webhook: WebhookServer | undefined;
-	#adapter: SlackAdapter | undefined;
+	/** One adapter per bound platform, built at start. */
+	readonly #adapters = new Map<ChatPlatform, ChannelAdapter>();
 	#ipc: IpcServer | undefined;
 	#timer: NodeJS.Timeout | undefined;
 	#lastMediaSweep = 0;
@@ -335,6 +344,8 @@ export class Daemon {
 	>();
 	#lastGateSweepAt = 0;
 	#taskSweeper: TaskSweeper | undefined;
+	/** `<task>:<reason>` of every overlap check a task was left out of, logged once each (memory only). */
+	readonly #overlapSkipped = new Set<string>();
 	#lastTaskSweepAt = 0;
 	#taskSweeping = false;
 	/** Local `herdr status server` check on the task sweep cadence (herdr on only); feeds `herdr_unreachable`. */
@@ -355,8 +366,8 @@ export class Daemon {
 	readonly #frozen: () => FreezeState | undefined;
 	#broker: ApprovalBroker | undefined;
 	#lanes: LaneManager | undefined;
-	/** Outbound Slack posts of the core (approval cards, lanes, tasks, uploads, inject markers), redacted on the way. */
-	readonly #slackPort: ChannelPort;
+	/** Outbound posts of the core (approval cards, lanes, tasks, uploads, inject markers), redacted on the way. */
+	readonly #channels: ChannelRegistry;
 	/** Task cards (`<channel>:<ts>`) whose button (`머지`, `추천대로`) was clicked in this process: a second click does nothing. Never cleared. */
 	readonly #mergeClicks = new Set<string>();
 	/** Approvals (canonical `<channel>:<ts>`) whose `다시 요청` was clicked in this process, on either card. Never cleared. */
@@ -367,11 +378,51 @@ export class Daemon {
 	constructor(options: DaemonOptions) {
 		this.#options = options;
 		const channels = new ChannelRegistry();
-		channels.register(options.slack);
-		this.#slackPort = channels.get("slack");
+		for (const binding of options.channels) channels.register(binding.port);
+		this.#channels = channels;
 		this.#clock = options.clock ?? { now: () => Date.now() };
 		this.#log = options.log;
 		this.#frozen = createFreezeProbe(options.config.homeDir);
+	}
+
+	/** The adapter of a thread ref's platform; none for an unbound platform or a malformed ref. */
+	#adapterOfThread(threadRef: string): ChannelAdapter | undefined {
+		const platform = platformOfThreadRef(threadRef);
+		return platform === undefined ? undefined : this.#adapters.get(platform);
+	}
+
+	/** The adapter of a conversation id's platform; none for an unbound platform. */
+	#adapterOfConversation(conversationId: string): ChannelAdapter | undefined {
+		const platform = platformOfConversationId(conversationId);
+		return platform === undefined ? undefined : this.#adapters.get(platform);
+	}
+
+	/** The adapter that reaches the owner's notice conversation (`ownerChannel()`); logged when none is bound. */
+	#ownerAdapter(): ChannelAdapter | undefined {
+		const channel = this.#store?.ownerChannel();
+		if (channel === undefined) return undefined;
+		const adapter = this.#adapterOfConversation(channel);
+		if (adapter === undefined && this.#adapters.size > 0) this.#log.warn("owner_channel_unbound", { channel });
+		return adapter;
+	}
+
+	/** Per platform with a thread reader: what the mailbox reads a turn's thread context through. */
+	#threadSources(): Map<ChatPlatform, ThreadSource> {
+		const timeout =
+			this.#options.threadContextTimeoutMs === undefined ? {} : { timeoutMs: this.#options.threadContextTimeoutMs };
+		const sources = new Map<ChatPlatform, ThreadSource>();
+		for (const binding of this.#options.channels) {
+			const replies = binding.readThread;
+			if (replies === undefined) continue;
+			const platform = binding.port.platform;
+			sources.set(platform, {
+				...timeout,
+				botUserId: () => this.#adapters.get(platform)?.botUserId,
+				replies,
+				mentionUser: (userId) => binding.port.mentionUser(userId),
+			});
+		}
+		return sources;
 	}
 
 	/**
@@ -393,7 +444,7 @@ export class Daemon {
 		const peerTouched = this.peerTouched(originKey);
 		const base = buildHostTools({
 			originKey,
-			port: this.#slackPort,
+			channels: this.#channels,
 			broker: this.#approval,
 			log: this.#log,
 			homeDir: config.homeDir,
@@ -401,6 +452,7 @@ export class Daemon {
 			...(chatOrigin !== undefined ? { ompExecutable: config.ompExecutable } : {}),
 			...(channel === undefined ? {} : { channel }),
 			...(config.dispatchHosts === undefined ? {} : { dispatchHosts: config.dispatchHosts }),
+			...(config.workerOmpArgs === undefined ? {} : { workerOmpArgs: config.workerOmpArgs }),
 			...(config.herdrBoard === undefined ? {} : { herdrBoard: config.herdrBoard }),
 			...(config.herdr === undefined ? {} : { herdr: config.herdr }),
 			frozen: this.#frozen,
@@ -412,7 +464,7 @@ export class Daemon {
 							threadRef: () =>
 								this.#router?.mailbox(originKey).state.threadRef ?? this.#store?.latestInboundThread(originKey),
 							rootText: (threadRef: string) => this.#store?.getInbound(threadRef)?.textRef,
-							port: this.#slackPort,
+							channels: this.#channels,
 							now: () => this.#clock.now(),
 						},
 					}),
@@ -432,15 +484,18 @@ export class Daemon {
 					log: this.#log,
 				})
 			: [];
-		const tools = peerTouched
-			? base
-			: !lanes
-				? [...base, ...monitorTools]
-				: lane
-					? [...base, ...buildLaneTools(lanes, originKey)]
-					: channel === undefined
-						? base
-						: [...base, buildWorkStartTool(lanes, channel), ...monitorTools];
+		// Work lanes and monitors report into Slack threads only: another platform's conversation gets the base set.
+		const otherPlatform = chatOrigin !== undefined && chatOrigin.platform !== "slack";
+		const tools =
+			peerTouched || otherPlatform
+				? base
+				: !lanes
+					? [...base, ...monitorTools]
+					: lane
+						? [...base, ...buildLaneTools(lanes, originKey)]
+						: channel === undefined
+							? base
+							: [...base, buildWorkStartTool(lanes, channel), ...monitorTools];
 		// Each call runs inside the origin's mailbox: no stall alert while the child waits on the host (an approval
 		// click can take minutes), and `drain` counts it as unfinished work.
 		return tools.map((tool) => ({
@@ -500,10 +555,11 @@ export class Daemon {
 
 	/** Working directory of the omp child: the project of a work lane, the bot workspace otherwise. */
 	cwdFor(originKey: string): string {
-		return (
-			(isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey)?.cwd : undefined) ??
-			this.#options.config.workspaceDir
-		);
+		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
+		if (lane === undefined) return this.#options.config.workspaceDir;
+		// A landed or discarded lane has no worktree any more: its session answers later questions from the
+		// repository it was merged into.
+		return existsSync(lane.cwd) ? lane.cwd : (lane.meta.repo ?? this.#options.config.workspaceDir);
 	}
 
 	/**
@@ -558,13 +614,17 @@ export class Daemon {
 			crash,
 			() => this.#nudgePump(),
 			log,
-			config.ownerSlackUserId,
+			config.channels.slack.ownerUserId,
 			config.logChannel,
 		);
 		this.#store = store;
 		this.#broker = new ApprovalBroker({
-			port: this.#slackPort,
-			ownerUserId: config.ownerSlackUserId,
+			channels: this.#channels,
+			ownerUserId: config.channels.slack.ownerUserId,
+			platformOwners: {
+				slack: config.channels.slack.ownerUserId,
+				...(config.channels.discord === undefined ? {} : { discord: config.channels.discord.ownerUserId }),
+			},
 			escalationChannel: config.escalationChannel,
 			log,
 			store,
@@ -579,6 +639,7 @@ export class Daemon {
 			recovered_inflight: store.recoveredInflight,
 			requeued_ambiguous: requeued,
 		});
+		for (const key of config.deprecated ?? []) log.warn("config_deprecated_key", { key, use: DEPRECATED_KEYS[key] });
 
 		// Rule (2): settle dispatched rows of the dead process before any new child is started.
 		const recovered = await recoverDispatched({
@@ -609,37 +670,12 @@ export class Daemon {
 			// Read on every turn: a reload replaces this.#options.config, a captured local config would not follow it.
 			recallEnabled: () => this.#options.config.recallEnabled !== false,
 			distillProvider: (originKey) => this.#distill(originKey),
-			threadSource: {
-				...(this.#options.threadContextTimeoutMs === undefined
-					? {}
-					: { timeoutMs: this.#options.threadContextTimeoutMs }),
-				botUserId: () => this.#adapter?.botUserId,
-				replies: async (channel, threadTs, limit) => {
-					const transport = this.#options.slack.transport;
-					const out: SlackThreadMessage[] = [];
-					let cursor: string | undefined;
-					// Oldest-first pages; a `limit` (root only) is a single call.
-					for (let page = 0; page < THREAD_CONTEXT_MAX_PAGES; page++) {
-						const res = await transport.conversationsReplies({
-							channel,
-							ts: threadTs,
-							...(limit === undefined ? {} : { limit }),
-							...(cursor === undefined ? {} : { cursor }),
-						});
-						for (const m of res.messages) {
-							out.push({ ts: m.ts, text: m.text ?? "", user: m.user, botId: m.bot_id });
-						}
-						cursor = res.nextCursor;
-						if (cursor === undefined || limit !== undefined) break;
-					}
-					return out;
-				},
-			},
+			threadSource: this.#threadSources(),
 			idleStopMs: config.idleTimeoutMinutes === undefined ? undefined : config.idleTimeoutMinutes * 60_000,
 			...(config.model === undefined ? {} : { defaultModel: config.model }),
-			onStall: (info) => void this.#adapter?.setStalled(info.threadRef, info.stalled),
+			onStall: (info) => void this.#adapterOfThread(info.threadRef)?.setStalled(info.threadRef, info.stalled),
 			onProgress: ({ threadRef, progress }) =>
-				void this.#adapter?.setProgress(threadRef, {
+				void this.#adapterOfThread(threadRef)?.setProgress(threadRef, {
 					...progress,
 					recentTools: progress.recentTools.map((tool) => redact(tool)),
 					...(progress.todo?.current === undefined
@@ -648,16 +684,21 @@ export class Daemon {
 				}),
 			onEscalate: (info) => this.#escalateTurnFailures(info),
 			onProviderLimit: (info) => this.#notifyProviderLimit(info),
+			onCacheMiss: (info) => this.#postThreadNotices([info.threadRef], formatCacheMissNotice(info)),
+			onColdCache: (info) => this.#postThreadNotices([info.threadRef], formatColdCacheNotice(info)),
 			onSessionMismatch: (info) => this.#postThreadNotices([info.threadRef], formatSessionMismatchNotice(info)),
 			// A monitor's failed turn already retries with backoff through its own failure path: no thread post.
 			onStuckLoop: (info) => {
 				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
 				this.#postThreadNotices([info.threadRef], redact(stuckStopText(info.toolName, info.count)));
 			},
+			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing.
+			isHeld: (originKey) => this.#store?.getLaneByOrigin(originKey)?.status === "paused",
+			onHeldWork: (info) => this.#lanes?.onHeldWork(info.originKey),
 			onStallEscalate: (info) => {
 				const target = this.#store;
 				if (target === undefined) return;
-				void this.#adapter?.postNotice(target.ownerChannel(), formatStallNotice(info));
+				void this.#ownerAdapter()?.postNotice(target.ownerChannel(), formatStallNotice(info));
 			},
 			dialogs: {
 				open: (originKey) => this.#approval.openDialogs(originKey),
@@ -668,17 +709,25 @@ export class Daemon {
 		});
 		this.#lanes = new LaneManager({
 			store,
-			port: this.#slackPort,
+			channels: this.#channels,
 			clock: this.#clock,
 			log,
 			sessionsRoot,
 			route: (record) => this.#router?.route(record) ?? Promise.resolve(),
 			stopWhenIdle: (originKey) => this.#router?.mailbox(originKey).stopWhenIdle() ?? Promise.resolve(),
+			pauseTurn: (originKey) =>
+				this.#router?.mailbox(originKey).pauseTurn() ?? Promise.resolve({ busy: false, settled: true }),
+			resumePending: (originKey) => this.#router?.mailbox(originKey).resumePending() ?? Promise.resolve(),
 			sessionDirFor: (originKey) => sessionDirFor(sessionsRoot, originKey, 1),
 			frozen: this.#frozen,
 			approvals: { request: (channel, summary) => this.#approval.request(channel, summary) },
+			// taskAutoLand is a live setting: `ompbot reload` turns lane auto-merge on or off for the next close.
+			autoLandPolicy: () => this.#autoLandPolicy(),
+			ownerUserId: config.channels.slack.ownerUserId,
+			laneBusy: (originKey) => this.#router?.mailbox(originKey).state.busy ?? false,
 			...(this.#options.maxLanes === undefined ? {} : { maxLanes: this.#options.maxLanes }),
 			...(this.#options.verifyClaim === undefined ? {} : { verify: this.#options.verifyClaim }),
+			...(this.#options.landLane === undefined ? {} : { land: this.#options.landLane }),
 		});
 		this.#monitors = new MonitorScheduler({
 			store,
@@ -715,7 +764,10 @@ export class Daemon {
 				store.ensureOrigin(originKey, lane?.sessionDir ?? sessionDirFor(sessionsRoot, originKey, 1));
 				// A closed lane stays closed for anything but `!reopen`: a question (or a `!followup` payload) reaches its
 				// session behind the answer-only notice; control commands stay as typed — the mailbox reads the recorded text.
-				const question = lane?.status === "closed" && classifyClosedLaneMessage(message.text) === "question";
+				// `머지해`/`폐기해` (the whole message, while the landing waits) are the card's buttons in words.
+				const closedAs =
+					lane?.status === "closed" ? classifyClosedLaneMessage(message.text, lane.meta.land?.state) : undefined;
+				const question = closedAs === "question";
 				const { inserted, row } = store.recordInbound({
 					originKey,
 					platformMessageId: message.platformMessageId,
@@ -728,8 +780,33 @@ export class Daemon {
 					store.setCursor(`${PEER_HOP_RESET_CURSOR}${message.threadRef}`, String(this.#clock.now()));
 				}
 				if (lane) {
+					// `멈춰`/`계속` (the whole message) are the lane's hold and release: the core settles them itself,
+					// before any closed-lane reading — a closed lane's pause holds only its auto-merge.
+					const control = classifyLaneControl(message.text);
+					if (control !== undefined) {
+						void this.#settleLaneControl(row, lane.name, control);
+						return {};
+					}
+					if (lane.status === "paused") this.#heldLaneNotice(lane);
+					// The core settles these itself; they never reach the lane's omp session.
+					const refusal = closedAs === "reopen" ? this.#lanes?.reopenRefusal(lane) : undefined;
+					if (closedAs === "land" || closedAs === "discard") {
+						void this.#settleLaneCommand(row, lane.name, { kind: closedAs });
+						return {};
+					}
+					if (refusal !== undefined) {
+						void this.#settleLaneCommand(row, lane.name, { kind: "refused", text: refusal });
+						return {};
+					}
 					this.#lanes?.onOwnerMessage(lane, message.text);
 				} else {
+					// `멈춰`/`계속` (the whole message) in a [TASK] thread hold or release that thread's one active task; the
+					// core settles it like a lane control. A thread without an active task keeps the message as it is.
+					const control = store.tasks.isTaskRoot(message.threadRef) ? classifyLaneControl(message.text) : undefined;
+					if (control !== undefined && this.#activeTasksOf(message.threadRef).length > 0) {
+						void this.#settleTaskControl(row, control);
+						return {};
+					}
 					const trigger = parseLaneTrigger(message.text);
 					if (trigger) {
 						void this.#startLane(row, trigger);
@@ -812,12 +889,15 @@ export class Daemon {
 				if (taskId !== undefined) return this.#handleTaskMerge(taskId, channel, messageTs);
 				const recommended = parseTaskRecommendActionId(actionId);
 				if (recommended !== undefined) return this.#handleTaskRecommend(recommended, value, channel, messageTs);
+				const laneAction = parseLaneActionId(actionId);
+				if (laneAction !== undefined) return this.#handleLaneButton(laneAction, channel, messageTs);
 				log.info("action_ignored", { action: actionId, user: userId });
 			},
 		};
-		const deliveries: DeliverySource = {
+		// Each adapter takes only the deliveries whose thread ref is an id of its own platform.
+		const deliveriesOf = (platform: IdPlatform): DeliverySource => ({
 			claimDue: () =>
-				store.claimDue().map((row) => ({
+				store.claimDue(undefined, platform).map((row) => ({
 					deliveryId: row.deliveryId,
 					originKey: row.originKey,
 					threadRef: row.threadRef,
@@ -849,41 +929,33 @@ export class Daemon {
 			},
 			defer: (deliveryId, error, retry) => void store.deferDelivery(deliveryId, error, retry),
 			recordPost: (post) => store.feedback.recordPost(post),
+			isPost: (post) => store.feedback.isPost(post),
 			recordFeedback: (feedback) => {
 				const outcome = store.feedback.applyReaction(feedback);
 				log.info("turn_feedback", { ...feedback, outcome });
 			},
-		};
-		// Missed-message backfill: once at startup, then on every socket (re)connect (upstream adapter semantics).
-		// The adapter's live ingest failures trigger it too: they never advance the watermark, so without this a
-		// transiently failed message would sit unanswered until the next reconnect. `buildDeps` is lazy per pass,
-		// so creating the runner before the adapter exists is fine.
-		const backfill = new BackfillRunner(() => this.#backfillDeps());
-		this.#adapter = new SlackAdapter({
-			transport: this.#options.slack.transport,
-			core,
-			deliveries,
-			ownerUserId: config.ownerSlackUserId,
-			clock: this.#clock,
-			log,
-			mediaRoot: join(config.homeDir, "media"),
-			...(config.mentionFreeChannels === undefined ? {} : { mentionFreeChannels: config.mentionFreeChannels }),
-			...(config.logChannel === undefined ? {} : { logChannel: config.logChannel }),
-			...(config.peerBots === undefined ? {} : { peerBots: config.peerBots }),
-			...(config.requireMention === undefined ? {} : { requireMention: config.requireMention }),
-			...(config.peerHopLimit === undefined ? {} : { peerHopLimit: config.peerHopLimit }),
-			isTaskRoot: (threadRef) => store.tasks.isTaskRoot(threadRef),
-			onInboundFailure: () => backfill.trigger(),
-			...(config.dispatchHosts === undefined ? {} : { dispatchHosts: config.dispatchHosts }),
 		});
-		await this.#adapter.start();
+		for (const binding of this.#options.channels) {
+			const platform = binding.port.platform;
+			if (platform === "telegram") throw new Error("telegram has no delivery ledger ids yet: it cannot be bound");
+			const adapter = binding.createAdapter({
+				core,
+				deliveries: deliveriesOf(platform),
+				clock: this.#clock,
+				log,
+				config,
+				store,
+			});
+			this.#adapters.set(platform, adapter);
+		}
+		for (const adapter of this.#adapters.values()) await adapter.start();
 		this.#announceMarker("back");
 
 		// A waiting click cannot outlive the process: expire every pending card and say so on them.
 		void this.#broker.expireStale(false).catch((error) => log.warn("approval_expire_failed", { error: String(error) }));
 
-		this.#options.slack.transport.onReady = () => backfill.trigger();
-		backfill.trigger();
+		// Missed messages since the last run: one recovery pass per platform now (each reconnect runs another).
+		for (const adapter of this.#adapters.values()) adapter.recover();
 
 		const herdrRun = this.#options.herdrRun;
 		setLocalHerdrBin(config.herdr?.bin);
@@ -947,14 +1019,21 @@ export class Daemon {
 					});
 				},
 				// taskAutoLand is live as well: `ompbot reload` turns auto-merge on or off for the next reach.
-				autoLandPolicy: () => {
-					const policy = this.#options.config.taskAutoLand;
-					return policy === undefined ? undefined : { repos: policy.repos, maxRisk: policy.maxRisk ?? "L2" };
-				},
+				autoLandPolicy: () => this.#autoLandPolicy(),
 				repoMatches: (row, repos) => this.repoMatches(row, repos),
+				changedPaths: async (row) => {
+					const changed = await taskChangedPaths(row.worktree, realProcessRunner);
+					if (changed.ok) return changed.paths;
+					const key = `${row.taskId}:${changed.reason}`;
+					if (!this.#overlapSkipped.has(key)) {
+						this.#overlapSkipped.add(key);
+						log.info("task_overlap_skipped", { task: row.taskId, reason: changed.reason });
+					}
+					return undefined;
+				},
 				autoLand: (row) => this.autoLand(row),
-				transport: this.#slackPort,
-				ownerUserId: config.ownerSlackUserId,
+				channels: this.#channels,
+				ownerUserId: config.channels.slack.ownerUserId,
 				now: () => this.#clock.now(),
 				log,
 			});
@@ -969,49 +1048,15 @@ export class Daemon {
 		this.#nudgePump();
 		// Proof of life from the very first moment: a fresh stamp means the sweep_stalled gate starts closed.
 		this.#beat();
-		log.info("daemon_ready", { socket: this.socketPath, herdr: config.herdr === undefined ? "off" : "on" });
+		log.info("daemon_ready", {
+			socket: this.socketPath,
+			herdr: config.herdr === undefined ? "off" : "on",
+			discord: this.#adapters.has("discord") ? "on" : "off",
+		});
 		if (bootConfigText === undefined) log.warn("last_good_config_skipped", { reason: "config_unreadable" });
 		else if (readConfigText(config.homeDir) === bootConfigText)
 			recordLastGoodConfig(config.homeDir, (error) => log.warn("last_good_config_failed", { error }), bootConfigText);
 		else log.warn("last_good_config_skipped", { reason: "config_changed_since_boot" });
-	}
-
-	/** Backfill deps resolved fresh per pass: targets follow the ledger as channels and threads appear. */
-	#backfillDeps(): BackfillDeps {
-		const store = this.store;
-		const adapter = this.#adapter;
-		if (adapter === undefined) throw new Error("backfill before adapter start");
-		const channelCursorPrefix = channelCursorKey("");
-		return {
-			transport: this.#options.slack.transport,
-			ingest: (event) => adapter.ingestRecovered(event),
-			notifier: (channel, text) => adapter.postNotice(channel, text),
-			cursors: store,
-			log: this.#log,
-			now: Date.now(),
-			botUserId: adapter.botUserId ?? "",
-			// A channel is a target once any conversation of it exists: the channel origin, or a root/thread origin
-			// (`slack/ch/<C>/t/<R>`) — a plain channel root opens only its own root origin, never the channel one — or
-			// once it has a stored channel watermark: `ompbot gc` removes quiet root origins but never cursors, so a
-			// channel scanned before stays a target like its channel origin row used to keep it. One target per
-			// channel: the `ch:<C>` watermark spans every root and reply, and replies of answered threads also come
-			// back as thread targets. An unreadable (left/deleted) channel is quarantined by the backfill itself.
-			channels: [
-				...new Map([
-					...store.listCursorKeys(channelCursorPrefix).map((key): [string, ChannelTarget] => {
-						const channel = key.slice(channelCursorPrefix.length);
-						return [channel, { channel, kind: channel.startsWith("D") ? "im" : "channel" }];
-					}),
-					...store.listSlackOrigins().flatMap((originKey): Array<[string, ChannelTarget]> => {
-						const ref = parseChatOrigin(originKey);
-						if (ref?.platform !== "slack") return [];
-						const channel = ref.conversationId;
-						return [[channel, { channel, kind: ref.kind === "dm" ? "im" : "channel" }]];
-					}),
-				]).values(),
-			],
-			threads: store.listSlackThreadTargets(Date.now() - 7 * 24 * 3_600_000, 200),
-		};
 	}
 
 	/**
@@ -1037,6 +1082,212 @@ export class Daemon {
 			}
 		}
 		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+	}
+
+	/**
+	 * `머지해` / `폐기해` in a closed lane's thread (or a `!reopen` the lane cannot take: `refusal`): settled with the
+	 * core's own answer like a lane start — the lane's omp session never sees it. The answer is recorded once the
+	 * landing ended; a landing cut off by a restart is finished by the lane tick and shown on the lane's card.
+	 */
+	async #settleLaneCommand(
+		row: InboundRow,
+		name: string,
+		command: { kind: "land" | "discard" } | { kind: "refused"; text: string },
+	): Promise<void> {
+		const store = this.store;
+		const opRef = `lane:${row.platformMessageId}`;
+		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		let reply: string;
+		try {
+			const lanes = this.#lanes;
+			if (!lanes) throw new Error("lanes unavailable");
+			if (command.kind === "refused") reply = `⚠️ ${command.text}`;
+			else reply = (command.kind === "land" ? await lanes.requestLand(name, "owner") : await lanes.discard(name)).text;
+		} catch (error) {
+			this.#log.error("lane_command_failed", { lane: name, command: command.kind, error: String(error) });
+			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+		}
+		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+	}
+
+	/**
+	 * `멈춰` / `계속` in a lane's thread (the whole message, judged by `classifyLaneControl`): settled with the
+	 * core's own answer like a lane start — the lane's omp session never sees it. The answer is whatever the
+	 * manager re-read after stopping (or resuming) the lane.
+	 */
+	async #settleLaneControl(row: InboundRow, name: string, control: "pause" | "resume"): Promise<void> {
+		const store = this.store;
+		const opRef = `lane:${row.platformMessageId}`;
+		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		let reply: string;
+		try {
+			const lanes = this.#lanes;
+			if (!lanes) throw new Error("lanes unavailable");
+			const outcome =
+				control === "pause" ? await lanes.pause(name, "owner-message") : await lanes.resume(name, "owner-message");
+			reply = outcome.text;
+		} catch (error) {
+			this.#log.error("lane_control_failed", { lane: name, control, error: String(error) });
+			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+		}
+		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+	}
+
+	/** A thread's working or blocked [TASK]s: the ones a `멈춰`/`계속` there can act on. */
+	#activeTasksOf(threadRef: string): TaskRow[] {
+		return this.store.tasks
+			.getByThread(threadRef)
+			.filter((task) => task.status === "working" || task.status === "blocked");
+	}
+
+	/**
+	 * `멈춰`/`계속` in a [TASK] thread: settled with the core's own answer (`task:` op ref), never sent to omp. With
+	 * more than one active task in the thread nothing is applied and the answer lists their ids.
+	 */
+	async #settleTaskControl(row: InboundRow, control: "pause" | "resume"): Promise<void> {
+		const store = this.store;
+		const opRef = `task:${row.platformMessageId}`;
+		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		let reply: string;
+		try {
+			const active = this.#activeTasksOf(row.threadRef);
+			const only = active.length === 1 ? active[0] : undefined;
+			reply =
+				only === undefined
+					? `이 스레드에 활성 TASK가 여럿입니다(${active.map((task) => task.taskId).join(", ")}) — 아무것도 ${control === "pause" ? "멈추지" : "재개하지"} 않았습니다. \`ompbot tasks ${control} <id>\`로 하나를 고르세요.`
+					: (await this.controlTask(only.taskId, control)).text;
+		} catch (error) {
+			this.#log.error("task_control_failed", { thread: row.threadRef, control, error: String(error) });
+			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+		}
+		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+	}
+
+	/**
+	 * Owner pause/resume of one [TASK] (thread phrase or `ompbot tasks pause|resume`). A pause marks the ledger first
+	 * (the sweep holds its prompts, stale notice and auto-merge from then on), then sends the worker an Esc and reports
+	 * only what herdr re-read. A resume lifts the sweep hold only; it never prompts the worker. `ok: false` = nothing
+	 * was applied.
+	 */
+	async controlTask(taskId: string, control: "pause" | "resume"): Promise<{ ok: boolean; text: string }> {
+		const tasks = this.store.tasks;
+		const row = tasks.get(taskId);
+		if (row === undefined) return { ok: false, text: `TASK를 찾지 못했습니다: ${taskId}` };
+		if (control === "resume") {
+			if (!tasks.isPaused(row)) return { ok: true, text: `${taskId}는 멈춘 상태가 아닙니다.` };
+			const after = tasks.unpauseTask(taskId);
+			if (tasks.isPaused(after)) return { ok: false, text: `⚠️ ${taskId} 재개를 확인하지 못했습니다.` };
+			this.#log.info("task_resumed", { task: taskId });
+			return {
+				ok: true,
+				text: `▶ ${taskId} 재개했습니다 — 스윕 재촉·stale 알림·자동 머지 보류를 풀었습니다. 워커에 재개 프롬프트는 보내지 않았습니다(필요하면 ompbot_dispatch로 보냅니다).`,
+			};
+		}
+		if (row.status !== "working" && row.status !== "blocked") {
+			return { ok: false, text: `${taskId}는 ${row.status} 상태라 멈추지 않았습니다(working·blocked만 멈춥니다).` };
+		}
+		const after = tasks.pauseTask(taskId);
+		if (!tasks.isPaused(after)) return { ok: false, text: `⚠️ ${taskId} 멈춤을 기록하지 못했습니다.` };
+		this.#log.info("task_paused", { task: taskId });
+		let worker: string;
+		let stopped = false;
+		if (this.#options.config.herdr === undefined) {
+			worker = "herdr가 꺼져 있어 Esc를 보내지 않았습니다";
+		} else {
+			const entry = row.host === null ? undefined : this.#options.config.dispatchHosts?.[row.host];
+			const herdrRun = this.#options.herdrRun;
+			const interrupted = await herdrInterruptAgent(row.agent, {
+				cwd: this.#options.config.workspaceDir,
+				...(entry === undefined ? {} : { sshTarget: entry.ssh }),
+				...(entry?.herdrBin === undefined ? {} : { herdrBin: entry.herdrBin }),
+				...(herdrRun === undefined ? {} : { run: herdrRun }),
+			});
+			this.#log.info("task_interrupt", { task: taskId, confirmed: interrupted.confirmed, status: interrupted.status });
+			worker = interrupted.text;
+			stopped = interrupted.confirmed;
+		}
+		// Only a re-read stopped worker leads with "멈췄습니다"; otherwise only the sweep hold is certain.
+		const lead = stopped ? `⏸ ${taskId} 멈췄습니다` : `⚠️ ${taskId} 스윕만 멈췄습니다(워커 멈춤 미확인)`;
+		return {
+			ok: true,
+			text: `${lead} — 스윕 재촉·stale 알림·자동 머지를 보류합니다. 워커: ${worker}. 재개는 \`계속\` 또는 \`ompbot tasks resume ${taskId}\`.`,
+		};
+	}
+
+	/**
+	 * One notice per pause that the held lane's thread messages wait: the row stays pending, `계속` delivers it.
+	 * The key is the lane's `pausedAt`, so a restart (or a second message) stays quiet.
+	 */
+	#heldLaneNotice(lane: LaneRow): void {
+		const store = this.store;
+		const key = `lane_held_notice:${lane.name}:${lane.meta.pausedAt ?? 0}`;
+		if (store.getCursor(key) !== undefined) return;
+		store.setCursor(key, String(this.#clock.now()));
+		const route = this.#channels.forThreadRef(lane.threadRef);
+		if (route === undefined) return;
+		void route.port
+			.post(route.target, { text: "⏸ 멈춘 상태라 전달하지 않았습니다 — `계속`이라고 쓰면 전달합니다." })
+			.catch((error: unknown) => this.#log.warn("lane_held_notice_failed", { lane: lane.name, error: String(error) }));
+	}
+
+	/**
+	 * A `머지` / `폐기` click on a lane's Outcome card: the core lands or discards the lane and redraws the card with
+	 * the result. A lane that is not waiting for it (already landed, discarded, working again, or a click while the
+	 * first one still runs) takes nothing; a lane that no longer exists loses the buttons with a note.
+	 */
+	async #handleLaneButton(
+		action: { kind: "merge" | "discard" | "pause" | "resume"; name: string },
+		channel: string | undefined,
+		messageTs: string | undefined,
+	): Promise<void> {
+		const { kind, name } = action;
+		const lanes = this.#lanes;
+		if (lanes === undefined || this.#store?.getLane(name) === undefined) {
+			this.#log.info(`lane_${kind}_ignored`, { lane: name, reason: "not_found" });
+			const port = channel === undefined ? undefined : this.#channels.forConversation(channel)?.port;
+			if (port === undefined || channel === undefined || messageTs === undefined) return;
+			await port
+				.edit(
+					{ platform: port.platform, conversationId: channel, messageId: messageTs },
+					{ text: `⚠️ 이 레인을 찾을 수 없음 (${name})`, buttons: [] },
+				)
+				.catch((error: unknown) => this.#log.warn("lane_card_edit_failed", { lane: name, error: String(error) }));
+			return;
+		}
+		const outcome =
+			kind === "merge"
+				? await lanes.requestLand(name, "owner")
+				: kind === "discard"
+					? await lanes.discard(name)
+					: kind === "pause"
+						? await lanes.pause(name, "button")
+						: await lanes.resume(name, "button");
+		this.#log.info(outcome.handled ? `lane_${kind}_requested` : `lane_${kind}_ignored`, { lane: name });
+		if (kind === "pause" || kind === "resume") {
+			// The status message changes, but the owner clicked: the answer tells what was re-read.
+			const lane = this.#store?.getLane(name);
+			const route = lane === undefined ? undefined : this.#channels.forThreadRef(lane.threadRef);
+			if (route !== undefined) {
+				await route.port
+					.post(route.target, { text: outcome.text })
+					.catch((error: unknown) => this.#log.warn("lane_button_reply_failed", { lane: name, error: String(error) }));
+			}
+			return;
+		}
+		if (outcome.handled) return;
+		// A refused click changes no card, so the owner is told why in the lane's thread (a text command gets the same).
+		const lane = this.#store?.getLane(name);
+		const route = lane === undefined ? undefined : this.#channels.forThreadRef(lane.threadRef);
+		if (route === undefined) return;
+		await route.port
+			.post(route.target, { text: `⚠️ ${outcome.text}` })
+			.catch((error: unknown) => this.#log.warn("lane_button_reply_failed", { lane: name, error: String(error) }));
+	}
+
+	/** `taskAutoLand` as the [TASK] sweep and the lanes apply it (`maxRisk` defaults to L2); `undefined` = off. */
+	#autoLandPolicy(): AutoLandPolicy | undefined {
+		const policy = this.#options.config.taskAutoLand;
+		return policy === undefined ? undefined : { repos: policy.repos, maxRisk: policy.maxRisk ?? "L2" };
 	}
 
 	#dispatchPending(originKey: string): void {
@@ -1071,6 +1322,8 @@ export class Daemon {
 		const stale = store.listInbound({ state: "pending" }).filter((row) => now - row.createdAt >= interval);
 		for (const originKey of new Set(stale.map((row) => row.originKey))) {
 			if (router.mailbox(originKey).state.busy) continue;
+			// A paused lane holds its owner messages on purpose until `계속`; a retry would count the wait as a failure.
+			if (store.getLaneByOrigin(originKey)?.status === "paused") continue;
 			const previous = this.#pendingRetries.get(originKey);
 			if (previous !== undefined && now - previous.at < interval) continue;
 			const oldest = stale
@@ -1109,7 +1362,7 @@ export class Daemon {
 			return;
 		}
 		state.failures += 1;
-		const adapter = this.#adapter;
+		const adapter = this.#ownerAdapter();
 		if (state.failures < PENDING_ALERT_AFTER || adapter === undefined) return;
 		const now = this.#clock.now();
 		const sign = state.sign === "" ? "resume_pending_stuck" : state.sign;
@@ -1136,13 +1389,15 @@ export class Daemon {
 	/** Rule (3) plus the periodic work: deliver due rows, update status messages, stop quiet omp children. */
 	pump(): Promise<void> {
 		this.#pumping = this.#pumping.then(async () => {
-			const adapter = this.#adapter;
-			if (!adapter || this.#stopped) return;
-			try {
-				await adapter.pumpDeliveries();
-				await adapter.tick();
-			} catch (error) {
-				this.#log.error("pump_failed", { error: String(error) });
+			if (this.#stopped) return;
+			// One platform's failure leaves the others' deliveries and status upkeep running.
+			for (const adapter of this.#adapters.values()) {
+				try {
+					await adapter.pumpDeliveries();
+					await adapter.tick();
+				} catch (error) {
+					this.#log.error("pump_failed", { platform: adapter.platform, error: String(error) });
+				}
 			}
 		});
 		return this.#pumping;
@@ -1222,7 +1477,8 @@ export class Daemon {
 		if (heartbeat === undefined) return;
 		try {
 			const loopMs = heartbeat.beat(this.#clock.now(), {
-				socket: this.#options.slack.transport.connectionState?.(),
+				socket: this.#adapters.get("slack")?.connectionState(),
+				discord: this.#adapters.get("discord")?.connectionState(),
 				draining: this.#router?.draining === true,
 			});
 			if (loopMs > EVENT_LOOP_WARN_MS) this.#log.warn("event_loop_blocked", { loop_ms: loopMs });
@@ -1238,7 +1494,7 @@ export class Daemon {
 	 */
 	#escalateTurnFailures(info: TurnFailureEscalation): void {
 		const store = this.#store;
-		const adapter = this.#adapter;
+		const adapter = this.#ownerAdapter();
 		if (store === undefined || adapter === undefined) return;
 		if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
 		const now = this.#clock.now();
@@ -1268,7 +1524,7 @@ export class Daemon {
 	 */
 	#notifyProviderLimit(info: ProviderLimitInfo): void {
 		const store = this.#store;
-		const adapter = this.#adapter;
+		const adapter = this.#ownerAdapter();
 		if (store === undefined || adapter === undefined) return;
 		const now = this.#clock.now();
 		let incident = { notify: true, count: 1, firstAt: now };
@@ -1296,7 +1552,7 @@ export class Daemon {
 	async #sweepGates(): Promise<void> {
 		const interval = this.#options.gateSweepMs ?? DEFAULT_GATE_SWEEP_MS;
 		const store = this.#store;
-		const adapter = this.#adapter;
+		const adapter = this.#ownerAdapter();
 		if (interval <= 0 || store === undefined || adapter === undefined) return;
 		const now = this.#clock.now();
 		if (now - this.#lastGateSweepAt < interval) return;
@@ -1411,8 +1667,7 @@ export class Daemon {
 		const every = this.#options.config.skillReviewTurns ?? DEFAULT_SKILL_REVIEW_TURNS;
 		if (every <= 0 || this.#reviewing || this.#router?.draining === true) return;
 		const store = this.#store;
-		const adapter = this.#adapter;
-		if (store === undefined || adapter === undefined) return;
+		if (store === undefined || this.#adapters.size === 0) return;
 		// Same latest-updated_at rule as the escalation/gate notices' ownerChannel(): a stale duplicate DM origin row
 		// must not make the answered count (and so the review cadence) follow a dead conversation.
 		const dmOrigin = store.ownerDmOrigin();
@@ -1442,7 +1697,7 @@ export class Daemon {
 	 */
 	async #distill(originKey: string): Promise<string> {
 		const channel = parseChatOrigin(originKey)?.conversationId;
-		if (this.#store === undefined || this.#adapter === undefined || channel === undefined) {
+		if (this.#store === undefined || channel === undefined || this.#adapterOfConversation(channel) === undefined) {
 			return "이 대화에서는 스킬 리뷰를 시작할 수 없습니다.";
 		}
 		if (this.#reviewing) return "이미 리뷰 중입니다. 끝나면 결과를 알려 드립니다.";
@@ -1466,7 +1721,7 @@ export class Daemon {
 	/** Background review of `sourceOrigin`'s session digest; the caller has checked `#reviewing` and the freeze. */
 	#startSkillReview(sourceOrigin: string, channel: string, announceEmpty = false): void {
 		const store = this.#store;
-		const adapter = this.#adapter;
+		const adapter = this.#adapterOfConversation(channel);
 		if (store === undefined || adapter === undefined) return;
 		this.#reviewing = true;
 		const origin = store.getOrigin(sourceOrigin);
@@ -1555,7 +1810,8 @@ export class Daemon {
 		this.#options.config = plan.next;
 		this.#store?.setLogChannel(plan.next.logChannel);
 		this.#broker?.setEscalationChannel(plan.next.escalationChannel);
-		this.#adapter?.setChannelPolicy({
+		// The inbound policy keys are Slack's config fields.
+		this.#adapters.get("slack")?.setChannelPolicy({
 			...(plan.next.mentionFreeChannels === undefined ? {} : { mentionFreeChannels: plan.next.mentionFreeChannels }),
 			...(plan.next.logChannel === undefined ? {} : { logChannel: plan.next.logChannel }),
 			...(plan.next.peerBots === undefined ? {} : { peerBots: plan.next.peerBots }),
@@ -1619,11 +1875,10 @@ export class Daemon {
 	}
 
 	#postThreadNotices(threads: string[], text: string): void {
-		const adapter = this.#adapter;
-		if (adapter === undefined) return;
 		for (const ref of threads) {
 			const parsed = parseThreadRef(ref);
-			if (parsed === undefined) continue;
+			const adapter = this.#adapterOfThread(ref);
+			if (parsed === undefined || adapter === undefined) continue;
 			void adapter.postNotice(parsed.channel, text, parsed.threadTs === TOP_LEVEL_TS ? undefined : parsed.threadTs);
 		}
 	}
@@ -1656,7 +1911,7 @@ export class Daemon {
 	 * With `thread` the marker is a reply in that existing thread and the owner message a reply of it.
 	 */
 	async inject(request: InjectRequest): Promise<InjectResult> {
-		if (!this.#adapter) throw new Error("daemon not started");
+		if (!this.#adapters.has("slack")) throw new Error("daemon not started");
 		if (request.asOwner !== true) throw new Error("inject requires --as-owner");
 		// Owner DM (`slack/dm/D…`) or a channel the bot was invited to (`slack/ch/C…`); no thread origins.
 		const ref = parseChatOrigin(request.origin);
@@ -1673,49 +1928,45 @@ export class Daemon {
 				.trim() ?? "";
 		const preview = firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine;
 		const { outcome, markerTs } = await this.#ingestOwnerText(
-			{ channel, threadTs: request.thread, inChannel: ref.kind === "ch" },
-			escapeSlack(request.text),
-			preview === "" ? `🧪 inject ${nonce}` : `🧪 inject ${nonce}\n> ${escapeSlack(preview)}`,
-			request.quoted === undefined ? undefined : [{ text: escapeSlack(request.quoted) }],
+			{ channel, threadTs: request.thread, kind: ref.kind },
+			request.text,
+			preview === "" ? `🧪 inject ${nonce}` : `🧪 inject ${nonce}\n> ${escapeMrkdwn(preview)}`,
+			request.quoted === undefined ? undefined : [request.quoted],
 		);
 		if (outcome === "dropped") throw new Error("inject_rejected: message was not accepted");
 		return { nonce, threadRef: threadRefOf(channel, request.thread ?? markerTs) };
 	}
 
 	/**
-	 * Feeds `text` (Slack-escaped) as an owner message through the adapter's own message path: the bot posts `marker`
-	 * (in `threadTs`'s thread, or as a root) and the owner message takes the marker's ts. `posted.ts` is set as soon as
-	 * the marker is up, so a caller still knows it when the ingest throws. In a channel the bot mention leads the text,
-	 * exactly like a real owner message there.
+	 * Feeds `text` (as typed, unescaped) as an owner message through the adapter's own message path: the bot posts
+	 * `marker` (in `threadTs`'s thread, or as a root) and the owner message takes the marker's id. `posted.ts` is set as
+	 * soon as the marker is up, so a caller still knows it when the ingest throws.
 	 */
 	async #ingestOwnerText(
-		target: { channel: string; threadTs?: string | undefined; inChannel: boolean },
+		target: { channel: string; threadTs?: string | undefined; kind: "dm" | "ch" },
 		text: string,
 		marker: string,
-		attachments?: Array<{ text: string }>,
+		quoted?: readonly string[],
 		posted: { ts?: string } = {},
 	): Promise<{ outcome: IngestOutcome; markerTs: string }> {
-		const adapter = this.#adapter;
-		if (!adapter) throw new Error("daemon not started");
-		const { channel, threadTs, inChannel } = target;
-		const mention =
-			inChannel && adapter.botUserId !== undefined ? `${this.#slackPort.mentionUser(adapter.botUserId)} ` : "";
-		const { messageId } = await this.#slackPort.post(
+		const { channel, threadTs, kind } = target;
+		const adapter = this.#adapterOfConversation(channel);
+		const route = this.#channels.forConversation(channel);
+		if (adapter === undefined || route === undefined) throw new Error("daemon not started");
+		const { messageId } = await route.port.post(
 			{ conversationId: channel, ...(threadTs === undefined ? {} : { threadId: threadTs }) },
 			{ text: marker },
 		);
 		posted.ts = messageId;
 		// A reply in an approval card's thread settles the card without an inbound row, so acceptance comes from the
 		// adapter's own verdict, not from the ledger.
-		const outcome = await adapter.ingestRecovered({
-			type: "message",
-			channel,
-			channel_type: inChannel ? "channel" : "im",
-			user: this.#options.config.ownerSlackUserId,
-			text: `${mention}${text}`,
-			ts: messageId,
-			...(threadTs === undefined ? {} : { thread_ts: threadTs }),
-			attachments,
+		const outcome = await adapter.ingestOwner({
+			conversationId: channel,
+			kind,
+			threadId: threadTs,
+			messageId,
+			text,
+			quoted,
 		});
 		return { outcome, markerTs: messageId };
 	}
@@ -1738,24 +1989,9 @@ export class Daemon {
 		});
 	}
 
-	/**
-	 * Whether a local task's repository is one of `repos`: the same git common directory (`git rev-parse
-	 * --git-common-dir`), so any worktree of a listed repository matches and a look-alike path does not. A path git
-	 * cannot read is a mismatch.
-	 */
-	async repoMatches(row: TaskRow, repos: readonly string[]): Promise<boolean> {
-		const commonDir = async (path: string): Promise<string | undefined> => {
-			const result = await realProcessRunner(
-				["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-				{ timeoutMs: 10_000, env: dispatchEnv(process.env) },
-			);
-			const dir = result.stdout.trim();
-			return result.code === 0 && dir !== "" ? dir : undefined;
-		};
-		const own = await commonDir(row.repo);
-		if (own === undefined) return false;
-		for (const repo of repos) if ((await commonDir(repo)) === own) return true;
-		return false;
+	/** Whether a local task's repository is one of `repos` (`repoMatchesCommonDir`: the same git common directory). */
+	repoMatches(row: TaskRow, repos: readonly string[]): Promise<boolean> {
+		return repoMatchesCommonDir(row.repo, repos);
 	}
 
 	/**
@@ -1766,7 +2002,7 @@ export class Daemon {
 	 */
 	async autoLand(row: TaskRow): Promise<boolean> {
 		const log = this.#log;
-		if (this.#router?.draining === true || this.#adapter === undefined || this.#store === undefined) {
+		if (this.#router?.draining === true || this.#adapters.size === 0 || this.#store === undefined) {
 			log.info("task_autoland_ignored", { task: row.taskId, reason: "not_ready" });
 			return false;
 		}
@@ -1783,7 +2019,7 @@ export class Daemon {
 			}
 			const posted: { ts?: string } = {};
 			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, inChannel: !thread.channel.startsWith("D") },
+				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
 				AUTO_LAND_TEXT,
 				AUTO_LAND_MARKER,
 				undefined,
@@ -1819,7 +2055,7 @@ export class Daemon {
 			channel,
 			messageTs,
 			requiredStatus: "blocked",
-			ownerText: escapeSlack(recommend === "" ? "추천대로" : `추천대로 (추천: ${recommend})`),
+			ownerText: recommend === "" ? "추천대로" : `추천대로 (추천: ${recommend})`,
 			marker: "🔘 추천대로 (버튼)",
 			notFound: { text: `이미 처리됐거나 막힌 상태가 아님 (TASK 없음: ${taskId})`, buttons: [] },
 			settledCard: buildBlockedSettledCard,
@@ -1858,9 +2094,11 @@ export class Daemon {
 		this.#mergeClicks.add(key);
 		const redraw = async (card: TaskCard | { text: string; buttons: [] }) => {
 			if (channel === undefined || messageTs === undefined) return;
-			const msg = "title" in card ? cardMessage(card, this.#slackPort) : card;
-			await this.#slackPort
-				.edit({ platform: "slack", conversationId: channel, messageId: messageTs }, msg)
+			const port = this.#channels.forConversation(channel)?.port;
+			if (port === undefined) return;
+			const msg = "title" in card ? cardMessage(card, port) : card;
+			await port
+				.edit({ platform: port.platform, conversationId: channel, messageId: messageTs }, msg)
 				.catch((error: unknown) => log.warn(`task_${kind}_card_edit_failed`, { task: taskId, error: String(error) }));
 		};
 		const row = this.#store?.tasks.get(taskId);
@@ -1879,9 +2117,8 @@ export class Daemon {
 		await redraw(button.settledCard(row, button.requestedNote(CLOCK_FORMAT.format(this.#clock.now()))));
 		const posted: { ts?: string } = {};
 		try {
-			// Slack DM ids start with `D`; anything else is a channel, where the bot answers only when mentioned.
 			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, inChannel: !thread.channel.startsWith("D") },
+				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
 				button.ownerText,
 				button.marker,
 				undefined,
@@ -1942,10 +2179,8 @@ export class Daemon {
 		const posted: { ts?: string } = {};
 		try {
 			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, inChannel: !thread.channel.startsWith("D") },
-				escapeSlack(
-					`다시 요청: ${firstLine.slice(0, 200)}\n(방금 시간 초과로 거부된 승인 요청입니다. 같은 요청을 ompbot_request_approval로 다시 올려 주세요.)`,
-				),
+				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
+				`다시 요청: ${firstLine.slice(0, 200)}\n(방금 시간 초과로 거부된 승인 요청입니다. 같은 요청을 ompbot_request_approval로 다시 올려 주세요.)`,
 				"🔘 다시 요청 (버튼)",
 				undefined,
 				posted,
@@ -1996,6 +2231,12 @@ export class Daemon {
 			const asOwner = "asOwner" in request && request.asOwner === true;
 			return { ok: true, ...(await this.inject({ origin, asOwner, text, quoted, thread })) };
 		}
+		if (request.op === "tasks_pause" || request.op === "tasks_resume") {
+			const id = "id" in request ? request.id : undefined;
+			if (typeof id !== "string" || this.#store?.tasks.get(id) === undefined)
+				return { ok: false, error: "task not found" };
+			return this.controlTask(id, request.op === "tasks_pause" ? "pause" : "resume");
+		}
 		if (request.op === "tasks_check" || request.op === "tasks_sync") {
 			const id = "id" in request ? request.id : undefined;
 			const row = typeof id === "string" ? this.#store?.tasks.get(id) : undefined;
@@ -2029,7 +2270,7 @@ export class Daemon {
 		installProcessAudit(undefined);
 		this.#ipc?.stop();
 		this.#webhook?.stop();
-		await this.#adapter?.stop();
+		for (const adapter of this.#adapters.values()) await adapter.stop();
 		await this.#pumping;
 		this.#monitors?.stop();
 		await this.#monitors?.idle();

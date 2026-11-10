@@ -6,13 +6,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { PeerInboundMessage, PeerInboundOutcome } from "../src/channel/types";
 import { normalizePeerInbound } from "../src/core/normalize";
 import { parseCommand } from "../src/core/types";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { PEER_HOP_NOTICE, type PeerInboundMessage, type PeerInboundOutcome, SlackAdapter } from "../src/slack/adapter";
+import { PEER_HOP_NOTICE, SlackAdapter } from "../src/slack/adapter";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackMessageEvent } from "../src/slack/transport";
@@ -417,7 +419,7 @@ describe("daemon: peer bot input", () => {
 				peerBots: [{ userId: PEER, name: "떡" }],
 				...config,
 			},
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",

@@ -1,5 +1,12 @@
 import { Database } from "bun:sqlite";
-import { parseThreadRef, THREAD_LINK_PREFIX, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { parseThreadRef, platformOfThreadRef, THREAD_LINK_PREFIX, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import {
+	type ChatPlatform,
+	chatPlatformOf,
+	type IdPlatform,
+	parseChatOrigin,
+	platformOfConversationId,
+} from "../core/origin-key";
 import { COMMAND_OP_REF, parseCommand } from "../core/types";
 import {
 	assertLaneTransition,
@@ -80,7 +87,7 @@ export interface StoreOptions {
 	/** Applied to every body / text / error string before it is stored. */
 	redact: (text: string) => string;
 	/** Fallback Slack channel for monitor output before any owner DM is known. */
-	ownerSlackUserId?: string;
+	slackOwnerUserId?: string;
 	/** Slack channel (the #log ledger) that gets a copy of every completion report; absent = no copies. */
 	logChannel?: string | undefined;
 	hooks?: {
@@ -190,6 +197,21 @@ const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
 	origin_url TEXT
 );`;
 
+export const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
+	name TEXT PRIMARY KEY,
+	title TEXT NOT NULL,
+	thread_ref TEXT NOT NULL UNIQUE,
+	origin_key TEXT NOT NULL UNIQUE,
+	cwd TEXT NOT NULL,
+	session_dir TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'working'
+		CHECK (status IN ('working','done-claimed','not-done','paused','closed')),
+	history TEXT NOT NULL DEFAULT '[]',
+	meta TEXT NOT NULL DEFAULT '{}',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS origins (
 	origin_key TEXT PRIMARY KEY,
@@ -237,20 +259,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS deliveries_state_next ON deliveries(state, next_at);
 CREATE INDEX IF NOT EXISTS deliveries_created ON deliveries(created_at);
 CREATE INDEX IF NOT EXISTS deliveries_thread ON deliveries(thread_ref);
-CREATE TABLE IF NOT EXISTS lanes (
-	name TEXT PRIMARY KEY,
-	title TEXT NOT NULL,
-	thread_ref TEXT NOT NULL UNIQUE,
-	origin_key TEXT NOT NULL UNIQUE,
-	cwd TEXT NOT NULL,
-	session_dir TEXT NOT NULL,
-	status TEXT NOT NULL DEFAULT 'working'
-		CHECK (status IN ('working','done-claimed','not-done','closed')),
-	history TEXT NOT NULL DEFAULT '[]',
-	meta TEXT NOT NULL DEFAULT '{}',
-	created_at INTEGER NOT NULL,
-	updated_at INTEGER NOT NULL
-);
+${LANES_DDL}
 CREATE TABLE IF NOT EXISTS slack_cursors (
 	cursor_key TEXT PRIMARY KEY,
 	last_ts TEXT NOT NULL,
@@ -429,7 +438,7 @@ export class Store {
 	readonly tasks: TaskLedger;
 	/** Posted delivery messages and the owner's 👍/👎 on them; shares this connection. */
 	readonly feedback: FeedbackLedger;
-	private readonly ownerSlackUserId: string | undefined;
+	private readonly slackOwnerUserId: string | undefined;
 	private logChannel: string | undefined;
 
 	/** Config reload: answers recorded from now on copy to the new #log channel (none when undefined). */
@@ -439,7 +448,7 @@ export class Store {
 
 	constructor(options: StoreOptions) {
 		this.clock = options.clock;
-		this.ownerSlackUserId = options.ownerSlackUserId;
+		this.slackOwnerUserId = options.slackOwnerUserId;
 		this.logChannel = options.logChannel;
 		this.redact = options.redact;
 		this.hooks = options.hooks ?? {};
@@ -650,27 +659,33 @@ export class Store {
 		return row?.n ?? 0;
 	}
 
-	/** Slack origin keys (`slack/dm/<id>`, `slack/ch/<id>`) — backfill channel targets. */
-	listSlackOrigins(): string[] {
+	/** Origin keys of one chat platform (`<platform>/dm/<id>`, `<platform>/ch/<id>[/t/<id>]`) — backfill targets. */
+	listOrigins(platform: ChatPlatform): string[] {
 		const rows = this.db
-			.query("SELECT origin_key FROM origins WHERE origin_key LIKE 'slack/%' ORDER BY origin_key")
-			.all() as Array<{ origin_key: string }>;
+			.query("SELECT origin_key FROM origins WHERE origin_key LIKE ? ORDER BY origin_key")
+			.all(`${platform}/%`) as Array<{ origin_key: string }>;
 		return rows.map((row) => row.origin_key);
 	}
 
+	/** `listOrigins("slack")`: the Slack backfill's channel targets. */
+	listSlackOrigins(): string[] {
+		return this.listOrigins("slack");
+	}
+
 	/**
-	 * Threads the bot answered in recently (deliveries carry `<channel>:<rootTs>`), newest first — backfill thread
-	 * targets. The 7-day window and cap mirror the upstream participated-thread tracking. Top-level posts
-	 * (`<channel>:-`: slash-command answers, log-channel copies) have no thread to read, so they are never targets.
+	 * Threads the bot answered in recently on one chat platform's origins (deliveries carry `<channel>:<rootTs>`),
+	 * newest first — backfill thread targets. The 7-day window and cap mirror the upstream participated-thread
+	 * tracking. Top-level posts (`<channel>:-`: slash-command answers, log-channel copies) have no thread to read, so
+	 * they are never targets.
 	 */
-	listSlackThreadTargets(since: number, limit: number): Array<{ channel: string; rootTs: string }> {
+	listThreadTargets(platform: ChatPlatform, since: number, limit: number): Array<{ channel: string; rootTs: string }> {
 		const rows = this.db
 			.query(
 				`SELECT origin_key, thread_ref, MAX(created_at) AS last FROM deliveries
-				 WHERE thread_ref IS NOT NULL AND thread_ref NOT LIKE ? AND origin_key LIKE 'slack/%' AND created_at >= ?
+				 WHERE thread_ref IS NOT NULL AND thread_ref NOT LIKE ? AND origin_key LIKE ? AND created_at >= ?
 				 GROUP BY origin_key, thread_ref ORDER BY last DESC LIMIT ?`,
 			)
-			.all(`%:${TOP_LEVEL_TS}`, since, limit) as Array<{ origin_key: string; thread_ref: string }>;
+			.all(`%:${TOP_LEVEL_TS}`, `${platform}/%`, since, limit) as Array<{ origin_key: string; thread_ref: string }>;
 		const targets: Array<{ channel: string; rootTs: string }> = [];
 		for (const row of rows) {
 			const parsed = parseThreadRef(row.thread_ref);
@@ -678,6 +693,11 @@ export class Store {
 			targets.push({ channel: parsed.channel, rootTs: parsed.threadTs });
 		}
 		return targets;
+	}
+
+	/** `listThreadTargets("slack", …)`: the Slack backfill's thread targets. */
+	listSlackThreadTargets(since: number, limit: number): Array<{ channel: string; rootTs: string }> {
+		return this.listThreadTargets("slack", since, limit);
 	}
 
 	/**
@@ -867,15 +887,16 @@ export class Store {
 	}
 
 	/**
-	 * Recall candidates of one Slack conversation space, newest first: owner messages and confirmed first-part bot
+	 * Recall candidates of one conversation space (its platform read from the id), newest first: owner messages and confirmed first-part bot
 	 * answers of the last 90 days whose origin AND thread both belong to `channel` (a DM origin's steer pointer into
 	 * a channel thread is excluded by the origin test), other than the `excludeThreadRef` thread and top-level posts.
 	 * Chat commands, command answers, failure notices and steer pointers are dropped after the query.
 	 */
 	listRecallCandidates(channel: string, excludeThreadRef: string, limit: number): RecallCandidate[] {
+		const platform = platformOfConversationId(channel);
+		if (platform === undefined) return [];
 		const chEsc = channel.replace(/[\\%_]/g, (c) => `\\${c}`);
-		const scope = `(origin_key = 'slack/dm/' || $ch OR origin_key = 'slack/ch/' || $ch
-			OR origin_key LIKE 'slack/ch/' || $chEsc || '/t/%' ESCAPE '\\')
+		const scope = `(origin_key = $dm OR origin_key = $chKey OR origin_key LIKE $threads ESCAPE '\\')
 			AND thread_ref LIKE $chEsc || ':%' ESCAPE '\\' AND thread_ref <> $ch || ':-' AND thread_ref <> $exclude
 			AND created_at >= $since`;
 		const rows = this.db
@@ -888,6 +909,9 @@ export class Store {
 				 ORDER BY created_at DESC LIMIT $limit`,
 			)
 			.all({
+				$dm: `${platform}/dm/${channel}`,
+				$chKey: `${platform}/ch/${channel}`,
+				$threads: `${platform}/ch/${chEsc}/t/%`,
 				$ch: channel,
 				$chEsc: chEsc,
 				$exclude: excludeThreadRef,
@@ -1015,7 +1039,7 @@ export class Store {
 	 * before the rows close, so a replayed answer (rows already answered) finds none and notifies nothing twice.
 	 */
 	private steeredThreads(input: { originKey: string; opRef: string; threadRef: string }): string[] {
-		if (!input.originKey.startsWith("slack/")) return [];
+		if (chatPlatformOf(input.originKey) === undefined) return [];
 		const rows = this.db
 			.query(
 				"SELECT DISTINCT thread_ref FROM inbound WHERE origin_key = ? AND op_ref = ? AND state = 'dispatched' AND thread_ref != ? ORDER BY thread_ref",
@@ -1056,7 +1080,8 @@ export class Store {
 	 */
 	private copyCompletion(input: { originKey: string; opRef: string; threadRef: string }, body: string): void {
 		if (this.logChannel === undefined || COMMAND_OP_REF.test(input.opRef)) return;
-		if (!input.originKey.startsWith("slack/") && !input.originKey.startsWith(LANE_ORIGIN_PREFIX)) return;
+		// Slack chats only: the #log channel is a Slack channel.
+		if (chatPlatformOf(input.originKey) !== "slack" && !input.originKey.startsWith(LANE_ORIGIN_PREFIX)) return;
 		const first = body.split("\n").find((line) => line.trim() !== "");
 		if (first === undefined || !COMPLETION_MARKER.test(first.trim())) return;
 		const requested = parseThreadRef(input.threadRef);
@@ -1104,18 +1129,22 @@ export class Store {
 
 	// ---- monitors ----
 
-	/** The owner's live DM origin key (`slack/dm/<id>`), newest by updated_at — undefined before the owner ever DM'd. */
-	ownerDmOrigin(): string | undefined {
+	/**
+	 * The owner's live DM origin key on `platform` (`<platform>/dm/<id>`), newest by updated_at — undefined before the
+	 * owner ever DM'd there.
+	 */
+	ownerDmOrigin(platform: ChatPlatform = "slack"): string | undefined {
 		const row = this.db
-			.query("SELECT origin_key FROM origins WHERE origin_key LIKE 'slack/dm/%' ORDER BY updated_at DESC LIMIT 1")
-			.get() as { origin_key: string } | null;
+			.query("SELECT origin_key FROM origins WHERE origin_key LIKE ? ORDER BY updated_at DESC LIMIT 1")
+			.get(`${platform}/dm/%`) as { origin_key: string } | null;
 		return row?.origin_key;
 	}
 
 	/** Slack channel for monitor output: the owner's known DM, else the owner user id (Slack opens that DM). */
 	ownerChannel(): string {
 		const origin = this.ownerDmOrigin();
-		return origin !== undefined ? origin.slice("slack/dm/".length) : (this.ownerSlackUserId ?? "");
+		const dm = origin === undefined ? undefined : parseChatOrigin(origin)?.conversationId;
+		return dm ?? this.slackOwnerUserId ?? "";
 	}
 
 	/** Thread ref of a top-level (non-threaded) post in the owner DM. */
@@ -1365,14 +1394,19 @@ export class Store {
 		})();
 	}
 
-	/** Sweeps stale rows, then moves due pending deliveries (next_at <= now) to inflight and returns them. */
-	claimDue(limit = 20): DeliveryRow[] {
+	/**
+	 * Sweeps stale rows, then moves up to `limit` due pending deliveries (next_at <= now) to inflight and returns them.
+	 * With `platform` only the rows whose thread ref posts to that platform are taken (monitor and lane answers
+	 * included: their thread ref is a chat conversation like any other); the rest stay pending for their adapter.
+	 */
+	claimDue(limit = 20, platform?: IdPlatform): DeliveryRow[] {
 		const now = this.clock.now();
 		this.sweepExpired();
 		return this.db.transaction(() =>
-			this.selectDeliveries("state = 'pending' AND next_at <= ? ORDER BY delivery_id LIMIT ?", [now, limit]).map(
-				(row) => this.applyEvent(row, "claim", now),
-			),
+			this.selectDeliveries("state = 'pending' AND next_at <= ? ORDER BY delivery_id", [now])
+				.filter((row) => platform === undefined || platformOfThreadRef(row.threadRef) === platform)
+				.slice(0, limit)
+				.map((row) => this.applyEvent(row, "claim", now)),
 		)();
 	}
 
@@ -1567,6 +1601,7 @@ export class Store {
 		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
 		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");
 		this.migrateApprovals();
+		this.migrateLanes();
 		// After the rebuild (which already creates the dashboard columns): a 'replied'-era table lacks them, and every
 		// table lacks `mirror_ref` until this adds it.
 		const approvalColumns = this.db.query("PRAGMA table_info(approvals)").all() as Array<{ name: string }>;
@@ -1599,6 +1634,25 @@ export class Store {
 				"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at) SELECT approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at FROM approvals_old",
 			);
 			this.db.run("DROP TABLE approvals_old");
+		})();
+	}
+
+	/**
+	 * The `paused` status widens a CHECK constraint, which SQLite cannot ALTER: a lanes table without it is
+	 * rebuilt (rename, create, copy, drop) in one transaction. Existing rows keep their data.
+	 */
+	private migrateLanes(): void {
+		const current = this.db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lanes'").get() as {
+			sql: string;
+		} | null;
+		if (current === null || current.sql.includes("'paused'")) return;
+		this.db.transaction(() => {
+			this.db.run("ALTER TABLE lanes RENAME TO lanes_old");
+			this.db.run(LANES_DDL);
+			this.db.run(
+				"INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at) SELECT name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at FROM lanes_old",
+			);
+			this.db.run("DROP TABLE lanes_old");
 		})();
 	}
 

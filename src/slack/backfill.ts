@@ -477,7 +477,7 @@ export async function runBackfillPass(
 
 /**
  * Single-flight trigger (upstream RecoveryScheduler): concurrent triggers coalesce into one follow-up pass instead of
- * stacking. The daemon wires `transport.onReady` and startup to `trigger()`.
+ * stacking. `SlackBinding` wires it as the adapter's `recover()`: startup and every socket reconnect (`transport.onReady`).
  */
 export class BackfillRunner {
 	#running = false;

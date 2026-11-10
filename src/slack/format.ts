@@ -1,10 +1,6 @@
-import { CARD_MAX_BLOCKS, type CardElement, cardFallbackText, cardToBlocks, parseCard, type SlackBlock } from "./card";
-
-export const CHUNK_LIMIT = 3900;
-export const REDELIVERED_PREFIX = "(중복 가능: 재전송)";
-
-// Room kept in every chunk so a code fence cut by a split can be closed ("\n```") and reopened ("```\n").
-const FENCE_RESERVE = 8;
+import { type CardElement, splitCards } from "../channel/card";
+import { CHUNK_LIMIT, chunkText, cutCodePointSafe, FENCE_RESERVE, REDELIVERED_PREFIX } from "../channel/text";
+import { CARD_MAX_BLOCKS, cardFallbackText, cardToBlocks, parseCard, type SlackBlock } from "./card";
 
 /** Markdown -> Slack mrkdwn. Fenced blocks pass through untouched; GFM tables become fixed-width fenced blocks. */
 export function toMrkdwn(markdown: string): string {
@@ -225,56 +221,6 @@ function renderTableBlock(block: string, restore: (s: string) => string): string
 	return ["```", rowLine(rows[0] ?? []), separator, ...rows.slice(1).map(rowLine), "```"].join("\n");
 }
 
-function splitAt(text: string, limit: number, keepWhole: (cut: number) => number): [string, string] {
-	if (text.length <= limit) return [text, ""];
-	let cut = text.lastIndexOf("\n\n", limit);
-	if (cut < limit / 2) cut = text.lastIndexOf("\n", limit);
-	if (cut < limit / 2) cut = text.lastIndexOf(" ", limit);
-	if (cut < limit / 2) {
-		cut = limit;
-		// never split a surrogate pair
-		const code = text.charCodeAt(cut - 1);
-		if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
-	}
-	cut = keepWhole(cut);
-	return [text.slice(0, cut), text.slice(cut).replace(/^\n+/, "")];
-}
-
-/**
- * Splits into messages of at most `limit` characters, preferring paragraph/line boundaries and keeping code fences
- * balanced. A cut inside one of the `keepWhole` spans (each at most the limit) moves to the line break before it, or
- * past it when the span opens the message.
- */
-export function chunkText(
-	text: string,
-	limit = CHUNK_LIMIT,
-	keepWhole: ReadonlyArray<readonly [number, number]> = [],
-): string[] {
-	const budget = limit - FENCE_RESERVE;
-	const raw: string[] = [];
-	let rest = text;
-	while (rest.length > 0) {
-		const base = text.length - rest.length;
-		const [head, tail] = splitAt(rest, budget, (cut) => {
-			const span = keepWhole.find(([start, end]) => start < base + cut && base + cut < end);
-			if (span === undefined) return cut;
-			const before = span[0] - base - 1;
-			return before > 0 ? before : span[1] - base;
-		});
-		raw.push(head);
-		rest = tail;
-	}
-	if (raw.length === 0) return [""];
-	let open = false;
-	return raw.map((chunk) => {
-		let out = open ? `\`\`\`\n${chunk}` : chunk;
-		const fences = (chunk.match(/```/g) ?? []).length;
-		if (fences % 2 === 1) open = !open;
-		if (open) out = `${out}\n\`\`\``;
-		return out;
-	});
-}
-
 /**
  * mrkdwn-converted, chunked message bodies for one delivery. A redelivered answer is marked in its first message;
  * `footer` (elapsed time, tool count) closes the last one as an italic line.
@@ -322,53 +268,6 @@ export interface CardFallback {
 
 /** `renderMarkdownParts`' result; `cardIssues` lists why card fences stayed text (`card <n>: <issue>`). */
 export type MarkdownParts = MarkdownPart[] & { cardIssues?: readonly string[] };
-
-/** Card fences one answer turns into card parts at most; later ones stay text. */
-export const MAX_CARDS = 3;
-
-export type CardSegment = { kind: "text"; text: string } | { kind: "card"; json: string; raw: string };
-
-const CLOSING_FENCE = /^```\s*$/;
-
-/**
- * The body cut at its ` ```card ` fences: one opening a line and closed by a ` ``` ` line. A ` ```card ` inside another
- * fence, an unclosed one and any after the first `MAX_CARDS` stay text. Joining every segment's `text`/`raw` with
- * "\n" gives the body back byte for byte.
- */
-export function splitCards(body: string): CardSegment[] {
-	const lines = body.split("\n");
-	const segments: CardSegment[] = [];
-	let text: string[] = [];
-	let inFence = false;
-	let cards = 0;
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i] ?? "";
-		if (inFence) {
-			text.push(line);
-			if (CLOSING_FENCE.test(line)) inFence = false;
-			continue;
-		}
-		if (cards < MAX_CARDS && /^```card\s*$/.test(line)) {
-			const close = lines.findIndex((next, j) => j > i && CLOSING_FENCE.test(next));
-			if (close > i) {
-				if (text.length > 0) segments.push({ kind: "text", text: text.join("\n") });
-				text = [];
-				segments.push({
-					kind: "card",
-					json: lines.slice(i + 1, close).join("\n"),
-					raw: lines.slice(i, close + 1).join("\n"),
-				});
-				cards += 1;
-				i = close;
-				continue;
-			}
-		}
-		if (line.startsWith("```")) inFence = true;
-		text.push(line);
-	}
-	if (text.length > 0) segments.push({ kind: "text", text: text.join("\n") });
-	return segments;
-}
 
 type Piece = { kind: "text"; text: string } | { kind: "card"; card: CardElement; blocks: SlackBlock[]; raw: string };
 
@@ -476,13 +375,6 @@ function bellLine(tokens: readonly string[]): string {
 	return ["🔔", ...shown, ...(rest > 0 ? [`외 ${rest}개`] : [])].join(" ");
 }
 
-/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
-function clipUnits(text: string, limit: number): string {
-	if (text.length <= limit) return text;
-	const code = text.charCodeAt(limit - 1);
-	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
-}
-
 /**
  * One mrkdwn line as `header` plain text: `*x*`·`_x_`·`~x~`·`` `x` `` keep only their inside, `<url|label>` its label,
  * live tokens their readable name (`@오너`, `#label`, …); cut to the header limit.
@@ -497,7 +389,7 @@ export function plainHeaderText(line: string, names: MentionNames): string {
 		.replace(/(^|[^\w_])_{1,2}([^_\n]+?)_{1,2}(?=$|[^\w_])/g, "$1$2")
 		.replace(/(^|[^\w~])~{1,2}([^~\n]+?)~{1,2}(?=$|[^\w~])/g, "$1$2")
 		.trim();
-	return clipUnits(plain, HEADER_LIMIT);
+	return cutCodePointSafe(plain, HEADER_LIMIT);
 }
 
 /** A monitor delivery's `⏰ <name>` first line (at most 150 chars, with a body after it) as a header title. */
@@ -585,7 +477,10 @@ export function renderMarkdownParts(
 		if (piece.kind === "card") {
 			const titleText = title === "" ? "" : toMrkdwn(title);
 			return {
-				text: clipUnits(`${i === 0 ? prefix : ""}${titleText}${cardFallbackText(piece.card)}`, MARKDOWN_TEXT_LIMIT),
+				text: cutCodePointSafe(
+					`${i === 0 ? prefix : ""}${titleText}${cardFallbackText(piece.card)}`,
+					MARKDOWN_TEXT_LIMIT,
+				),
 				blocks: [...head(i), ...piece.blocks, ...tail(i)],
 				card: {
 					...(charts && piece.blocks.some((block) => block.type === "data_visualization")
@@ -602,20 +497,10 @@ export function renderMarkdownParts(
 		const fallback = `${i === 0 ? prefix : ""}${toMrkdwn(`${title}${piece.text}`)}`;
 		return {
 			// A message carrying live tokens keeps its whole fallback: a peer bot reads only `text`, mention and request.
-			text: withTokens[i] ? fallback : clipUnits(fallback, MARKDOWN_TEXT_LIMIT),
+			text: withTokens[i] ? fallback : cutCodePointSafe(fallback, MARKDOWN_TEXT_LIMIT),
 			blocks: [...head(i), { type: "markdown", text: markdowns[i] ?? piece.text }, ...tail(i)],
 		};
 	});
 	if (cardIssues.length > 0) parts.cardIssues = cardIssues;
 	return parts;
-}
-
-/** Running-status text while the turn has emitted no omp event for the stall window (120 s). */
-export const STALL_STATUS_TEXT = "⏸ 응답 없음 2분";
-
-export function formatElapsed(ms: number): string {
-	const total = Math.max(0, Math.floor(ms / 1000));
-	const mm = String(Math.floor(total / 60)).padStart(2, "0");
-	const ss = String(total % 60).padStart(2, "0");
-	return `${mm}:${ss}`;
 }

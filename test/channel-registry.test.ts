@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { ChannelPort, PostTarget } from "../src/channel/port";
 import { ChannelRegistry } from "../src/channel/registry";
+import type { ChatPlatform } from "../src/core/origin-key";
 import { REDACTED } from "../src/redact";
 import { SlackChannel } from "../src/slack/channel";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
@@ -41,5 +43,78 @@ describe("ChannelRegistry", () => {
 		expect(resolved?.target).toEqual({ conversationId: "C1", threadId: "1.2" });
 		expect(registry.forOrigin("monitor/x")).toBeUndefined();
 		expect(registry.forOrigin("telegram/dm/42")).toBeUndefined();
+	});
+});
+
+/** A second platform's port that records what reached it. */
+function fakePort(platform: ChatPlatform): ChannelPort & { posts: Array<{ target: PostTarget; text: string }> } {
+	const posts: Array<{ target: PostTarget; text: string }> = [];
+	return {
+		platform,
+		capabilities: { permalink: false, reactions: true },
+		posts,
+		post: async (target, msg) => {
+			posts.push({ target, text: msg.text });
+			return { platform, conversationId: target.conversationId, messageId: String(posts.length) };
+		},
+		edit: async () => undefined,
+		react: async () => undefined,
+		uploadFile: async () => ({ fileId: "F1" }),
+		permalink: async () => undefined,
+		mentionUser: (userId) => `<@${userId}>`,
+	};
+}
+
+describe("ChannelRegistry routing by thread ref and conversation id", () => {
+	function twoPlatforms() {
+		const slack = fakePort("slack");
+		const discord = fakePort("discord");
+		const registry = new ChannelRegistry();
+		registry.register(slack);
+		registry.register(discord);
+		return { registry, slack, discord };
+	}
+
+	test("forThreadRef picks the platform's port and splits the target", () => {
+		const { registry } = twoPlatforms();
+		const slack = registry.forThreadRef("C1:1.2");
+		expect(slack?.port.platform).toBe("slack");
+		expect(slack?.target).toEqual({ conversationId: "C1", threadId: "1.2" });
+		const discord = registry.forThreadRef("111111111111111111:222222222222222222");
+		expect(discord?.port.platform).toBe("discord");
+		expect(discord?.target).toEqual({ conversationId: "111111111111111111", threadId: "222222222222222222" });
+		const top = registry.forThreadRef("D1:-");
+		expect(top?.port.platform).toBe("slack");
+		expect(top?.target).toEqual({ conversationId: "D1" });
+		expect(top !== undefined && "threadId" in top.target).toBe(false);
+	});
+
+	test("an unregistered platform and a malformed ref resolve to nothing", () => {
+		const slackOnly = new ChannelRegistry();
+		slackOnly.register(fakePort("slack"));
+		expect(slackOnly.forThreadRef("111111111111111111:222222222222222222")).toBeUndefined();
+		expect(slackOnly.forConversation("111111111111111111")).toBeUndefined();
+		const { registry } = twoPlatforms();
+		expect(registry.forThreadRef("nocolon")).toBeUndefined();
+		expect(registry.forConversation("c-1")).toBeUndefined();
+	});
+
+	test("forConversation picks the port by the id's grammar", () => {
+		const { registry } = twoPlatforms();
+		expect(registry.forConversation("C0ESCALATE1")).toMatchObject({
+			port: { platform: "slack" },
+			target: { conversationId: "C0ESCALATE1" },
+		});
+		expect(registry.forConversation("123456789012345678")?.port.platform).toBe("discord");
+	});
+
+	test("both ports get a token-shaped string redacted", async () => {
+		const { registry, slack, discord } = twoPlatforms();
+		const toSlack = registry.forThreadRef("C1:1.2");
+		const toDiscord = registry.forThreadRef("111111111111111111:222222222222222222");
+		await toSlack?.port.post(toSlack.target, { text: `토큰 ${token}` });
+		await toDiscord?.port.post(toDiscord.target, { text: `토큰 ${token}` });
+		expect(slack.posts.map((p) => p.text)).toEqual([`토큰 ${REDACTED}`]);
+		expect(discord.posts.map((p) => p.text)).toEqual([`토큰 ${REDACTED}`]);
 	});
 });

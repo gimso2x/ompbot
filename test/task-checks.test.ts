@@ -14,6 +14,7 @@ import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { formatReachedNotice } from "../src/tasks/notify";
 import { TaskSweeper } from "../src/tasks/sweeper";
+import { registryOf } from "./helpers/channels";
 
 const T0 = Date.parse("2026-11-04T01:00:00Z");
 /** The sweeper's in-memory check results; a fresh one per evaluation unless a test shares it. */
@@ -130,7 +131,7 @@ function sweeperFor(t: Task, host: Pick<FakeHost, "ops">): { sweeper: TaskSweepe
 		remind: async () => ({ ok: true }),
 		agentStatus: async () => ({ ok: true, status: "idle" }),
 		readAgent: async () => ({ ok: true, output: "" }),
-		transport: new SlackChannel(transport),
+		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: "UOWN",
 		now: () => T0,
 		log: { info() {}, warn() {} },

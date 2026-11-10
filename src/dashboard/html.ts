@@ -16,6 +16,7 @@ import { renderMarkdown } from "./markdown";
 import type { MonitorDetailRun, MonitorProcedure } from "./monitor-detail";
 import type {
 	DashboardSnapshot,
+	FlowChainInfo,
 	JobHealth,
 	JobInfo,
 	JobState,
@@ -56,12 +57,13 @@ const TURN_LABELS: { kind: Record<TurnKind, string>; wait: Record<TurnWaitReason
 };
 
 /**
- * A background job's badge word and tone: its `health`, with `ok` told apart by `state` (running or done). Shipped to
+ * A background job's badge word and tone: its `health`, with `ok` told apart by `state` (running, done or stopped). Shipped to
  * the page like `TURN_LABELS`.
  */
 const JOB_LABELS: Record<Exclude<JobHealth, "ok"> | Exclude<JobState, "failed">, [string, string]> = {
 	running: ["진행 중", "is-info"],
 	done: ["완료", "is-success"],
+	stopped: ["중단", ""],
 	failed: ["실패", "is-danger"],
 	dead: ["멈춤(프로세스 없음)", "is-danger"],
 	stale: ["갱신 끊김", "is-warning"],
@@ -78,6 +80,14 @@ const MONITOR_STAGES: Record<string, [string, string]> = {
 	dispatched: ["진행 중", "is-run"],
 	authored: ["작성됨", "is-run"],
 	skipped: ["건너뜀", "is-skip"],
+};
+
+/** A settled approval's word and badge tone (list and panel). Shipped to the page like `TURN_LABELS`. */
+const APPROVAL_OUTCOMES: Record<string, [string, string]> = {
+	approved: ["승인", "is-success"],
+	denied: ["거절", "is-danger"],
+	expired: ["만료", "is-warning"],
+	replied: ["답장", "is-info"],
 };
 
 /** A monitor run's slot-to-settle time: `52초`, `5분 52초`, `6시간 15분`. Shipped to the page. */
@@ -172,7 +182,7 @@ export interface DashboardUi {
 /**
  * The redrawn part of the page for one snapshot: the top bar, the side navigation and the chosen view. Self-contained
  * on purpose — no imports, and the only module-level helpers are `gateText`/`alertText`/`GATE_LIMITS`/`TURN_LABELS`/
- * `JOB_LABELS`/`MONITOR_STAGES`/`monitorTook`,
+ * `JOB_LABELS`/`MONITOR_STAGES`/`APPROVAL_OUTCOMES`/`monitorTook`,
  * which the page ships next to it: the page ships this very function's source as its inline script, so the server's
  * first render and every client redraw are the same code. Every free string goes through `esc`.
  *
@@ -252,6 +262,7 @@ export function renderDashboardMain(
 		const icons: Record<string, string> = {
 			inbox: '<path d="M2.5 4h11v8.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1V4Z"/><path d="M2.5 9h3.2l1 1.5h2.6l1-1.5h3.2"/>',
 			turns: '<polyline points="1.8 8 4.8 8 6.6 3.8 9.4 12.2 11.2 8 14.2 8"/>',
+			flow: '<rect x="1.5" y="5.5" width="4" height="5" rx="1"/><rect x="10.5" y="5.5" width="4" height="5" rx="1"/><path d="M5.5 8h4.5M8.6 6.4 10.2 8l-1.6 1.6"/>',
 			lanes:
 				'<circle cx="4.5" cy="4" r="1.5"/><circle cx="4.5" cy="12" r="1.5"/><circle cx="11.5" cy="8" r="1.5"/><path d="M4.5 5.5v5M6 4h3.5a2 2 0 0 1 2 2v.5"/>',
 			approvals:
@@ -275,6 +286,7 @@ export function renderDashboardMain(
 		blocked: ["막힘", "is-warning"],
 		review: ["검토 대기", "is-warning"],
 		"not-done": ["미완료", "is-warning"],
+		paused: ["멈춤", "is-warning"],
 		done: ["완료", "is-success"],
 		"done-claimed": ["완료 보고", "is-success"],
 		delivered: ["전달", "is-success"],
@@ -303,6 +315,7 @@ export function renderDashboardMain(
 	const VIEWS: Array<[string, string]> = [
 		["inbox", "인박스"],
 		["turns", "턴"],
+		["flow", "흐름"],
 		["lanes", "레인"],
 		["approvals", "승인 대기"],
 		["monitors", "모니터"],
@@ -472,6 +485,10 @@ export function renderDashboardMain(
 			`<p class="notice is-warning" role="status">${badge(" 안내", "is-warning")}<span>모르는 보기 '${esc(asked)}'예요. 인박스를 보여 드려요. 왼쪽 내비나 ⌘K 명령 팔레트에서 다른 보기를 고를 수 있어요.</span></p>`,
 		);
 	}
+	const clearBtn =
+		q !== ""
+			? `<button type="button" class="button is-ghost is-sm" data-clear-search>검색 '${esc(ui.q)}' 지우기 (Esc)</button>`
+			: "";
 	const nothing =
 		q !== ""
 			? `<div class="empty-box" role="status"><p class="note">'${esc(ui.q)}'와 맞는 항목이 없어요.</p><p class="note-sub">다음 행동: 검색어를 지우거나(Esc) 다른 제목·TASK ID·머신 이름으로 다시 검색해 보세요.</p><button type="button" class="button is-ghost is-sm" data-clear-search>검색어 지우기 (Esc)</button></div>`
@@ -479,7 +496,7 @@ export function renderDashboardMain(
 	const head = (title: string, count: number | string | undefined, extra = ""): string =>
 		`<div class="view-head"><h1 class="view-title">${esc(title)}</h1>${
 			count === undefined ? "" : `<span class="count-chip">${esc(count)}</span>`
-		}${extra}</div>`;
+		}${extra}${clearBtn}</div>`;
 
 	const COLS: Array<[Col, string, string, string]> = [
 		["attention", "확인 필요", "확인할 항목이 없어요", "막히거나 오너 결정이 필요한 작업이 생기면 여기에 모입니다."],
@@ -516,7 +533,9 @@ export function renderDashboardMain(
 									)}</b> ${esc(task.title)} · ${esc(STATES[task.status]?.[0] ?? task.status)} ${at(task.closedAt)}</a>`,
 							)
 							.join("")}</details>`;
-			return `<section class="col" id="col-${id}" aria-label="${esc(label)}"><h2 class="col-head"><span>${esc(
+			return `<section class="col" id="col-${id}" aria-label="${esc(label)}"${
+				cards.length === 0 && recent === "" ? " data-empty" : ""
+			}><h2 class="col-head"><span>${esc(
 				label,
 			)}</span><span class="count-chip">${cards.length}</span></h2>${body}${recent}</section>`;
 		}).join("");
@@ -551,7 +570,12 @@ export function renderDashboardMain(
 									.join("")
 							: `<div class="notice is-danger">${badge("herdr 조회 실패", "is-danger")}<span>${esc(herdr.error)}</span><span class="notice-next">다음 행동: 로컬 herdr 실행 파일과 데몬 설정을 확인하세요(<code>ompbot doctor</code>).</span></div>`
 					}</section>`;
-		return `${head("에이전트 인박스", shown.length, machines)}${banners.join("")}${
+		// The head names what it counts: the 진행 중 column, the same number as the side nav.
+		const working = shown.filter((entry) => entry.col === "working").length;
+		if (q !== "" && shown.length === 0 && closed.length === 0) {
+			return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nothing}${agents}`;
+		}
+		return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${
 			shown.length === 0 ? nothing : ""
 		}<nav class="col-chips" aria-label="열로 이동">${chips}</nav><div class="inbox">${columns}</div>${agents}`;
 	};
@@ -661,7 +685,8 @@ export function renderDashboardMain(
 			};
 			const shownJobs = jobs.ok ? jobs.items.filter((job) => hit(job.title, job.name, job.detail, job.thread)) : [];
 			// Running or troubled jobs sit above the board where they are seen; cleanly finished ones fold at the bottom.
-			const finished = (job: JobInfo): boolean => job.state === "done" && job.health === "ok";
+			const finished = (job: JobInfo): boolean =>
+				(job.state === "done" || job.state === "stopped") && job.health === "ok";
 			const liveJobs = shownJobs.filter((job) => !finished(job));
 			const doneJobs = shownJobs.filter(finished);
 			const jobTop = !jobs.ok
@@ -709,9 +734,13 @@ export function renderDashboardMain(
 			);
 			const restartHeld = new Set(holding.map((turn) => turn.originKey));
 			const placeOf = (key: string): string => {
-				if (key.startsWith("slack/dm/")) return "DM";
-				const channel = /^slack\/ch\/([^/]+)(\/t\/[^/]+)?$/.exec(key);
-				if (channel !== null) return channel[2] === undefined ? `${channel[1]} 채널 메인` : (channel[1] ?? "");
+				// Any platform's owner DM (`<platform>/dm/<id>`); this runs in the browser, so no parseChatOrigin here.
+				if (/^[a-z]+\/dm\//.test(key)) return "DM";
+				const channel = /^(slack|discord)\/ch\/([^/]+)(\/t\/[^/]+)?$/.exec(key);
+				if (channel !== null) {
+					const id = `${channel[1] === "discord" ? "Discord " : ""}${channel[2] ?? ""}`;
+					return channel[3] === undefined ? `${id} 채널 메인` : id;
+				}
 				return key.startsWith("monitor/") ? "" : key;
 			};
 			const threadLink = (key: string): string =>
@@ -835,11 +864,42 @@ export function renderDashboardMain(
 					cards.length === 0
 						? `<div class="col-empty-wrap"><p class="col-empty">${esc(none)}</p><p class="col-empty-sub">${esc(hint)}</p></div>`
 						: cards.map(threadCard).join("");
-				return `<section class="col" id="col-${id}" aria-label="${esc(label)}"><h2 class="col-head"><span>${esc(
+				return `<section class="col" id="col-${id}" aria-label="${esc(label)}"${cards.length === 0 ? " data-empty" : ""}><h2 class="col-head"><span>${esc(
 					label,
 				)}</span><span class="count-chip">${cards.length}</span></h2>${body}</section>`;
 			}).join("");
+			if (q !== "" && threads.length === 0) {
+				return `${title}${lead}${jobTop}${jobDone}`;
+			}
 			return `${title}${lead}${jobTop}<nav class="col-chips" aria-label="열로 이동">${chips}</nav><div class="inbox">${columns}</div>${jobDone}`;
+		}
+		if (view === "flow") {
+			const flows = s.flows;
+			if (flows === undefined || !flows.ok) {
+				return `${head("흐름", undefined)}${banners.join("")}${failed(flows?.error ?? "이 스냅샷에는 흐름이 없어요")}`;
+			}
+			const shown = flows.items.filter((chain) =>
+				hit(chain.title, chain.place, ...chain.tasks.flatMap((step) => [step.taskId, step.title, step.branch])),
+			);
+			const cards = shown.map((chain) => {
+				const first = chain.tasks[0]?.createdAt;
+				return `<section class="flow-card${chain.here === null ? " is-closed" : ""}" data-thread="${esc(
+					chain.threadRef,
+				)}"><h2 class="flow-title"><span>${esc(chain.title)}</span><small>${chain.done}/${chain.total} 끝남</small></h2><p class="flow-meta">${esc(
+					[`TASK ${chain.total}개`, `${at(first)} ~ ${at(chain.updatedAt)}`, chain.place ?? ""]
+						.filter((part) => part !== "")
+						.join(" · "),
+				)}</p>${renderFlowChain(chain, selected, false)}</section>`;
+			});
+			const lead =
+				'<p class="lead flow-lead">요청 하나가 어떤 TASK를 거쳐 끝나는지 등록 순서대로 보여 줘요. 노란 테두리 상자가 다음에 풀 고리예요. 상자를 누르면 오른쪽에 TASK 상세가 열려요.</p>';
+			return `${head("흐름", flows.items.length)}${banners.join("")}${lead}${
+				cards.length === 0
+					? flows.items.length > 0
+						? nothing
+						: '<div class="empty-box"><p class="note">최근 7일 안에 TASK가 있는 요청이 없어요</p><p class="note-sub">요청이 TASK로 등록되면 여기에 고리로 표시됩니다.</p></div>'
+					: `<div class="flow-list">${cards.join("")}</div>`
+			}`;
 		}
 		if (view === "lanes") {
 			const lanes = s.lanes;
@@ -882,13 +942,41 @@ export function renderDashboardMain(
 						],
 					);
 				});
-			return listOf(
+			const stats = approvals.stats;
+			const settled = stats.approved + stats.denied + stats.expired + stats.replied;
+			const lead =
+				settled === 0
+					? ""
+					: `<p class="list-lead">최근 ${stats.days}일 ${[
+							`승인 ${stats.approved}`,
+							`거절 ${stats.denied}`,
+							...(stats.replied > 0 ? [`답장 ${stats.replied}`] : []),
+							`만료 ${stats.expired}`,
+							...(stats.medianAnswerMs === null ? [] : [`답까지 중앙값 ${monitorTook(stats.medianAnswerMs)}`]),
+						]
+							.map((text) => `<span>${esc(text)}</span>`)
+							.join("")}</p>`;
+			const decided = approvals.recent
+				.filter((item) => hit(item.summary, item.title, item.originKey, ...Object.values(item.detail ?? {})))
+				.map((item) => {
+					const [word, tone] = APPROVAL_OUTCOMES[item.status] ?? [item.status, ""];
+					return row(item.approvalId, [badge(word, tone)], esc(item.title), [
+						`요청 ${at(item.createdAt)}${item.tookMs === null ? "" : ` · ${esc(monitorTook(item.tookMs))} 뒤 ${esc(word)}`}`,
+						item.originLabel === null ? "" : esc(item.originLabel),
+					]);
+				});
+			return `${listOf(
 				"승인 대기",
 				rows,
 				approvals.items.length,
 				"기다리는 승인이 없어요",
 				"승인이 필요한 작업이 올라오면 슬랙 승인 카드와 함께 여기에 표시됩니다.",
-			);
+				lead,
+			)}${
+				decided.length === 0
+					? ""
+					: `<h2 class="list-section">최근 결정 <span class="count-chip">${decided.length}</span></h2><div class="rows" data-list="decided">${decided.join("")}</div>`
+			}`;
 		}
 		if (view === "monitors") {
 			const monitors = s.monitors;
@@ -941,6 +1029,13 @@ export function renderDashboardMain(
 				]
 					.map((text) => `<span class="mon-chip">${esc(text)}</span>`)
 					.join("");
+				const health = [
+					...(monitor.running ? [badge("실행 중", "is-info")] : []),
+					...(monitor.failStreak > 0
+						? [badge(monitor.failStreak > 1 ? `연속 실패 ${monitor.failStreak}회` : "최근 실패", "is-danger")]
+						: []),
+					...(monitor.openIncidents > 0 ? [badge(`사건 ${monitor.openIncidents}`, "is-danger")] : []),
+				];
 				// Oldest on the left, empty slots before the first event.
 				const dots = [
 					...Array.from({ length: Math.max(0, 7 - monitor.recent.length) }, () => dot(undefined)),
@@ -955,16 +1050,40 @@ export function renderDashboardMain(
 				}</span><span class="mon-sched">${esc(monitor.schedule)}</span></div><div class="row-main"><p class="row-title">${esc(
 					monitor.name,
 				)}</p><p class="row-sub">${esc(monitor.summary)}</p><p class="mon-chips">${chips}</p>${
-					monitor.openIncidents > 0
-						? `<div class="badges">${badge(`사건 ${monitor.openIncidents}`, "is-danger")}</div>`
-						: ""
+					health.length === 0 ? "" : `<div class="badges">${health.join("")}</div>`
 				}</div><div class="mon-side"><span class="mon-dots">${dots}</span>${lastLines(monitor)
 					.map((line) => `<span class="mon-last">${line}</span>`)
 					.join("")}</div></a>`;
 			};
 			const shown = monitors.items.filter((monitor) =>
-				hit(monitor.name, monitor.summary, monitor.destination, monitor.schedule),
+				hit(
+					monitor.name,
+					monitor.summary,
+					monitor.destination,
+					monitor.copyTo,
+					monitor.schedule,
+					monitor.model ?? "기본 모델",
+					...monitor.files.map((file) => file.name),
+				),
 			);
+			// The whole list in one line: what is still due today and how the last runs ended.
+			const sum = (pick: (monitor: MonitorInfo) => number): number =>
+				monitors.items.reduce((total, monitor) => total + pick(monitor), 0);
+			const failedRuns = sum((monitor) => monitor.stats.failed);
+			const skippedRuns = sum((monitor) => monitor.stats.skipped);
+			const lead =
+				monitors.items.length === 0
+					? ""
+					: `<p class="list-lead">${[
+							`오늘 남은 실행 ${monitors.items.filter((monitor) => dayOf(monitor) === "today").length}`,
+							`최근 ${monitors.items[0]?.stats.days ?? 0}일 전달 ${sum((monitor) => monitor.stats.delivered)}`,
+							`조용히 끝남 ${sum((monitor) => monitor.stats.quiet)}`,
+							...(skippedRuns > 0 ? [`건너뜀 ${skippedRuns}`] : []),
+						]
+							.map((text) => `<span>${esc(text)}</span>`)
+							.join("")}<span${failedRuns > 0 ? ' class="is-danger"' : ""}>실패 ${failedRuns}</span>${
+							monitors.items.some((monitor) => monitor.running) ? "<span>지금 실행 중 있음</span>" : ""
+						}</p>`;
 			const rows = GROUPS.flatMap(([key, label]) => {
 				const group = shown.filter((monitor) => dayOf(monitor) === key);
 				return group.length === 0
@@ -980,6 +1099,7 @@ export function renderDashboardMain(
 				monitors.items.length,
 				"켜진 모니터가 없어요",
 				"ompbot monitors add로 등록한 정기·조건 모니터가 여기에 표시됩니다.",
+				lead,
 			);
 		}
 		if (view === "alerts") {
@@ -999,7 +1119,9 @@ export function renderDashboardMain(
 							? ["지금 열림", "is-danger"]
 							: alert.gateState === "closed"
 								? ["지금은 닫힘 · 기록만 남음", ""]
-								: ["상태 모름", "is-warning"];
+								: alert.gateState === "unknown"
+									? ["상태 모름", "is-warning"]
+									: ["기록만 남음", ""];
 					return row(String(alert.incidentId), [badge(word, tone), badge(`${alert.count}회`, "")], esc(text.title), [
 						`처음 ${at(alert.firstAt)} · 마지막 ${at(alert.lastAt)} · 지속 ${dur(msOf(alert.lastAt) - msOf(alert.firstAt))}`,
 						`할 일: ${cmd(text.todo)}`,
@@ -1026,96 +1148,106 @@ export function renderDashboardMain(
 			warn: ["주의", "is-warning"],
 			bad: ["문제", "is-danger"],
 		};
-		const card = (id: string, title: string, level: string, body: string, wide = false): string => {
+		const cards: string[] = [];
+		const pushCard = (id: string, title: string, level: string, body: string, wide = false): void => {
 			const [word, tone] = LEVELS[level] ?? ["?", ""];
-			return `<section class="sys-card${wide ? " is-wide" : ""}" data-card="${id}" aria-label="${esc(title)}"><header class="sys-head"><span class="sys-dot ${tone}" aria-hidden="true"></span><h3 class="h3">${esc(
-				title,
-			)}</h3>${badge(word, tone)}</header>${body}</section>`;
+			if (!hit(id, title, word, body.replace(/<[^>]*>/g, " "))) return;
+			cards.push(
+				`<section class="sys-card${wide ? " is-wide" : ""}" data-card="${id}" aria-label="${esc(title)}"><header class="sys-head"><span class="sys-dot ${tone}" aria-hidden="true"></span><h3 class="h3">${esc(
+					title,
+				)}</h3>${badge(word, tone)}</header>${body}</section>`,
+			);
 		};
 		const note = (text: string): string => `<p class="note">${esc(text)}</p>`;
 		const noDaemon = note(d.ok ? "" : `데몬 상태를 읽지 못했어요: ${d.error}`);
-		const cards: string[] = [];
 
-		cards.push(
-			!d.ok
-				? card("daemon", "데몬", "bad", noDaemon)
-				: card(
-						"daemon",
-						"데몬",
-						!d.running ? "bad" : d.frozen || d.drain || d.heartbeat?.draining ? "warn" : "ok",
-						facts([
-							["상태", d.running ? "켜짐" : "꺼짐 · DB에서 읽음"],
-							["시작 뒤", d.started ? `${dur(d.started.ageMs)} · ${at(d.started.at)}부터` : "-"],
-							["커밋", d.commit ? `<code>${esc(d.commit)}</code>` : "-"],
-							["omp", esc(d.ompVersion)],
-							["대화", `${d.origins}개 중 ${d.busy}개 작업 중`],
-							["동결", d.frozen ? `${esc(d.frozen.reason || "-")} · ${esc(d.frozen.since)}부터` : "아님"],
-							[
-								"drain",
-								d.drain
-									? `턴 ${d.drain.turns} · 도구 ${d.drain.hostTools} · 승인 ${d.drain.approvals}`
-									: d.heartbeat?.draining
-										? "진행 중"
-										: "아님",
-							],
-						]),
-					),
-		);
+		if (!d.ok) pushCard("daemon", "데몬", "bad", noDaemon);
+		else {
+			pushCard(
+				"daemon",
+				"데몬",
+				!d.running ? "bad" : d.frozen || d.drain || d.heartbeat?.draining ? "warn" : "ok",
+				facts([
+					["상태", d.running ? "켜짐" : "꺼짐 · DB에서 읽음"],
+					["시작 뒤", d.started ? `${dur(d.started.ageMs)} · ${at(d.started.at)}부터` : "-"],
+					["커밋", d.commit ? `<code>${esc(d.commit)}</code>` : "-"],
+					["omp", esc(d.ompVersion)],
+					["대화", `${d.origins}개 중 ${d.busy}개 작업 중`],
+					["동결", d.frozen ? `${esc(d.frozen.reason || "-")} · ${esc(d.frozen.since)}부터` : "아님"],
+					[
+						"drain",
+						d.drain
+							? `턴 ${d.drain.turns} · 도구 ${d.drain.hostTools} · 승인 ${d.drain.approvals}`
+							: d.heartbeat?.draining
+								? "진행 중"
+								: "아님",
+					],
+				]),
+			);
+		}
 
 		const socket = d.ok ? d.heartbeat?.socket : undefined;
-		cards.push(
-			!d.ok
-				? card("slack", "Slack", "warn", noDaemon)
-				: socket === undefined
-					? card("slack", "Slack", "warn", note("소켓 상태 기록이 아직 없어요."))
-					: card(
-							"slack",
-							"Slack",
-							socket.state === "up" ? "ok" : "bad",
-							facts([
-								["소켓", socket.state === "up" ? "연결" : "끊김"],
-								["그 뒤", `${dur(clock - msOf(socket.since))} · ${at(socket.since)}부터`],
-							]),
-						),
-		);
+		if (!d.ok) pushCard("slack", "Slack", "warn", noDaemon);
+		else if (socket === undefined) pushCard("slack", "Slack", "warn", note("소켓 상태 기록이 아직 없어요."));
+		else {
+			pushCard(
+				"slack",
+				"Slack",
+				socket.state === "up" ? "ok" : "bad",
+				facts([
+					["소켓", socket.state === "up" ? "연결" : "끊김"],
+					["그 뒤", `${dur(clock - msOf(socket.since))} · ${at(socket.since)}부터`],
+				]),
+			);
+		}
+		// Only an install with Discord on records its gateway in the heartbeat; without it there is no card.
+		const gateway = d.ok ? d.heartbeat?.discord : undefined;
+		if (gateway !== undefined) {
+			pushCard(
+				"discord",
+				"Discord",
+				gateway.state === "up" ? "ok" : "bad",
+				facts([
+					["게이트웨이", gateway.state === "up" ? "연결" : "끊김"],
+					["그 뒤", `${dur(clock - msOf(gateway.since))} · ${at(gateway.since)}부터`],
+				]),
+			);
+		}
 
 		const beat = d.ok ? d.heartbeat : undefined;
-		cards.push(
-			!d.ok
-				? card("sweep", "스윕·하트비트", "warn", noDaemon)
-				: beat === undefined
-					? card("sweep", "스윕·하트비트", "warn", note("하트비트 기록이 아직 없어요."))
-					: card(
-							"sweep",
-							"스윕·하트비트",
-							beat.ageMs > GATE_LIMITS.sweepStalledMs ? "warn" : "ok",
-							facts([
-								["나이", `${dur(beat.ageMs)} 전 · ${at(beat.at)}`],
-								["loop", beat.loopMs === undefined ? "-" : `${beat.loopMs}ms`],
-								["기준", `${dur(GATE_LIMITS.sweepStalledMs)} 넘으면 주의`],
-							]),
-						),
-		);
+		if (!d.ok) pushCard("sweep", "스윕·하트비트", "warn", noDaemon);
+		else if (beat === undefined) pushCard("sweep", "스윕·하트비트", "warn", note("하트비트 기록이 아직 없어요."));
+		else {
+			pushCard(
+				"sweep",
+				"스윕·하트비트",
+				beat.ageMs > GATE_LIMITS.sweepStalledMs ? "warn" : "ok",
+				facts([
+					["나이", `${dur(beat.ageMs)} 전 · ${at(beat.at)}`],
+					["loop", beat.loopMs === undefined ? "-" : `${beat.loopMs}ms`],
+					["기준", `${dur(GATE_LIMITS.sweepStalledMs)} 넘으면 주의`],
+				]),
+			);
+		}
 
-		cards.push(
-			!d.ok
-				? card("ledger", "전달 장부", "warn", noDaemon)
-				: card(
-						"ledger",
-						"전달 장부",
-						d.ledger.ambiguous + d.ledger.expired > 0 ? "warn" : "ok",
-						facts([
-							["대기", String(d.ledger.pending)],
-							["보내는 중", String(d.ledger.inflight)],
-							["확인", String(d.ledger.confirmed)],
-							["모호", String(d.ledger.ambiguous)],
-							["만료", String(d.ledger.expired)],
-						]),
-					),
-		);
+		if (!d.ok) pushCard("ledger", "전달 장부", "warn", noDaemon);
+		else {
+			pushCard(
+				"ledger",
+				"전달 장부",
+				d.ledger.ambiguous + d.ledger.expired > 0 ? "warn" : "ok",
+				facts([
+					["대기", String(d.ledger.pending)],
+					["보내는 중", String(d.ledger.inflight)],
+					["확인", String(d.ledger.confirmed)],
+					["모호", String(d.ledger.ambiguous)],
+					["만료", String(d.ledger.expired)],
+				]),
+			);
+		}
 
 		const backup = s.backup;
-		if (!backup.ok) cards.push(card("backup", "백업", "bad", note(backup.error)));
+		if (!backup.ok) pushCard("backup", "백업", "bad", note(backup.error));
 		else {
 			const max = GATE_LIMITS.backupMaxAgeMs;
 			const stale = (age: { ageMs: number } | null | undefined): boolean =>
@@ -1124,52 +1256,62 @@ export function renderDashboardMain(
 				age === undefined
 					? none
 					: `${at(age.at)} · ${dur(age.ageMs)} 전${age.ageMs > max ? ` ${badge("오래됨", "is-warning")}` : ""}`;
-			cards.push(
-				card(
-					"backup",
-					"백업",
-					backup.local === undefined ? "bad" : stale(backup.local) || stale(backup.offsite) ? "warn" : "ok",
-					facts([
-						["로컬", stamped(backup.local, badge("기록 없음", "is-danger"))],
-						[
-							"오프사이트",
-							backup.offsite === null ? "설정 안 됨" : stamped(backup.offsite, badge("기록 없음", "is-warning")),
-						],
-						["기준", `${Math.round(max / 3_600_000)}시간 안에 한 번`],
-					]),
-				),
+			pushCard(
+				"backup",
+				"백업",
+				backup.local === undefined ? "bad" : stale(backup.local) || stale(backup.offsite) ? "warn" : "ok",
+				facts([
+					["로컬", stamped(backup.local, badge("기록 없음", "is-danger"))],
+					[
+						"오프사이트",
+						backup.offsite === null ? "설정 안 됨" : stamped(backup.offsite, badge("기록 없음", "is-warning")),
+					],
+					["기준", `${Math.round(max / 3_600_000)}시간 안에 한 번`],
+				]),
 			);
 		}
 
 		const gates = s.gates;
-		if (!gates.ok) cards.push(card("gates", "게이트", "bad", note(`게이트를 읽지 못했어요: ${gates.error}`), true));
+		if (!gates.ok) pushCard("gates", "게이트", "bad", note(`게이트를 읽지 못했어요: ${gates.error}`), true);
 		else {
-			const lines = gates.items
+			const filteredGates = gates.items
 				.slice()
 				.sort((a, b) => Number(b.state === "open") - Number(a.state === "open"))
-				.map((gate) => {
-					const open = gate.state === "open";
-					return `<li class="gate-row${open ? " is-open" : ""}" data-gate="${esc(gate.name)}" data-state="${esc(
-						gate.state,
-					)}"><span class="sys-dot ${open ? "is-warning" : "is-success"}" aria-hidden="true"></span><span class="gate-word">${
-						open ? "열림" : "닫힘"
-					}</span><span class="gate-label">${esc(gateText(gate.name).label)}</span><code class="gate-detail">${esc(
+				.filter((gate) =>
+					hit(
+						"gates",
+						"게이트",
+						gate.name,
+						gateText(gate.name).label,
 						gate.detail,
-					)}</code></li>`;
-				});
-			cards.push(
-				card(
+						gate.state === "open" ? "열림" : "닫힘",
+					),
+				);
+			const lines = filteredGates.map((gate) => {
+				const open = gate.state === "open";
+				return `<li class="gate-row${open ? " is-open" : ""}" data-gate="${esc(gate.name)}" data-state="${esc(
+					gate.state,
+				)}"><span class="sys-dot ${open ? "is-warning" : "is-success"}" aria-hidden="true"></span><span class="gate-word">${
+					open ? "열림" : "닫힘"
+				}</span><span class="gate-label">${esc(gateText(gate.name).label)}</span><code class="gate-detail">${esc(
+					gate.detail,
+				)}</code></li>`;
+			});
+			if (lines.length > 0 || q === "") {
+				pushCard(
 					"gates",
 					`게이트 ${gates.items.length}개`,
 					gates.items.some((gate) => gate.state === "open") ? "warn" : "ok",
 					`<ul class="gate-list">${lines.join("")}</ul>`,
 					true,
-				),
-			);
+				);
+			}
 		}
 
 		const monitorCount = d.ok ? d.monitors.count : s.monitors.ok ? s.monitors.items.length : 0;
-		const troubled = s.monitors.ok ? s.monitors.items.filter((monitor) => monitor.openIncidents > 0).length : 0;
+		const troubled = s.monitors.ok
+			? s.monitors.items.filter((monitor) => monitor.openIncidents > 0 || monitor.failStreak > 0).length
+			: 0;
 		const herdr = s.herdr;
 		const hosts = herdr.ok ? herdr.hosts.filter((host) => host.ok || host.error !== "herdr is not configured") : [];
 		const machines =
@@ -1201,19 +1343,19 @@ export function renderDashboardMain(
 			live?.machines.some((machine) => !machine.connected) === true ||
 			!herdr.ok ||
 			hosts.some((host) => !host.ok);
-		cards.push(
-			card(
-				"monitors",
-				"모니터·herdr 머신",
-				herdrDown || troubled > 0 || !s.monitors.ok ? "warn" : "ok",
-				facts([
-					["모니터", `${monitorCount}개${troubled > 0 ? ` · 사건 ${troubled}` : ""}`],
-					["herdr 머신", machines],
-				]),
-			),
+		pushCard(
+			"monitors",
+			"모니터·herdr 머신",
+			herdrDown || troubled > 0 || !s.monitors.ok ? "warn" : "ok",
+			facts([
+				["모니터", `${monitorCount}개${troubled > 0 ? ` · 사건 ${troubled}` : ""}`],
+				["herdr 머신", machines],
+			]),
 		);
 
-		return `${head("시스템", undefined)}${banners.join("")}<div class="sys-grid">${cards.join("")}</div>`;
+		return `${head("시스템", undefined)}${banners.join("")}${
+			cards.length === 0 ? nothing : `<div class="sys-grid">${cards.join("")}</div>`
+		}`;
 	};
 
 	// ---- top bar and side navigation ----
@@ -1240,7 +1382,11 @@ export function renderDashboardMain(
 	/** Only alerts whose gate is open right now warn; closed-gate records are a grey count. */
 	const openAlerts = s.alerts.ok ? s.alerts.items.filter((alert) => alert.gateState === "open").length : 0;
 	const NAV: Record<string, [number, boolean]> = {
-		inbox: [entries.length, !s.tasks.ok || entries.some((entry) => entry.col === "attention")],
+		// Entries in the 진행 중 column, like the turns item; an entry in 확인 필요 lights the warning.
+		inbox: [
+			entries.filter((entry) => entry.col === "working").length,
+			!s.tasks.ok || entries.some((entry) => entry.col === "attention"),
+		],
 		// Threads in the 진행 중 column, the same number the column shows; a thread in 확인 필요 or a troubled job
 		// lights the warning. Running jobs are counted in the view's head, not here.
 		turns: [
@@ -1252,29 +1398,39 @@ export function renderDashboardMain(
 		approvals: [count(s.approvals), warnOf(s.approvals, count(s.approvals) > 0)],
 		monitors: [
 			count(s.monitors),
-			warnOf(s.monitors, s.monitors.ok && s.monitors.items.some((monitor) => monitor.openIncidents > 0)),
+			warnOf(
+				s.monitors,
+				s.monitors.ok && s.monitors.items.some((monitor) => monitor.openIncidents > 0 || monitor.failStreak > 0),
+			),
 		],
 		alerts: openAlerts > 0 ? [openAlerts, true] : [count(s.alerts), !s.alerts.ok],
 		system: [d.ok ? d.openGates.length : 0, !d.ok || !d.running || d.openGates.length > 0 || d.frozen !== undefined],
 	};
-	const nav = VIEWS.map(([id, label]) => {
-		const [n, warn] = NAV[id] ?? [0, false];
-		const current = id === view || (id === "inbox" && view === "list");
-		return `<a class="nav-item" href="${id === "inbox" ? "./" : `?view=${id}`}" data-view="${id}"${
-			current ? ' aria-current="page"' : ""
-		}><span>${esc(label)}</span><span class="nav-count${warn ? " is-warn" : ""}">${n}</span>${navIcon(id)}</a>`;
-	}).join("");
+	// The flow view is reached from a conversation's or a TASK's detail panel, not the side nav.
+	const nav = VIEWS.filter(([id]) => id !== "flow")
+		.map(([id, label]) => {
+			const [n, warn] = NAV[id] ?? [0, false];
+			const current = id === view || (id === "inbox" && view === "list");
+			return `<a class="nav-item" href="${id === "inbox" ? "./" : `?view=${id}`}" data-view="${id}"${
+				current ? ' aria-current="page"' : ""
+			}><span>${esc(label)}</span><span class="nav-count${warn ? " is-warn" : ""}">${n}</span>${navIcon(id)}</a>`;
+		})
+		.join("");
+	const hasLayout = view === "inbox" || view === "list" || view === "turns";
 	const layout = view === "list" || (view === "turns" && ui.layout === "list") ? "list" : "board";
-	// The turns view switches between its own board and table; everywhere else Board/List is the inbox's.
+	// The turns view switches between its own board and table; inbox and list switch between theirs.
 	const [boardHref, listHref] =
 		view === "turns" ? ["?view=turns", "?view=turns&amp;layout=list"] : ["./", "?view=list"];
+	const layoutSeg = hasLayout
+		? `<div class="seg" role="group" aria-label="보기 방식"><a class="seg-item" href="${boardHref}" data-layout="board"${
+				layout === "board" ? ' aria-current="true"' : ""
+			}>Board</a><a class="seg-item" href="${listHref}" data-layout="list"${layout === "list" ? ' aria-current="true"' : ""}>List</a></div>`
+		: "";
 	const themeBtn = (mode: string, text: string): string =>
 		`<button type="button" class="seg-item" data-theme-set="${mode}" aria-pressed="${theme === mode}">${text}</button>`;
 	const topbar = `<header class="topbar"><nav class="crumbs" aria-label="위치"><span>ompbot</span><span aria-hidden="true">/</span><span aria-current="page">${esc(
 		viewLabel,
-	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div><div class="top-tools"><div class="seg" role="group" aria-label="보기 방식"><a class="seg-item" href="${boardHref}" data-layout="board"${
-		layout === "board" ? ' aria-current="true"' : ""
-	}>Board</a><a class="seg-item" href="${listHref}" data-layout="list"${layout === "list" ? ' aria-current="true"' : ""}>List</a></div><div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
+	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div><div class="top-tools">${layoutSeg}<div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
 	const content = view === "inbox" ? inboxView() : view === "list" ? listView() : sectionView();
 	return `${topbar}<nav class="sidenav" aria-label="보기">${nav}</nav><main class="view" id="view" aria-label="${esc(
 		viewLabel,
@@ -1296,14 +1452,17 @@ export function renderTaskFacts(task: TaskInfo): string {
 	const at = (iso: string | undefined): string => (iso ? esc(iso.slice(0, 16).replace("T", " ")) : "-");
 	const percent =
 		task.acChecked === undefined || task.acTotal === 0 ? 0 : Math.round((task.acChecked / task.acTotal) * 100);
+	const acValue =
+		task.acChecked === undefined
+			? !task.open
+				? `${task.acTotal}개`
+				: `-/${task.acTotal}`
+			: `${task.acChecked}/${task.acTotal}<span class="meter" role="img" aria-label="AC ${percent}%"><i style="width:${percent}%"></i></span>`;
 	const rows: Array<[string, string]> = [
 		["TASK", `<span class="mono">${esc(task.taskId)}</span> · 위험 ${esc(task.risk)}`],
 		["브랜치", `<code>${esc(task.branch)}</code>`],
 		["머신", `${esc(task.host)} · ${esc(task.agent)}`],
-		[
-			"AC 충족",
-			`${task.acChecked === undefined ? "-" : task.acChecked}/${task.acTotal}<span class="meter" role="img" aria-label="AC ${percent}%"><i style="width:${percent}%"></i></span>`,
-		],
+		["AC 충족", acValue],
 		[
 			"단계",
 			`${task.stepsDone === undefined ? "-" : `${task.stepsDone}/${task.stepsTotal ?? "-"}`}${
@@ -1349,11 +1508,87 @@ export function renderTaskFacts(task: TaskInfo): string {
 }
 
 /**
+ * The `slack://` link that opens a conversation's Slack thread in the app (`<C>:<ts>`), or its channel for a ref with
+ * no message ts (a monitor's `<C>:-`); "" without the workspace id or a usable ref. The dashboard only reads: the owner
+ * steps into a running turn by replying in that thread. Self-contained (shipped to the page).
+ */
+export function slackThreadHref(team: string | null | undefined, threadRef: string | null | undefined): string {
+	const ref = /^([CDG][A-Z0-9]+):(\d+\.\d+)?/.exec(threadRef ?? "");
+	if (!team || ref === null) return "";
+	const thread = ref[2] === undefined ? "" : `&message=${ref[2]}&thread_ts=${ref[2]}`;
+	return `slack://channel?team=${encodeURIComponent(team)}&id=${ref[1]}${thread}`;
+}
+
+/**
+ * A request's TASK chain: the `지금` line and the row of boxes, 요청 first. `focus` marks one TASK box as selected.
+ * In the flow view (`panel` false) a TASK box opens its panel in place; inside another view's detail panel (`panel`
+ * true) the chain comes in its own section with the `n/m 끝남` count and the boxes go to the flow view's page, since
+ * closed TASKs past the snapshot's limit only have a panel there. Self-contained (shipped to the page).
+ */
+export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: boolean): string {
+	const esc = (value: unknown): string =>
+		String(value ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	const at = (iso: string | null | undefined): string => (iso ? iso.slice(5, 16).replace("T", " ") : "-");
+	/** status → [chip, tone of the chip]. */
+	const CHIPS: Record<string, [string, string]> = {
+		working: ["진행 중", "run"],
+		blocked: ["막힘", "fail"],
+		review: ["리뷰 대기", "wait"],
+		done: ["완료", "done"],
+		cancelled: ["취소", "off"],
+	};
+	const place = chain.place ?? "";
+	const request = `<span class="flow-bh"><b>요청</b><span class="flow-chip c-off">${esc(
+		[place, at(chain.requestedAt)].filter((part) => part !== "" && part !== "-").join(" · ") || "?",
+	)}</span></span><span class="flow-bt">${esc(chain.title)}</span>`;
+	const requestBox =
+		chain.originKey === ""
+			? `<div class="flow-box t-req">${request}</div>`
+			: `<a class="flow-box t-req" href="?view=turns&amp;item=${esc(encodeURIComponent(chain.originKey))}">${request}</a>`;
+	const boxes = chain.tasks
+		.map((step) => {
+			const [chip, chipTone] = CHIPS[step.status] ?? [step.status, "off"];
+			const here = step.taskId === chain.here;
+			const selected = step.taskId === focus;
+			const chars = Array.from(step.stage.msg.replace(/\s+/g, " ").trim());
+			const clipped = chars.length > 50 ? `${chars.slice(0, 49).join("")}…` : chars.join("");
+			const msg = clipped !== "" && step.stage.tone !== "done" ? ` · ${clipped}` : "";
+			const open = panel ? "" : ` data-item="${esc(step.taskId)}" data-row="${esc(step.taskId)}"`;
+			return `<span class="flow-arr" aria-hidden="true">→</span><a class="flow-box t-${esc(step.stage.tone)}${
+				here ? " is-here" : ""
+			}${selected ? " is-selected" : ""}" href="?view=flow&amp;item=${esc(encodeURIComponent(step.taskId))}"${open} data-state="${esc(
+				`${step.status}:${step.stage.label}`,
+			)}"${selected ? ' aria-current="true"' : ""}><span class="flow-bh"><b>${esc(
+				step.taskId,
+			)}</b><span class="flow-chip c-${chipTone}">${esc(chip)}</span>${
+				here ? '<span class="flow-here-chip">지금 여기</span>' : ""
+			}</span><span class="flow-bt">${esc(step.title)}</span><span class="flow-bs s-${esc(step.stage.tone)}">${esc(
+				step.stage.label,
+			)}${esc(msg)}</span></a>`;
+		})
+		.join("");
+	const body = `<p class="flow-now"><b>지금</b> ${esc(chain.now)}</p><div class="flow-row">${requestBox}${boxes}</div>`;
+	return panel
+		? `<section class="detail-flow" aria-label="흐름"><h3 class="h3">흐름 <small>${chain.done}/${chain.total} 끝남</small></h3>${body}</section>`
+		: body;
+}
+
+/**
  * The detail panel of `?task=<ID>`: the TASK's title, status and {@link renderTaskFacts}, with a way to its agent's
  * card when the board has one. An ID not in the snapshot gets the "지금 목록에 없는 TASK" notice. Self-contained apart
  * from {@link renderTaskFacts}, which ships beside it.
  */
-export function renderTaskDetail(taskId: string, task: TaskInfo | undefined, cardKey?: string): string {
+export function renderTaskDetail(
+	taskId: string,
+	task: TaskInfo | undefined,
+	cardKey?: string,
+	chain?: FlowChainInfo,
+): string {
 	const esc = (value: unknown): string =>
 		String(value ?? "")
 			.replace(/&/g, "&amp;")
@@ -1377,11 +1612,17 @@ export function renderTaskDetail(taskId: string, task: TaskInfo | undefined, car
 			? ""
 			: `<a class="button is-ghost" href="?card=${esc(encodeURIComponent(cardKey))}" data-card="${esc(cardKey)}">에이전트 패널 보기</a>`;
 	const actions = `<div class="detail-actions"><span class="badge ${tone}">${esc(label)}</span><button type="button" class="copy-btn" data-copy="${esc(task.taskId)}" data-copy-label="TASK ID" aria-label="TASK ID 복사">TASK ID 복사</button><button type="button" class="copy-btn" data-copy="${esc(task.branch)}" data-copy-label="브랜치" aria-label="브랜치 복사">브랜치 복사</button></div>`;
+	const leadText =
+		task.acChecked === undefined && !task.open
+			? `AC ${task.acTotal}개`
+			: `AC ${task.acChecked === undefined ? "-" : task.acChecked}/${task.acTotal} · 단계 ${
+					task.stepsDone === undefined ? "-" : `${task.stepsDone}/${task.stepsTotal ?? "-"}`
+				}`;
 	return `<p class="eyebrow">TASK · ${esc(task.host)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 		task.title,
-	)}</h2>${actions}<p class="lead">AC ${
-		task.acChecked === undefined ? "-" : task.acChecked
-	}/${task.acTotal} · 단계 ${task.stepsDone === undefined ? "-" : `${task.stepsDone}/${task.stepsTotal ?? "-"}`}</p>${renderTaskFacts(task)}${card}`;
+	)}</h2>${actions}<p class="lead">${leadText}</p>${renderTaskFacts(task)}${card}${
+		chain === undefined ? "" : renderFlowChain(chain, task.taskId, true)
+	}`;
 }
 
 /**
@@ -1394,6 +1635,7 @@ export function renderDetailHead(
 	card: BoardCard | undefined,
 	task: TaskInfo | undefined,
 	now: number,
+	chain?: FlowChainInfo,
 ): string {
 	const esc = (value: unknown): string =>
 		String(value ?? "")
@@ -1452,7 +1694,9 @@ export function renderDetailHead(
 				)}" data-task="${esc(task.taskId)}">TASK만 보기</a></section>`;
 	return `<p class="eyebrow">${esc(card.machineName)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 		card.paneLabel,
-	)}</h2><div class="detail-actions">${badges.join("")}</div>${lines}${reply}${about}`;
+	)}</h2><div class="detail-actions">${badges.join("")}</div>${lines}${reply}${about}${
+		chain === undefined || task === undefined ? "" : renderFlowChain(chain, task.taskId, true)
+	}`;
 }
 
 /**
@@ -1477,6 +1721,7 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 	};
 	const LABELS: Record<string, string> = {
 		turns: "턴",
+		flow: "흐름",
 		lanes: "레인",
 		approvals: "승인 대기",
 		monitors: "모니터",
@@ -1518,6 +1763,8 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 			: s.turns.threads.find((item) => item.originKey === id);
 		if (thread) {
 			const latest = thread.latest;
+			// The conversation's TASK chain, when the request became TASKs.
+			const chain = s.flows?.ok ? s.flows.items.find((item) => item.originKey === thread.originKey) : undefined;
 			const verdicts = s.feedback.ok ? s.feedback.verdicts : {};
 			const feedbackBadge = (inboundId: number): string => {
 				const verdict = verdicts[String(inboundId)];
@@ -1547,7 +1794,43 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				["입수 번호", esc(latest.inboundId)],
 				["턴", esc(`${thread.turnCount}${thread.openCount > 0 ? ` · ${openTurnsText(thread)}` : ""}`)],
 				["대화", `<code>${esc(thread.originKey)}</code>`],
-			])}<h3 class="h2">최근 턴</h3><ol class="turn-recent" aria-label="최근 턴 (누르면 트레이스)">${recent}</ol>`;
+			])}${chain === undefined ? "" : renderFlowChain(chain, "", true)}<h3 class="h2">최근 턴</h3><ol class="turn-recent" aria-label="최근 턴 (누르면 트레이스)">${recent}</ol>`;
+		}
+	}
+	if (view === "flow" && s.flows?.ok) {
+		// The flow carries every one of its TASKs, closed ones past the snapshot's closed-TASK limit included.
+		const chain = s.flows.items.find((item) => item.tasks.some((step) => step.taskId === id));
+		const step = chain?.tasks.find((item) => item.taskId === id);
+		if (chain && step) {
+			const STATUS: Record<string, string> = {
+				working: "진행 중",
+				blocked: "막힘",
+				review: "리뷰 대기",
+				done: "완료",
+				cancelled: "취소",
+			};
+			const task = s.tasks.ok ? s.tasks.items.find((item) => item.taskId === id) : undefined;
+			return `${show(step.title, [
+				["TASK", `<code>${esc(step.taskId)}</code>`],
+				["상태", esc(STATUS[step.status] ?? step.status)],
+				["지금 단계", esc(`${step.stage.label}${step.stage.msg === "" ? "" : ` · ${step.stage.msg}`}`)],
+				["위험", esc(step.risk)],
+				["호스트", esc(step.host)],
+				["브랜치", `<code>${esc(step.branch)}</code>`],
+				["등록", at(step.createdAt)],
+				["닫힘", at(step.closedAt)],
+				["AC", `${step.acTotal}개`],
+				[
+					"요청",
+					chain.originKey === ""
+						? esc(chain.title)
+						: `<a href="?view=turns&amp;item=${esc(encodeURIComponent(chain.originKey))}">${esc(chain.title)}</a>`,
+				],
+			])}${
+				task === undefined
+					? ""
+					: `<section class="detail-task" aria-label="TASK 진행"><h3 class="h3">진행</h3>${renderTaskFacts(task)}</section>`
+			}`;
 		}
 	}
 	if (view === "lanes" && s.lanes.ok) {
@@ -1562,7 +1845,10 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 		}
 	}
 	if (view === "approvals" && s.approvals.ok) {
-		const item = s.approvals.items.find((approval) => approval.approvalId === id);
+		// A pending one, else a settled one of 최근 결정: the same panel with the outcome in place of the countdown.
+		const item =
+			s.approvals.items.find((approval) => approval.approvalId === id) ??
+			s.approvals.recent.find((approval) => approval.approvalId === id);
 		if (item) {
 			// Same order and labels as the Slack card's sections (`DETAIL_SECTIONS` in safety/approval.ts).
 			const SECTIONS = [
@@ -1576,13 +1862,22 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				const value = item.detail?.[key];
 				if (value) facts.push([label, esc(value)]);
 			}
-			facts.push(
-				// Rounded up like the list badge (`N분 남음`), so both read the same minute.
-				["남은 시간", item.remainingMs <= 0 ? "만료 처리 중" : `${Math.ceil(item.remainingMs / 60_000)}분`],
-				["요청", at(item.createdAt)],
-				["만료", at(item.expiresAt)],
-				["요청한 곳", esc(item.originLabel ?? "-")],
-			);
+			if ("status" in item) {
+				const word = (APPROVAL_OUTCOMES[item.status] ?? [item.status])[0];
+				facts.push(
+					["결과", `${esc(word)}${item.tookMs === null ? "" : ` · 요청 ${esc(monitorTook(item.tookMs))} 뒤`}`],
+					["요청", at(item.createdAt)],
+					["결정", at(item.decidedAt)],
+				);
+			} else {
+				facts.push(
+					// Rounded up like the list badge (`N분 남음`), so both read the same minute.
+					["남은 시간", item.remainingMs <= 0 ? "만료 처리 중" : `${Math.ceil(item.remainingMs / 60_000)}분`],
+					["요청", at(item.createdAt)],
+					["만료", at(item.expiresAt)],
+				);
+			}
+			facts.push(["요청한 곳", esc(item.originLabel ?? "-")]);
 			const links = [
 				item.cardUrl === null
 					? ""
@@ -1591,14 +1886,16 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 					? ""
 					: `<a class="button is-ghost" href="${esc(item.originUrl)}" target="_blank" rel="noopener noreferrer">요청 스레드 열기</a>`,
 			].join("");
-			return `<p class="eyebrow">${esc(LABELS[view])}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
+			return `<p class="eyebrow">${"status" in item ? "승인 결정" : esc(LABELS[view])}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 				item.title,
 			)}</h2>${item.summary.trim() === item.title ? "" : `<p class="lead detail-summary">${esc(item.summary)}</p>`}${
 				item.detail === null ? '<p class="lead">세부 내용 없음(요약만 받은 요청)</p>' : ""
 			}<dl class="facts">${facts.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${value}</dd>`).join("")}</dl>${
-				links === ""
-					? '<p class="lead">슬랙의 승인 메시지에서 승인하거나 거절해요.</p>'
-					: `<div class="detail-actions">${links}</div>`
+				links !== ""
+					? `<div class="detail-actions">${links}</div>`
+					: "status" in item
+						? ""
+						: '<p class="lead">슬랙의 승인 메시지에서 승인하거나 거절해요.</p>'
 			}<details class="detail-internal"><summary>내부 정보</summary><dl class="facts"><dt>승인 ID</dt><dd><code>${esc(
 				item.approvalId,
 			)}</code></dd><dt>대화</dt><dd><code>${esc(item.originKey ?? "-")}</code></dd></dl></details>`;
@@ -1623,8 +1920,36 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 					"모델",
 					esc(`${monitor.model ?? "기본 모델"}${monitor.thinking === null ? "" : ` · thinking ${monitor.thinking}`}`),
 				],
-				["상태", monitor.openIncidents > 0 ? `열린 사건 ${monitor.openIncidents}` : "열린 사건 없음"],
-			])}<div class="mon-detail">${
+				[
+					"상태",
+					esc(
+						[
+							...(monitor.running ? ["실행 중"] : []),
+							...(monitor.failStreak > 0 ? [`연속 실패 ${monitor.failStreak}회`] : []),
+							monitor.openIncidents > 0 ? `열린 사건 ${monitor.openIncidents}` : "열린 사건 없음",
+						].join(" · "),
+					),
+				],
+				[
+					`최근 ${monitor.stats.days}일`,
+					esc(
+						[
+							`전달 ${monitor.stats.delivered}`,
+							`조용히 끝남 ${monitor.stats.quiet}`,
+							`실패 ${monitor.stats.failed}`,
+							...(monitor.stats.skipped > 0 ? [`건너뜀 ${monitor.stats.skipped}`] : []),
+							...(monitor.stats.medianMs === null ? [] : [`정기 실행 중앙값 ${monitorTook(monitor.stats.medianMs)}`]),
+						].join(" · "),
+					),
+				],
+			])}${
+				// The monitor's own conversation, while the turn board still lists it.
+				s.turns.ok && s.turns.threads.some((thread) => thread.originKey === monitor.originKey)
+					? `<div class="detail-actions"><a class="button is-ghost" href="?view=turns&amp;item=${esc(
+							encodeURIComponent(monitor.originKey),
+						)}">이 모니터의 대화 보기</a></div>`
+					: ""
+			}<div class="mon-detail">${
 				monitorBody ??
 				'<div class="skeleton" role="status"><p class="note-sub">하는 일과 최근 실행을 불러오는 중…</p><div class="skeleton-bar is-w70"></div><div class="skeleton-bar is-w90"></div><div class="skeleton-bar is-w50"></div></div>'
 			}</div>`;
@@ -1640,7 +1965,9 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 					? "지금 열림"
 					: alert.gateState === "closed"
 						? "지금은 닫힘 · 기록만 남음"
-						: "상태 모름";
+						: alert.gateState === "unknown"
+							? "상태 모름"
+							: "기록만 남음";
 			const rows: Array<[string, string]> = [
 				["상태", `${esc(state)} · 기록 ${esc(alert.status)}`],
 				["할 일", esc(text.todo).replace(/`([^`]+)`/g, "<code>$1</code>")],
@@ -1938,12 +2265,15 @@ const SCRIPT = `const GATE_LIMITS = ${JSON.stringify(GATE_LIMITS)};
 const TURN_LABELS = ${JSON.stringify(TURN_LABELS)};
 const JOB_LABELS = ${JSON.stringify(JOB_LABELS)};
 const MONITOR_STAGES = ${JSON.stringify(MONITOR_STAGES)};
+const APPROVAL_OUTCOMES = ${JSON.stringify(APPROVAL_OUTCOMES)};
 const monitorTook = ${monitorTook.toString()};
 const gateText = ${gateText.toString()};
 const alertText = ${alertText.toString()};
 const openTurnsText = ${openTurnsText.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
+const renderFlowChain = ${renderFlowChain.toString()};
+const slackThreadHref = ${slackThreadHref.toString()};
 const renderTaskDetail = ${renderTaskDetail.toString()};
 const renderDetailHead = ${renderDetailHead.toString()};
 const renderItemDetail = ${renderItemDetail.toString()};
@@ -2197,6 +2527,7 @@ function boot() {
 		main.innerHTML = html;
 		drawnMain = html;
 		markChanges();
+		scrollToHere(main);
 		const next = document.getElementById("view");
 		if (next) next.scrollTop = scroll;
 		if (top) window.scrollTo(0, 0);
@@ -2210,23 +2541,71 @@ function boot() {
 			if (target) target.focus();
 		}
 	}
+	/** Each flow row starts scrolled so its selected box, else its 지금 여기 box, is in sight. */
+	function scrollToHere(root) {
+		for (const row of root.querySelectorAll(".flow-row")) {
+			const box = row.querySelector(".is-selected") || row.querySelector(".is-here");
+			if (!box) continue;
+			const end = box.offsetLeft + box.offsetWidth;
+			if (end > row.clientWidth) row.scrollLeft = end - row.clientWidth + 4;
+		}
+	}
+	/** The flow chain holding TASK \`id\`, for the TASK and card panels. */
+	function chainOf(id) {
+		if (!snapshot || !snapshot.flows || !snapshot.flows.ok) return undefined;
+		return snapshot.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === id));
+	}
+	/** The bar's 슬랙 스레드에서 답하기 link follows the open conversation, on every tab. */
+	function syncSlack() {
+		const link = document.getElementById("detail-slack");
+		if (!link) return;
+		const thread = threadOpen() ? threadOf(open.id) : undefined;
+		const href = thread && snapshot ? slackThreadHref(snapshot.slackTeam, thread.threadRef) : "";
+		link.hidden = href === "";
+		if (href !== "") link.setAttribute("href", href);
+	}
+	/** The bar's context title shows the open conversation or card title while on non-head tabs. */
+	function syncBarTitle() {
+		const barTitle = document.getElementById("detail-bar-title");
+		if (!barTitle) return;
+		const titleEl = document.getElementById("detail-title");
+		const text = open && titleEl ? (titleEl.textContent || "").trim() : "";
+		const tabbed = !!open && (open.kind === "card" || threadOpen());
+		barTitle.textContent = text;
+		barTitle.hidden = !tabbed || tab === "head" || text === "";
+	}
 	function drawDetail() {
-		if (!open) return;
+		syncSlack();
+		if (!open) {
+			syncBarTitle();
+			return;
+		}
 		let html = null;
 		if (open.kind === "card") {
 			if (board === null) return;
 			const card = cardOf(open.id);
-			html = renderDetailHead(open.id, card, card && card.taskId ? taskById(card.taskId) : undefined, Date.now());
+			html = renderDetailHead(
+				open.id,
+				card,
+				card && card.taskId ? taskById(card.taskId) : undefined,
+				Date.now(),
+				card && card.taskId ? chainOf(card.taskId) : undefined,
+			);
 		} else if (snapshot) {
 			if (open.kind === "task") {
 				const card = board && board.ok ? board.cards.find((item) => item.taskId === open.id) : undefined;
-				html = renderTaskDetail(open.id, taskById(open.id), card ? card.key : undefined);
+				html = renderTaskDetail(open.id, taskById(open.id), card ? card.key : undefined, chainOf(open.id));
 			} else html = renderItemDetail(snapshot, ui.view, open.id, monitorHtml === null ? undefined : monitorHtml);
 		}
-		if (html === null || html === drawnHead) return;
+		if (html === null || html === drawnHead) {
+			syncBarTitle();
+			return;
+		}
 		const focused = document.activeElement && document.activeElement.id === "detail-title";
 		head.innerHTML = html;
 		drawnHead = html;
+		scrollToHere(head);
+		syncBarTitle();
 		const title = document.getElementById("detail-title");
 		if (focused && title) title.focus({ preventScroll: true });
 	}
@@ -2241,6 +2620,7 @@ function boot() {
 		conv.hidden = !tabbed || name !== "conv";
 		plan.hidden = !card || name !== "plan";
 		detail.scrollTop = name === "conv" ? detail.scrollHeight : 0;
+		syncBarTitle();
 		syncTrace();
 		syncLive();
 	}
@@ -2530,6 +2910,7 @@ function boot() {
 			{ label: "보기: 에이전트 인박스 (Board)", sub: "g i", run: () => setView("inbox") },
 			{ label: "보기: 에이전트 목록 (List)", sub: "g l", run: () => setView("list") },
 			{ label: "보기: 턴", sub: "g t", run: () => setView("turns") },
+			{ label: "보기: 흐름", sub: "g f", run: () => setView("flow") },
 			{ label: "보기: 레인", sub: "g n", run: () => setView("lanes") },
 			{ label: "보기: 승인 대기", sub: "g a", run: () => setView("approvals") },
 			{ label: "보기: 모니터", sub: "g m", run: () => setView("monitors") },
@@ -2807,7 +3188,7 @@ function boot() {
 		if (gPending) {
 			gPending = false;
 			if (chordTimer) clearTimeout(chordTimer);
-			const G_MAP = { i: "inbox", l: "list", t: "turns", n: "lanes", a: "approvals", m: "monitors", e: "alerts", s: "system" };
+			const G_MAP = { i: "inbox", l: "list", t: "turns", f: "flow", n: "lanes", a: "approvals", m: "monitors", e: "alerts", s: "system" };
 			const dest = G_MAP[event.key.toLowerCase()];
 			if (dest) {
 				event.preventDefault();
@@ -2975,17 +3356,22 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 				: item !== undefined
 					? { kind: "item" as const, id: item }
 					: undefined;
+	const chainOf = (id: string | undefined): FlowChainInfo | undefined =>
+		id === undefined || !snapshot.flows?.ok
+			? undefined
+			: snapshot.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === id));
 	let headHtml = "";
 	if (open?.kind === "card") {
 		const found = live?.cards.find((entry) => entry.key === open.id);
 		const owner = found?.taskId === undefined ? undefined : tasks.find((entry) => entry.taskId === found.taskId);
-		headHtml = renderDetailHead(open.id, found, owner, live?.generatedAt ?? 0);
+		headHtml = renderDetailHead(open.id, found, owner, live?.generatedAt ?? 0, chainOf(found?.taskId));
 	} else if (open?.kind === "task") {
 		const key = live?.cards.find((entry) => entry.taskId === open.id)?.key;
 		headHtml = renderTaskDetail(
 			open.id,
 			tasks.find((entry) => entry.taskId === open.id),
 			key,
+			chainOf(open.id),
 		);
 	} else if (open?.kind === "item") {
 		headHtml = renderItemDetail(snapshot, view ?? "inbox", open.id);
@@ -2994,7 +3380,7 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 		open === undefined || open.kind === "card" ? "카드 상세" : open.kind === "task" ? "TASK 상세" : "항목 상세";
 	const turnsList = view === "turns" && layout === "list";
 	const back =
-		view !== undefined && /^(list|turns|lanes|approvals|monitors|alerts|system)$/.test(view)
+		view !== undefined && /^(list|turns|flow|lanes|approvals|monitors|alerts|system)$/.test(view)
 			? `?view=${view}${turnsList ? "&amp;layout=list" : ""}`
 			: "./";
 	// A turn-board conversation: tabs 개요/대화/트레이스, 대화 first; the old one-turn address opens on 트레이스.
@@ -3007,6 +3393,8 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 				: snapshot.turns.threads.find((entry) => entry.originKey === open.id)
 			: undefined;
 	const tab = open?.kind === "card" ? "head" : thread ? (oldTurn ? "trace" : "conv") : undefined;
+	const slackHref = found === undefined ? "" : slackThreadHref(snapshot.slackTeam, found.threadRef);
+	const barTitle = /<h2 class="detail-title"[^>]*>([\s\S]*?)<\/h2>/.exec(headHtml)?.[1] ?? "";
 	const ui = {
 		...(view === undefined ? {} : { view }),
 		...(open === undefined ? {} : { selected: found?.originKey ?? open.id }),
@@ -3032,7 +3420,11 @@ ${renderDashboardMain(snapshot, board, undefined, ui)}
 </div>
 <div class="search"><input id="search" type="search" placeholder="제목·TASK·머신 검색 ( / )" aria-label="제목·TASK ID·머신 검색" autocomplete="off"></div>
 ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" hidden>` : `<aside id="detail" class="detail is-open" aria-label="${label}">`}
-<div class="detail-bar"><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
+<div class="detail-bar"><span id="detail-bar-title" class="detail-bar-title"${
+		tab === undefined || tab === "head" || barTitle === "" ? " hidden" : ""
+	}>${barTitle}</span><a id="detail-slack" class="button is-ghost detail-slack" href="${slackHref.replace(/&/g, "&amp;")}"${
+		slackHref === "" ? " hidden" : ""
+	}>슬랙 스레드에서 답하기</a><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
 <div id="detail-tabs" class="tabs" role="tablist" aria-label="상세 보기"${tab === undefined ? " hidden" : ""}>${renderDetailTabs(
 		thread ? "thread" : "card",
 		tab ?? "head",
@@ -3045,7 +3437,7 @@ ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" 
 <footer class="hint-bar" aria-label="단축키 안내"><span class="hint-item"><kbd>j</kbd><kbd>k</kbd><span>이동</span></span><span class="hint-item"><kbd>Enter</kbd><span>열기</span></span><span class="hint-item"><kbd>Esc</kbd><span>닫기</span></span><span class="hint-item"><kbd>/</kbd><span>검색</span></span><span class="hint-item"><kbd>g</kbd><kbd>i</kbd><span>인박스</span></span><span class="hint-item"><kbd>g</kbd><kbd>a</kbd><span>승인</span></span><button type="button" class="hint-btn" data-cmd-open><kbd>⌘K</kbd><span>명령 팔레트</span></button><button type="button" class="hint-btn" data-help-open><kbd>?</kbd><span>도움말</span></button></footer>
 </div>
 <div id="cmd-palette" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="명령 팔레트" hidden><div class="modal-card"><div class="cmd-head"><input id="cmd-input" type="text" placeholder="보기 전환, TASK ID·카드 이동, 테마 전환…" aria-label="명령 또는 TASK 검색" autocomplete="off"><button type="button" class="detail-close" data-cmd-close>닫기 <kbd>Esc</kbd></button></div><div id="cmd-list" class="cmd-list" role="listbox" aria-label="명령 목록"></div></div></div>
-<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
+<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>흐름</span><span><kbd>g</kbd> <kbd>f</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <p id="stale" class="stale" role="status" hidden></p>
 ${board === undefined ? "" : `<script type="application/json" id="board-data">${JSON.stringify(board).replace(/</g, "\\u003c")}</script>\n`}<script>${SCRIPT}</script>

@@ -12,6 +12,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type CacheMissInfo,
+	type ColdCacheInfo,
 	OriginMailbox,
 	type SessionMismatchInfo,
 	type StuckLoopInfo,
@@ -214,6 +216,8 @@ let logLines: string[];
 let sessionStore: FakeSessionStore;
 let defaultModel: string | undefined;
 let escalations: TurnFailureEscalation[];
+let cacheMisses: CacheMissInfo[];
+let coldCaches: ColdCacheInfo[];
 let escalateAfter: number | undefined;
 let restoreListed: readonly string[] | undefined;
 let sessionBackupsRoot: string | undefined;
@@ -229,13 +233,28 @@ function buildRouter(): OriginRouter {
 		...(defaultModel === undefined ? {} : { defaultModel }),
 		...(escalateAfter === undefined ? {} : { escalateAfter }),
 		...(sessionBackupsRoot === undefined ? {} : { sessionBackupsRoot }),
-		...(threadBot === undefined ? {} : { threadSource: { botUserId: () => threadBot?.id, replies: async () => [] } }),
+		...(threadBot === undefined
+			? {}
+			: {
+					threadSource: new Map([
+						[
+							"slack" as const,
+							{
+								botUserId: () => threadBot?.id,
+								replies: async () => [],
+								mentionUser: (userId: string) => `<@${userId}>`,
+							},
+						],
+					]),
+				}),
 		log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
 		statusProvider: (origin) => {
 			statusCalls.push(origin);
 			return "status: ok";
 		},
 		onEscalate: (info) => escalations.push(info),
+		onCacheMiss: (info) => cacheMisses.push(info),
+		onColdCache: (info) => coldCaches.push(info),
 		driverFactory: (_origin, sessionDir) => {
 			const driver = new RestoreFailingDriver(
 				{
@@ -265,6 +284,8 @@ beforeEach(() => {
 	sessionStore = new FakeSessionStore();
 	defaultModel = undefined;
 	escalations = [];
+	cacheMisses = [];
+	coldCaches = [];
 	escalateAfter = undefined;
 	restoreListed = undefined;
 	sessionBackupsRoot = undefined;
@@ -1833,5 +1854,167 @@ describe("mailbox: a peer bot's failed turn answers that bot", () => {
 		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([
 			"[turn failed] omp_executable_missing — 다시 보내 주세요",
 		]);
+	});
+});
+
+describe("mailbox: prompt cache monitor", () => {
+	const MIN = 60_000;
+	const MODEL = "claude-opus-5-5";
+	/** omp's `message_end` of an assistant call with its usage (cache write priced like Opus: $6.25 per million). */
+	const usageEvent = (cacheRead: number, cacheWrite: number): OmpEvent => ({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [],
+			provider: "anthropic",
+			model: MODEL,
+			usage: { input: 3, output: 5, cacheRead, cacheWrite, cost: { cacheWrite: cacheWrite * 6.25e-6 } },
+		},
+	});
+	let events: OmpEvent[];
+	const cacheMissLogs = () => logLines.filter((line) => line.includes("event=cache_miss"));
+	const monitorId = () =>
+		store.monitors.addMonitor({
+			name: "retro",
+			trigger: { kind: "cron", schedule: "0 23 * * *", timezone: "UTC" },
+			instruction: "x",
+			overlap: "queue",
+			enabled: true,
+		}).id;
+
+	beforeEach(() => {
+		events = [];
+		driverOptions = { holdTurns: true, events };
+	});
+
+	/** One finished turn on `origin`: its usage events and its final have been handled. */
+	async function turn(text: string, origin = ORIGIN): Promise<InboundRecord> {
+		const record = msg(text, { originKey: origin });
+		await router.route(record);
+		const driver = drivers.at(-1);
+		if (driver === undefined) throw new Error("no driver");
+		await untilFinal(router.mailbox(origin), driver, () => driver.release());
+		return record;
+	}
+
+	/** Stops the origin's child by the idle sweep, so the next turn starts a new one. */
+	async function restartChild(origin = ORIGIN, idleMs = IDLE_STOP_MS): Promise<void> {
+		clock.advance(idleMs);
+		expect(await router.mailbox(origin).sweepIdle()).toBe(true);
+	}
+
+	/** A saved session of `origin` epoch 1 whose last entry is an assistant message (with `usage`, if given) at `at`. */
+	function seedSession(origin: string, at: number, usage?: { cacheRead: number; cacheWrite: number }): void {
+		const sessionDir = sessionDirFor(join(dir, "sessions"), origin, 1);
+		sessionStore.open(sessionDir);
+		const session = sessionStore.sessions.get(sessionDir);
+		if (session === undefined) throw new Error("no session");
+		session.entries.push({
+			id: "e3",
+			parentId: "e2",
+			type: "message",
+			timestamp: new Date(at).toISOString(),
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "이전 답" }],
+				stopReason: "stop",
+				...(usage === undefined
+					? {}
+					: {
+							provider: "anthropic",
+							model: MODEL,
+							usage: { input: 3, output: 5, ...usage, cost: { cacheWrite: usage.cacheWrite * 6.25e-6 } },
+						}),
+			},
+		});
+		session.nextId = 4;
+	}
+
+	test("AC-2: a restarted child's big miss logs reason=child_restart once and calls onCacheMiss once; a second within 24h does not", async () => {
+		events.push(usageEvent(300_000, 30_000));
+		await turn("one");
+		expect(cacheMissLogs()).toHaveLength(0);
+		await restartChild();
+		events.splice(0, events.length, usageEvent(28_000, 302_000));
+		const second = await turn("two");
+		expect(cacheMissLogs().filter((line) => line.includes("reason=child_restart"))).toHaveLength(1);
+		expect(cacheMisses).toHaveLength(1);
+		expect(cacheMisses[0]).toMatchObject({
+			originKey: ORIGIN,
+			threadRef: second.threadRef,
+			reason: "child_restart",
+			missedTokens: 302_000,
+			cacheWrite: 302_000,
+			model: MODEL,
+		});
+		await restartChild();
+		await turn("three");
+		expect(cacheMissLogs().filter((line) => line.includes("reason=child_restart"))).toHaveLength(2);
+		expect(cacheMisses).toHaveLength(1);
+	});
+
+	test("AC-2: a monitor origin logs its miss but never calls onCacheMiss", async () => {
+		const origin = monitorOrigin(monitorId());
+		events.push(usageEvent(300_000, 30_000));
+		await turn("run", origin);
+		await restartChild(origin, MONITOR_IDLE_STOP_MS);
+		events.splice(0, events.length, usageEvent(28_000, 302_000));
+		await turn("run again", origin);
+		expect(cacheMissLogs().filter((line) => line.includes("reason=child_restart"))).toHaveLength(1);
+		expect(cacheMisses).toHaveLength(0);
+	});
+
+	test("AC-2b: a new mailbox seeds its baseline from the session's last assistant usage", async () => {
+		seedSession(ORIGIN, clock.now() - 10 * MIN, { cacheRead: 300_000, cacheWrite: 30_000 });
+		events.push(usageEvent(28_000, 302_000));
+		await turn("after the daemon restart");
+		expect(cacheMissLogs().filter((line) => line.includes("reason=child_restart"))).toHaveLength(1);
+		expect(cacheMisses.map((miss) => [miss.reason, miss.missedTokens])).toEqual([["child_restart", 302_000]]);
+	});
+
+	test("AC-2b: a session without assistant usage seeds nothing: the first call is no miss", async () => {
+		seedSession(ORIGIN, clock.now() - 10 * MIN);
+		events.push(usageEvent(28_000, 302_000));
+		await turn("first");
+		expect(cacheMissLogs()).toHaveLength(0);
+		expect(cacheMisses).toHaveLength(0);
+	});
+
+	test("a /new-ompbot session is judged on its own prefix, not the old session's", async () => {
+		events.push(usageEvent(300_000, 30_000));
+		await turn("one");
+		await router.route(msg("/new-ompbot"));
+		events.splice(0, events.length, usageEvent(0, 25_000));
+		await turn("fresh");
+		expect(cacheMissLogs()).toHaveLength(0);
+		expect(cacheMisses).toHaveLength(0);
+	});
+
+	test("AC-3: a 250k conversation idle for 2 hours warns its new turn's thread once per baseline", async () => {
+		seedSession(ORIGIN, clock.now() - 120 * MIN, { cacheRead: 240_000, cacheWrite: 10_000 });
+		const first = await turn("돌아왔어");
+		expect(coldCaches).toHaveLength(1);
+		expect(coldCaches[0]).toMatchObject({
+			originKey: ORIGIN,
+			threadRef: first.threadRef,
+			prefixTokens: 250_000,
+			idleMs: 120 * MIN,
+		});
+		expect(coldCaches[0]?.estimatedCost).toBeCloseTo(250_000 * 6.25e-6, 9);
+		await turn("하나 더");
+		expect(coldCaches).toHaveLength(1);
+	});
+
+	test("AC-3: a 150k conversation idle for 2 hours is not warned", async () => {
+		seedSession(ORIGIN, clock.now() - 120 * MIN, { cacheRead: 140_000, cacheWrite: 10_000 });
+		await turn("돌아왔어");
+		expect(coldCaches).toHaveLength(0);
+	});
+
+	test("AC-3: a monitor origin is never warned", async () => {
+		const origin = monitorOrigin(monitorId());
+		seedSession(origin, clock.now() - 120 * MIN, { cacheRead: 240_000, cacheWrite: 10_000 });
+		await turn("run", origin);
+		expect(coldCaches).toHaveLength(0);
 	});
 });

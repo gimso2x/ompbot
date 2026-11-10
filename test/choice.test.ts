@@ -13,6 +13,7 @@ import {
 	parseChoiceActionId,
 } from "../src/safety/approval";
 import { answerDialogOnSlack } from "../src/safety/choice";
+import { registryOf } from "./helpers/channels";
 
 const OWNER = "U_OWNER";
 const ORIGIN = { originKey: "slack/dm/D1", channel: "D1", threadTs: "100.1" };
@@ -174,7 +175,7 @@ function harness() {
 	const store = memoryStore();
 	const logs = new Seen<string>();
 	const broker = new ApprovalBroker({
-		port,
+		channels: registryOf(port),
 		ownerUserId: OWNER,
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		store,
@@ -554,7 +555,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 			(w) => w.kind === "edit" && w.ts !== choice.ts && (w.msg.buttons?.length ?? 0) > 0,
 		);
 		const rebooted = new ApprovalBroker({
-			port: h.port,
+			channels: registryOf(h.port),
 			ownerUserId: OWNER,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			store: h.store,
@@ -585,7 +586,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		h.send({ method: "select", id: "r1", title: "고르기", options: ["A", "B"] });
 		const shown = await h.card(true);
 		const rebooted = new ApprovalBroker({
-			port: h.port,
+			channels: registryOf(h.port),
 			ownerUserId: OWNER,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			store: h.store,

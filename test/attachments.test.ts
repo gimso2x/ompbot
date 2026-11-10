@@ -3,10 +3,12 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sniffImageMime } from "../src/channel/attachments";
+import type { CoreSink, DeliverySource } from "../src/channel/types";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
-import { type CoreSink, type DeliverySource, SlackAdapter } from "../src/slack/adapter";
-import { downloadAttachmentFile, hostAllowed, sniffImageMime } from "../src/slack/attachments";
+import { SlackAdapter } from "../src/slack/adapter";
+import { downloadAttachmentFile, hostAllowed } from "../src/slack/attachments";
 import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackMessageEvent } from "../src/slack/transport";
 

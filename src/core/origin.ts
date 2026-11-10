@@ -61,11 +61,19 @@ export interface OriginRouterDeps {
 	onEscalate?: MailboxDeps["onEscalate"];
 	/** Owner notice for a provider usage limit seen in a turn's omp retry events; see `MailboxDeps`. */
 	onProviderLimit?: MailboxDeps["onProviderLimit"];
+	/** Thread notice for a large unexpected prompt cache miss; see `MailboxDeps`. */
+	onCacheMiss?: MailboxDeps["onCacheMiss"];
+	/** Thread notice for a large conversation resumed on a cold cache; see `MailboxDeps`. */
+	onColdCache?: MailboxDeps["onColdCache"];
 	onSessionMismatch?: MailboxDeps["onSessionMismatch"];
 	/** Thread notice for a turn aborted on a tool repeat loop; see `MailboxDeps`. */
 	onStuckLoop?: MailboxDeps["onStuckLoop"];
 	/** Owner dialogs a plain message may answer; see `MailboxDeps.dialogs`. */
 	dialogs?: MailboxDeps["dialogs"];
+	/** Whether an origin's work is held (a paused lane); passed per mailbox (`MailboxDeps.isHeld`). */
+	isHeld?: (originKey: string) => boolean;
+	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */
+	onHeldWork?: MailboxDeps["onHeldWork"];
 }
 
 /** Owns one `OriginMailbox` per origin key. */
@@ -84,12 +92,14 @@ export class OriginRouter {
 	mailbox(originKey: string): OriginMailbox {
 		let mailbox = this.#mailboxes.get(originKey);
 		if (!mailbox) {
-			const { sessionsRoot, ...rest } = this.#deps;
+			const { sessionsRoot, isHeld, onHeldWork, ...rest } = this.#deps;
 			mailbox = new OriginMailbox({
 				...rest,
 				originKey,
 				sessionDirFor: (key, epoch) => sessionDirFor(sessionsRoot, key, epoch),
 				isDraining: () => this.draining,
+				...(isHeld === undefined ? {} : { isHeld: () => isHeld(originKey) }),
+				...(onHeldWork === undefined ? {} : { onHeldWork }),
 			});
 			if (this.#dispatchStopped) mailbox.stopDispatching();
 			this.#mailboxes.set(originKey, mailbox);

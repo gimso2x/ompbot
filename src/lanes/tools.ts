@@ -1,4 +1,5 @@
 import type { HostToolDef } from "../safety/host-tools";
+import { TASK_RISKS } from "../tasks/docs";
 import type { LaneManager } from "./manager";
 
 function stringParam(params: Record<string, unknown>, key: string): string {
@@ -13,13 +14,24 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 		name: "ompbot_work_start",
 		label: "Start work lane",
 		description:
-			"Start a long task as its own work lane: a new Slack thread in the owner DM and a separate omp session running in `cwd`. Use it for tasks that take long or touch another project. Returns the lane name.",
+			"Start a long task as its own work lane: a new Slack thread in the owner DM and a separate omp session working in its own git worktree and branch (`lane/L-YYYYMMDD-NN`) of the repository that contains `cwd`. Use it for tasks that take long or touch another project. Returns the lane name.",
 		parameters: {
 			type: "object",
 			properties: {
 				title: { type: "string", description: "Short title shown on the thread" },
-				cwd: { type: "string", description: "Absolute path of the project directory" },
+				cwd: { type: "string", description: "Absolute path of the project directory (inside a git repository)" },
 				brief: { type: "string", description: "What the lane must do" },
+				acceptance: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Acceptance criteria, one per item. An item may end with `[check: command ["bun","run","check"]]` (or `file <path>`): the bot re-runs it in the lane worktree before the lane can close.',
+				},
+				risk: {
+					type: "string",
+					enum: [...TASK_RISKS],
+					description: "Risk class L0 (trivial) .. L4 (dangerous); default L3",
+				},
 			},
 			required: ["title", "cwd"],
 			additionalProperties: false,
@@ -31,6 +43,8 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 				cwd: stringParam(params, "cwd"),
 				brief,
 				channel,
+				acceptance: params.acceptance,
+				risk: params.risk,
 			});
 			return `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;
 		},

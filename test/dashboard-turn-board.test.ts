@@ -241,6 +241,35 @@ describe("turn board snapshot", () => {
 		}
 		expect(json).toContain(`${"가".repeat(79)}…`);
 	});
+
+	test("Discord origins: a DM card reads DM, a server thread card names Discord and its channel", async () => {
+		const dm = "discord/dm/123456789012345678";
+		const thread = "discord/ch/111111111111111111/t/222222222222222222";
+		const main = "discord/ch/111111111111111111";
+		seed([
+			{ origin: dm, text: "디스코드 DM", state: "answered", createdAt: NOW - HOUR, dispatchedAt: NOW - HOUR },
+			{ origin: thread, text: "디스코드 스레드", state: "answered", createdAt: NOW - HOUR, dispatchedAt: NOW - HOUR },
+			{ origin: main, text: "디스코드 채널 메인", state: "answered", createdAt: NOW - HOUR, dispatchedAt: NOW - HOUR },
+			{ origin: "slack/dm/UY", text: "슬랙 DM", state: "answered", createdAt: NOW - HOUR, dispatchedAt: NOW - HOUR },
+		]);
+		const snapshot = await buildSnapshot(deps());
+		expect(
+			threadsOf(snapshot)
+				.map((t) => t.originKey)
+				.sort(),
+		).toEqual([dm, main, thread, "slack/dm/UY"].sort());
+		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+		const eyebrow = (key: string): string => {
+			const at = html.indexOf(`data-row="${key}"`);
+			if (at < 0) throw new Error(`no card ${key}`);
+			const start = html.indexOf('<p class="card-eyebrow">', at);
+			return html.slice(start, html.indexOf("</p>", start)).replace(/<[^>]*>/g, "");
+		};
+		expect(eyebrow(dm)).toEndWith(" · DM");
+		expect(eyebrow("slack/dm/UY")).toEndWith(" · DM");
+		expect(eyebrow(thread)).toEndWith(" · Discord 111111111111111111");
+		expect(eyebrow(main)).toEndWith(" · Discord 111111111111111111 채널 메인");
+	});
 });
 
 describe("turn board page", () => {

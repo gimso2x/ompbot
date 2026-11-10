@@ -14,24 +14,24 @@ export type TaskCheckCache = Map<string, { head: string; results: Map<string, Si
 
 const UNCOMMITTED = "미커밋 변경이 있어 check를 미룹니다";
 
-/** Runs the checks at the worktree's HEAD, reusing what this HEAD already answered; uncommitted changes defer them. */
-async function runTaskChecks(
-	row: TaskRow,
+/**
+ * Runs the checks at `worktree`'s HEAD; uncommitted changes defer them. `resultsAt(head)` hands back the signal
+ * results already known at that HEAD (filled in place as signals run), so the same commit is never checked twice.
+ * Shared by the task sweep and the work lanes; host failures throw.
+ */
+export async function runWorktreeChecks(
 	ops: TaskHostOps,
-	cache: TaskCheckCache,
+	worktree: string,
+	resultsAt: (head: string) => Map<string, SignalCheck>,
 	requests: readonly TaskCheckRequest[],
 ): Promise<TaskChecksRun> {
-	const head = await ops.headOf(row.worktree);
+	const head = await ops.headOf(worktree);
 	if (!head.clean) return { deferred: UNCOMMITTED };
-	let entry = cache.get(row.taskId);
-	if (entry?.head !== head.sha) {
-		entry = { head: head.sha, results: new Map() };
-		cache.set(row.taskId, entry);
-	}
+	const known = resultsAt(head.sha);
 	const io = {
-		runCheck: (argv: string[]) => ops.runCheck({ worktree: row.worktree, argv, timeoutMs: CHECK_TIMEOUT_MS }),
+		runCheck: (argv: string[]) => ops.runCheck({ worktree, argv, timeoutMs: CHECK_TIMEOUT_MS }),
 		readFile: async (path: string) => {
-			const read = await ops.readFile(`${row.worktree}/${path}`);
+			const read = await ops.readFile(`${worktree}/${path}`);
 			if (!read.ok) throw new Error(`cannot read ${path}: ${read.error}`);
 			return read.value;
 		},
@@ -39,14 +39,36 @@ async function runTaskChecks(
 	const results: TaskCheck[] = [];
 	// One at a time: two test suites racing in one worktree would judge each other.
 	for (const request of requests) {
-		let result = entry.results.get(request.signal);
+		let result = known.get(request.signal);
 		if (result === undefined) {
 			result = await runSignal(request.signal, io);
-			entry.results.set(request.signal, result);
+			known.set(request.signal, result);
 		}
 		results.push({ id: request.id, signal: request.signal, ok: result.ok, detail: result.detail });
 	}
 	return { head: head.sha, results };
+}
+
+/** The task's checks through the sweep's cache: a new HEAD replaces the task's entry. */
+function runTaskChecks(
+	row: TaskRow,
+	ops: TaskHostOps,
+	cache: TaskCheckCache,
+	requests: readonly TaskCheckRequest[],
+): Promise<TaskChecksRun> {
+	return runWorktreeChecks(
+		ops,
+		row.worktree,
+		(head) => {
+			let entry = cache.get(row.taskId);
+			if (entry?.head !== head) {
+				entry = { head, results: new Map() };
+				cache.set(row.taskId, entry);
+			}
+			return entry.results;
+		},
+		requests,
+	);
 }
 
 /** The task branch's diff for the integrity classifier; a failed read defers the classification, never passes it. */

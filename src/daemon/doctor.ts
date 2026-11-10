@@ -3,7 +3,16 @@ import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { WebClient } from "@slack/web-api";
-import { ConfigError, HOME_MODE, loadConfig, type OmpbotConfig, readSlackTokens, SECRET_MODE } from "../config";
+import {
+	ConfigError,
+	HOME_MODE,
+	loadConfig,
+	type OmpbotConfig,
+	readDiscordToken,
+	readSlackTokens,
+	SECRET_MODE,
+} from "../config";
+import { DiscordRest } from "../discord/rest";
 import { checkOmpRuntime } from "../omp/runtime-check";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
@@ -27,6 +36,44 @@ function listening(host: string, port: number): Promise<boolean> {
 
 const modeOf = (path: string): number => statSync(path).mode & 0o777;
 const octal = (mode: number): string => `0${mode.toString(8)}`;
+
+type Report = (ok: boolean, name: string, detail: string) => void;
+
+/**
+ * `channels.discord` set: the token file's mode, then the token against `GET /users/@me` (bot id and name) and
+ * `GET /gateway/bot` (gateway URL). Only ids, names and URLs are printed. Off: no line at all.
+ */
+export async function checkDiscord(
+	config: OmpbotConfig,
+	report: Report,
+	fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+	const discord = config.channels.discord;
+	if (discord === undefined) return;
+	let token: string;
+	try {
+		const mode = modeOf(discord.botTokenFile);
+		report(mode === SECRET_MODE, "discord token", `mode=${octal(mode)} expected=${octal(SECRET_MODE)}`);
+		if (mode !== SECRET_MODE) return;
+		token = readDiscordToken(config);
+	} catch (error) {
+		report(false, "discord token", error instanceof ConfigError ? error.code : "missing");
+		return;
+	}
+	const rest = new DiscordRest({ token, fetchImpl });
+	try {
+		const user = await rest.getCurrentUser();
+		report(true, "discord users/@me", `bot_user_id=${user.id} username=${user.username ?? "?"}`);
+	} catch (error) {
+		report(false, "discord users/@me", error instanceof Error ? error.message : String(error));
+	}
+	try {
+		const gateway = await rest.getGatewayBot();
+		report(true, "discord gateway/bot", `url=${gateway.url}`);
+	} catch (error) {
+		report(false, "discord gateway/bot", error instanceof Error ? error.message : String(error));
+	}
+}
 
 /**
  * Prints one `ok`/`fail` line per check. Only paths, modes, token *prefixes* and public ids are printed; token values
@@ -182,6 +229,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 					: "request_failed";
 			report(false, "slack auth.test", code);
 		}
+		await checkDiscord(config, report);
 	}
 	return failures === 0 ? 0 : 1;
 }

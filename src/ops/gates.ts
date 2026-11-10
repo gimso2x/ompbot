@@ -323,10 +323,15 @@ export function collectGates(options: GatesOptions): Gate[] {
 			// A pre-migration ledger must stay readable, never throw (same stance as the other column guards).
 			ledger.push(gate("origin_silent", false, "schema=old"));
 		} else {
+			// A paused lane holds its owner messages until the owner resumes it: a wait on the owner, not a silence.
+			const heldByPause =
+				tableExists(db, "lanes") && columnExists(db, "lanes", "origin_key")
+					? " AND origin_key NOT IN (SELECT origin_key FROM lanes WHERE status = 'paused')"
+					: "";
 			const silent = db
 				.query(
 					`SELECT COUNT(*) AS n, COUNT(DISTINCT origin_key) AS origins, MIN(created_at) AS oldest FROM inbound
-					 WHERE state = 'pending' AND created_at <= ${now - ORIGIN_SILENT_MS} AND origin_key NOT LIKE 'monitor/%'${waitingOnOwner}
+					 WHERE state = 'pending' AND created_at <= ${now - ORIGIN_SILENT_MS} AND origin_key NOT LIKE 'monitor/%'${waitingOnOwner}${heldByPause}
 					 AND origin_key NOT IN (SELECT origin_key FROM inbound WHERE state = 'dispatched' AND ${lastSign} > ${now - INBOUND_STARVATION_MS})`,
 				)
 				.get() as { n: number; origins: number; oldest: number | null };

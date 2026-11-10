@@ -116,6 +116,9 @@ export function renderMarkdown(source: string): string {
 			if (first) {
 				const ordered = /\d/.test(first[2] ?? "");
 				const base = (first[1] ?? "").length;
+				const start = ordered ? Number.parseInt(first[2] ?? "1", 10) : 1;
+				let topSeq = start;
+				let hadSub = false;
 				const items: string[] = [];
 				while (i < lines.length) {
 					const item = LIST.exec(lines[i] ?? "");
@@ -129,7 +132,16 @@ export function renderMarkdown(source: string): string {
 							body = task[2] ?? "";
 						}
 						const depth = Math.min(3, Math.floor(Math.max(0, (item[1] ?? "").length - base) / 2));
-						items.push(`<li class="md-d${depth}">${box}${inline(body)}</li>`);
+						let valAttr = "";
+						if (ordered) {
+							if (depth === 0) {
+								const n = topSeq++;
+								if (hadSub) valAttr = ` value="${n}"`;
+							} else {
+								hadSub = true;
+							}
+						}
+						items.push(`<li class="md-d${depth}"${valAttr}>${box}${inline(body)}</li>`);
 						i++;
 						continue;
 					}
@@ -144,7 +156,6 @@ export function renderMarkdown(source: string): string {
 					}
 					break;
 				}
-				const start = ordered ? Number.parseInt(first[2] ?? "1", 10) : 1;
 				out.push(
 					ordered
 						? `<ol${start === 1 ? "" : ` start="${start}"`}>${items.join("")}</ol>`

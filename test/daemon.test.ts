@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { openBotStore } from "../src/core/origin";
 import { crashHook } from "../src/daemon/crash";
 import { Daemon, PENDING_ALERT_AFTER } from "../src/daemon/daemon";
@@ -13,8 +14,8 @@ import { createLogger } from "../src/log";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { REDELIVERED_PREFIX } from "../src/slack/format";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const ORIGIN = "slack/dm/D1";
@@ -39,7 +40,7 @@ afterEach(async () => {
 function newDaemon(transport: WaitingTransport): Daemon {
 	const daemon = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: BOOT_ID,
@@ -246,7 +247,7 @@ describe("sweep heartbeat", () => {
 		const lines: string[] = [];
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,
@@ -284,7 +285,7 @@ describe("sweep heartbeat", () => {
 		let verifyCalls = 0;
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,
@@ -338,7 +339,7 @@ describe("sweep heartbeat", () => {
 		const transport = new WaitingTransport();
 		const daemon = new Daemon({
 			config: { ...home.config, idleTimeoutMinutes: 1 },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,
@@ -490,7 +491,7 @@ describe("stop() drains running turns before stopping the children", () => {
 	): Daemon {
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: (line) => options.lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,
@@ -658,7 +659,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 	function newRetryDaemon(transport: WaitingTransport, drivers: FakeOmpDriver[], wedged: boolean): Daemon {
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -801,7 +802,7 @@ describe("provider limit notice", () => {
 		const transport = new WaitingTransport();
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: BOOT_ID,

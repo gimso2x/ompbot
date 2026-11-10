@@ -554,4 +554,91 @@ describe("dashboard monitors view", () => {
 		expect(loaded).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
 		expect(loaded).toContain("&lt;script&gt;alert(4)&lt;/script&gt;");
 	});
+
+	test("AC-8: 30-day outcome counts and median, fail streak and running flag; the list's summary line, badges, search and panel", async () => {
+		addMonitors([
+			{ id: "bad", name: "실패 잦음", trigger: cron("0 1 * * *") },
+			{ id: "run", name: "도는 중", trigger: cron("0 1 * * *") },
+			{ id: "ok", name: "잘 돎", trigger: cron("30 7 * * *"), model: "zai/glm-5.3" },
+		]);
+		const day = 24 * HOUR;
+		const ended = (ago: number, stage: string, took: number, manual = false): Ev => ({
+			slotAt: NOW - ago,
+			updatedAt: NOW - ago + took,
+			stage,
+			manual,
+		});
+		addEvents("bad", [
+			ended(40 * day, "delivered", MINUTE),
+			ended(3 * day, "delivered", 5 * MINUTE),
+			ended(2 * day, "failed", MINUTE),
+			ended(day, "failed_no_retry", MINUTE),
+		]);
+		addEvents("run", [{ slotAt: NOW - 5 * MINUTE, updatedAt: NOW - 4 * MINUTE, stage: "dispatched" }]);
+		addEvents("ok", [
+			ended(4 * day, "skipped", 0),
+			ended(3 * day, "delivered", 2 * MINUTE),
+			ended(2 * day, "delivered", 30 * MINUTE, true),
+			ended(day, "no_report", 4 * MINUTE),
+		]);
+		const { snapshot, items } = await monitorsOf();
+		expect(byName(items, "실패 잦음")).toMatchObject({
+			originKey: "monitor/bad",
+			running: false,
+			failStreak: 2,
+			// The 40-day-old run is outside the window.
+			stats: { days: 30, delivered: 1, quiet: 0, failed: 2, skipped: 0, medianMs: 5 * MINUTE },
+		});
+		expect(byName(items, "도는 중")).toMatchObject({
+			running: true,
+			failStreak: 0,
+			stats: { days: 30, delivered: 0, quiet: 0, failed: 0, skipped: 0, medianMs: null },
+		});
+		// The median leaves the manual run and the skipped slot out.
+		expect(byName(items, "잘 돎")).toMatchObject({
+			running: false,
+			failStreak: 0,
+			stats: { days: 30, delivered: 2, quiet: 1, failed: 0, skipped: 1, medianMs: 3 * MINUTE },
+		});
+
+		const html = monitorsHtml(snapshot);
+		const lead = /<p class="list-lead">(.*?)<\/p>/.exec(html)?.[1] ?? "";
+		expect(lead).toContain('<span class="is-danger">실패 2</span>');
+		for (const word of ["오늘 남은 실행 1", "최근 30일 전달 3", "조용히 끝남 1", "건너뜀 1", "지금 실행 중 있음"]) {
+			expect(textOf(lead)).toContain(word);
+		}
+		expect(textOf(rowHtml(html, "bad"))).toContain("연속 실패 2회");
+		expect(textOf(rowHtml(html, "run"))).toContain("실행 중");
+		expect(rowHtml(html, "ok")).not.toContain('class="badges"');
+		expect(html).toMatch(/data-view="monitors"[^>]*><span>모니터<\/span><span class="nav-count is-warn">3</);
+		const found = renderDashboardMain(snapshot, undefined, NOW, { view: "monitors", q: "glm-5.3" });
+		expect(found).toContain('data-row="ok"');
+		expect(found).not.toContain('data-row="bad"');
+
+		const panel = renderItemDetail(snapshot, "monitors", "bad");
+		expect(panel).toContain("<dt>상태</dt><dd>연속 실패 2회 · 열린 사건 없음</dd>");
+		expect(panel).toContain("<dt>최근 30일</dt><dd>전달 1 · 조용히 끝남 0 · 실패 2 · 정기 실행 중앙값 5분 0초</dd>");
+		// No conversation on the turn board yet: no link to it.
+		expect(panel).not.toContain("이 모니터의 대화 보기");
+		expect(renderItemDetail(snapshot, "monitors", "run")).toContain("<dt>상태</dt><dd>실행 중 · 열린 사건 없음</dd>");
+
+		// Once the monitor's run is a conversation on the turn board, the panel links to it.
+		insert("origins", [
+			{ origin_key: "monitor/bad", epoch: 1, session_dir: join(home, "sessions", "bad"), updated_at: NOW },
+		]);
+		insert("inbound", [
+			{
+				platform_message_id: "m0",
+				origin_key: "monitor/bad",
+				epoch: 1,
+				text_ref: "실패 잦음",
+				state: "answered",
+				created_at: NOW - day,
+				thread_ref: "C0LOG:-",
+				op_ref: "op0",
+			},
+		]);
+		const linked = renderItemDetail((await monitorsOf()).snapshot, "monitors", "bad");
+		expect(linked).toContain('href="?view=turns&amp;item=monitor%2Fbad">이 모니터의 대화 보기</a>');
+	});
 });

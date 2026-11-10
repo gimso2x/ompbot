@@ -2,7 +2,8 @@ import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { agentSkillsRoot, NAME_PATTERN, rollbackSkill } from "../review/skills";
 
-export const SKILLS_USAGE = `  skills rollback <이름>         스킬을 직전 개정으로 되돌립니다(설치는 직전 내용을 revisions/에 보존)
+export const SKILLS_USAGE = `  skills rollback <name>         restore an installed skill's previous revision (every install keeps the replaced
+                                 SKILL.md under revisions/)
 `;
 
 /**
@@ -13,7 +14,7 @@ export function skillsCommand(args: string[], env: Record<string, string | undef
 	const { positionals } = parseArgs({ args, allowPositionals: true, options: {} });
 	const [sub, name] = positionals;
 	if (sub !== "rollback" || typeof name !== "string" || name === "") {
-		process.stderr.write(`usage: ompbot skills rollback <이름>\n${SKILLS_USAGE}`);
+		process.stderr.write(`usage: ompbot skills rollback <name>\n${SKILLS_USAGE}`);
 		return 2;
 	}
 	if (!NAME_PATTERN.test(name)) {

@@ -18,11 +18,13 @@ import {
 	approvalActionId,
 	parseApprovalActionId,
 } from "../src/safety/approval";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
 import { SlackCallError } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 
 const ESC = "C0ESCALATE1";
 const REQ = "C0REQUEST01";
@@ -169,7 +171,7 @@ describe("broker: mirror card in the asking thread", () => {
 	/** `null`: no escalation channel configured. */
 	function broker(escalationChannel: string | null = ESC): ApprovalBroker {
 		return new ApprovalBroker({
-			port: new SlackChannel(transport),
+			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			escalationChannel: escalationChannel ?? undefined,
 			log: createLogger({
@@ -436,7 +438,7 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: { ...home.config, escalationChannel: ESC },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: (line) => logs.push(line), clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

@@ -6,11 +6,9 @@
  * image, link, table/data_table, data_visualization and their over-limit code-block fallbacks. Not carried over:
  * buttons, selects, actions, and emoji placeholder conversion (identity here). The package itself is not a dependency.
  */
-import { CardSpecError, standardComponentDefinitions, toCard } from "@json-render/chat";
-import type { CardChild, CardElement } from "chat";
-import { isRecord } from "../omp/type-guards";
+import type { CardChild } from "chat";
+import { type CardElement, chartToAscii, tableToAscii, validateCard } from "../channel/card";
 
-export type { CardElement } from "chat";
 export type SlackBlock = Record<string, unknown>;
 
 type TableChild = Extract<CardChild, { type: "table" }>;
@@ -18,12 +16,6 @@ type ChartChild = Extract<CardChild, { type: "chart" }>;
 type TextChild = Extract<CardChild, { type: "text" }>;
 type FieldsChild = Extract<CardChild, { type: "fields" }>;
 
-/** The standard json-render components without `Actions`/`Button`: a model-made button must not reach `onAction`. */
-const { Actions: _actions, Button: _button, ...CARD_COMPONENTS } = standardComponentDefinitions;
-
-export { CARD_COMPONENTS };
-
-export const SLACK_CARD_LIMITS = { tables: 1, charts: 2, tableRows: 100, chartLabel: 20, chartTitle: 50 } as const;
 /** Slack's 50 blocks per message minus the redelivered, `🔔` and footer context blocks a card part may carry. */
 export const CARD_MAX_BLOCKS = 47;
 
@@ -52,50 +44,20 @@ const EMPTY_TEXT = " ";
 export type ParsedCard = { ok: true; card: CardElement; blocks: SlackBlock[] } | { ok: false; issues: string[] };
 
 /**
- * Light repair before validation: an element without `children` gets `[]`, without `props` `{}`; a spec without
- * `root` whose elements hold exactly one `Card` gets that key as root. Nothing else is touched.
- */
-function repairSpec(spec: Record<string, unknown>): void {
-	const elements = spec.elements;
-	if (!isRecord(elements)) return;
-	for (const element of Object.values(elements)) {
-		if (!isRecord(element)) continue;
-		element.children ??= [];
-		element.props ??= {};
-	}
-	if (spec.root === undefined) {
-		const cards = Object.entries(elements).filter(([, element]) => isRecord(element) && element.type === "Card");
-		if (cards.length === 1) spec.root = cards[0]?.[0];
-	}
-}
-
-/**
  * A card fence's JSON as a validated card and its blocks; never throws. Bad JSON, a `CardSpecError` and a card over
  * `CARD_MAX_BLOCKS` blocks come back as `issues`. `charts: false` draws charts as ASCII code blocks.
  */
 export function parseCard(json: string, options: { charts: boolean } = { charts: true }): ParsedCard {
-	let spec: unknown;
+	const validated = validateCard(json);
+	if (!validated.ok) return validated;
+	const { card } = validated;
 	try {
-		spec = JSON.parse(json);
-	} catch (err) {
-		return { ok: false, issues: [`JSON: ${err instanceof Error ? err.message : String(err)}`] };
-	}
-	if (!isRecord(spec) || Array.isArray(spec))
-		return { ok: false, issues: ["spec must be a JSON object with root and elements"] };
-	repairSpec(spec);
-	try {
-		// The spec's shape is checked by toCard itself (zod catalog and structure validation).
-		const card = toCard(spec as unknown as Parameters<typeof toCard>[0], {
-			components: CARD_COMPONENTS,
-			limits: SLACK_CARD_LIMITS,
-		});
 		const blocks = cardToBlocks(card, options);
 		if (blocks.length > CARD_MAX_BLOCKS) {
 			return { ok: false, issues: [`the card needs ${blocks.length} blocks, at most ${CARD_MAX_BLOCKS}`] };
 		}
 		return { ok: true, card, blocks };
 	} catch (err) {
-		if (err instanceof CardSpecError) return { ok: false, issues: [...err.issues] };
 		return { ok: false, issues: [err instanceof Error ? err.message : String(err)] };
 	}
 }
@@ -298,28 +260,6 @@ function chartToDataVisualization(element: ChartChild): SlackBlock | null {
 	};
 }
 
-function chartToAscii(element: ChartChild): string {
-	const { chart, title } = element;
-	if (chart.type === "pie") {
-		const table = tableToAscii({
-			headers: ["Label", "Value"],
-			rows: chart.segments.map((segment) => [segment.label, String(segment.value)]),
-		});
-		return `${title}\n${table}`;
-	}
-	const table = tableToAscii({
-		headers: [chart.xLabel ?? "", ...chart.series.map((s) => s.name)],
-		rows: chart.categories.map((category) => [
-			category,
-			...chart.series.map((s) => {
-				const point = s.data.find((p) => p.label === category);
-				return point ? String(point.value) : "";
-			}),
-		]),
-	});
-	return `${title}\n${table}`;
-}
-
 function childToFallbackText(child: CardChild): string | undefined {
 	switch (child.type) {
 		case "chart":
@@ -372,17 +312,4 @@ function compact(value: Record<string, unknown>): SlackBlock {
 		if (item !== undefined) output[key] = item;
 	}
 	return output;
-}
-
-function tableToAscii(table: { headers: readonly string[]; rows: ReadonlyArray<readonly string[]> }): string {
-	const rows = [table.headers, ...table.rows];
-	const widths = table.headers.map((_, column) => Math.max(...rows.map((row) => row[column]?.length ?? 0)));
-	return rows
-		.map((row) =>
-			row
-				.map((cell, column) => (cell ?? "").padEnd(widths[column] ?? 0))
-				.join(" | ")
-				.trimEnd(),
-		)
-		.join("\n");
 }

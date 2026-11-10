@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { DispatchHostConfig } from "../config";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { ApprovalDetail, ApprovalResult } from "../safety/approval";
@@ -24,13 +25,18 @@ export interface DispatchToolDeps {
 	homeDir: string;
 	workspaceDir: string;
 	/** Remote dispatch targets (hub fleet pattern): herdr runs on that host over ssh. */
-	dispatchHosts?: Record<string, { ssh: string; workDir?: string; herdrBin?: string }>;
+	dispatchHosts?: Record<string, DispatchHostConfig>;
+	/** Config `workerOmpArgs`: extra omp arguments of local herdr workers (remote ones take their host's `ompArgs`). */
+	workerOmpArgs?: string[];
 	/** Test seam: process runner override. */
 	run?: import("./omp").ProcessRunner;
 	/** herdr-web-ui task board (`config.herdrBoard`): started agents get a card link; absent → no links. */
 	herdrBoard?: HerdrBoardConfig;
 	/** [TASK] state docs (`taskSpec`); absent → `taskSpec` is refused and dispatch is exactly the plain flow. */
-	tasks?: Omit<TaskDispatchDeps, "originKey" | "workspaceDir" | "dispatchHosts" | "run" | "log" | "boardLink">;
+	tasks?: Omit<
+		TaskDispatchDeps,
+		"originKey" | "workspaceDir" | "dispatchHosts" | "workerOmpArgs" | "run" | "log" | "boardLink"
+	>;
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state every call is refused before any command runs. */
 	frozen?: () => FreezeState | undefined;
 	/** Config `herdr`: present → herdr/host/taskSpec dispatch; absent → the tool is simple-only (`omp -p`). */
@@ -197,6 +203,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 						originKey: deps.originKey,
 						workspaceDir: deps.workspaceDir,
 						...(deps.dispatchHosts === undefined ? {} : { dispatchHosts: deps.dispatchHosts }),
+						...(deps.workerOmpArgs === undefined ? {} : { workerOmpArgs: deps.workerOmpArgs }),
 						...(deps.run === undefined ? {} : { run: deps.run }),
 						...(boardLink === undefined ? {} : { boardLink }),
 						log: deps.log,
@@ -262,7 +269,14 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				deps.log.info("dispatch_remote_prompted", { host, agent: name });
 				return `후속 지시를 ${host}/${name}에 전달했습니다. ${check}${gate.suffix}`;
 			}
-			const start = await herdrRemoteStart({ sshTarget: hostEntry.ssh, name, task, cwd, options: sshOptions });
+			const start = await herdrRemoteStart({
+				sshTarget: hostEntry.ssh,
+				name,
+				task,
+				cwd,
+				...(hostEntry.ompArgs === undefined ? {} : { agentArgs: hostEntry.ompArgs }),
+				options: sshOptions,
+			});
 			if (!start.ok) return `시작 실패: ${start.error}`;
 			deps.log.info("dispatch_remote_started", { host, agent: name, cwd });
 			const link = boardLink === undefined ? undefined : await boardLink(host, start.paneId);

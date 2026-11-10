@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
@@ -19,33 +19,31 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { collectGates } from "../src/ops/gates";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { registryOf } from "./helpers/channels";
 import { git, makeRepo } from "./helpers/git-fixtures";
+import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 const START = 1_800_000_000_000;
 const SHA = "a".repeat(40);
 
 let home: TestHome;
 let repos: string[];
+let workRepo: string | undefined;
 
 beforeEach(() => {
 	home = makeHome("ompbot-lanes-home-");
 	repos = [];
+	workRepo = undefined;
 });
 
 afterEach(() => {
 	home.remove();
-	for (const repo of repos) rmSync(repo, { recursive: true, force: true });
+	for (const repo of repos) removeRepoAndWorktrees(repo);
 });
-
-/** A distinct plain directory for lanes that do not need a git repository (cleaned up with the repos). */
-function makeDir(): string {
-	const dir = realpathSync(mkdtempSync(join(tmpdir(), "ompbot-lanes-dir-")));
-	repos.push(dir);
-	return dir;
-}
 
 /** Adds one more commit, as a lane doing real work would. */
 function commitMore(repo: string): void {
@@ -100,7 +98,7 @@ function harness(
 	const pending: Promise<unknown>[] = [];
 	const manager = new LaneManager({
 		store,
-		port: new SlackChannel(transport),
+		channels: registryOf(new SlackChannel(transport)),
 		clock,
 		log,
 		sessionsRoot,
@@ -111,6 +109,16 @@ function harness(
 		},
 		stopWhenIdle: (origin) => {
 			const run = router.mailbox(origin).stopWhenIdle();
+			pending.push(run);
+			return run;
+		},
+		pauseTurn: (origin) => {
+			const run = router.mailbox(origin).pauseTurn();
+			pending.push(run);
+			return run;
+		},
+		resumePending: (origin) => {
+			const run = router.mailbox(origin).resumePending();
 			pending.push(run);
 			return run;
 		},
@@ -138,7 +146,11 @@ function harness(
 	};
 }
 
-const cwdOf = (): string => home.config.workspaceDir;
+/** One git repository per test for lanes whose claims are judged by a stubbed `verify` (made on first use). */
+const cwdOf = (): string => {
+	workRepo ??= makeRepo(repos);
+	return workRepo;
+};
 
 describe("lane trigger parsing", () => {
 	test("`작업: <제목> @<절대경로>` with title, path and brief", () => {
@@ -161,10 +173,21 @@ describe("lane trigger parsing", () => {
 	});
 
 	test("the lane prompt starts with the ulw keyword line and names the claim tool", () => {
-		const prompt = buildLanePrompt({ name: "demo", title: "Demo", cwd: "/tmp/p", brief: "do it" });
+		const prompt = buildLanePrompt({
+			name: "demo",
+			title: "Demo",
+			cwd: "/tmp/p-l-20261110-01",
+			brief: "do it",
+			branch: "lane/L-20261110-01",
+			baseBranch: "main",
+			acceptance: [{ id: "AC-1", text: 'README 한 줄 [check: command ["bun","test"]]' }],
+		});
 		expect(prompt.split("\n")[0]).toBe("ulw explore ulw debugging set goal and work");
 		expect(prompt).toContain("Demo");
 		expect(prompt).toContain("do it");
+		expect(prompt).toContain("/tmp/p-l-20261110-01");
+		expect(prompt).toContain("lane/L-20261110-01");
+		expect(prompt).toContain("AC-1: README 한 줄");
 		expect(prompt).toContain("ompbot_claim_done");
 		expect(prompt).toContain("ompbot_lane_progress");
 	});
@@ -293,8 +316,9 @@ describe("lane start and registry", () => {
 			originKey: "ompbot/work/demo-task",
 			status: "working",
 			threadRef: `D1:${root?.ts}`,
-			cwd: realpathSync(cwdOf()),
+			cwd: lane.meta.worktree,
 		});
+		expect(lane.meta.worktree).toStartWith(`${cwdOf()}-l-`);
 		expect(lane.meta.statusTs).toBe(status?.ts);
 		expect(lane.sessionDir).toBe(sessionDirFor(join(home.dir, "sessions"), "ompbot/work/demo-task", 1));
 		expect(h.store.getOrigin("ompbot/work/demo-task")?.sessionDir).toBe(lane.sessionDir);
@@ -307,8 +331,8 @@ describe("lane start and registry", () => {
 
 	test("two lanes get separate origins and session dirs; equal titles get a numbered name", async () => {
 		const h = harness();
-		const a = await h.manager.start({ title: "same", cwd: makeDir(), channel: "D1" });
-		const b = await h.manager.start({ title: "same", cwd: makeDir(), channel: "D1" });
+		const a = await h.manager.start({ title: "same", cwd: makeRepo(repos), channel: "D1" });
+		const b = await h.manager.start({ title: "same", cwd: makeRepo(repos), channel: "D1" });
 		await h.settle();
 		expect([a.name, b.name]).toEqual(["same", "same-2"]);
 		expect(a.sessionDir).not.toBe(b.sessionDir);
@@ -352,7 +376,7 @@ describe("concurrent lane cap", () => {
 	test("the default cap is 4: the fifth start is refused with a clear message", async () => {
 		expect(DEFAULT_MAX_LANES).toBe(4);
 		const h = harness();
-		const cwds = [cwdOf(), makeDir(), makeDir(), makeDir(), makeDir()];
+		const cwds = [cwdOf(), makeRepo(repos), makeRepo(repos), makeRepo(repos), makeRepo(repos)];
 		for (let n = 0; n < 4; n += 1) {
 			const cwd = cwds[n];
 			if (cwd === undefined) throw new Error("test needs five cwds");
@@ -380,52 +404,33 @@ describe("concurrent lane cap", () => {
 		await h.settle();
 		const first = h.store.listLanes()[0];
 		if (!first) throw new Error("no lane");
-		const repo = first.cwd;
-		commitMore(repo);
-		await h.manager.claimDone(first.originKey, { repo, commit: "HEAD", summary: "s" });
+		commitMore(first.cwd);
+		await h.manager.claimDone(first.originKey, { repo: first.cwd, commit: "HEAD", summary: "s" });
 		expect(h.store.getLane(first.name)?.status).toBe("closed");
-		await h.manager.start({ title: "after", cwd: repo, channel: "D1" });
+		await h.manager.start({ title: "after", cwd: first.meta.repo ?? "", channel: "D1" });
 		expect(h.store.countOpenLanes()).toBe(2);
 		await h.settle();
 		h.close();
 	});
 });
 
-describe("workspace lease (one lane per repository at a time)", () => {
-	test("a second start on the same cwd is refused naming the running lane; sub- and parent paths count too", async () => {
+describe("several lanes on one repository (each in its own worktree; no workspace lease)", () => {
+	test("a second start on the same repository, and one on its sub path, run beside the first; a parent outside git is refused", async () => {
 		const repo = makeRepo(repos);
-		const h = harness();
-		const lane = await h.manager.start({ title: "first", cwd: repo, channel: "D1" });
-		await h.settle();
-
-		const refused = await h.manager.start({ title: "second", cwd: repo, channel: "D1" }).catch((e: unknown) => e);
-		expect(refused).toBeInstanceOf(LaneInputError);
-		expect(String((refused as Error).message)).toContain("진행 중인 레인이 있습니다");
-		expect(String((refused as Error).message)).toContain(lane.name);
-		// A subdirectory of the repository is the same repository, and so is the outer directory.
 		mkdirSync(join(repo, "pkg"));
-		await expect(h.manager.start({ title: "sub", cwd: join(repo, "pkg"), channel: "D1" })).rejects.toThrow(
-			"진행 중인 레인이 있습니다",
-		);
+		const h = harness();
+		const first = await h.manager.start({ title: "first", cwd: repo, channel: "D1" });
+		const second = await h.manager.start({ title: "second", cwd: repo, channel: "D1" });
+		const sub = await h.manager.start({ title: "sub", cwd: join(repo, "pkg"), channel: "D1" });
+		await h.settle();
+		expect(h.store.listLanes().map((lane) => lane.status)).toEqual(["working", "working", "working"]);
+		expect(new Set([first.meta.worktree, second.meta.worktree, sub.meta.worktree]).size).toBe(3);
+		expect(sub.cwd).toBe(join(sub.meta.worktree ?? "", "pkg"));
+		// The temp directory above the repository is not inside any git repository.
 		await expect(h.manager.start({ title: "outer", cwd: dirname(repo), channel: "D1" })).rejects.toBeInstanceOf(
 			LaneInputError,
 		);
-		expect(h.store.listLanes()).toHaveLength(1);
-		expect(h.transport.posts((text) => text.includes("second"))).toEqual([]);
-		h.close();
-	});
-
-	test("a closed lane frees its repository: the same cwd can start again", async () => {
-		const h = harness({ verify: async () => ({ ok: true, sha: SHA }) });
-		const first = await h.manager.start({ title: "first", cwd: cwdOf(), channel: "D1" });
-		await h.settle();
-		await h.manager.claimDone(first.originKey, { repo: cwdOf(), commit: "HEAD", summary: "s" });
-		expect(h.store.getLane(first.name)?.status).toBe("closed");
-
-		const second = await h.manager.start({ title: "second", cwd: cwdOf(), channel: "D1" });
-		expect(second.cwd).toBe(realpathSync(cwdOf()));
-		expect(h.store.countOpenLanes()).toBe(1);
-		await h.settle();
+		expect(h.store.listLanes()).toHaveLength(3);
 		h.close();
 	});
 
@@ -439,29 +444,27 @@ describe("workspace lease (one lane per repository at a time)", () => {
 		h.close();
 	});
 
-	test("two starts racing on the same cwd cannot both hold it", async () => {
+	test("two starts racing on the same repository both start, in different worktrees", async () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const results = await Promise.allSettled([
 			h.manager.start({ title: "r1", cwd: repo, channel: "D1" }),
 			h.manager.start({ title: "r2", cwd: repo, channel: "D1" }),
 		]);
-		expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
-		expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
-		const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
-		if (!rejected) throw new Error("expected one start to be rejected");
-		expect(rejected.reason).toBeInstanceOf(LaneInputError);
-		expect(h.store.listLanes()).toHaveLength(1);
+		expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
+		const worktrees = h.store.listLanes().map((lane) => lane.meta.worktree);
+		expect(new Set(worktrees).size).toBe(2);
 		await h.settle();
 		h.close();
 	});
 });
 
 describe("done claims are verified by the core", () => {
-	test("clean repo + existing commit: lane closed with the sha, root and status become ✅, child stops after its turn", async () => {
+	test("clean repo + existing commit: lane closed with the sha, root and status become 🔍 (waiting for its merge), child stops after its turn", async () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const lane = await h.manager.start({ title: "readme-line", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
 		const driver = h.drivers.get(lane.originKey);
 		if (!driver) throw new Error("no driver");
@@ -469,17 +472,18 @@ describe("done claims are verified by the core", () => {
 		driver.onExit(() => stopped.resolve());
 		const rootTs = lane.threadRef.slice(lane.threadRef.indexOf(":") + 1);
 
-		commitMore(repo);
-		const text = await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "added a line" });
+		commitMore(wt);
+		const text = await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "added a line" });
 		await h.settle();
-		const head = git(repo, "rev-parse", "HEAD");
+		const head = git(wt, "rev-parse", "HEAD");
 		expect(text).toContain(head);
 		const closed = h.store.getLane(lane.name);
 		expect(closed?.status).toBe("closed");
 		expect(closed?.meta.sha).toBe(head);
 		expect(closed?.history.at(-1)).toMatchObject({ event: "closed", sha: head });
-		expect(h.updates(rootTs).at(-1)).toBe("✅ readme-line");
-		expect(h.updates(lane.meta.statusTs ?? "").at(-1)).toBe("✅ readme-line");
+		// Closed is not merged yet: ✅ comes with the landing (test/lane-land.test.ts).
+		expect(h.updates(rootTs).at(-1)).toBe("🔍 readme-line");
+		expect(h.updates(lane.meta.statusTs ?? "").at(-1)).toBe("🔍 readme-line · 머지 대기");
 		// The turn that made the claim is still running: the child lives until it has reported.
 		expect(h.router.mailbox(lane.originKey).state.driverRunning).toBe(true);
 		driver.release();
@@ -492,11 +496,12 @@ describe("done claims are verified by the core", () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const lane = await h.manager.start({ title: "dirty", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
-		writeFileSync(join(repo, "README.md"), "hello\nnew line\n");
+		writeFileSync(join(wt, "README.md"), "hello\nnew line\n");
 		const rootTs = lane.threadRef.slice(lane.threadRef.indexOf(":") + 1);
 
-		const text = await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "done?" });
+		const text = await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "done?" });
 		await h.settle();
 		expect(text).toContain("[not-done]");
 		expect(text).toContain("uncommitted changes");
@@ -515,10 +520,10 @@ describe("done claims are verified by the core", () => {
 		expect(h.store.getLane(lane.name)?.status).toBe("not-done");
 
 		// Fixing it and claiming again closes.
-		git(repo, "commit", "-q", "-am", "add line");
-		await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "now committed" });
+		git(wt, "commit", "-q", "-am", "add line");
+		await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "now committed" });
 		expect(h.store.getLane(lane.name)?.status).toBe("closed");
-		expect(h.store.getLane(lane.name)?.meta.sha).toBe(git(repo, "rev-parse", "HEAD"));
+		expect(h.store.getLane(lane.name)?.meta.sha).toBe(git(wt, "rev-parse", "HEAD"));
 		h.close();
 	});
 
@@ -527,12 +532,13 @@ describe("done claims are verified by the core", () => {
 		const state: { value: { since: string; reason: string; by: string } | undefined } = { value: undefined };
 		const h = harness({ frozen: () => state.value });
 		const lane = await h.manager.start({ title: "held", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
-		writeFileSync(join(repo, "README.md"), "hello\nnew line\n");
+		writeFileSync(join(wt, "README.md"), "hello\nnew line\n");
 		const steers = () => h.drivers.get(lane.originKey)?.calls.filter((call) => call.startsWith("steer:")) ?? [];
 
 		state.value = { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" };
-		expect(await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "done?" })).toContain(
+		expect(await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "done?" })).toContain(
 			"[not-done]",
 		);
 		await h.settle();
@@ -543,7 +549,7 @@ describe("done claims are verified by the core", () => {
 		expect(h.store.getLane(lane.name)?.status).toBe("not-done");
 
 		state.value = undefined;
-		await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "done now?" });
+		await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "done now?" });
 		await h.settle();
 		expect(steers()).toHaveLength(1);
 		expect(steers()[0]).toContain("not-done");
@@ -621,8 +627,9 @@ describe("done claims are verified by the core", () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const lane = await h.manager.start({ title: "ghost", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
-		const text = await h.manager.claimDone(lane.originKey, { repo, commit: "1234567", summary: "s" });
+		const text = await h.manager.claimDone(lane.originKey, { repo: wt, commit: "1234567", summary: "s" });
 		expect(text).toContain("does not exist");
 		expect(h.store.getLane(lane.name)?.status).toBe("not-done");
 		h.close();
@@ -633,13 +640,14 @@ describe("done claims are verified by the core", () => {
 		const base = git(repo, "rev-parse", "HEAD");
 		const h = harness();
 		const lane = await h.manager.start({ title: "no-op", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
 		expect(h.store.getLane(lane.name)?.meta.baseSha).toBe(base);
-		const text = await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "nothing" });
+		const text = await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "nothing" });
 		expect(text).toContain("no_new_commit");
 		expect(h.store.getLane(lane.name)?.status).toBe("not-done");
-		commitMore(repo);
-		await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "now real" });
+		commitMore(wt);
+		await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "now real" });
 		expect(h.store.getLane(lane.name)?.status).toBe("closed");
 		h.close();
 	});
@@ -720,15 +728,16 @@ describe("done claims are verified by the core", () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const lane = await h.manager.start({ title: "tools", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
 		const tools = buildLaneTools(h.manager, lane.originKey);
 		expect(tools.map((tool) => tool.name)).toEqual(["ompbot_lane_progress", "ompbot_claim_done"]);
 		const signal = new AbortController().signal;
 		const [progress, claim] = tools;
-		await expect(claim?.execute({ repo }, { signal })).rejects.toThrow("commit is required");
+		await expect(claim?.execute({ repo: wt }, { signal })).rejects.toThrow("commit is required");
 		expect(await progress?.execute({ text: "tests written" }, { signal })).toBe("progress recorded");
-		commitMore(repo);
-		expect(await claim?.execute({ repo, commit: "HEAD", summary: "s" }, { signal })).toContain("검증 통과");
+		commitMore(wt);
+		expect(await claim?.execute({ repo: wt, commit: "HEAD", summary: "s" }, { signal })).toContain("검증 통과");
 		h.close();
 	});
 });
@@ -736,9 +745,12 @@ describe("done claims are verified by the core", () => {
 describe("closed lane follow-up: a question keeps it closed, `!reopen` reopens", () => {
 	async function closedLane(h: Harness, repo: string) {
 		const lane = await h.manager.start({ title: "followup", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
-		commitMore(repo);
-		expect(await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "s" })).toContain("검증 통과");
+		commitMore(wt);
+		expect(await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "s" })).toContain(
+			"검증 통과",
+		);
 		const closed = h.store.getLane(lane.name);
 		if (closed?.status !== "closed") throw new Error("lane did not close");
 		return closed;
@@ -771,6 +783,7 @@ describe("closed lane follow-up: a question keeps it closed, `!reopen` reopens",
 		const repo = makeRepo(repos);
 		const h = harness();
 		const closed = await closedLane(h, repo);
+		const wt = closed.cwd;
 		const closedSha = closed.meta.sha;
 		h.manager.onOwnerMessage(closed, "!reopen 고쳐줘");
 		const reopened = h.store.getLane(closed.name);
@@ -778,13 +791,17 @@ describe("closed lane follow-up: a question keeps it closed, `!reopen` reopens",
 		expect(reopened?.history.at(-1)?.event).toBe("reopened");
 		expect(reopened?.meta.baseSha).toBe(closedSha);
 		// The usual check still applies: no commit after the closing sha is not done.
-		expect(await h.manager.claimDone(closed.originKey, { repo, commit: "HEAD", summary: "s" })).toContain("[not-done]");
+		expect(await h.manager.claimDone(closed.originKey, { repo: wt, commit: "HEAD", summary: "s" })).toContain(
+			"[not-done]",
+		);
 		expect(h.store.getLane(closed.name)?.status).toBe("not-done");
-		commitMore(repo);
-		expect(await h.manager.claimDone(closed.originKey, { repo, commit: "HEAD", summary: "s" })).toContain("검증 통과");
+		commitMore(wt);
+		expect(await h.manager.claimDone(closed.originKey, { repo: wt, commit: "HEAD", summary: "s" })).toContain(
+			"검증 통과",
+		);
 		const again = h.store.getLane(closed.name);
 		expect(again?.status).toBe("closed");
-		expect(again?.meta.sha).toBe(git(repo, "rev-parse", "HEAD"));
+		expect(again?.meta.sha).toBe(git(wt, "rev-parse", "HEAD"));
 		expect(again?.meta.sha).not.toBe(closedSha);
 		await h.settle();
 		h.close();
@@ -794,11 +811,12 @@ describe("closed lane follow-up: a question keeps it closed, `!reopen` reopens",
 		const repo = makeRepo(repos);
 		const h = harness();
 		const closed = await closedLane(h, repo);
+		const wt = closed.cwd;
 		const [progress, claim] = buildLaneTools(h.manager, closed.originKey);
 		const signal = new AbortController().signal;
 		expect(await progress?.execute({ text: "more work" }, { signal })).toContain("!reopen");
-		commitMore(repo);
-		expect(await claim?.execute({ repo, commit: "HEAD", summary: "s" }, { signal })).toContain("!reopen");
+		commitMore(wt);
+		expect(await claim?.execute({ repo: wt, commit: "HEAD", summary: "s" }, { signal })).toContain("!reopen");
 		const after = h.store.getLane(closed.name);
 		expect(after?.status).toBe("closed");
 		expect(after?.history).toEqual(closed.history);
@@ -840,16 +858,17 @@ describe("status message cadence", () => {
 		const repo = makeRepo(repos);
 		const h = harness();
 		const lane = await h.manager.start({ title: "retry", cwd: repo, channel: "D1" });
+		const wt = lane.cwd;
 		await h.settle();
 		const rootTs = lane.threadRef.slice(lane.threadRef.indexOf(":") + 1);
 		h.transport.failNext.updateMessage = [new Error("slack down")];
-		commitMore(repo);
-		await h.manager.claimDone(lane.originKey, { repo, commit: "HEAD", summary: "s" });
+		commitMore(wt);
+		await h.manager.claimDone(lane.originKey, { repo: wt, commit: "HEAD", summary: "s" });
 		expect(h.store.getLane(lane.name)?.status).toBe("closed");
 		expect(h.store.getLane(lane.name)?.meta.renderedRoot).toBe("🔄 retry");
 		await h.manager.tick();
-		expect(h.store.getLane(lane.name)?.meta.renderedRoot).toBe("✅ retry");
-		expect(h.updates(rootTs).at(-1)).toBe("✅ retry");
+		expect(h.store.getLane(lane.name)?.meta.renderedRoot).toBe("🔍 retry");
+		expect(h.updates(rootTs).at(-1)).toBe("🔍 retry");
 		h.close();
 	});
 });
@@ -875,7 +894,7 @@ describe("lanes inside the daemon", () => {
 		const clock = { now: () => Date.now() };
 		const daemon = new Daemon({
 			config: home.config,
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -909,14 +928,16 @@ describe("lanes inside the daemon", () => {
 		await transport.waitForPosts((text) => text.includes("작업 레인 `demo`을 시작했습니다"));
 
 		const lane = daemon.store.getLane("demo");
-		expect(lane).toMatchObject({ status: "working", originKey: "ompbot/work/demo", cwd: repo });
+		const wt = lane?.meta.worktree ?? "";
+		expect(wt).toStartWith(`${repo}-l-`);
+		expect(lane).toMatchObject({ status: "working", originKey: "ompbot/work/demo", cwd: wt });
 		const root = transport.posts((text) => text === "🔄 demo")[0];
 		expect(lane?.threadRef).toBe(`D1:${root?.ts}`);
 		// The lane's own omp session got the ulw prompt; the DM conversation's session never saw the trigger text.
 		await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore ulw debugging"));
 		expect(drivers.get("ompbot/work/demo")?.calls[1]).toContain("README에 한 줄 추가");
 		expect(drivers.has("slack/dm/D1")).toBe(false);
-		expect(daemon.cwdFor("ompbot/work/demo")).toBe(repo);
+		expect(daemon.cwdFor("ompbot/work/demo")).toBe(wt);
 		expect(daemon.cwdFor("slack/dm/D1")).toBe(home.config.workspaceDir);
 
 		// Owner message in the lane thread -> lane origin.
@@ -943,12 +964,12 @@ describe("lanes inside the daemon", () => {
 		// A claim with a clean commit closes the lane through the tool.
 		const claim = daemon.hostToolsFor("ompbot/work/demo").find((tool) => tool.name === "ompbot_claim_done");
 		const signal = new AbortController().signal;
-		commitMore(repo);
-		expect(await claim?.execute({ repo, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
+		commitMore(wt);
+		expect(await claim?.execute({ repo: wt, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
 		expect(daemon.store.getLane("demo")?.status).toBe("closed");
 		const rootUpdates = () =>
 			transport.calls.flatMap((c) => (c.method === "updateMessage" && c.ts === root?.ts ? [c.text] : []));
-		expect(rootUpdates().at(-1)).toBe("✅ demo");
+		expect(rootUpdates().at(-1)).toBe("🔍 demo");
 
 		// `!reopen` in the closed lane's thread reopens it and runs on the same recorded session.
 		await ownerMessage("!reopen one more thing", "1900000000.000200", root?.ts ?? "");
@@ -972,9 +993,10 @@ describe("lanes inside the daemon", () => {
 		await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
 		const root = transport.posts((text) => text === "🔄 ask")[0];
 		const claim = daemon.hostToolsFor("ompbot/work/ask").find((tool) => tool.name === "ompbot_claim_done");
-		commitMore(repo);
+		const wt = daemon.store.getLane("ask")?.cwd ?? "";
+		commitMore(wt);
 		const signal = new AbortController().signal;
-		expect(await claim?.execute({ repo, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
+		expect(await claim?.execute({ repo: wt, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
 		expect(daemon.store.getLane("ask")?.status).toBe("closed");
 
 		await ownerMessage("이거 왜 이렇게 했어?", "1900000000.000400", root?.ts ?? "");
@@ -1007,17 +1029,16 @@ describe("lanes inside the daemon", () => {
 	});
 
 	test("the host tool ompbot_work_start starts a lane; the cap refuses further lanes with a clear reply", async () => {
+		const repo = makeRepo(repos);
 		const daemon = await startDaemon(1);
 		const start = daemon.hostToolsFor("slack/dm/D1").find((tool) => tool.name === "ompbot_work_start");
 		const signal = new AbortController().signal;
-		const started = await start?.execute({ title: "tool lane", cwd: home.config.workspaceDir, brief: "b" }, { signal });
+		const started = await start?.execute({ title: "tool lane", cwd: repo, brief: "b" }, { signal });
 		expect(started).toContain("lane tool-lane started");
 		expect(daemon.store.getLane("tool-lane")?.status).toBe("working");
-		await expect(start?.execute({ title: "second", cwd: home.config.workspaceDir }, { signal })).rejects.toThrow(
-			"상한(1개)",
-		);
+		await expect(start?.execute({ title: "second", cwd: repo }, { signal })).rejects.toThrow("상한(1개)");
 
-		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: third @${home.config.workspaceDir}` });
+		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: third @${repo}` });
 		await transport.waitForPosts(
 			(text) => text.includes("작업 레인을 시작하지 못했습니다") && text.includes("상한(1개)"),
 		);
@@ -1025,8 +1046,9 @@ describe("lanes inside the daemon", () => {
 	});
 
 	test("a lane thread survives a daemon restart (registry is in the ledger)", async () => {
+		const repo = makeRepo(repos);
 		const first = await startDaemon();
-		await first.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: persist @${home.config.workspaceDir}` });
+		await first.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: persist @${repo}` });
 		await transport.waitForPosts((text) => text.includes("작업 레인 `persist`"));
 		await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
 		const root = transport.posts((text) => text === "🔄 persist")[0];

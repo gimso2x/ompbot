@@ -38,11 +38,45 @@ export interface SlackConfig {
 /** Which child process powers a conversation: omp's RPC child (default) or the Claude Code CLI. */
 export type AgentKind = "omp" | "claude";
 
+/** `channels.discord`: present → the daemon also talks on Discord (Gateway + REST with the bot token). */
+export interface DiscordChannelConfig {
+	/** The owner's Discord user id (snowflake); only this user's messages are taken. */
+	ownerUserId: string;
+	/** Absolute, resolved against the config directory; one line, mode 0600. */
+	botTokenFile: string;
+	applicationId: string;
+	/** Servers whose messages are taken; absent: every server the bot is in. DMs are not affected. */
+	guildIds?: string[];
+	/** Channel ids where the owner's root messages are answered without a mention. */
+	mentionFreeChannels?: string[];
+	/** In a server channel only a mention addresses the bot. Default false. */
+	requireMention?: boolean;
+}
+
+/** Per-platform chat settings: who the owner is on each platform the bot talks on. Slack is required, Discord optional. */
+export interface ChannelsConfig {
+	slack: { ownerUserId: string };
+	discord?: DiscordChannelConfig;
+}
+
+/** Old top-level keys still read, each with the key that replaced it (the daemon warns about them at startup). */
+export const DEPRECATED_KEYS = { ownerSlackUserId: "channels.slack.ownerUserId" } as const;
+
+/** One `dispatchHosts` entry: ssh target, remote work directory, remote herdr binary, worker omp extra arguments. */
+export interface DispatchHostConfig {
+	ssh: string;
+	workDir?: string;
+	herdrBin?: string;
+	ompArgs?: string[];
+}
+
 export interface OmpbotConfig {
 	schemaVersion: 1;
 	homeDir: string;
 	configPath: string;
-	ownerSlackUserId: string;
+	channels: ChannelsConfig;
+	/** Deprecated keys the file still uses (see `DEPRECATED_KEYS`); absent when it uses none. */
+	deprecated?: Array<keyof typeof DEPRECATED_KEYS>;
 	slack: SlackConfig;
 	ompExecutable: string;
 	workspaceDir: string;
@@ -85,8 +119,16 @@ export interface OmpbotConfig {
 	 * dispatch only. `bin` is the absolute path of the local herdr (default: `herdr` on PATH).
 	 */
 	herdr?: { bin?: string };
-	/** Remote dispatch targets for `ompbot_dispatch host=…`: herdr runs on that host over ssh. Needs `herdr`. */
-	dispatchHosts?: Record<string, { ssh: string; workDir?: string; herdrBin?: string }>;
+	/**
+	 * Extra arguments for the local herdr worker omp (`herdr agent start … -- <args>`), e.g. `["--prewalk"]`. Not
+	 * applied to `omp -p` simple dispatch nor to remote hosts (those use `dispatchHosts.<h>.ompArgs`).
+	 */
+	workerOmpArgs?: string[];
+	/**
+	 * Remote dispatch targets for `ompbot_dispatch host=…`: herdr runs on that host over ssh. Needs `herdr`.
+	 * `ompArgs`: extra arguments for that host's herdr worker omp, resolved by that host's omp settings.
+	 */
+	dispatchHosts?: Record<string, DispatchHostConfig>;
 	/**
 	 * herdr-web-ui task board: `url` is the public board page (card links `<url>?card=<key>` go into dispatch reports),
 	 * `api` the web UI origin reachable from this host (default `http://127.0.0.1:7317`). Unset → no board links.
@@ -94,10 +136,12 @@ export interface OmpbotConfig {
 	 */
 	herdrBoard?: { url: string; api?: string };
 	/**
-	 * [TASK] auto-merge: a local task (never a `dispatchHosts` one) whose repository shares its git common directory
-	 * with one of `repos` (absolute, trailing slash dropped), whose risk is at most `maxRisk` (default L2), and whose
-	 * outcome stands on at least one passing re-run check without warnings gets "머지해" from the bot instead of a
-	 * question. Unset → every reached task waits for the owner. Needs `herdr`.
+	 * Auto-merge of [TASK]s and work lanes: a local task (never a `dispatchHosts` one) or a closed lane whose
+	 * repository shares its git common directory with one of `repos` (absolute, trailing slash dropped), whose risk is
+	 * at most `maxRisk` (default L2), and whose outcome stands on at least one passing re-run check without warnings
+	 * is merged without a question — a task gets "머지해" from the bot, a lane is landed by the core
+	 * (`src/lanes/land.ts`). Unset → every reached task and closed lane waits for the owner. Works without `herdr`
+	 * (lanes); the [TASK] sweep itself only runs with it.
 	 */
 	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk };
 	/** Slack channel id that receives approval cards (owner mention, link back to the asking thread). Default: the asking conversation. */
@@ -178,12 +222,118 @@ function optionalString(
 const CHANNEL_ID = /^[CG][A-Z0-9]{8,}$/;
 const SLACK_USER_ID = /^U[A-Z0-9]{8,}$/;
 
+/**
+ * `channels` plus the old `ownerSlackUserId`: either names the Slack owner, both must agree, and one of them must
+ * be there. Only known platforms and keys are accepted under `channels`.
+ */
+function parseChannels(
+	configPath: string,
+	root: Record<string, unknown>,
+	home: string,
+): { channels: ChannelsConfig; deprecated: Array<keyof typeof DEPRECATED_KEYS> } {
+	const legacy = optionalString(configPath, root, "ownerSlackUserId");
+	let owner: string | undefined;
+	let discord: DiscordChannelConfig | undefined;
+	if (root.channels !== undefined) {
+		const channels = asRecord(root.channels);
+		if (channels === undefined) invalid(configPath, "channels");
+		for (const key of Object.keys(channels)) {
+			if (key !== "slack" && key !== "discord") invalid(configPath, `channels.${key}`);
+		}
+		if (channels.discord !== undefined) discord = parseDiscordChannel(configPath, channels.discord, home);
+		if (channels.slack !== undefined) {
+			const slack = asRecord(channels.slack);
+			if (slack === undefined) invalid(configPath, "channels.slack");
+			for (const key of Object.keys(slack)) {
+				if (key !== "ownerUserId") invalid(configPath, `channels.slack.${key}`);
+			}
+			owner = requiredString(configPath, slack, "ownerUserId", "channels.slack.ownerUserId");
+		}
+	}
+	if (owner !== undefined && legacy !== undefined && owner !== legacy) {
+		invalid(configPath, "channels.slack.ownerUserId");
+	}
+	const ownerUserId = owner ?? legacy;
+	if (ownerUserId === undefined) invalid(configPath, "channels.slack.ownerUserId");
+	return {
+		channels: { slack: { ownerUserId }, ...(discord === undefined ? {} : { discord }) },
+		deprecated: legacy === undefined ? [] : ["ownerSlackUserId"],
+	};
+}
+
+/** A Discord id (snowflake): 17–20 digits. */
+const SNOWFLAKE = /^[0-9]{17,20}$/;
+const DISCORD_KEYS: Record<string, true> = {
+	ownerUserId: true,
+	botTokenFile: true,
+	applicationId: true,
+	guildIds: true,
+	mentionFreeChannels: true,
+	requireMention: true,
+};
+
+function parseDiscordChannel(configPath: string, value: unknown, home: string): DiscordChannelConfig {
+	const record = asRecord(value);
+	if (record === undefined) invalid(configPath, "channels.discord");
+	for (const key of Object.keys(record)) {
+		if (!Object.hasOwn(DISCORD_KEYS, key)) invalid(configPath, `channels.discord.${key}`);
+	}
+	const snowflake = (key: string): string => {
+		const id = record[key];
+		if (typeof id !== "string" || !SNOWFLAKE.test(id)) invalid(configPath, `channels.discord.${key}`);
+		return id;
+	};
+	const snowflakes = (key: string): string[] | undefined => {
+		const ids = record[key];
+		if (ids === undefined) return undefined;
+		if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !SNOWFLAKE.test(id))) {
+			invalid(configPath, `channels.discord.${key}`);
+		}
+		return [...(ids as string[])];
+	};
+	const ownerUserId = snowflake("ownerUserId");
+	const botTokenFile = resolve(
+		home,
+		requiredString(configPath, record, "botTokenFile", "channels.discord.botTokenFile"),
+	);
+	const applicationId = snowflake("applicationId");
+	const guildIds = snowflakes("guildIds");
+	const mentionFreeChannels = snowflakes("mentionFreeChannels");
+	const requireMention = record.requireMention;
+	if (requireMention !== undefined && typeof requireMention !== "boolean") {
+		invalid(configPath, "channels.discord.requireMention");
+	}
+	return {
+		ownerUserId,
+		botTokenFile,
+		applicationId,
+		...(guildIds === undefined ? {} : { guildIds }),
+		...(mentionFreeChannels === undefined ? {} : { mentionFreeChannels }),
+		...(requireMention === undefined ? {} : { requireMention }),
+	};
+}
+
 /** An optional integer no smaller than `min`. */
 function optionalInt(configPath: string, obj: Record<string, unknown>, key: string, min: number): number | undefined {
 	const value = obj[key];
 	if (value === undefined) return undefined;
 	if (typeof value !== "number" || !Number.isInteger(value) || value < min) invalid(configPath, key);
 	return value;
+}
+
+/** An optional argument list: an array of non-empty strings (copied), else `field` is invalid. */
+function optionalArgList(
+	configPath: string,
+	obj: Record<string, unknown>,
+	key: string,
+	field: string = key,
+): string[] | undefined {
+	const value = obj[key];
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.some((arg) => typeof arg !== "string" || arg.trim() === "")) {
+		invalid(configPath, field);
+	}
+	return [...(value as string[])];
 }
 
 /** An optional Slack channel id (`C…`/`G…`). */
@@ -207,6 +357,13 @@ function checkHome(homeDir: string): void {
 }
 
 function readSecret(path: string, prefix: string): string {
+	const value = readSecretFile(path);
+	if (!value.startsWith(prefix)) throw new ConfigError("token_prefix", path, `expected prefix ${prefix}`);
+	return value;
+}
+
+/** A 0600 secret file's trimmed content (`secret_missing` / `secret_permissions` otherwise). */
+function readSecretFile(path: string): string {
 	let mode: number;
 	try {
 		mode = statSync(path).mode;
@@ -222,7 +379,6 @@ function readSecret(path: string, prefix: string): string {
 	} catch {
 		throw new ConfigError("secret_missing", path);
 	}
-	if (!value.startsWith(prefix)) throw new ConfigError("token_prefix", path, `expected prefix ${prefix}`);
 	return value;
 }
 
@@ -232,6 +388,20 @@ export function readSlackTokens(config: OmpbotConfig): SlackTokens {
 		botToken: readSecret(config.slack.botTokenFile, "xoxb-"),
 		appToken: readSecret(config.slack.appTokenFile, "xapp-"),
 	};
+}
+
+/**
+ * Reads the Discord bot token file again (permission check included). Discord tokens carry no fixed prefix, so the
+ * only shape check is one non-empty line; a wrong token shows up as gateway close 4004.
+ */
+export function readDiscordToken(config: OmpbotConfig): string {
+	const discord = config.channels.discord;
+	if (discord === undefined) throw new Error("channels.discord is not configured");
+	const value = readSecretFile(discord.botTokenFile);
+	if (value === "" || /[\r\n]/.test(value)) {
+		throw new ConfigError("config_invalid", discord.botTokenFile, "field=channels.discord.botTokenFile");
+	}
+	return value;
 }
 
 /**
@@ -275,6 +445,8 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	const idleTimeoutMinutes = optionalInt(configPath, root, "idleTimeoutMinutes", 0);
 	const skillReviewTurns = optionalInt(configPath, root, "skillReviewTurns", 0);
 
+	const { channels, deprecated } = parseChannels(configPath, root, home);
+
 	const mentionFreeChannels = root.mentionFreeChannels;
 	if (
 		mentionFreeChannels !== undefined &&
@@ -293,7 +465,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				invalid(configPath, `peerBots.${i}.userId`);
 			}
 			// The owner is never a peer: a peer message carries no owner authority, so listing the owner would only shadow it.
-			if (record.userId === root.ownerSlackUserId) invalid(configPath, `peerBots.${i}.userId`);
+			if (record.userId === channels.slack.ownerUserId) invalid(configPath, `peerBots.${i}.userId`);
 			if (typeof record.name !== "string" || record.name.length < 1 || record.name.length > 32) {
 				invalid(configPath, `peerBots.${i}.name`);
 			}
@@ -331,8 +503,10 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			if (record.herdrBin !== undefined && typeof record.herdrBin !== "string") {
 				invalid(configPath, `dispatchHosts.${name}.herdrBin`);
 			}
+			optionalArgList(configPath, record, "ompArgs", `dispatchHosts.${name}.ompArgs`);
 		}
 	}
+	const workerOmpArgs = optionalArgList(configPath, root, "workerOmpArgs");
 
 	const offsiteRaw = root.offsite;
 	let offsite: OmpbotConfig["offsite"];
@@ -399,8 +573,9 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		const bin = optionalString(configPath, record, "bin", "herdr.bin");
 		if (bin !== undefined && !isAbsolute(bin)) invalid(configPath, "herdr.bin");
 		herdr = bin === undefined ? {} : { bin };
-	} else if (dispatchHosts !== undefined || herdrBoard !== undefined || taskAutoLand !== undefined) {
-		// All three are herdr features: without the switch they would be silently dead, so refuse the file instead.
+	} else if (dispatchHosts !== undefined || herdrBoard !== undefined) {
+		// Both are herdr features: without the switch they would be silently dead, so refuse the file instead.
+		// `taskAutoLand` is not one of them: work lanes land without herdr.
 		invalid(configPath, "herdr");
 	}
 
@@ -457,7 +632,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		schemaVersion: 1,
 		homeDir: home,
 		configPath,
-		ownerSlackUserId: requiredString(configPath, root, "ownerSlackUserId"),
+		channels,
 		slack: {
 			botTokenFile: resolve(home, requiredString(configPath, slack, "botTokenFile", "slack.botTokenFile")),
 			appTokenFile: resolve(home, requiredString(configPath, slack, "appTokenFile", "slack.appTokenFile")),
@@ -465,6 +640,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		ompExecutable,
 		workspaceDir: resolve(home, requiredString(configPath, root, "workspaceDir")),
 	};
+	if (deprecated.length > 0) config.deprecated = deprecated;
 	const appId = optionalString(configPath, slack, "appId", "slack.appId");
 	const teamId = optionalString(configPath, slack, "teamId", "slack.teamId");
 	const botUserId = optionalString(configPath, slack, "botUserId", "slack.botUserId");
@@ -499,13 +675,16 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (webhook !== undefined) config.webhook = webhook as { port: number; bind?: "127.0.0.1" | "::1" };
 	if (dashboard !== undefined) config.dashboard = dashboard as NonNullable<OmpbotConfig["dashboard"]>;
 	if (herdr !== undefined) config.herdr = herdr;
-	if (dispatchHosts !== undefined) {
-		config.dispatchHosts = dispatchHosts as Record<string, { ssh: string; workDir?: string; herdrBin?: string }>;
-	}
+	if (dispatchHosts !== undefined) config.dispatchHosts = dispatchHosts as Record<string, DispatchHostConfig>;
+	if (workerOmpArgs !== undefined) config.workerOmpArgs = workerOmpArgs;
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
 	if (taskAutoLand !== undefined) config.taskAutoLand = taskAutoLand;
 
-	if (options.checkTokens !== false) readSlackTokens(config); // fail at startup on permissions/prefix; values are discarded here
+	if (options.checkTokens !== false) {
+		// Fail at startup on permissions/prefix/shape; values are discarded here.
+		readSlackTokens(config);
+		if (config.channels.discord !== undefined) readDiscordToken(config);
+	}
 	return config;
 }

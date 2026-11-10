@@ -262,6 +262,11 @@ export class FakeOmpDriver implements OmpSessionDriver {
 		this.#turn?.release();
 	}
 
+	/** Test control: emit an event outside a turn (a queued steer omp started on its own while the lane is held). */
+	emitTestEvent(event: OmpEvent): void {
+		this.#emit(event);
+	}
+
 	/** Test control: resolves once the running `messageEvents` turn emitted all its scripted messages. */
 	untilScripted(): Promise<void> {
 		const turn = this.#turn;

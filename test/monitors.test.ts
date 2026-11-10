@@ -78,7 +78,7 @@ beforeEach(() => {
 	frozenState = undefined;
 	const sessions = new FakeSessionStore();
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, ownerSlackUserId: OWNER });
+	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
 	router = new OriginRouter({
 		store,
 		clock,
@@ -1159,7 +1159,7 @@ describe("monitors: script edge triggering", () => {
 		await scheduler.idle();
 
 		// A second process on the same database file: only the durable state carries over.
-		const reopened = openStore({ path: join(dir, "ompbot.db"), clock, redact, ownerSlackUserId: OWNER });
+		const reopened = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
 		const restarted = new MonitorScheduler({
 			store: reopened,
 			router: { route: async () => {}, newEpochIfIdle: async () => false },

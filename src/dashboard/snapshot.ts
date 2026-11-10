@@ -3,6 +3,7 @@ import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "no
 import { join } from "node:path";
 import type { OmpbotConfig } from "../config";
 import { TOP_LEVEL_TS } from "../core/normalize";
+import { parseChatOrigin } from "../core/origin-key";
 import { COMMAND_TEXT, parseCommand } from "../core/types";
 import { readSweepHeartbeat } from "../daemon/heartbeat";
 import {
@@ -20,8 +21,16 @@ import {
 	type ProcessRunner,
 	type RunProcessResult,
 } from "../dispatch/omp";
+import { type FlowTransition, type TaskStage, taskFlowStatus, taskStage } from "../flow/task-flow";
 import { DEFAULT_TIMEZONE } from "../monitors/cron";
-import { MONITOR_ORIGIN_PREFIX, type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
+import {
+	MONITOR_ORIGIN_PREFIX,
+	type MonitorRow,
+	type MonitorSql,
+	monitorOrigin,
+	nextFireOf,
+	toMonitor,
+} from "../monitors/ledger";
 import type { MonitorDeliver, MonitorOverlap, MonitorTrigger } from "../monitors/spec";
 import { readLockStartedAt } from "../ops/apply";
 import { readStamp } from "../ops/backup";
@@ -70,6 +79,8 @@ export interface DaemonInfo {
 		ageMs: number;
 		loopMs?: number;
 		socket?: { state: "up" | "down"; since: string };
+		/** Discord gateway; absent on an install without Discord. */
+		discord?: { state: "up" | "down"; since: string };
 		draining?: boolean;
 	};
 	/** `git rev-parse --short HEAD` of the checkout this process runs from; absent when git cannot tell. */
@@ -192,6 +203,43 @@ export interface TaskInfo {
 	error?: string;
 }
 
+/** Threads in the flow view: a TASK registered in this window, or any open TASK. */
+export const FLOW_WINDOW_MS = 7 * 86_400_000;
+const FLOW_NOW_MSG_CHARS = 70;
+
+/** One TASK box of a flow, built from the flow's own row (not cut to the snapshot's closed-TASK limit). */
+export interface FlowStepInfo {
+	taskId: string;
+	title: string;
+	status: TaskStatus;
+	risk: TaskRisk;
+	host: string;
+	branch: string;
+	createdAt: string;
+	closedAt?: string;
+	acTotal: number;
+	stage: TaskStage;
+}
+
+/** One request thread: its request line and its TASKs in registration order. */
+export interface FlowChainInfo {
+	threadRef: string;
+	originKey: string;
+	/** `DM`, `채널 <C> 스레드`, … of the origin key. */
+	place: string | null;
+	/** The thread's first inbound as one masked line, or `(원문 없음)`. */
+	title: string;
+	requestedAt: string | null;
+	/** Newest TASK `updated_at`. */
+	updatedAt: string;
+	done: number;
+	total: number;
+	/** The TASK to look at next: the first blocked open one, else the earliest open one; null when all are closed. */
+	here: string | null;
+	now: string;
+	tasks: FlowStepInfo[];
+}
+
 export interface LaneInfo {
 	name: string;
 	title: string;
@@ -229,6 +277,48 @@ export interface ApprovalInfo {
 	remainingMs: number;
 	/** `DM`, `채널 <C> 스레드`, `채널 <C> 메인` or the raw origin key. */
 	originLabel: string | null;
+}
+
+export type ApprovalOutcomeStatus = "approved" | "denied" | "expired" | "replied";
+
+/** A settled approval, as the 최근 결정 list shows it; the fields it shares with {@link ApprovalInfo} read the same. */
+export interface ApprovalDecision {
+	approvalId: string;
+	summary: string;
+	title: string;
+	status: ApprovalOutcomeStatus;
+	createdAt: string;
+	/** null on a row settled without a time. */
+	decidedAt: string | null;
+	/** Card up to its settling (`decided_at − created_at`, ≥ 0); null without `decidedAt`. */
+	tookMs: number | null;
+	originKey: string | null;
+	originLabel: string | null;
+	detail: ApprovalInfo["detail"];
+	cardUrl: string | null;
+	originUrl: string | null;
+}
+
+/** Approvals settled in the last {@link APPROVAL_STATS_DAYS} days, by outcome. */
+export interface ApprovalStats {
+	days: number;
+	approved: number;
+	denied: number;
+	expired: number;
+	replied: number;
+	/** Median card-to-answer time of the owner's answers (approved, denied, replied); null without any. */
+	medianAnswerMs: number | null;
+}
+
+/** A monitor's ended events of the last {@link MONITOR_STATS_DAYS} days, by outcome. */
+export interface MonitorStats {
+	days: number;
+	delivered: number;
+	quiet: number;
+	failed: number;
+	skipped: number;
+	/** Median slot-to-settle time (retry waits included) of the delivered and quiet scheduled runs; null without any. */
+	medianMs: number | null;
 }
 
 /** A file a monitor uses, by name only (never its directory). */
@@ -281,9 +371,19 @@ export interface MonitorInfo {
 	lastRun: MonitorRun | null;
 	/** Whether any scheduled (not manual) event exists, beyond {@link recent} too. */
 	scheduledRun: boolean;
+	/** Its conversation's origin key (`monitor/<id>`), as the turn board lists it. */
+	originKey: string;
+	/** Whether the newest event is still on its way (not in {@link ENDED_STAGES}). */
+	running: boolean;
+	/** How many of the newest events in a row failed (`failed`, `failed_no_retry`), counted over {@link recent}. */
+	failStreak: number;
+	stats: MonitorStats;
 }
 
 const MONITOR_RECENT = 7;
+const MONITOR_STATS_DAYS = 30;
+const APPROVAL_STATS_DAYS = 7;
+const APPROVAL_RECENT = 20;
 const MONITOR_FILES = 4;
 const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토", "일"];
 /** Stages after which an event is over (the rest are still on their way). */
@@ -302,6 +402,44 @@ const SENTENCE_END = /[가-힣][.?!](?=\s|$)/;
 /** Slot to settle (`updated_at − slot_at`, ≥ 0, retry waits included) of an ended event; null while running. */
 export function monitorDurationMs(stage: string, slotAt: number, updatedAt: number): number | null {
 	return ENDED_STAGES[stage] === true ? Math.max(0, updatedAt - slotAt) : null;
+}
+
+/** The middle value (the mean of the two middle ones for an even count), rounded; null for none. */
+function median(values: number[]): number | null {
+	const sorted = values.slice().sort((a, b) => a - b);
+	const upper = sorted[sorted.length >> 1];
+	if (upper === undefined) return null;
+	return sorted.length % 2 === 1 ? upper : Math.round(((sorted[(sorted.length >> 1) - 1] ?? upper) + upper) / 2);
+}
+
+/** One monitor's ended events slotted since `now − MONITOR_STATS_DAYS`, by outcome. */
+function monitorStats(db: Database, monitorId: string, now: number): MonitorStats {
+	const stats: MonitorStats = {
+		days: MONITOR_STATS_DAYS,
+		delivered: 0,
+		quiet: 0,
+		failed: 0,
+		skipped: 0,
+		medianMs: null,
+	};
+	const events = rows<{ stage: string; manual: number; slot_at: number; updated_at: number }>(
+		db,
+		"SELECT stage, manual, slot_at, updated_at FROM monitor_events WHERE monitor_id = ? AND slot_at >= ?",
+		monitorId,
+		now - MONITOR_STATS_DAYS * 86_400_000,
+	);
+	const took: number[] = [];
+	for (const event of events) {
+		if (event.stage === "failed" || event.stage === "failed_no_retry") stats.failed++;
+		else if (event.stage === "skipped") stats.skipped++;
+		else if (event.stage === "delivered" || event.stage === "no_report") {
+			if (event.stage === "delivered") stats.delivered++;
+			else stats.quiet++;
+			if (event.manual === 0) took.push(Math.max(0, event.updated_at - event.slot_at));
+		}
+	}
+	stats.medianMs = median(took);
+	return stats;
 }
 
 /** A cron expression in words, in the monitor's own time zone (named when not Asia/Seoul); else `cron <expr>`. */
@@ -407,16 +545,16 @@ const JOB_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const JOB_LIMIT = 50;
 /** A running job whose `updatedAt` is older than this reads as `stale`. */
 export const JOB_STALE_MS = 10 * 60_000;
-/** A `done` job leaves the list once its `updatedAt` is older than this. */
+/** A `done` or `stopped` job leaves the list once its `updatedAt` is older than this. */
 export const JOB_DONE_KEEP_MS = 24 * 3_600_000;
 const JOB_TITLE_CHARS = 120;
 const JOB_DETAIL_CHARS = 200;
 const JOB_FIELD_CHARS = 200;
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
 
-export type JobState = "running" | "done" | "failed";
+export type JobState = "running" | "done" | "stopped" | "failed";
 /**
- * ok: running and updated within {@link JOB_STALE_MS}, or done · stale: running, not updated since · dead: running, its
+ * ok: running and updated within {@link JOB_STALE_MS}, or done, or stopped on purpose · stale: running, not updated since · dead: running, its
  * `pid` is gone · failed: `state: "failed"` · invalid: the file is not JSON or lacks `state`/`updatedAt`.
  */
 export type JobHealth = "ok" | "stale" | "dead" | "failed" | "invalid";
@@ -480,10 +618,13 @@ export interface DashboardSnapshot {
 	turns: Section<{ items: TurnInfo[]; threads: ThreadInfo[] }>;
 	feedback: Section<FeedbackInfo>;
 	tasks: Section<{ items: TaskInfo[] }>;
+	/** Always built; optional only so snapshots made before the flow view still type. */
+	flows?: Section<{ items: FlowChainInfo[] }>;
 	lanes: Section<{ items: LaneInfo[] }>;
 	/** `herdr agent list` per host; while the agent board is live, its column counts instead (`hosts` empty). */
 	herdr: Section<{ hosts: HerdrHostInfo[]; board?: BoardSummary }>;
-	approvals: Section<{ items: ApprovalInfo[] }>;
+	/** `items`: the pending ones, oldest first; `recent`: the last settled ones, newest first. */
+	approvals: Section<{ items: ApprovalInfo[]; recent: ApprovalDecision[]; stats: ApprovalStats }>;
 	monitors: Section<{ items: MonitorInfo[] }>;
 	alerts: Section<{ items: AlertInfo[] }>;
 	/** Every health gate, as `ompbot gates` lists them. */
@@ -491,12 +632,20 @@ export interface DashboardSnapshot {
 	backup: Section<BackupInfo>;
 	/** Progress files of long-running jobs outside the bot (`<home>/jobs/*.json`), newest update first. */
 	jobs: Section<{ items: JobInfo[] }>;
+	/**
+	 * The Slack workspace id (config `slack.teamId`) the turn panels' 슬랙 스레드에서 답하기 link needs; null without
+	 * it. Always built; optional only so hand-made snapshots still type.
+	 */
+	slackTeam?: string | null;
 }
 
 export type DashboardConfig = Partial<
 	Pick<OmpbotConfig, "agent" | "ompExecutable" | "offsite" | "herdr" | "dispatchHosts" | "herdrBoard">
 > &
-	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">>;
+	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
+		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
+		slack?: { teamId?: string };
+	};
 
 export interface SnapshotDeps {
 	homeDir: string;
@@ -581,13 +730,38 @@ function approvalDetail(json: string | null): ApprovalInfo["detail"] {
 	return Object.keys(detail).length === 0 ? null : detail;
 }
 
+/** The approvals settled since `now − APPROVAL_STATS_DAYS` (by `decided_at`, else `created_at`), by outcome. */
+function approvalStats(db: Database, now: number): ApprovalStats {
+	const settled = rows<{ status: ApprovalOutcomeStatus; created_at: number; decided_at: number | null }>(
+		db,
+		"SELECT status, created_at, decided_at FROM approvals WHERE status != 'pending' AND COALESCE(decided_at, created_at) >= ?",
+		now - APPROVAL_STATS_DAYS * 86_400_000,
+	);
+	const stats: ApprovalStats = {
+		days: APPROVAL_STATS_DAYS,
+		approved: 0,
+		denied: 0,
+		expired: 0,
+		replied: 0,
+		medianAnswerMs: null,
+	};
+	const answers: number[] = [];
+	for (const row of settled) {
+		stats[row.status]++;
+		if (row.status !== "expired" && row.decided_at !== null) answers.push(Math.max(0, row.decided_at - row.created_at));
+	}
+	stats.medianAnswerMs = median(answers);
+	return stats;
+}
+
+/** `DM` for any platform's owner DM; a channel by its id, named after its platform when that is not Slack. */
 function originLabel(originKey: string | null): string | null {
 	if (originKey === null) return null;
-	if (originKey.startsWith("slack/dm/")) return "DM";
-	const thread = /^slack\/ch\/([^/]+)\/t\/[^/]+$/.exec(originKey);
-	if (thread !== null) return `채널 ${thread[1]} 스레드`;
-	const main = /^slack\/ch\/([^/]+)$/.exec(originKey);
-	return main === null ? originKey : `채널 ${main[1]} 메인`;
+	if (parseChatOrigin(originKey)?.kind === "dm") return "DM";
+	const channel = /^(slack|discord)\/ch\/([^/]+)(\/t\/[^/]+)?$/.exec(originKey);
+	if (channel === null) return originKey;
+	const platform = channel[1] === "discord" ? "Discord " : "";
+	return `${platform}채널 ${channel[2]} ${channel[3] === undefined ? "메인" : "스레드"}`;
 }
 
 /** Identical commands inside one snapshot share one process (one `herdr agent list` per host). */
@@ -747,9 +921,11 @@ async function listHerdrAgents(target: HerdrTarget, run: ProcessRunner): Promise
 	};
 }
 
-/** A request as one masked line: secrets masked, attachment notes folded, whitespace collapsed, cut to the limit. */
+/** A request as one masked line: secrets masked, Slack links and attachment notes folded, whitespace collapsed, cut to the limit. */
 function previewLine(text: string): string {
 	const line = redact(text)
+		.replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2")
+		.replace(/<https?:\/\/([^>]+)>/g, "$1")
 		.replace(/\[첨부: [^\]]*\]/g, "[첨부]")
 		.replace(/\s+/g, " ")
 		.trim();
@@ -842,8 +1018,8 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return invalid("JSON 객체가 아님");
 	const fields = parsed as Record<string, unknown>;
 	const state = fields.state;
-	if (state !== "running" && state !== "done" && state !== "failed") {
-		return invalid("state가 없거나 running·done·failed가 아님");
+	if (state !== "running" && state !== "done" && state !== "stopped" && state !== "failed") {
+		return invalid("state가 없거나 running·done·stopped·failed가 아님");
 	}
 	const updatedMs =
 		typeof fields.updatedAt === "string" && ISO_8601.test(fields.updatedAt) ? Date.parse(fields.updatedAt) : Number.NaN;
@@ -857,7 +1033,7 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 	const health: JobHealth =
 		state === "failed"
 			? "failed"
-			: state === "done"
+			: state === "done" || state === "stopped"
 				? "ok"
 				: pid !== undefined && !isAlive(pid)
 					? "dead"
@@ -888,7 +1064,7 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 
 /**
  * `<home>/jobs/<name>.json` files whose name passes {@link JOB_NAME}: newest update first, at most {@link JOB_LIMIT},
- * `done` jobs only for {@link JOB_DONE_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
+ * `done` and `stopped` jobs only for {@link JOB_DONE_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
  */
 function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean): JobInfo[] {
 	const dir = join(homeDir, "jobs");
@@ -902,7 +1078,7 @@ function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolea
 	return entries
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && JOB_NAME.test(entry.name.slice(0, -5)))
 		.map((entry) => readJob(dir, entry.name, now, isAlive))
-		.filter((job) => !(job.state === "done" && job.ageMs > JOB_DONE_KEEP_MS))
+		.filter((job) => !((job.state === "done" || job.state === "stopped") && job.ageMs > JOB_DONE_KEEP_MS))
 		.sort((a, b) => a.ageMs - b.ageMs)
 		.slice(0, JOB_LIMIT);
 }
@@ -978,6 +1154,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					...(beat.socket === undefined
 						? {}
 						: { socket: { state: beat.socket.state, since: formatKst(beat.socket.since.getTime()) } }),
+					...(beat.discord === undefined
+						? {}
+						: { discord: { state: beat.discord.state, since: formatKst(beat.discord.since.getTime()) } }),
 					...(beat.draining === undefined ? {} : { draining: beat.draining }),
 				};
 			}
@@ -1223,6 +1402,84 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			return { items: [...(await Promise.all(open.map(describeOpen))), ...closed.map(baseTask)] };
 		});
 
+		const flows = section(() => {
+			const handle = needDb();
+			const since = now - FLOW_WINDOW_MS;
+			const scope =
+				"thread_ref IN (SELECT thread_ref FROM tasks WHERE created_at >= ? OR status IN ('working','blocked','review'))";
+			const read = rows<TaskSql>(handle, `SELECT * FROM tasks WHERE ${scope} ORDER BY created_at, task_id`, since).map(
+				(r) => toTaskRow(r).row,
+			);
+			const transitions = rows<FlowTransition>(
+				handle,
+				`SELECT task_id AS taskId, from_status AS fromStatus, to_status AS toStatus, actor, reason, at
+				FROM task_transitions WHERE task_id IN (SELECT task_id FROM tasks WHERE ${scope}) ORDER BY transition_id`,
+				since,
+			);
+			const statuses = taskFlowStatus(read, transitions);
+			const threads = new Map<string, TaskRow[]>();
+			for (const row of read) threads.set(row.threadRef, [...(threads.get(row.threadRef) ?? []), row]);
+			const chains = [...threads].map(([threadRef, list]) => {
+				const steps = list.map((row): FlowStepInfo => {
+					const stage = taskStage(row, statuses);
+					return {
+						taskId: row.taskId,
+						title: redact(row.title),
+						status: row.status,
+						risk: row.risk,
+						host: row.host ?? "local",
+						branch: row.branch,
+						createdAt: formatKst(row.createdAt),
+						...(row.closedAt === null ? {} : { closedAt: formatKst(row.closedAt) }),
+						acTotal: row.acceptance.length,
+						stage: { ...stage, msg: redact(stage.msg) },
+					};
+				});
+				const open = list.filter((row) => row.status !== "done" && row.status !== "cancelled");
+				const here = open.find((row) => row.status === "blocked") ?? open[0];
+				const updatedAt = Math.max(...list.map((row) => row.updatedAt));
+				let line: string;
+				if (here === undefined) {
+					const closedAt = Math.max(...list.map((row) => row.closedAt ?? row.updatedAt));
+					line = `모두 끝남 · 마지막 close ${formatKst(closedAt).slice(5, 16).replace("T", " ")}`;
+				} else {
+					const stage = steps.find((step) => step.taskId === here.taskId)?.stage;
+					const msg = Array.from((stage?.msg ?? "").replace(/\s+/g, " ").trim());
+					const cut =
+						msg.length > FLOW_NOW_MSG_CHARS ? `${msg.slice(0, FLOW_NOW_MSG_CHARS - 1).join("")}…` : msg.join("");
+					line = `${here.taskId} ${stage?.label ?? ""}${cut === "" ? "" : ` · ${cut}`}${
+						open.length > 1 ? ` · 외 열림 ${open.length - 1}` : ""
+					}`;
+				}
+				const request = rows<{ text_ref: string; created_at: number }>(
+					handle,
+					"SELECT text_ref, created_at FROM inbound WHERE thread_ref = ? ORDER BY inbound_id LIMIT 1",
+					threadRef,
+				)[0];
+				// Slack link markup: `<url|label>` reads as the label, `<url>` as host/path.
+				const text = request?.text_ref
+					.replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2")
+					.replace(/<https?:\/\/([^>]+)>/g, "$1");
+				const originKey = list[0]?.originKey ?? "";
+				const info: FlowChainInfo = {
+					threadRef,
+					originKey,
+					place: originLabel(originKey),
+					title: text === undefined ? "(원문 없음)" : previewLine(text),
+					requestedAt: request === undefined ? null : formatKst(request.created_at),
+					updatedAt: formatKst(updatedAt),
+					done: list.filter((row) => row.status === "done").length,
+					total: list.length,
+					here: here?.taskId ?? null,
+					now: line,
+					tasks: steps,
+				};
+				return { open: open.length > 0, updatedAt, info };
+			});
+			chains.sort((a, b) => Number(b.open) - Number(a.open) || b.updatedAt - a.updatedAt);
+			return { items: chains.map((chain) => chain.info) };
+		});
+
 		const lanes = section(() => ({
 			items: rows<{ name: string; title: string; status: string; cwd: string; updated_at: number }>(
 				needDb(),
@@ -1299,6 +1556,39 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						originLabel: originLabel(r.origin_key),
 					};
 				}),
+				recent: rows<{
+					approval_id: string;
+					summary: string;
+					status: ApprovalOutcomeStatus;
+					created_at: number;
+					decided_at: number | null;
+					origin_key: string | null;
+					detail_json: string | null;
+					card_url: string | null;
+					origin_url: string | null;
+				}>(
+					handle,
+					`SELECT approval_id, summary, status, created_at, decided_at, origin_key, ${optional} FROM approvals
+					WHERE status != 'pending' ORDER BY COALESCE(decided_at, created_at) DESC, created_at DESC LIMIT ?`,
+					APPROVAL_RECENT,
+				).map((r): ApprovalDecision => {
+					const summary = redact(r.summary);
+					return {
+						approvalId: r.approval_id,
+						summary,
+						title: approvalTitle(summary),
+						status: r.status,
+						createdAt: formatKst(r.created_at),
+						decidedAt: r.decided_at === null ? null : formatKst(r.decided_at),
+						tookMs: r.decided_at === null ? null : Math.max(0, r.decided_at - r.created_at),
+						originKey: r.origin_key,
+						originLabel: originLabel(r.origin_key),
+						detail: approvalDetail(r.detail_json),
+						cardUrl: r.card_url?.startsWith("https://") ? r.card_url : null,
+						originUrl: r.origin_url?.startsWith("https://") ? r.origin_url : null,
+					};
+				}),
+				stats: approvalStats(handle, now),
 			};
 		});
 
@@ -1315,6 +1605,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					MONITOR_RECENT,
 				);
 				const last = events[0];
+				const firstNotFailed = events.findIndex(
+					(event) => event.stage !== "failed" && event.stage !== "failed_no_retry",
+				);
 				const incidents = rows<{ n: number }>(
 					handle,
 					"SELECT COUNT(*) AS n FROM monitor_incidents WHERE monitor_id = ? AND status = 'alerted'",
@@ -1359,6 +1652,10 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 							"SELECT EXISTS(SELECT 1 FROM monitor_events WHERE monitor_id = ? AND manual = 0) AS n",
 							monitor.id,
 						)[0]?.n === 1,
+					originKey: monitorOrigin(monitor.id),
+					running: last !== undefined && ENDED_STAGES[last.stage] !== true,
+					failStreak: firstNotFailed < 0 ? events.length : firstNotFailed,
+					stats: monitorStats(handle, monitor.id, now),
 				};
 				return { next, info };
 			});
@@ -1433,6 +1730,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			turns: await turns,
 			feedback: await feedback,
 			tasks: await tasks,
+			flows: await flows,
 			lanes: await lanes,
 			herdr: await herdr,
 			approvals: await approvals,
@@ -1441,6 +1739,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			gates,
 			backup: await backup,
 			jobs: await jobs,
+			slackTeam: deps.config?.slack?.teamId ?? null,
 		};
 	} finally {
 		db?.close();

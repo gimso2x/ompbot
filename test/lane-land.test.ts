@@ -1,0 +1,1209 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseThreadRef } from "../src/core/normalize";
+import { Daemon } from "../src/daemon/daemon";
+import { buildLaneOutcomeCard } from "../src/lanes/card";
+import type { IntegrityRefusal } from "../src/lanes/integrity";
+import { createLaneLander, type LandLane, type LandRequest, laneLandBlockers } from "../src/lanes/land";
+import type { LaneRow } from "../src/lanes/status";
+import { classifyClosedLaneMessage } from "../src/lanes/trigger";
+import { defaultGit, type GitResult, type GitRunner } from "../src/lanes/verify";
+import { createLogger } from "../src/log";
+import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
+import { SlackChannel } from "../src/slack/channel";
+import type { FakeCall } from "../src/slack/fake-transport";
+import { SlackCallError } from "../src/slack/transport";
+import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
+import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { git, makeRepo } from "./helpers/git-fixtures";
+import { type LaneHarness, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
+
+// Lane landing (doc/plans/lane-task-parity.md C절): every git effect below is a real git repository in a temp
+// directory with a local bare repository as `origin`; nothing leaves this machine.
+
+const CHECK_A = 'a.txt가 있다 [check: command ["sh","-c","test -f a.txt"]]';
+const NO_CHECK = "README를 다듬는다";
+
+type Post = Extract<FakeCall, { method: "postMessage" }>;
+
+let home: TestHome;
+let repos: string[];
+let scratch: string[];
+let daemons: Daemon[];
+
+beforeEach(() => {
+	home = makeHome("ompbot-lane-land-home-");
+	repos = [];
+	scratch = [];
+	daemons = [];
+});
+
+afterEach(async () => {
+	for (const daemon of daemons) await daemon.stop();
+	home.remove();
+	for (const repo of repos) removeRepoAndWorktrees(repo);
+	for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+});
+
+function tempDir(prefix: string): string {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+	scratch.push(dir);
+	return dir;
+}
+
+const baseOf = (repo: string): string => git(repo, "symbolic-ref", "--short", "HEAD");
+const headOf = (repo: string, ref = "HEAD"): string => git(repo, "rev-parse", ref);
+
+/** A local bare repository added to `repo` as `origin`, holding its current branch. */
+function addOrigin(repo: string): string {
+	const bare = tempDir("ompbot-lane-land-bare-");
+	git(bare, "init", "-q", "--bare");
+	git(repo, "remote", "add", "origin", bare);
+	git(repo, "push", "-q", "origin", baseOf(repo));
+	return bare;
+}
+
+function repoWithOrigin(): { repo: string; bare: string; base: string } {
+	const repo = makeRepo(repos);
+	return { repo, bare: addOrigin(repo), base: baseOf(repo) };
+}
+
+/** Commits `files` in `dir` (a lane worktree or the repository itself); returns the new HEAD. */
+function commitIn(dir: string, ...files: string[]): string {
+	for (const file of files) writeFileSync(join(dir, file), `${file}\n`);
+	git(dir, "add", "--", ...files);
+	git(dir, "commit", "-q", "-m", `add ${files.join(" ")}`);
+	return headOf(dir);
+}
+
+/** The real landing over `git`; every worktree removal is appended to `removals` (the last step of a landing). */
+function realLander(git: GitRunner = defaultGit, removals: string[][] = []): LandLane {
+	return createLaneLander({
+		git,
+		pushGit: git,
+		removeWorktree: (input) => {
+			removals.push(["removeWorktree", input.branch]);
+			return createTaskHostOps().removeWorktree(input);
+		},
+	});
+}
+
+/** The real landing with every call counted. */
+function countingLand(git?: GitRunner): { land: LandLane; calls: LandRequest[] } {
+	const real = realLander(git);
+	const calls: LandRequest[] = [];
+	return {
+		calls,
+		land: (request, hooks) => {
+			calls.push(request);
+			return real(request, hooks);
+		},
+	};
+}
+
+/** `defaultGit` with every argv recorded; `intercept` may replace one call (to fail after it ran). */
+function recordingGit(intercept?: (args: string[], run: () => Promise<GitResult>) => Promise<GitResult>) {
+	const calls: string[][] = [];
+	const run: GitRunner = (args) => {
+		calls.push(args);
+		return intercept === undefined ? defaultGit(args) : intercept(args, () => defaultGit(args));
+	};
+	const count = (...words: string[]) => calls.filter((args) => words.every((word) => args.includes(word))).length;
+	return { git: run, calls, count };
+}
+
+/** The real host ops with every `runCheck` counted. */
+function countingOps(): { ops: TaskHostOps; checks: () => number } {
+	const real = createTaskHostOps();
+	let checks = 0;
+	return {
+		checks: () => checks,
+		ops: {
+			...real,
+			runCheck(input) {
+				checks += 1;
+				return real.runCheck(input);
+			},
+		},
+	};
+}
+
+async function closeLane(
+	h: LaneHarness,
+	repo: string,
+	over: { title?: string; acceptance?: string[]; risk?: string; file?: string } = {},
+): Promise<{ lane: LaneRow; sha: string }> {
+	const started = await h.manager.start({
+		title: over.title ?? "land",
+		cwd: repo,
+		channel: "D1",
+		acceptance: over.acceptance ?? [CHECK_A],
+		risk: over.risk ?? "L2",
+	});
+	await h.settle();
+	const sha = commitIn(started.cwd, over.file ?? "a.txt");
+	expect(
+		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" }),
+	).toContain("검증 통과");
+	await h.settle();
+	return { lane: requireLane(h, started.name), sha };
+}
+
+function requireLane(h: LaneHarness, name: string): LaneRow {
+	const lane = h.store.getLane(name);
+	if (lane === undefined) throw new Error(`no lane ${name}`);
+	return lane;
+}
+
+const rootTsOf = (lane: LaneRow): string => parseThreadRef(lane.threadRef)?.threadTs ?? "";
+
+/** Everything posted into the lane's thread except its `⏳` status message: the Outcome cards. */
+const cardPosts = (transport: WaitingTransport, lane: LaneRow): Post[] =>
+	transport.posts().filter((post) => post.threadTs === rootTsOf(lane) && post.ts !== lane.meta.statusTs);
+
+/** What a posted message shows now: its last edit, or the post itself. */
+function shownNow(transport: WaitingTransport, ts: string): { text: string; blocks: string } {
+	const edit = transport.calls.findLast((call) => call.method === "updateMessage" && call.ts === ts);
+	const post = transport.posts().find((call) => call.ts === ts);
+	const shown = edit?.method === "updateMessage" ? edit : post;
+	return { text: shown?.text ?? "", blocks: JSON.stringify(shown?.blocks ?? []) };
+}
+
+const mergeId = (lane: LaneRow): string => `ompbot:lane:merge:${lane.name}`;
+const discardId = (lane: LaneRow): string => `ompbot:lane:discard:${lane.name}`;
+const rootUpdates = (transport: WaitingTransport, lane: LaneRow): string[] =>
+	transport.calls.flatMap((call) => (call.method === "updateMessage" && call.ts === rootTsOf(lane) ? [call.text] : []));
+
+describe("landLane: ff merge, push, cleanup (AC-1)", () => {
+	test("a closed ff-able lane: the checked-out base branch moves by `merge --ff-only`, preSha is recorded, the worktree and lane branch are gone, state landed", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		const rec = recordingGit();
+		const h = laneHarness(home.dir, { land: realLander(rec.git) });
+		const { lane, sha } = await closeLane(h, repo);
+		expect(lane.meta.land).toMatchObject({ state: "pending", attempts: 0 });
+		expect(rootUpdates(h.transport, lane).at(-1)).toBe("🔍 land");
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(outcome.handled).toBe(true);
+		const landed = requireLane(h, lane.name);
+		expect(landed.status).toBe("closed");
+		expect(landed.meta.land).toMatchObject({ state: "landed", preSha: before, pushed: `origin/${base}` });
+		expect(rec.count("merge", "--ff-only", sha)).toBe(1);
+		expect(rec.count("update-ref")).toBe(0);
+		// The live checkout followed the merge: HEAD is the claim and the file is in the working tree.
+		expect(headOf(repo)).toBe(sha);
+		expect(baseOf(repo)).toBe(base);
+		expect(existsSync(join(repo, "a.txt"))).toBe(true);
+		expect(git(repo, "status", "--porcelain")).toBe("");
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(false);
+		expect(git(repo, "branch", "--list", lane.meta.branch ?? "")).toBe("");
+		expect(rootUpdates(h.transport, lane).at(-1)).toBe("✅ land");
+		h.close();
+	});
+});
+
+describe("landLane: the live checkout is left alone or refuses (AC-2)", () => {
+	test("another branch is checked out: only the base ref moves by `update-ref`; HEAD, index and working tree are untouched", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		const rec = recordingGit();
+		const h = laneHarness(home.dir, { land: realLander(rec.git) });
+		const { lane, sha } = await closeLane(h, repo);
+		git(repo, "checkout", "-q", "-b", "other");
+		writeFileSync(join(repo, "wip.txt"), "wip\n");
+		const statusBefore = git(repo, "status", "--porcelain");
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "landed", preSha: before });
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(sha);
+		expect(baseOf(repo)).toBe("other");
+		expect(headOf(repo)).toBe(before);
+		expect(git(repo, "status", "--porcelain")).toBe(statusBefore);
+		expect(existsSync(join(repo, "a.txt"))).toBe(false);
+		expect(rec.count("update-ref", `refs/heads/${base}`, sha, before)).toBe(1);
+		expect(rec.count("merge", "--ff-only")).toBe(0);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		h.close();
+	});
+
+	test("the checked-out base branch is dirty: nothing changes, state blocked with the reason, the card keeps its buttons", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		const h = laneHarness(home.dir);
+		const { lane } = await closeLane(h, repo);
+		writeFileSync(join(repo, "README.md"), "edited by somebody\n");
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const blocked = requireLane(h, lane.name);
+		expect(blocked.meta.land?.state).toBe("blocked");
+		expect(blocked.meta.land?.reason).toContain("README.md");
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(before);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		expect(git(repo, "status", "--porcelain")).toContain("README.md");
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		expect(git(repo, "branch", "--list", lane.meta.branch ?? "")).not.toBe("");
+		const card = shownNow(h.transport, blocked.meta.land?.cardTs ?? "");
+		expect(card.text).toContain("README.md");
+		expect(card.blocks).toContain(mergeId(lane));
+		expect(card.blocks).toContain(discardId(lane));
+
+		// The owner cleans the checkout and asks again: a blocked lane lands.
+		git(repo, "checkout", "-q", "--", "README.md");
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+});
+
+describe("landLane: the base branch moved ahead (AC-3)", () => {
+	test("not ff-able: base and remote unchanged, closed → working with a rebase steer; the re-claim runs the checks again; the second refusal is blocked", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const ops = countingOps();
+		const h = laneHarness(home.dir, { hostOps: ops.ops });
+		const { lane } = await closeLane(h, repo);
+		expect(ops.checks()).toBe(1);
+		const ahead = commitIn(repo, "elsewhere.txt");
+		const remoteBefore = headOf(bare, `refs/heads/${base}`);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const working = requireLane(h, lane.name);
+		expect(working.status).toBe("working");
+		expect(working.meta.land).toMatchObject({ attempts: 1 });
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(remoteBefore);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		const steers = h.steers(lane.originKey);
+		expect(steers).toHaveLength(1);
+		expect(steers[0]).toContain("rebase");
+		expect(steers[0]).toContain(base);
+		expect(steers[0]).toContain("ompbot_claim_done");
+		expect(rootUpdates(h.transport, lane).at(-1)).toBe("🔄 land");
+
+		// The lane rebases and claims again: the claim goes through the checks once more.
+		git(lane.cwd, "rebase", "-q", base);
+		expect(
+			await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "HEAD", summary: "rebase 후 a.txt" }),
+		).toContain("검증 통과");
+		await h.settle();
+		expect(ops.checks()).toBe(2);
+		const reclaimed = requireLane(h, lane.name);
+		expect(reclaimed.status).toBe("closed");
+		expect(reclaimed.meta.land).toMatchObject({ state: "pending", attempts: 1 });
+
+		// The base moved again before this landing: the second refusal goes to the owner instead of the lane.
+		const aheadAgain = commitIn(repo, "elsewhere-2.txt");
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const blocked = requireLane(h, lane.name);
+		expect(blocked.status).toBe("closed");
+		expect(blocked.meta.land).toMatchObject({ state: "blocked", attempts: 2 });
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(aheadAgain);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(remoteBefore);
+		expect(h.steers(lane.originKey)).toHaveLength(1);
+		h.close();
+	});
+
+	test("after one rebase the lane lands", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane } = await closeLane(h, repo);
+		commitIn(repo, "elsewhere.txt");
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		git(lane.cwd, "rebase", "-q", base);
+		const rebased = headOf(lane.cwd);
+		await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "HEAD", summary: "rebase 후 a.txt" });
+		await h.settle();
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		expect(headOf(repo)).toBe(rebased);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(rebased);
+		h.close();
+	});
+});
+
+describe("landLane: push policy, refusal, serial landings, resume (AC-4)", () => {
+	test("an auto-merge in taskAutoLand.repos pushes; the same lane outside repos is not merged and not pushed", async () => {
+		const inside = repoWithOrigin();
+		const outside = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [inside.repo], maxRisk: "L2" }),
+		});
+		const a = await closeLane(h, inside.repo, { title: "inside" });
+		expect(requireLane(h, a.lane.name).meta.land?.state).toBe("landed");
+		expect(headOf(inside.bare, `refs/heads/${inside.base}`)).toBe(a.sha);
+		expect(counted.calls).toHaveLength(1);
+		expect(counted.calls[0]?.push).toBe(true);
+
+		const before = headOf(outside.bare, `refs/heads/${outside.base}`);
+		const b = await closeLane(h, outside.repo, { title: "outside" });
+		expect(requireLane(h, b.lane.name).meta.land?.state).toBe("pending");
+		expect(counted.calls).toHaveLength(1);
+		expect(headOf(outside.repo, `refs/heads/${outside.base}`)).toBe(before);
+		expect(headOf(outside.bare, `refs/heads/${outside.base}`)).toBe(before);
+		h.close();
+	});
+
+	test("an owner-requested landing outside repos pushes once and the card names origin/<baseBranch>", async () => {
+		const elsewhere = makeRepo(repos);
+		const { repo, bare, base } = repoWithOrigin();
+		const rec = recordingGit();
+		const h = laneHarness(home.dir, {
+			land: realLander(rec.git),
+			autoLandPolicy: () => ({ repos: [elsewhere], maxRisk: "L2" }),
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("pending");
+		expect(rec.count("push")).toBe(0);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const landed = requireLane(h, lane.name);
+		expect(landed.meta.land).toMatchObject({ state: "landed", pushed: `origin/${base}` });
+		expect(rec.count("push")).toBe(1);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		expect(shownNow(h.transport, landed.meta.land?.cardTs ?? "").text).toContain(`origin/${base}`);
+		h.close();
+	});
+
+	test("a refused push: merged locally, state merged-not-pushed with the reason, the remote unchanged", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		// Somebody else pushed to origin meanwhile: this push is not a fast-forward there.
+		const other = tempDir("ompbot-lane-land-clone-");
+		git(other, "clone", "-q", bare, ".");
+		const theirs = commitIn(other, "theirs.txt");
+		git(other, "push", "-q", "origin", `HEAD:refs/heads/${base}`);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const after = requireLane(h, lane.name);
+		expect(after.meta.land?.state).toBe("merged-not-pushed");
+		expect(after.meta.land?.reason).toBeTruthy();
+		expect(headOf(repo)).toBe(sha);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(theirs);
+		const cards = cardPosts(h.transport, lane);
+		const last = shownNow(h.transport, cards.at(-1)?.ts ?? "");
+		expect(last.text).toContain("push");
+		expect(last.blocks).not.toContain(mergeId(lane));
+		h.close();
+	});
+
+	test("commits made on the lane branch after the claim: nothing is merged or removed, state blocked", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		const worktree = lane.meta.worktree ?? "";
+		const late = commitIn(worktree, "late.txt");
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const after = requireLane(h, lane.name);
+		expect(after.meta.land?.state).toBe("blocked");
+		expect(after.meta.land?.reason).toContain(sha.slice(0, 12));
+		expect(after.meta.land?.reason).toContain(`${base}는 바뀌지 않았습니다`);
+		expect(headOf(repo)).toBe(before);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		// The later commit is still there: the cleanup never ran.
+		expect(headOf(worktree)).toBe(late);
+		expect(headOf(repo, `refs/heads/${lane.meta.branch}`)).toBe(late);
+		h.close();
+	});
+
+	test("an auto-merge whose push is refused tells it on a new card; the first card points to it", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const other = tempDir("ompbot-lane-land-clone-");
+		git(other, "clone", "-q", bare, ".");
+		const theirs = commitIn(other, "theirs.txt");
+		git(other, "push", "-q", "origin", `HEAD:refs/heads/${base}`);
+		const h = laneHarness(home.dir, {
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			ownerUserId: "U_OWNER",
+		});
+		const { lane, sha } = await closeLane(h, repo);
+
+		const after = requireLane(h, lane.name);
+		expect(after.meta.land?.state).toBe("merged-not-pushed");
+		expect(headOf(repo)).toBe(sha);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(theirs);
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(2);
+		expect(after.meta.land?.cardTs).toBe(cards[1]?.ts);
+		expect(cards[1]?.text).toContain("push");
+		expect(cards[1]?.text).toContain("<@U_OWNER>");
+		expect(shownNow(h.transport, cards[0]?.ts ?? "").text).toContain("새 카드");
+		expect(rootUpdates(h.transport, lane).at(-1)).toStartWith("⚠️");
+		h.close();
+	});
+
+	test("a landing that keeps throwing is retried by the tick and blocked at the third throw", async () => {
+		const { repo } = repoWithOrigin();
+		let calls = 0;
+		const land: LandLane = () => {
+			calls += 1;
+			return Promise.reject(new Error("git host unavailable"));
+		};
+		const h = laneHarness(home.dir, { land });
+		const { lane } = await closeLane(h, repo);
+
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(true);
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", requestedBy: "owner", errors: 1 });
+		await h.manager.tick();
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", errors: 2 });
+		await h.manager.tick();
+		await h.settle();
+		const after = requireLane(h, lane.name);
+		expect(calls).toBe(3);
+		expect(after.meta.land?.state).toBe("blocked");
+		expect(after.meta.land?.reason).toContain("3번");
+		expect(after.meta.land?.requestedBy).toBeUndefined();
+		// Blocked is the owner's call again: the tick leaves it alone.
+		await h.manager.tick();
+		await h.settle();
+		expect(calls).toBe(3);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		h.close();
+	});
+
+	test("a tick that listed the lane before it was landed does not land it again", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		let busy = true;
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			laneBusy: () => busy,
+		});
+		const { lane } = await closeLane(h, repo);
+		// What a slow tick still holds: the lane as it waited for its turn to end.
+		const stale = h.store.listLanes();
+		expect(stale.find((row) => row.name === lane.name)?.meta.land).toMatchObject({
+			state: "pending",
+			requestedBy: "auto",
+		});
+		busy = false;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		const posts = cardPosts(h.transport, lane).length;
+
+		h.store.listLanes = () => stale;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(cardPosts(h.transport, lane)).toHaveLength(posts);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+
+	test("two landings on one repository run one after the other", async () => {
+		const { repo, base } = repoWithOrigin();
+		const rec = recordingGit();
+		const h = laneHarness(home.dir, { land: realLander(rec.git, rec.calls) });
+		const a = await closeLane(h, repo, { title: "first", file: "a.txt" });
+		const b = await closeLane(h, repo, { title: "second", acceptance: [NO_CHECK], file: "b.txt" });
+
+		await Promise.all([h.manager.requestLand(a.lane.name, "owner"), h.manager.requestLand(b.lane.name, "owner")]);
+		await h.settle();
+		const mentions = (word: string) => rec.calls.flatMap((args, index) => (args.includes(word) ? [index] : []));
+		const [first, second] = [mentions(a.sha), mentions(b.sha)];
+		expect(first.length).toBeGreaterThan(1);
+		expect(second.length).toBeGreaterThan(0);
+		// The first landing was over (its worktree removal is its last step) before the second made its first call.
+		const cleanup = rec.calls.findIndex((args) => args[0] === "removeWorktree" && args[1] === a.lane.meta.branch);
+		expect(cleanup).toBeGreaterThan(Math.max(...first));
+		expect(cleanup).toBeLessThan(Math.min(...second));
+		expect(requireLane(h, a.lane.name).meta.land?.state).toBe("landed");
+		// The second lane started from the same commit: after the first landed it is no longer ff-able.
+		expect(requireLane(h, b.lane.name).status).toBe("working");
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(a.sha);
+		h.close();
+	});
+
+	test("cut off right after the merge: the next tick finishes without merging or pushing twice (preSha unknown)", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		let fail = true;
+		const rec = recordingGit(async (args, run) => {
+			const result = await run();
+			if (fail && args.includes("merge") && args.includes("--ff-only")) {
+				fail = false;
+				throw new Error("killed after the merge");
+			}
+			return result;
+		});
+		const h = laneHarness(home.dir, { land: realLander(rec.git) });
+		const { lane, sha } = await closeLane(h, repo);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", requestedBy: "owner" });
+		expect(headOf(repo)).toBe(sha);
+		expect(rec.count("push")).toBe(0);
+
+		await h.manager.tick();
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "landed", preSha: "unknown" });
+		expect(rec.count("merge", "--ff-only")).toBe(1);
+		expect(rec.count("push")).toBe(1);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(false);
+		const card = shownNow(h.transport, requireLane(h, lane.name).meta.land?.cardTs ?? "");
+		expect(card.text).toContain("reflog");
+		h.close();
+	});
+
+	test("cut off right after the push: the next tick finishes without a second merge or push", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		let fail = true;
+		const rec = recordingGit(async (args, run) => {
+			const result = await run();
+			if (fail && args.includes("push")) {
+				fail = false;
+				throw new Error("killed after the push");
+			}
+			return result;
+		});
+		const h = laneHarness(home.dir, { land: realLander(rec.git) });
+		const { lane, sha } = await closeLane(h, repo);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("pending");
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+
+		await h.manager.tick();
+		await h.settle();
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "landed", preSha: before });
+		expect(rec.count("merge", "--ff-only")).toBe(1);
+		expect(rec.count("push")).toBe(1);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(false);
+		h.close();
+	});
+});
+
+describe("closed → Outcome card and auto-merge (AC-5)", () => {
+	const reasonTask = (reason: string): string => `자동 머지 안 함: ${reason}`;
+
+	/** A closed lane whose auto-merge was skipped: no landing, one card with the reason line and both buttons. */
+	function expectAsked(h: LaneHarness, lane: LaneRow, calls: LandRequest[], reason: string): void {
+		expect(calls).toHaveLength(0);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("pending");
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.text).toContain("자동 머지 안 함: ");
+		expect(cards[0]?.text).toContain(reason);
+		const blocks = JSON.stringify(cards[0]?.blocks ?? []);
+		expect(blocks).toContain(mergeId(lane));
+		expect(blocks).toContain(discardId(lane));
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+	}
+
+	test("no blockers: landLane runs exactly once and one card without buttons goes up", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		expect(counted.calls).toHaveLength(1);
+		expect(counted.calls[0]).toMatchObject({ repo, baseBranch: base, sha, push: true });
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "landed", requestedBy: "auto" });
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.text).toContain("자동 머지");
+		expect(JSON.stringify(cards[0]?.blocks ?? [])).not.toContain("ompbot:lane:");
+		const shown = shownNow(h.transport, cards[0]?.ts ?? "");
+		expect(shown.blocks).not.toContain("ompbot:lane:");
+		expect(shown.text).toContain(`origin/${base}`);
+		// A later tick neither lands nor posts again.
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(cardPosts(h.transport, lane)).toHaveLength(1);
+		h.close();
+	});
+
+	test("the lane's own turn is still running at the close: the card goes up, the landing waits for the turn to end", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		let busy = true;
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			laneBusy: () => busy,
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		// Nothing removes the worktree under the turn that is writing the closing report.
+		expect(counted.calls).toHaveLength(0);
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", requestedBy: "auto" });
+		expect(cardPosts(h.transport, lane)).toHaveLength(1);
+		expect(cardPosts(h.transport, lane)[0]?.text).toContain("자동 머지");
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		expect((await h.manager.discard(lane.name)).handled).toBe(false);
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(0);
+
+		busy = false;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		expect(cardPosts(h.transport, lane)).toHaveLength(1);
+		h.close();
+	});
+
+	test("`멈춰` while the auto-merge waits for the lane's turn: the tick after the turn lands nothing, the card asks again", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		let busy = true;
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			laneBusy: () => busy,
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", requestedBy: "auto" });
+		const before = headOf(bare, `refs/heads/${base}`);
+
+		const outcome = await h.manager.pause(lane.name, "owner-message");
+		await h.settle();
+		expect(outcome.text).toContain("자동 머지");
+		busy = false;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(0);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		const held = requireLane(h, lane.name);
+		expect(held.meta.land).toMatchObject({ state: "pending", autoLandHeld: "오너 멈춤" });
+		expect(held.meta.land?.requestedBy).toBeUndefined();
+		// The card offers the buttons again, and the owner's own merge still lands.
+		const shown = shownNow(h.transport, held.meta.land?.cardTs ?? "");
+		expect(shown.blocks).toContain(mergeId(lane));
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(true);
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		h.close();
+	});
+
+	test("`멈춰` while the auto-merge card is going up: nothing lands and the card asks instead", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+		});
+		// The owner's pause arrives exactly while the "auto-merge" card is being posted.
+		const post = h.transport.postMessage.bind(h.transport);
+		let pausedDuringPost = false;
+		h.transport.postMessage = async (args) => {
+			if (!pausedDuringPost && args.text.includes("자동 머지")) {
+				pausedDuringPost = true;
+				const name = h.store.listLanes()[0]?.name ?? "";
+				expect((await h.manager.pause(name, "owner-message")).handled).toBe(true);
+			}
+			return post(args);
+		};
+		const before = headOf(bare, `refs/heads/${base}`);
+		const { lane } = await closeLane(h, repo);
+		await h.manager.tick();
+		await h.settle();
+		expect(pausedDuringPost).toBe(true);
+		expect(counted.calls).toHaveLength(0);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		const held = requireLane(h, lane.name);
+		expect(held.meta.land).toMatchObject({ state: "pending", autoLandHeld: "오너 멈춤" });
+		expect(held.meta.land?.requestedBy).toBeUndefined();
+		const shown = shownNow(h.transport, held.meta.land?.cardTs ?? "");
+		expect(shown.blocks).toContain(mergeId(lane));
+		expect(shown.text).toContain("오너 멈춤");
+		h.close();
+	});
+
+	test("the owner's request while the lane's turn still runs: accepted, landed by the tick after the turn", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		let busy = true;
+		const h = laneHarness(home.dir, { land: counted.land, laneBusy: () => busy });
+		const { lane } = await closeLane(h, repo);
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		expect(outcome.handled).toBe(true);
+		expect(outcome.text).toContain("끝나는 대로");
+		expect(counted.calls).toHaveLength(0);
+		const queued = shownNow(h.transport, requireLane(h, lane.name).meta.land?.cardTs ?? "");
+		expect(queued.text).toContain("머지 중");
+		expect(queued.blocks).not.toContain("ompbot:lane:");
+		// A second request while it waits changes nothing.
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(true);
+		busy = false;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+
+	test("no taskAutoLand at all: a card with both buttons and no auto-merge line", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land });
+		const { lane } = await closeLane(h, repo);
+		expect(counted.calls).toHaveLength(0);
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.text).not.toContain("자동 머지 안 함");
+		expect(JSON.stringify(cards[0]?.blocks ?? [])).toContain(mergeId(lane));
+		expect(JSON.stringify(cards[0]?.blocks ?? [])).toContain(discardId(lane));
+		h.close();
+	});
+
+	test("outside repos: asked", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [makeRepo(repos)], maxRisk: "L2" }),
+		});
+		const { lane } = await closeLane(h, repo);
+		expectAsked(h, lane, counted.calls, "taskAutoLand.repos 밖");
+		h.close();
+	});
+
+	test("risk above maxRisk: asked", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }) });
+		const { lane } = await closeLane(h, repo, { risk: "L3" });
+		expectAsked(h, lane, counted.calls, "위험 L3 > L2");
+		h.close();
+	});
+
+	test("no re-run check: asked", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }) });
+		const { lane } = await closeLane(h, repo, { acceptance: [NO_CHECK] });
+		expectAsked(h, lane, counted.calls, "재실행 검사 없음");
+		h.close();
+	});
+
+	test("closed through an owner-approved integrity refusal: asked", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const refusal: IntegrityRefusal = {
+			category: "unfinished_work_marker",
+			excerpt: "a.txt: 나중에",
+			remedy: "끝내세요",
+		};
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			integrity: () => [refusal],
+			approvals: { request: async () => "approved" },
+		});
+		const { lane } = await closeLane(h, repo);
+		expect(requireLane(h, lane.name).meta.land?.autoLandHeld).toBe("무결성 승인");
+		expectAsked(h, lane, counted.calls, "무결성 승인");
+		h.close();
+	});
+
+	test("frozen: asked, and the owner's request still lands while frozen (AC-6)", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		let frozen = false;
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			frozen: () => (frozen ? { since: "2027-01-15T00:00:00.000Z", reason: "", by: "test" } : undefined),
+		});
+		const started = await h.manager.start({
+			title: "land",
+			cwd: repo,
+			channel: "D1",
+			acceptance: [CHECK_A],
+			risk: "L2",
+		});
+		await h.settle();
+		commitIn(started.cwd, "a.txt");
+		frozen = true;
+		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" });
+		await h.settle();
+		const lane = requireLane(h, started.name);
+		expect(lane.status).toBe("closed");
+		expectAsked(h, lane, counted.calls, "동결 중");
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+
+	test("a failed re-run check on record: asked (the card is posted by the tick after a failed first post)", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }) });
+		const started = await h.manager.start({
+			title: "land",
+			cwd: repo,
+			channel: "D1",
+			acceptance: [CHECK_A],
+			risk: "L2",
+		});
+		await h.settle();
+		const sha = commitIn(started.cwd, "a.txt");
+		// The auto-merge card cannot be posted: nothing lands on an announcement the owner never saw.
+		h.transport.failNext.postMessage = [new SlackCallError("definitive", "slack_platform_error:channel_not_found")];
+		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" });
+		await h.settle();
+		expect(counted.calls).toHaveLength(0);
+		expect(requireLane(h, started.name).meta.land).toEqual({ state: "pending", attempts: 0 });
+		h.store.patchLane(started.name, undefined, {
+			checks: { head: sha, results: [{ id: "AC-1", signal: 'command ["false"]', ok: false, detail: "exit 1" }] },
+		});
+
+		await h.manager.tick();
+		await h.settle();
+		// The fake transport records the failed post too: the card is the one the lane row points to.
+		const lane = requireLane(h, started.name);
+		expect(counted.calls).toHaveLength(0);
+		expect(lane.meta.land).toMatchObject({ state: "pending", attempts: 0 });
+		const card = shownNow(h.transport, lane.meta.land?.cardTs ?? "");
+		expect(card.text).toContain("자동 머지 안 함: 재실행 검사 실패 1/1");
+		expect(card.blocks).toContain(mergeId(lane));
+		expect(card.blocks).toContain(discardId(lane));
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		h.close();
+	});
+
+	test("laneLandBlockers names every reason; [] only when none applies", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		const policy = { repos: [repo], maxRisk: "L2" as const };
+		expect(laneLandBlockers(lane, policy, true, false)).toEqual([]);
+		expect(laneLandBlockers(lane, policy, false, false)).toEqual(["저장소가 taskAutoLand.repos 밖"]);
+		expect(laneLandBlockers(lane, { ...policy, maxRisk: "L1" }, true, false)).toEqual(["위험 L2 > L1"]);
+		expect(laneLandBlockers(lane, policy, true, true)).toEqual(["동결 중"]);
+		const noChecks = { ...lane, meta: { ...lane.meta, checks: undefined } };
+		expect(laneLandBlockers(noChecks, policy, true, false)).toEqual(["재실행 검사 없음"]);
+		// Checks of another commit prove nothing about the claim.
+		const stale = { ...lane, meta: { ...lane.meta, checks: { head: "0".repeat(40), results: [] } } };
+		expect(laneLandBlockers(stale, policy, true, false)).toEqual(["재실행 검사 없음"]);
+		const failed = {
+			...lane,
+			meta: {
+				...lane.meta,
+				checks: { head: sha, results: [{ id: "AC-1", signal: "s", ok: false, detail: "exit 1" }] },
+			},
+		};
+		expect(laneLandBlockers(failed, policy, true, false)).toEqual(["재실행 검사 실패 1/1"]);
+		const held = {
+			...lane,
+			meta: { ...lane.meta, land: { state: "pending" as const, attempts: 0, autoLandHeld: "무결성 승인" } },
+		};
+		expect(laneLandBlockers(held, policy, true, false)).toEqual(["무결성 승인으로 통과"]);
+		const all = laneLandBlockers({ ...failed, meta: { ...failed.meta, risk: "L4" } }, policy, false, true);
+		expect(all).toEqual(["저장소가 taskAutoLand.repos 밖", "위험 L4 > L2", "재실행 검사 실패 1/1", "동결 중"]);
+
+		const card = buildLaneOutcomeCard(lane, { kind: "ask", ownerUserId: OWNER, skipped: all });
+		expect(card.text).toContain(reasonTask(all.join(" · ")));
+		expect(card.buttons?.map((button) => button.actionId)).toEqual([mergeId(lane), discardId(lane)]);
+		expect(card.buttons?.map((button) => button.label)).toEqual(["머지", "폐기"]);
+		h.close();
+	});
+});
+
+describe("merge and discard by the owner (AC-6)", () => {
+	test("`머지해`·`폐기해` count only as the whole message and only while the landing is pending or blocked", () => {
+		expect(classifyClosedLaneMessage("머지해", "pending")).toBe("land");
+		expect(classifyClosedLaneMessage("  머지해\n", "blocked")).toBe("land");
+		expect(classifyClosedLaneMessage("폐기해", "pending")).toBe("discard");
+		expect(classifyClosedLaneMessage("폐기해", "blocked")).toBe("discard");
+		for (const state of ["landed", "merged-not-pushed", "discarded", undefined] as const) {
+			expect(classifyClosedLaneMessage("머지해", state)).toBe("question");
+			expect(classifyClosedLaneMessage("폐기해", state)).toBe("question");
+		}
+		expect(classifyClosedLaneMessage("머지해 줘 제발", "pending")).toBe("question");
+		expect(classifyClosedLaneMessage("머지해야 하나?", "pending")).toBe("question");
+		expect(classifyClosedLaneMessage("머지해.", "pending")).toBe("question");
+		expect(classifyClosedLaneMessage("이거 왜 이렇게 했어?", "pending")).toBe("question");
+		expect(classifyClosedLaneMessage("!reopen 고쳐", "pending")).toBe("reopen");
+		expect(classifyClosedLaneMessage("!queue", "pending")).toBe("control");
+	});
+
+	test("discard removes the worktree and the branch: state discarded, nothing merged", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const before = headOf(repo);
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land });
+		const { lane, sha } = await closeLane(h, repo);
+
+		const outcome = await h.manager.discard(lane.name);
+		await h.settle();
+		expect(outcome.handled).toBe(true);
+		const discarded = requireLane(h, lane.name);
+		expect(discarded.status).toBe("closed");
+		expect(discarded.meta.land?.state).toBe("discarded");
+		expect(discarded.meta.sha).toBe(sha);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(false);
+		expect(git(repo, "branch", "--list", lane.meta.branch ?? "")).toBe("");
+		expect(headOf(repo)).toBe(before);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		expect(counted.calls).toHaveLength(0);
+		expect(shownNow(h.transport, discarded.meta.land?.cardTs ?? "").blocks).not.toContain("ompbot:lane:");
+		// Nothing is left to merge or discard.
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(false);
+		expect((await h.manager.discard(lane.name)).handled).toBe(false);
+		expect(counted.calls).toHaveLength(0);
+		h.close();
+	});
+
+	test("requests for one lane at the same time, and after it landed: landLane runs once", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land });
+		const { lane } = await closeLane(h, repo);
+		const both = await Promise.all([
+			h.manager.requestLand(lane.name, "owner"),
+			h.manager.requestLand(lane.name, "owner"),
+		]);
+		await h.settle();
+		expect(both.map((outcome) => outcome.handled).sort()).toEqual([false, true]);
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(false);
+		expect(counted.calls).toHaveLength(1);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+
+	test("a working lane takes neither a merge nor a discard", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, { land: counted.land });
+		const lane = await h.manager.start({ title: "land", cwd: repo, channel: "D1" });
+		await h.settle();
+		expect((await h.manager.requestLand(lane.name, "owner")).handled).toBe(false);
+		expect((await h.manager.discard(lane.name)).handled).toBe(false);
+		expect(counted.calls).toHaveLength(0);
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		h.close();
+	});
+
+	describe("through the daemon: thread messages and card buttons", () => {
+		let transport: WaitingTransport;
+		let drivers: Map<string, FakeOmpDriver>;
+		let counted: { land: LandLane; calls: LandRequest[] };
+		let logs: string[];
+
+		beforeEach(() => {
+			transport = new WaitingTransport();
+			drivers = new Map();
+			counted = countingLand();
+			logs = [];
+		});
+
+		/** A daemon with one closed lane `ask` waiting for the owner's merge decision. */
+		async function pendingLane(): Promise<{
+			daemon: Daemon;
+			repo: string;
+			bare: string;
+			base: string;
+			rootTs: string;
+			cardTs: string;
+			sha: string;
+		}> {
+			const { repo, bare, base } = repoWithOrigin();
+			const sessions = new FakeSessionStore();
+			const clock = { now: () => Date.now() };
+			const daemon = new Daemon({
+				config: home.config,
+				channels: [new SlackBinding(new SlackChannel(transport))],
+				log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
+				ompVersion: "omp-test 0",
+				bootId: "boot",
+				landLane: counted.land,
+				driverFactory: (origin, sessionDir) => {
+					const driver = new FakeOmpDriver({ sessionDir, store: sessions });
+					drivers.set(origin, driver);
+					return driver;
+				},
+			});
+			daemons.push(daemon);
+			await daemon.start();
+			await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: ask @${repo}` });
+			await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
+			const rootTs = transport.posts((text) => text === "🔄 ask")[0]?.ts ?? "";
+			const claim = daemon.hostToolsFor("ompbot/work/ask").find((tool) => tool.name === "ompbot_claim_done");
+			const worktree = daemon.store.getLane("ask")?.cwd ?? "";
+			const sha = commitIn(worktree, "a.txt");
+			const signal = new AbortController().signal;
+			expect(await claim?.execute({ repo: worktree, commit: "HEAD", summary: "a.txt 추가" }, { signal })).toContain(
+				"검증 통과",
+			);
+			await transport.waitForPosts((text) => text.startsWith("🔍 머지 대기"));
+			const cardTs = transport.posts((text) => text.startsWith("🔍 머지 대기"))[0]?.ts ?? "";
+			expect(daemon.store.getLane("ask")?.meta.land?.state).toBe("pending");
+			return { daemon, repo, bare, base, rootTs, cardTs, sha };
+		}
+
+		const send = (text: string, ts: string, rootTs: string) =>
+			transport.emitMessage({
+				type: "message",
+				channel: "D1",
+				channel_type: "im",
+				user: OWNER,
+				text,
+				ts,
+				thread_ts: rootTs,
+			});
+		const click = (actionId: string, cardTs: string) =>
+			transport.emitBlockAction({
+				user: { id: OWNER },
+				channel: { id: "D1" },
+				message: { ts: cardTs },
+				actions: [{ action_id: actionId, value: "ask" }],
+			});
+		const lanePrompts = () => drivers.get("ompbot/work/ask")?.calls.filter((call) => call.startsWith("prompt:")) ?? [];
+		const landState = (daemon: Daemon) => daemon.store.getLane("ask")?.meta.land?.state;
+
+		test("`머지해` (the whole message) lands the lane without reaching omp; a later `머지해` is an ordinary question", async () => {
+			const { daemon, bare, base, rootTs, sha } = await pendingLane();
+			await send("머지해", "1900000000.000100", rootTs);
+			await transport.waitForPosts((text) => text.includes("머지했습니다"));
+			expect(counted.calls).toHaveLength(1);
+			expect(landState(daemon)).toBe("landed");
+			expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+			expect(transport.posts((text) => text.includes("머지했습니다"))[0]?.text).toContain(`origin/${base}`);
+			expect(lanePrompts().some((call) => call.includes("머지해"))).toBe(false);
+			expect(daemon.store.getInbound("D1:1900000000.000100")).toMatchObject({
+				originKey: "ompbot/work/ask",
+				state: "answered",
+			});
+
+			await send("머지해", "1900000000.000200", rootTs);
+			await transport.waitForPosts((text) => text.startsWith("ECHO") && text.includes("머지해"));
+			expect(counted.calls).toHaveLength(1);
+			expect(landState(daemon)).toBe("landed");
+		});
+
+		test("after the landing the lane session works from the repository, and `!reopen` is refused by the core", async () => {
+			const { daemon, repo, rootTs } = await pendingLane();
+			const worktree = daemon.store.getLane("ask")?.cwd ?? "";
+			expect(daemon.cwdFor("ompbot/work/ask")).toBe(worktree);
+			await send("머지해", "1900000000.000100", rootTs);
+			await transport.waitForPosts((text) => text.includes("머지했습니다"));
+			expect(existsSync(worktree)).toBe(false);
+			expect(daemon.cwdFor("ompbot/work/ask")).toBe(repo);
+
+			await send("!reopen 하나만 더", "1900000000.000200", rootTs);
+			await transport.waitForPosts((text) => text.includes("worktree가 없습니다"));
+			const lane = daemon.store.getLane("ask");
+			expect(lane?.status).toBe("closed");
+			expect(lane?.meta.land?.state).toBe("landed");
+			expect(lane?.history.map((entry) => entry.event)).not.toContain("reopened");
+			expect(lanePrompts().some((call) => call.includes("!reopen"))).toBe(false);
+		});
+
+		test("`!reopen` while the merge is still waiting reopens the lane and drops the landing", async () => {
+			const { daemon, rootTs, cardTs } = await pendingLane();
+			await send("!reopen 하나만 더", "1900000000.000200", rootTs);
+			await transport.waitForPosts((text) => text === "ECHO !reopen 하나만 더");
+			const lane = daemon.store.getLane("ask");
+			expect(lane?.status).toBe("working");
+			expect(lane?.meta.land).toBeUndefined();
+			expect(existsSync(lane?.meta.worktree ?? "")).toBe(true);
+			// The stale card's button no longer lands anything.
+			await click("ompbot:lane:merge:ask", cardTs);
+			expect(counted.calls).toHaveLength(0);
+			expect(daemon.store.getLane("ask")?.status).toBe("working");
+		});
+
+		test("`머지해 줘 제발`, `머지해야 하나?` and a plain question are answered by the lane session; nothing lands", async () => {
+			const { daemon, rootTs } = await pendingLane();
+			for (const [index, text] of ["머지해 줘 제발", "머지해야 하나?", "이거 왜 이렇게 했어?"].entries()) {
+				await send(text, `1900000000.00030${index}`, rootTs);
+				await transport.waitForPosts((post) => post.startsWith("ECHO") && post.includes(text));
+				expect(lanePrompts().at(-1)).toContain(text);
+			}
+			expect(counted.calls).toHaveLength(0);
+			expect(landState(daemon)).toBe("pending");
+			expect(daemon.store.getLane("ask")?.status).toBe("closed");
+			expect(daemon.store.getLane("ask")?.history.at(-1)?.event).toBe("owner_question");
+		});
+
+		test("the `머지` button lands once however often it is clicked, and the card loses its buttons", async () => {
+			const { daemon, bare, base, cardTs, sha } = await pendingLane();
+			expect(JSON.stringify(transport.posts().find((post) => post.ts === cardTs)?.blocks)).toContain(
+				"ompbot:lane:merge:ask",
+			);
+			await Promise.all([click("ompbot:lane:merge:ask", cardTs), click("ompbot:lane:merge:ask", cardTs)]);
+			await click("ompbot:lane:merge:ask", cardTs);
+			expect(counted.calls).toHaveLength(1);
+			expect(landState(daemon)).toBe("landed");
+			expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+			const shown = shownNow(transport, cardTs);
+			expect(shown.blocks).not.toContain("ompbot:lane:");
+			expect(shown.text).toContain(`origin/${base}`);
+			expect(logs.some((line) => line.includes("event=action_ignored"))).toBe(false);
+		});
+
+		test("the `폐기` button discards: worktree and branch gone, nothing merged", async () => {
+			const { daemon, repo, cardTs } = await pendingLane();
+			const lane = daemon.store.getLane("ask");
+			const before = headOf(repo);
+			await click("ompbot:lane:discard:ask", cardTs);
+			expect(landState(daemon)).toBe("discarded");
+			expect(existsSync(lane?.meta.worktree ?? "")).toBe(false);
+			expect(git(repo, "branch", "--list", lane?.meta.branch ?? "")).toBe("");
+			expect(headOf(repo)).toBe(before);
+			expect(counted.calls).toHaveLength(0);
+			expect(shownNow(transport, cardTs).blocks).not.toContain("ompbot:lane:");
+			// A merge click on the discarded lane lands nothing, and the owner is told why in the lane's thread.
+			await click("ompbot:lane:merge:ask", cardTs);
+			expect(counted.calls).toHaveLength(0);
+			expect(transport.posts().some((post) => post.text.startsWith("⚠️ 머지할 상태가 아닙니다"))).toBe(true);
+		});
+
+		test("`폐기해` (the whole message) discards without reaching omp", async () => {
+			const { daemon, repo, rootTs } = await pendingLane();
+			const lane = daemon.store.getLane("ask");
+			await send("폐기해", "1900000000.000400", rootTs);
+			await transport.waitForPosts((text) => text.includes("폐기했습니다"));
+			expect(landState(daemon)).toBe("discarded");
+			expect(existsSync(lane?.meta.worktree ?? "")).toBe(false);
+			expect(git(repo, "branch", "--list", lane?.meta.branch ?? "")).toBe("");
+			expect(counted.calls).toHaveLength(0);
+			expect(lanePrompts().some((call) => call.includes("폐기해"))).toBe(false);
+		});
+
+		test("a button of a lane that does not exist is settled on the card, not ignored silently", async () => {
+			const { cardTs } = await pendingLane();
+			await click("ompbot:lane:merge:nope", cardTs);
+			expect(counted.calls).toHaveLength(0);
+			expect(shownNow(transport, cardTs).text).toContain("찾을 수 없");
+		});
+	});
+});

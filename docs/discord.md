@@ -1,0 +1,131 @@
+# Discord 봇 만들기
+
+ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. 슬래시 명령은 Portal에서 만들지 않습니다. ompbot이 기동할 때 스스로 등록합니다(초대 URL에 `applications.commands`를 넣는 이유입니다).
+
+진행 상태: 대화 연결(DM·서버 채널·스레드, `!`·슬래시 명령, 👀·진행 표시, 2000자 분할, `!shutup` 뮤트, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부·👍/👎 피드백, 재시작 중 놓친 메시지 복구, `doctor` 점검)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다.
+
+## 요약 (이것만 맞으면 됩니다)
+
+| 항목 | 값 |
+|---|---|
+| Application | 새로 하나 (이름 자유, 예: `ompbot`) |
+| Installation → Install Link | **None** (Public Bot을 끄기 전에 먼저) |
+| Installation → Installation Contexts | Guild Install만 (User Install 끔) |
+| Bot → Public Bot | 끔 |
+| Bot → Requires OAuth2 Code Grant | 끔 |
+| Privileged Gateway Intents | **Message Content Intent만 켬** (Presence·Server Members는 끔) |
+| OAuth2 scope | `bot`, `applications.commands` |
+| 봇 권한(정수) | `309237763136` |
+| 토큰 파일 | `~/.ompbot/secrets/discord-bot-token` (0600) |
+
+권한 정수 `309237763136`은 아래 8개의 합입니다: View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Add Reactions, Embed Links, Attach Files. 관리자 권한이나 메시지 삭제·멤버 관리 권한은 넣지 않습니다.
+
+## 1. Application과 봇 만들기
+
+1. https://discord.com/developers/applications 에 오너 계정으로 로그인하고 **New Application**을 누릅니다. 이름을 넣고 약관에 동의합니다.
+2. **General Information**에서 **Application ID**를 복사해 둡니다(18~19자리 숫자). 5절의 `applicationId`와 3절의 초대 URL에 씁니다. 원하면 여기서 앱 아이콘도 바꿉니다.
+3. 왼쪽 **Installation** 탭에서 먼저 정리합니다. 이걸 안 하면 다음 단계에서 Public Bot을 끌 때 "비공개 애플리케이션은 기본 승인 링크를 가질 수 없어요"(Private application cannot have a default authorization link) 오류가 나고 저장되지 않습니다.
+   - **Install Link**를 `Discord Provided Link`에서 **None**으로 바꿉니다. 초대는 3절의 URL로 하므로 기본 링크가 필요 없습니다.
+   - **Installation Contexts**에서 **User Install**을 끄고 **Guild Install**만 둡니다.
+   - **Save Changes**를 누릅니다.
+4. 왼쪽 **Bot** 탭으로 갑니다.
+   - **Public Bot**을 끕니다. 오너만 이 봇을 서버에 넣을 수 있게 됩니다.
+   - **Requires OAuth2 Code Grant**는 끈 채로 둡니다.
+   - **Privileged Gateway Intents**에서 **Message Content Intent**를 켜고 **Save Changes**를 누릅니다. 이걸 끄면 서버 채널에서 멘션 없는 글(스레드 안 답장 등)의 본문을 받지 못하고, ompbot이 이 인텐트를 요청하므로 Gateway가 닫힘 코드 4014로 연결을 끊습니다. 서버 100개 미만의 봇은 심사 없이 켤 수 있습니다.
+   - **Presence Intent**, **Server Members Intent**는 켜지 않습니다(쓰지 않습니다).
+   - Username과 아이콘은 여기서 바꿉니다. 메시지 위에 보이는 봇 이름이 됩니다.
+
+## 2. 봇 토큰을 파일로
+
+토큰은 한 번만 보입니다. 채팅·메모·셸 기록에 붙여넣지 말고 바로 파일에 넣습니다.
+
+1. **Bot** 탭에서 **Reset Token**을 누르고(2단계 인증이 켜져 있으면 코드 입력) 나온 토큰을 복사합니다.
+2. ompbot이 도는 서버의 터미널에서:
+
+```sh
+umask 077
+cat > ~/.ompbot/secrets/discord-bot-token
+```
+
+3. 토큰을 붙여넣고 Enter, 이어서 Ctrl-D를 누릅니다.
+4. 권한을 확인합니다. `-rw-------`이어야 합니다.
+
+```sh
+ls -l ~/.ompbot/secrets/discord-bot-token
+```
+
+토큰이 노출됐다고 생각되면 Portal에서 **Reset Token**으로 새로 받아 같은 파일을 덮어쓰고 데몬을 재시작합니다. 이전 토큰은 즉시 무효가 됩니다.
+
+## 3. 서버에 초대하기
+
+봇과 DM을 하려면 오너와 봇이 같은 서버에 있어야 합니다. 그래서 DM만 쓸 때도 서버 하나에 넣습니다. 오너 혼자 있는 서버를 하나 만들어 쓰는 것을 권합니다(Discord 왼쪽 **+** → 직접 만들기 → 나와 친구들을 위한 서버).
+
+아래 URL에서 `<APP_ID>`를 1절의 Application ID로 바꿔 브라우저에서 엽니다.
+
+```
+https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.commands&permissions=309237763136
+```
+
+서버를 고르고 권한 8개가 보이면 **승인**합니다. Portal의 **OAuth2 → URL Generator**에서 scope `bot`·`applications.commands`와 위 8개 권한을 체크해도 같은 URL이 만들어집니다.
+
+## 4. 오너 ID와 서버 ID
+
+1. Discord 앱 **사용자 설정 → 고급 → 개발자 모드**를 켭니다.
+2. 내 프로필(이름)을 우클릭(휴대폰은 길게 누름) → **사용자 ID 복사**. 5절의 `ownerUserId`입니다. 이 사용자의 글만 명령으로 받습니다.
+3. 서버 아이콘 우클릭 → **서버 ID 복사**. 5절의 `guildIds`에 넣으면 그 서버의 글만 받습니다(선택).
+4. 멘션 없이 모든 글에 답할 채널이 있으면 채널 우클릭 → **채널 ID 복사**로 `mentionFreeChannels`에 넣습니다(선택).
+
+## 5. ompbot 설정 (`channels.discord`)
+
+`~/.ompbot/config.json`에 넣습니다. Slack 설정은 그대로 둡니다(Slack은 계속 필수입니다).
+
+```json
+{
+  "channels": {
+    "slack": { "ownerUserId": "U…" },
+    "discord": {
+      "ownerUserId": "<4절의 사용자 ID>",
+      "botTokenFile": "secrets/discord-bot-token",
+      "applicationId": "<1절의 Application ID>",
+      "guildIds": ["<4절의 서버 ID>"],
+      "mentionFreeChannels": [],
+      "requireMention": false
+    }
+  }
+}
+```
+
+- `botTokenFile`은 ompbot 홈(`~/.ompbot`) 기준 상대경로입니다. 파일이 없으면 `secret_missing`, 권한이 0600이 아니면 `secret_permissions`로 기동하지 않습니다.
+- `guildIds`·`mentionFreeChannels`·`requireMention`은 선택입니다. `guildIds`를 비우면 봇이 들어간 모든 서버의 글을 받습니다(오너 글만 처리하는 건 같습니다).
+- 기존 `ownerSlackUserId` 키는 계속 읽히지만 경고가 납니다. `channels.slack.ownerUserId`로 옮기면 경고가 사라집니다.
+- `channels`는 재시작이 필요한 키입니다. `reload`로는 반영되지 않습니다.
+
+반영과 확인:
+
+```sh
+cd ~/work/ompbot
+bun src/main.ts doctor          # ok discord … 줄이 나와야 함
+bun src/main.ts apply --detach  # 재시작
+```
+
+## 6. 동작 확인
+
+- 봇과의 DM에 아무 질문 → 👀 반응 → 진행 표시 → 답 → ✅.
+- `!status`가 답합니다.
+- 서버 채널에서 봇을 멘션 → 스레드가 생기고 답이 스레드에 옵니다. 같은 스레드에 멘션 없이 답해도 이어집니다.
+- 승인이 필요한 일을 시키면 버튼 카드가 오고, 누르면 결과 줄로 바뀝니다.
+- 같은 시간에 Slack DM도 정상으로 답합니다.
+- `/status-ompbot`이 나에게만 보이는 응답으로 답합니다.
+- 데몬을 재시작하는 동안 DM을 보내 두면, 다시 뜬 뒤 그 DM에 답합니다.
+
+## 문제가 생기면
+
+| 증상 | 원인과 조치 |
+|---|---|
+| 로그에 Gateway 닫힘 `4004` | 토큰이 틀렸거나 리셋됨. 2절로 새 토큰을 넣고 재시작 |
+| 로그에 Gateway 닫힘 `4014` | Message Content Intent가 꺼져 있음. 1절 4단계 |
+| DM을 보낼 수 없다고 나옴 | 봇과 같은 서버에 있지 않음. 3절 초대 |
+| 서버 채널에서 반응 없음 | 봇을 멘션하지 않았거나, `guildIds`에 그 서버가 없거나, 채널 권한에서 봇의 View Channels가 막힘 |
+| 스레드를 못 만듦 | 그 채널에서 봇의 Create Public Threads·Send Messages in Threads 권한이 꺼짐 |
+| Public Bot을 끌 때 "기본 승인 링크" 오류 | Installation 탭 Install Link가 Discord Provided Link임. None으로 바꾸고 저장한 뒤 다시 끔(1절 3단계) |
+| 슬래시 명령이 안 보임 | 초대 URL에 `applications.commands`가 빠짐(3절 URL로 다시 초대). `guildIds` 없이 전역 등록이면 퍼지는 데 시간이 걸릴 수 있음. 로그의 `discord_commands_register_failed` 확인 |

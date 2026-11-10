@@ -212,6 +212,7 @@ export function renderProgress(taskId: string, now: number): string {
 		`updated: ${formatKst(now)}`,
 		"current: S1",
 		"next: spec.md를 읽고 이 파일의 단계 목록을 채운다",
+		"restated:",
 		"blocked_reason:",
 		"question:",
 		"recommend:",
@@ -300,6 +301,8 @@ export interface ParsedProgress {
 	updated: string;
 	current: string;
 	next: string;
+	/** `과제 / 첫 next / 완료 조건` the agent writes first on a resume; `""` when absent (files from before the key). */
+	restated: string;
 	blockedReason: string;
 	/** Decision request written with `status: blocked` (hub `[DECISION]`): the question, a recommendation, the impact. */
 	question: string;
@@ -335,6 +338,7 @@ export function parseProgress(text: string): ParsedProgress {
 		updated: front.get("updated") ?? "",
 		current: front.get("current") ?? "",
 		next: front.get("next") ?? "",
+		restated: front.get("restated") ?? "",
 		blockedReason: front.get("blocked_reason") ?? "",
 		question: front.get("question") ?? "",
 		recommend: front.get("recommend") ?? "",

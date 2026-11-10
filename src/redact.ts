@@ -4,12 +4,19 @@
 export const REDACTED = "[REDACTED]";
 
 /**
- * xox[abposre]-, xapp-, sk-ant-, sk-, GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_) as one regex source. `sk-` needs a
- * non-alphanumeric left edge so words like "task-1" or "risk-free" survive; `skRun` is the quantifier of the key body
- * after `sk-` / `sk-ant-`, the only part the upload check (`safety/host-tools.ts`) sets differently.
+ * Discord bot token: base64url user id (23–28) . timestamp (6–7) . HMAC (27+). It must start at a base64url edge, so a
+ * dotted name or the tail of a longer segment (a JWT header) never matches.
+ */
+const DISCORD_TOKEN_SHAPE = "(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{23,28}\\.[A-Za-z0-9_-]{6,7}\\.[A-Za-z0-9_-]{27,}";
+
+/**
+ * xox[abposre]-, xapp-, sk-ant-, sk-, GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_), Discord bot tokens as one regex
+ * source. `sk-` needs a non-alphanumeric left edge so words like "task-1" or "risk-free" survive; `skRun` is the
+ * quantifier of the key body after `sk-` / `sk-ant-`, the only part the upload check (`safety/host-tools.ts`) sets
+ * differently.
  */
 export const secretShapes = (skRun: string): string =>
-	`xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}`;
+	`xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}|${DISCORD_TOKEN_SHAPE}`;
 const SECRET_PATTERN = new RegExp(secretShapes("+"), "g");
 
 export type Redactor = (text: string) => string;

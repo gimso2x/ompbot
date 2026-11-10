@@ -243,4 +243,88 @@ describe("dashboard approvals", () => {
 		expect(broken).not.toContain("http://insecure");
 		expect(broken).not.toContain("슬랙 카드 열기");
 	});
+
+	test("AC-8: settled approvals list newest first with outcome and answer time; 7-day counts and median; their panel", async () => {
+		openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+		const db = new Database(dbPath, { strict: true });
+		const insert = db.query(
+			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at, origin_key, detail_json, card_url)
+			 VALUES (?, 'C0123456789', ?, ?, ?, ?, ?, ?, 'slack/dm/D0BOTDM', ?, ?)`,
+		);
+		const HOUR = 60 * MINUTE;
+		const settle = (ts: string, summary: string, status: string, createdAt: number, tookMs: number, card = false) =>
+			insert.run(
+				`C0123456789:${ts}`,
+				ts,
+				summary,
+				status,
+				createdAt,
+				createdAt + 30 * MINUTE,
+				createdAt + tookMs,
+				card ? JSON.stringify({ action: "git push origin main" }) : null,
+				card ? CARD_URL : null,
+			);
+		settle("1.1", "main을 push합니다. 토큰 xoxb-TEST-0 포함", "approved", NOW - 2 * HOUR, 40_000, true);
+		settle("1.2", "서비스 재시작", "denied", NOW - HOUR, 6 * MINUTE);
+		settle("1.3", "브랜치 삭제", "expired", NOW - 3 * HOUR, 30 * MINUTE);
+		settle("1.4", "배포 방식 확인", "replied", NOW - 26 * HOUR, 2 * MINUTE);
+		settle("1.5", "지난주 배포", "approved", NOW - 8 * 24 * HOUR, 10_000);
+		db.close();
+
+		const snapshot = await buildSnapshot(deps());
+		if (!snapshot.approvals.ok) throw new Error(snapshot.approvals.error);
+		expect(snapshot.approvals.items).toEqual([]);
+		expect(snapshot.approvals.recent.map((item) => [item.approvalId, item.status, item.tookMs])).toEqual([
+			["C0123456789:1.2", "denied", 6 * MINUTE],
+			["C0123456789:1.1", "approved", 40_000],
+			["C0123456789:1.3", "expired", 30 * MINUTE],
+			["C0123456789:1.4", "replied", 2 * MINUTE],
+			["C0123456789:1.5", "approved", 10_000],
+		]);
+		expect(snapshot.approvals.recent[1]).toMatchObject({
+			summary: "main을 push합니다. 토큰 [REDACTED] 포함",
+			title: "main을 push합니다.",
+			createdAt: "2026-11-04T12:20:00+09:00",
+			decidedAt: "2026-11-04T12:20:40+09:00",
+			detail: { action: "git push origin main" },
+			cardUrl: CARD_URL,
+			originLabel: "DM",
+		});
+		// The week: the 8-day-old row is out; the median is of the owner's three answers, the timeout aside.
+		expect(snapshot.approvals.stats).toEqual({
+			days: 7,
+			approved: 1,
+			denied: 1,
+			expired: 1,
+			replied: 1,
+			medianAnswerMs: 2 * MINUTE,
+		});
+
+		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "approvals" });
+		const text = html.replace(/<[^>]*>/g, " ");
+		expect(text).toContain("기다리는 승인이 없어요");
+		for (const word of ["최근 7일", "승인 1", "거절 1", "답장 1", "만료 1", "답까지 중앙값 2분 0초", "최근 결정"]) {
+			expect(text).toContain(word);
+		}
+		const decided = html.slice(html.indexOf('data-list="decided"'));
+		expect(decided.match(/data-row="/g)).toHaveLength(5);
+		expect(decided.indexOf('data-row="C0123456789:1.2"')).toBeLessThan(decided.indexOf('data-row="C0123456789:1.1"'));
+		expect(decided).toContain("요청 11-04 12:20 · 40초 뒤 승인");
+		expect(decided).toContain("요청 11-04 13:20 · 6분 0초 뒤 거절");
+		expect(text).not.toContain("C0123456789:1.1");
+		expect(text).not.toContain("xoxb-TEST-0");
+		const none = renderDashboardMain(snapshot, undefined, NOW, { view: "approvals", q: "재시작" });
+		expect(none.match(/data-row="/g)).toHaveLength(1);
+
+		const panel = renderItemDetail(snapshot, "approvals", "C0123456789:1.1");
+		expect(panel).toContain('<p class="eyebrow">승인 결정</p>');
+		expect(panel).toContain("<dt>할 일</dt><dd>git push origin main</dd>");
+		expect(panel).toContain("<dt>결과</dt><dd>승인 · 요청 40초 뒤</dd>");
+		expect(panel).toContain("<dt>결정</dt><dd>2026-11-04 12:20</dd>");
+		expect(panel).toContain("슬랙 카드 열기");
+		expect(panel).not.toContain("남은 시간");
+		const bare = renderItemDetail(snapshot, "approvals", "C0123456789:1.3");
+		expect(bare).toContain("<dt>결과</dt><dd>만료 · 요청 30분 0초 뒤</dd>");
+		expect(bare).not.toContain("슬랙의 승인 메시지에서");
+	});
 });

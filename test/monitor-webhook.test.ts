@@ -16,6 +16,7 @@ import {
 import { WEBHOOK_MAX_BODY_BYTES, WEBHOOK_MAX_PAYLOAD_BYTES, WebhookServer, webhookUrl } from "../src/monitors/webhook";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
@@ -396,7 +397,7 @@ describe("daemon with a webhook monitor", () => {
 		const prompts: string[] = [];
 		const daemon = new Daemon({
 			config: { ...home.config, webhook: { port } },
-			slack: new SlackChannel(transport),
+			channels: [new SlackBinding(new SlackChannel(transport))],
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -445,7 +446,7 @@ describe("daemon with a webhook monitor", () => {
 		const blocker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
 		const daemon = new Daemon({
 			config: { ...home.config, webhook: { port: blocker.port as number } },
-			slack: new SlackChannel(new WaitingTransport()),
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
 			log: log(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { AdapterDeps, ChannelAdapter, ChannelBinding } from "../src/channel/adapter";
+import type { ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../src/channel/port";
+import type { IngestOutcome } from "../src/channel/types";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import type { FakeCall } from "../src/slack/fake-transport";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -43,7 +47,7 @@ async function boot(overrides: { escalationChannel?: string } = {}): Promise<voi
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: { ...home.config, ...overrides },
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -235,5 +239,167 @@ describe("approval cards without an escalation channel", () => {
 		await ownerReply(DM, ts, "1800.000301", "좋아요 진행");
 		expect(await result).toBe("replied: 좋아요 진행");
 		expect(daemon.store.getInbound(`${DM}:1800.000301`)).toBeUndefined();
+	});
+});
+
+const DISCORD_CH = "111111111111111111";
+const DISCORD_DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
+
+/** A second platform's port: records posts and wakes a waiter on each one. */
+class SecondPort implements ChannelPort {
+	readonly platform = "discord" as const;
+	readonly capabilities = { permalink: false, reactions: true };
+	readonly posts: Array<{ target: PostTarget; msg: OutboundMessage }> = [];
+	#waiters: Array<() => void> = [];
+
+	async post(target: PostTarget, msg: OutboundMessage): Promise<MessageRef> {
+		this.posts.push({ target, msg });
+		for (const waiter of this.#waiters.splice(0)) waiter();
+		return { platform: "discord", conversationId: target.conversationId, messageId: `9000${this.posts.length}` };
+	}
+	async edit(): Promise<void> {}
+	async react(): Promise<void> {}
+	async uploadFile(): Promise<{ fileId: string }> {
+		return { fileId: "F1" };
+	}
+	async permalink(): Promise<string | undefined> {
+		return undefined;
+	}
+	mentionUser(userId: string): string {
+		return `<@${userId}>`;
+	}
+
+	/** Resolves once a post satisfying `match` arrived (bounded). */
+	waitForPost(match: (text: string) => boolean, timeoutMs = 10_000): Promise<void> {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const check = () => {
+			if (!this.posts.some((p) => match(p.msg.text))) return void this.#waiters.push(check);
+			clearTimeout(timer);
+			resolve();
+		};
+		const timer = setTimeout(() => reject(new Error("timed out waiting for a second-platform post")), timeoutMs);
+		check();
+		return promise;
+	}
+}
+
+/** A second platform's adapter: its pump takes what the daemon's delivery source hands it and confirms it. */
+class SecondAdapter implements ChannelAdapter {
+	readonly platform = "discord" as const;
+	readonly botUserId = "999999999999999999";
+	readonly pumped: string[] = [];
+	constructor(private readonly deps: AdapterDeps) {}
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {}
+	async pumpDeliveries(): Promise<number> {
+		const items = await this.deps.deliveries.claimDue();
+		for (const item of items) {
+			this.pumped.push(item.body);
+			await this.deps.deliveries.confirm(item.deliveryId);
+		}
+		return items.length;
+	}
+	async tick(): Promise<void> {}
+	async setStalled(): Promise<void> {}
+	async setProgress(): Promise<void> {}
+	async postNotice(): Promise<void> {}
+	async ingestOwner(): Promise<IngestOutcome> {
+		return "dropped";
+	}
+	setChannelPolicy(): void {}
+	connectionState(): undefined {
+		return undefined;
+	}
+	recover(): void {}
+}
+
+describe("a second platform beside Slack", () => {
+	let port: SecondPort;
+	let adapter: SecondAdapter | undefined;
+
+	async function bootTwo(overrides: { escalationChannel?: string } = {}): Promise<void> {
+		transport = new CardTransport();
+		port = new SecondPort();
+		const second: ChannelBinding = {
+			port,
+			createAdapter: (deps) => {
+				adapter = new SecondAdapter(deps);
+				return adapter;
+			},
+		};
+		const sessions = new FakeSessionStore();
+		daemon = new Daemon({
+			config: { ...home.config, ...overrides },
+			channels: [new SlackBinding(new SlackChannel(transport)), second],
+			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		await daemon.start();
+	}
+
+	test("each delivery goes through the adapter of its thread ref's platform only", async () => {
+		await bootTwo();
+		daemon.store.recordInterim({
+			originKey: `discord/dm/${DISCORD_DM}`,
+			opRef: "op-d",
+			threadRef: `${DISCORD_CH}:-`,
+			index: 0,
+			body: "디스코드로 갈 답",
+		});
+		daemon.store.recordInterim({
+			originKey: ORIGIN,
+			opRef: "op-s",
+			threadRef: `${DM}:-`,
+			index: 0,
+			body: "슬랙으로 갈 답",
+		});
+		await transport.waitForPosts((text) => text.includes("슬랙으로 갈 답"));
+		await daemon.pump();
+		expect(adapter?.pumped).toEqual(["디스코드로 갈 답"]);
+		expect(transport.posts((text) => text.includes("디스코드로 갈 답"))).toHaveLength(0);
+		expect(transport.posts((text) => text.includes("슬랙으로 갈 답"))).toHaveLength(1);
+		expect(daemon.store.listDeliveries().map((row) => [row.body, row.state])).toEqual([
+			["디스코드로 갈 답", "confirmed"],
+			["슬랙으로 갈 답", "confirmed"],
+		]);
+	});
+
+	test("a second-platform origin gets file upload, approval and dispatch only — no work start, lane or monitor tools", async () => {
+		await bootTwo();
+		const names = daemon.hostToolsFor(`discord/dm/${DISCORD_DM}`).map((t) => t.name);
+		expect(names).toContain("discord_send_file");
+		expect(names).toContain("ompbot_request_approval");
+		for (const absent of [
+			"slack_send_file",
+			"ompbot_work_start",
+			"ompbot_lane_progress",
+			"ompbot_claim_done",
+			"ompbot_monitor_add",
+			"ompbot_monitor_list",
+			"ompbot_monitor_remove",
+		]) {
+			expect(names).not.toContain(absent);
+		}
+		// The Slack origin keeps its full set.
+		const slackNames = daemon.hostToolsFor(ORIGIN).map((t) => t.name);
+		expect(slackNames).toContain("slack_send_file");
+		expect(slackNames).toContain("ompbot_work_start");
+		expect(slackNames).toContain("ompbot_monitor_add");
+	});
+
+	test("a second-platform conversation's approval card goes to that conversation even with an escalation channel", async () => {
+		await bootTwo({ escalationChannel: ESCALATION });
+		const tool = daemon.hostToolsFor(`discord/dm/${DISCORD_DM}`).find((t) => t.name === "ompbot_request_approval");
+		if (!tool) throw new Error("tool missing");
+		const abort = new AbortController();
+		const result = tool.execute({ summary: "force push main" }, { signal: abort.signal });
+		await port.waitForPost((text) => text.startsWith("🔐 승인 요청"));
+		expect(port.posts[0]?.target).toEqual({ conversationId: DISCORD_DM });
+		expect(port.posts[0]?.msg.text).toBe("🔐 승인 요청\nforce push main");
+		abort.abort();
+		await result.catch(() => undefined);
+		expect(transport.posts((text) => text.includes("승인 요청"))).toHaveLength(0);
 	});
 });

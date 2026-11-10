@@ -122,6 +122,16 @@ describe("document round trip", () => {
 		expect(parsed.steps[0]?.condition).toBe("문서");
 	});
 
+	test("PROGRESS carries an empty `restated:` key; a file without the key reads it as empty", () => {
+		const rendered = renderProgress(meta.taskId, meta.registeredAt);
+		expect(rendered.split("\n")).toContain("restated:");
+		expect(parseProgress(rendered).restated).toBe("");
+		const legacy = "---\ntask: T-20261026-01\nstatus: working\ncurrent: S1\nnext: 잇는다\n---\n# 단계\n";
+		expect(parseProgress(legacy).restated).toBe("");
+		const written = legacy.replace("next: 잇는다", "next: 잇는다\nrestated: 로그 회전 / S2 구현 / bun test 통과");
+		expect(parseProgress(written).restated).toBe("로그 회전 / S2 구현 / bun test 통과");
+	});
+
 	test("outcome sections collect commit/test/file evidence per AC", () => {
 		const parsed = parseOutcome(
 			"# T Outcome 증거\n## AC-1\n- commit: abc1234 feat\n- test: bun test → 5 pass\n## AC-2\n- file: README.md\n",
@@ -194,6 +204,17 @@ describe("checkTask table", () => {
 			verdict(await checkTask(notReached)),
 		);
 		expect((await checkTask({ ...base, outcome: undefined })).summary).toEqual([]);
+	});
+
+	test("the judgement carries PROGRESS `restated` as written, outside the reach key", async () => {
+		const plain = await checkTask(base);
+		const restated = await checkTask({ ...base, progress: `restated: 과제 / S2 / 완료 조건\n${progress()}` });
+		expect(plain.restated).toBe("");
+		expect(restated.restated).toBe("");
+		const front = progress().replace("---\n", "---\nrestated: 과제 / S2 / 완료 조건\n");
+		const written = await checkTask({ ...base, progress: front });
+		expect(written.restated).toBe("과제 / S2 / 완료 조건");
+		expect(written.reachKey).toBe(plain.reachKey);
 	});
 
 	test("the reach key changes when evidence changes", async () => {

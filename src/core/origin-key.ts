@@ -13,17 +13,34 @@ export interface ChatOriginRef {
 }
 
 /**
- * Exact id grammar per platform. Slack ids are upper-case alphanumeric with `<sec>.<usec>` thread ts; Telegram group
- * chat ids are negative (`-100…`); Discord ids are snowflakes.
+ * Exact id grammar per platform, the only definition of it. Slack ids start with an upper-case letter (`C…`, `D…`,
+ * `G…`, `U…`) and run on alphanumeric, with `<sec>.<usec>` thread ts; Telegram group chat ids are negative
+ * (`-100…`); Discord ids are snowflakes (digits only), so a Slack id and a Discord id never look alike.
  */
-const GRAMMAR: Record<ChatPlatform, { conversation: RegExp; thread: RegExp }> = {
-	slack: { conversation: /^[A-Z0-9]+$/, thread: /^[0-9.]+$/ },
+export const GRAMMAR: Readonly<Record<ChatPlatform, { readonly conversation: RegExp; readonly thread: RegExp }>> = {
+	slack: { conversation: /^[A-Z][A-Z0-9]+$/, thread: /^[0-9.]+$/ },
 	telegram: { conversation: /^-?[0-9]+$/, thread: /^[0-9]+$/ },
 	discord: { conversation: /^[0-9]+$/, thread: /^[0-9]+$/ },
 };
 
 const isChatPlatform = (value: string | undefined): value is ChatPlatform =>
 	value !== undefined && Object.hasOwn(GRAMMAR, value);
+
+/**
+ * Platforms a bare conversation id tells apart. Telegram is left out: its private chat ids are digits like Discord's,
+ * so it will need an explicit platform on the ledger rows instead.
+ */
+export type IdPlatform = "slack" | "discord";
+const ID_PLATFORMS: readonly IdPlatform[] = ["slack", "discord"];
+
+/**
+ * Platform of a conversation id met without an origin key (a delivery's thread ref, an approval card's channel), read
+ * with GRAMMAR's own conversation pattern so it never disagrees with `parseChatOrigin`; `undefined` when no platform's
+ * grammar accepts it.
+ */
+export function platformOfConversationId(id: string): IdPlatform | undefined {
+	return ID_PLATFORMS.find((platform) => GRAMMAR[platform].conversation.test(id));
+}
 
 /**
  * Platform whose namespace `key` lives in (`slack/…`, `telegram/…`, `discord/…`), whether or not the rest is

@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { MAX_CARDS, splitCards } from "../src/channel/card";
+import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { CARD_SKELETONS } from "../src/safety/prompt";
 import { CARD_MAX_BLOCKS, parseCard } from "../src/slack/card";
-import { MAX_CARDS, REDELIVERED_PREFIX, renderMarkdownParts, splitCards } from "../src/slack/format";
+import { renderMarkdownParts } from "../src/slack/format";
 
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
 const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });

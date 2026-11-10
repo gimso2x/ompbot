@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
+import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 // Owner messages in a closed lane's thread, driven through the real daemon -> adapter -> mailbox path. Only APIs
 // that already existed before the closed-lane change are used, so this file also runs against the old code.
@@ -29,7 +31,7 @@ beforeEach(() => {
 afterEach(async () => {
 	for (const daemon of daemons) await daemon.stop();
 	home.remove();
-	for (const repo of repos) rmSync(repo, { recursive: true, force: true });
+	for (const repo of repos) removeRepoAndWorktrees(repo);
 });
 
 function commitMore(repo: string): void {
@@ -45,7 +47,7 @@ async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
 	const clock = { now: () => Date.now() };
 	const daemon = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -61,9 +63,11 @@ async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
 	await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
 	const rootTs = transport.posts((text) => text === "🔄 ask")[0]?.ts ?? "";
 	const claim = daemon.hostToolsFor("ompbot/work/ask").find((tool) => tool.name === "ompbot_claim_done");
-	commitMore(repo);
+	// The lane works in its own worktree beside `repo`; that is where its commit lands.
+	const worktree = daemon.store.getLane("ask")?.cwd ?? "";
+	commitMore(worktree);
 	const signal = new AbortController().signal;
-	expect(await claim?.execute({ repo, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
+	expect(await claim?.execute({ repo: worktree, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
 	expect(daemon.store.getLane("ask")?.status).toBe("closed");
 	return { daemon, rootTs };
 }

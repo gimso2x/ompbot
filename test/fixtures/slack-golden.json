@@ -1,0 +1,1289 @@
+{
+	"steps": [
+		{
+			"step": "boot",
+			"calls": []
+		},
+		{
+			"step": "① dm question",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000100",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"threadTs": "1700000000.000100",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000001"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ECHO 안녕, 오늘 할 일 정리해줘",
+					"threadTs": "1700000000.000100",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 안녕, 오늘 할 일 정리해줘"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000002"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D1",
+					"ts": "1800000000.000001"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000100",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000100",
+					"name": "white_check_mark"
+				}
+			]
+		},
+		{
+			"step": "② channel mention",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1700000000.000200",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"threadTs": "1700000000.000200",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000003"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "ECHO 채널에서 묻는 질문",
+					"threadTs": "1700000000.000200",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 채널에서 묻는 질문"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000004"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "C1",
+					"ts": "1800000000.000003"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "C1",
+					"timestamp": "1700000000.000200",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1700000000.000200",
+					"name": "white_check_mark"
+				}
+			]
+		},
+		{
+			"step": "③ approval card",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000300",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"threadTs": "1700000000.000300",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000005"
+				},
+				{
+					"method": "getPermalink",
+					"channel": "D1",
+					"ts": "1700000000.000300"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "🔐 승인 요청\nforce push main",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🔐 승인 요청",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "force push main"
+							}
+						}
+					],
+					"ts": "1800000000.000006"
+				},
+				{
+					"method": "getPermalink",
+					"channel": "D1",
+					"ts": "1800000000.000006"
+				},
+				{
+					"method": "updateMessage",
+					"channel": "D1",
+					"ts": "1800000000.000006",
+					"text": "🔐 승인 요청\nforce push main",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🔐 승인 요청",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "force push main"
+							}
+						},
+						{
+							"type": "actions",
+							"elements": [
+								{
+									"type": "button",
+									"style": "primary",
+									"text": {
+										"type": "plain_text",
+										"text": "승인"
+									},
+									"action_id": "ompbot:approval:approve:D1:1800000000.000006",
+									"value": "approve"
+								},
+								{
+									"type": "button",
+									"style": "danger",
+									"text": {
+										"type": "plain_text",
+										"text": "거부"
+									},
+									"action_id": "ompbot:approval:deny:D1:1800000000.000006",
+									"value": "deny"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "⏳ 17:30까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(30분)"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "updateMessage",
+					"channel": "D1",
+					"ts": "1800000000.000006",
+					"text": "🔐 승인 요청\nforce push main\n✅ 승인됨 · 17:00",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🔐 승인 요청",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "force push main"
+							}
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 승인됨 · 17:00"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ECHO 배포 준비해줘",
+					"threadTs": "1700000000.000300",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 배포 준비해줘"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000007"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D1",
+					"ts": "1800000000.000005"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000300",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000300",
+					"name": "white_check_mark"
+				}
+			],
+			"result": "approved"
+		},
+		{
+			"step": "④ choice card",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000400",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"threadTs": "1700000000.000400",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000008"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "❓ 배포 대상\n버튼을 누르거나 이 스레드에 답장해 주세요",
+					"threadTs": "1700000000.000400",
+					"ts": "1800000000.000009"
+				},
+				{
+					"method": "updateMessage",
+					"channel": "D1",
+					"ts": "1800000000.000009",
+					"text": "❓ 배포 대상\n버튼을 누르거나 이 스레드에 답장해 주세요",
+					"blocks": [
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "❓ 배포 대상\n버튼을 누르거나 이 스레드에 답장해 주세요"
+							}
+						},
+						{
+							"type": "actions",
+							"elements": [
+								{
+									"type": "button",
+									"text": {
+										"type": "plain_text",
+										"text": "staging"
+									},
+									"action_id": "ompbot:choice:0:D1:1800000000.000009",
+									"value": "0"
+								},
+								{
+									"type": "button",
+									"text": {
+										"type": "plain_text",
+										"text": "production"
+									},
+									"action_id": "ompbot:choice:1:D1:1800000000.000009",
+									"value": "1"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "⏳ 17:30까지 답이 없으면 취소로 처리됩니다"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "updateMessage",
+					"channel": "D1",
+					"ts": "1800000000.000009",
+					"text": "❓ 배포 대상\n버튼을 누르거나 이 스레드에 답장해 주세요\n✅ 선택: production",
+					"blocks": []
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ECHO 어느 쪽으로 할까",
+					"threadTs": "1700000000.000400",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 어느 쪽으로 할까"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000010"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D1",
+					"ts": "1800000000.000008"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000400",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000400",
+					"name": "white_check_mark"
+				}
+			],
+			"result": {
+				"value": "production"
+			}
+		},
+		{
+			"step": "⑤ task cards",
+			"calls": [
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "🔍 리뷰 대기 24시간 · 로그 회전 — Outcome 도달 뒤 닫히지 않았습니다. (local/t-20270115-01 · T-20270115-01) <@UOWNER>\n*답하는 법*: \"머지해\"라고 답하거나 고칠 점을 적어 주세요. 그만두려면 `tasks close T-20270115-01 --as cancelled`.",
+					"threadTs": "1700000000.000500",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "⏳ 리뷰 대기 · 로그 회전",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "Outcome 도달 뒤 닫히지 않았습니다. <@UOWNER>\n*답하는 법*: \"머지해\"라고 답하거나 고칠 점을 적어 주세요. 그만두려면 `tasks close T-20270115-01 --as cancelled`."
+							}
+						},
+						{
+							"type": "section",
+							"fields": [
+								{
+									"type": "mrkdwn",
+									"text": "*대기 시간*\n24시간"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*브랜치*\n`task/T-20270115-01`"
+								}
+							]
+						},
+						{
+							"type": "actions",
+							"elements": [
+								{
+									"type": "button",
+									"style": "primary",
+									"text": {
+										"type": "plain_text",
+										"text": "머지"
+									},
+									"action_id": "ompbot:task:merge:T-20270115-01",
+									"value": "T-20270115-01"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "머지 = close → ff merge → push → 정리 · 재시작은 따로 승인"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000011"
+				},
+				{
+					"method": "updateMessage",
+					"channel": "C1",
+					"ts": "1800000000.000011",
+					"text": "🔍 머지 대기 · 로그 회전\n▶ 머지 요청됨 · 17:00",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🔍 머지 대기 · 로그 회전",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "로그 회전"
+							}
+						},
+						{
+							"type": "section",
+							"fields": [
+								{
+									"type": "mrkdwn",
+									"text": "*수락기준*\n2개"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*브랜치*\n`task/T-20270115-01`"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*워커*\nlocal/t-20270115-01 · T-20270115-01"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "▶ 머지 요청됨 · 17:00"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "🔘 머지 (버튼)",
+					"threadTs": "1700000000.000500",
+					"ts": "1800000000.000012"
+				},
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000012",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"threadTs": "1700000000.000500",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000013"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "ECHO 머지해",
+					"threadTs": "1700000000.000500",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 머지해"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000014"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "C1",
+					"ts": "1800000000.000013"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000012",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000012",
+					"name": "white_check_mark"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "🚧 멈춤 · 캐시 정리 — 결정이 필요합니다. (local/t-20270115-02 · T-20270115-02) <@UOWNER>\n\n*사유*: DB 경로를 정해야 함\n*질문*: 어느 경로?\n*추천*: A안: 캐시를 끄고 다시 측정\n*영향*: 재시작 필요\n*지금 단계*: S2\n*답하는 법*: 이 스레드에 결정을 적어 주시면 그 답을 담당 에이전트에 넘겨 재개합니다.",
+					"threadTs": "1700000000.000510",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🚧 막힘 · 캐시 정리",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "*사유*: DB 경로를 정해야 함\n*질문*: 어느 경로?\n*추천*: A안: 캐시를 끄고 다시 측정\n*영향*: 재시작 필요\n\n<@UOWNER> *답하는 법*: 이 스레드에 결정을 적어 주시면 그 답을 담당 에이전트에 넘겨 재개합니다."
+							}
+						},
+						{
+							"type": "section",
+							"fields": [
+								{
+									"type": "mrkdwn",
+									"text": "*단계*\nS2"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*브랜치*\n`task/T-20270115-02`"
+								}
+							]
+						},
+						{
+							"type": "actions",
+							"elements": [
+								{
+									"type": "button",
+									"style": "primary",
+									"text": {
+										"type": "plain_text",
+										"text": "추천대로"
+									},
+									"action_id": "ompbot:task:recommend:T-20270115-02",
+									"value": "A안: 캐시를 끄고 다시 측정"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "추천대로 = 위 추천 그대로 진행 · 다른 결정은 이 스레드에 답장"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000015"
+				},
+				{
+					"method": "updateMessage",
+					"channel": "C1",
+					"ts": "1800000000.000015",
+					"text": "🚧 막힘 · 캐시 정리\n▶ 추천대로 진행 요청됨 · 17:00 — 추천: A안: 캐시를 끄고 다시 측정",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🚧 막힘 · 캐시 정리",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "캐시 정리"
+							}
+						},
+						{
+							"type": "section",
+							"fields": [
+								{
+									"type": "mrkdwn",
+									"text": "*브랜치*\n`task/T-20270115-02`"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "▶ 추천대로 진행 요청됨 · 17:00 — 추천: A안: 캐시를 끄고 다시 측정"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "🔘 추천대로 (버튼)",
+					"threadTs": "1700000000.000510",
+					"ts": "1800000000.000016"
+				},
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000016",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"threadTs": "1700000000.000510",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000017"
+				},
+				{
+					"method": "postMessage",
+					"channel": "C1",
+					"text": "ECHO 추천대로 (추천: A안: 캐시를 끄고 다시 측정)",
+					"threadTs": "1700000000.000510",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 추천대로 (추천: A안: 캐시를 끄고 다시 측정)"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000018"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "C1",
+					"ts": "1800000000.000017"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000016",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "C1",
+					"timestamp": "1800000000.000016",
+					"name": "white_check_mark"
+				}
+			]
+		},
+		{
+			"step": "⑥ status commands",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000600",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing",
+					"threadTs": "1700000000.000600",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing"
+						}
+					],
+					"ts": "1800000000.000019"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000600",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000600",
+					"name": "white_check_mark"
+				}
+			],
+			"result": {
+				"response_type": "ephemeral",
+				"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/7/0/0\n입수 pending=0 dispatched=0 answered=7 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing"
+			}
+		},
+		{
+			"step": "⑦ interim and turn end",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D2",
+					"timestamp": "1700000000.000700",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D2",
+					"threadTs": "1700000000.000700",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000020"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D2",
+					"text": "먼저 찾은 것: 설정 파일 두 곳이 서로 다릅니다. 나머지를 확인하고 있어요.",
+					"threadTs": "1700000000.000700",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "먼저 찾은 것: 설정 파일 두 곳이 서로 다릅니다. 나머지를 확인하고 있어요."
+						}
+					],
+					"ts": "1800000000.000021"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D2",
+					"text": "⏳ 빌드가 끝날 때까지 기다리는 중이에요. 끝나면 결과를 이어서 알려 드릴게요.",
+					"threadTs": "1700000000.000700",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "⏳ 빌드가 끝날 때까지 기다리는 중이에요. 끝나면 결과를 이어서 알려 드릴게요."
+						}
+					],
+					"ts": "1800000000.000022"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D2",
+					"text": "빌드 통과. 두 설정을 하나로 맞췄습니다.",
+					"threadTs": "1700000000.000700",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "빌드 통과. 두 설정을 하나로 맞췄습니다."
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000023"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D2",
+					"ts": "1800000000.000020"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D2",
+					"timestamp": "1700000000.000700",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D2",
+					"timestamp": "1700000000.000700",
+					"name": "white_check_mark"
+				}
+			]
+		},
+		{
+			"step": "⑧ long and top-level answers",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000800",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"threadTs": "1700000000.000800",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000024"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "<3000 chars sha256=1427261314ee295f41716a64a936f04d998595992d35433f349f2d84c731a1c3>",
+					"threadTs": "1700000000.000800",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "<10990 chars sha256=5fecd0d1ad9f00f6c0bce2c7d4580ad389697d4307e3eb25f3f123ad5ab80beb>"
+						}
+					],
+					"ts": "1800000000.000025"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "<3000 chars sha256=96cacec01d43e607d982e55fe3013a1f64af95e509ac9221d51e0902faabedd5>",
+					"threadTs": "1700000000.000800",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "<4711 chars sha256=ef11c7c0574f02b03fad0587d9270abbb294190af16c26950dad6c84e13470f7>"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000026"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D1",
+					"ts": "1800000000.000024"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000800",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.000800",
+					"name": "white_check_mark"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "<3000 chars sha256=1abaed7acb3793b604911fac846f406f43f301ec73e9046dfd5e6883adbe23cd>",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "<10991 chars sha256=d5f1daa4086ed4e5f7cc527b9c23b60b8c6cbeafc2670b62ae4d8a4e4d37a656>"
+						}
+					],
+					"ts": "1800000000.000027"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "<2298 chars sha256=cdff4f0106a618c23fca97ab30888a2ce369226cdb8a245922d8c35abfe6a466>",
+					"threadTs": "1800000000.000027",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "<2298 chars sha256=cdff4f0106a618c23fca97ab30888a2ce369226cdb8a245922d8c35abfe6a466>"
+						}
+					],
+					"ts": "1800000000.000028"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "-",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "-",
+					"name": "white_check_mark"
+				}
+			]
+		},
+		{
+			"step": "⑨ slack_send_file",
+			"calls": [
+				{
+					"method": "uploadFile",
+					"channel": "D1",
+					"threadTs": "1700000000.000800",
+					"filePath": "<HOME>/workspace/report.txt",
+					"title": "Report",
+					"comment": "결과 파일",
+					"fileId": "F000029"
+				}
+			],
+			"result": "uploaded report.txt to the conversation thread (file id F000029)"
+		},
+		{
+			"step": "⑩ thumbs up",
+			"calls": []
+		},
+		{
+			"step": "⑪ rate limit",
+			"calls": [
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.001100",
+					"name": "eyes"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"threadTs": "1700000000.001100",
+					"text": "⏳ 작업 중 · 00:00",
+					"ts": "1800000000.000030"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ECHO 레이트 리밋 시험",
+					"threadTs": "1700000000.001100",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 레이트 리밋 시험"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:00"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000031"
+				},
+				{
+					"method": "postMessage",
+					"channel": "D1",
+					"text": "ECHO 레이트 리밋 시험",
+					"threadTs": "1700000000.001100",
+					"blocks": [
+						{
+							"type": "markdown",
+							"text": "ECHO 레이트 리밋 시험"
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "✅ 00:30"
+								}
+							]
+						}
+					],
+					"ts": "1800000000.000032"
+				},
+				{
+					"method": "deleteMessage",
+					"channel": "D1",
+					"ts": "1800000000.000030"
+				},
+				{
+					"method": "removeReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.001100",
+					"name": "eyes"
+				},
+				{
+					"method": "addReaction",
+					"channel": "D1",
+					"timestamp": "1700000000.001100",
+					"name": "white_check_mark"
+				}
+			],
+			"result": {
+				"deferred": [
+					{
+						"threadRef": "D1:1700000000.001100",
+						"attempts": 0,
+						"waitMs": 30000
+					}
+				]
+			}
+		}
+	],
+	"deliveries": [
+		{
+			"deliveryId": 1,
+			"originKey": "slack/dm/D1",
+			"opRef": "INC-1:fake_req_1",
+			"part": 0,
+			"threadRef": "D1:1700000000.000100",
+			"body": "ECHO 안녕, 오늘 할 일 정리해줘",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 2,
+			"originKey": "slack/ch/C1/t/1700000000.000200",
+			"opRef": "INC-2:fake_req_2",
+			"part": 0,
+			"threadRef": "C1:1700000000.000200",
+			"body": "ECHO 채널에서 묻는 질문",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 3,
+			"originKey": "slack/dm/D1",
+			"opRef": "INC-1:fake_req_3",
+			"part": 0,
+			"threadRef": "D1:1700000000.000300",
+			"body": "ECHO 배포 준비해줘",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 4,
+			"originKey": "slack/dm/D1",
+			"opRef": "INC-1:fake_req_4",
+			"part": 0,
+			"threadRef": "D1:1700000000.000400",
+			"body": "ECHO 어느 쪽으로 할까",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 5,
+			"originKey": "slack/ch/C1/t/1700000000.000500",
+			"opRef": "INC-3:fake_req_5",
+			"part": 0,
+			"threadRef": "C1:1700000000.000500",
+			"body": "ECHO 머지해",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 6,
+			"originKey": "slack/ch/C1/t/1700000000.000510",
+			"opRef": "INC-4:fake_req_6",
+			"part": 0,
+			"threadRef": "C1:1700000000.000510",
+			"body": "ECHO 추천대로 (추천: A안: 캐시를 끄고 다시 측정)",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 7,
+			"originKey": "slack/dm/D1",
+			"opRef": "status:D1:1700000000.000600",
+			"part": 0,
+			"threadRef": "D1:1700000000.000600",
+			"body": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 8,
+			"originKey": "slack/dm/D2",
+			"opRef": "INC-5:fake_req_7:interim:0",
+			"part": 0,
+			"threadRef": "D2:1700000000.000700",
+			"body": "먼저 찾은 것: 설정 파일 두 곳이 서로 다릅니다. 나머지를 확인하고 있어요.",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 9,
+			"originKey": "slack/dm/D2",
+			"opRef": "INC-5:fake_req_7:interim:1",
+			"part": 0,
+			"threadRef": "D2:1700000000.000700",
+			"body": "⏳ 빌드가 끝날 때까지 기다리는 중이에요. 끝나면 결과를 이어서 알려 드릴게요.",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 10,
+			"originKey": "slack/dm/D2",
+			"opRef": "INC-5:fake_req_7",
+			"part": 0,
+			"threadRef": "D2:1700000000.000700",
+			"body": "빌드 통과. 두 설정을 하나로 맞췄습니다.",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 11,
+			"originKey": "slack/dm/D1",
+			"opRef": "INC-1:fake_req_8",
+			"part": 0,
+			"threadRef": "D1:1700000000.000800",
+			"body": "<15701 chars sha256=4f5d805ba21a15ead8d87e1b8e60399f178046f04a453f1140f4f069c7704183>",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 12,
+			"originKey": "slack/dm/D1",
+			"opRef": "golden-top",
+			"part": 0,
+			"threadRef": "D1:-",
+			"body": "<13289 chars sha256=18af2803396dbf62251cb9c04b7e23fd2abda5b7d663a1d80203bd57c3ec24df>",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": null,
+			"sentParts": 0,
+			"replyTs": null
+		},
+		{
+			"deliveryId": 13,
+			"originKey": "slack/dm/D1",
+			"opRef": "INC-1:fake_req_9",
+			"part": 0,
+			"threadRef": "D1:1700000000.001100",
+			"body": "ECHO 레이트 리밋 시험",
+			"state": "confirmed",
+			"attempts": 0,
+			"redelivered": false,
+			"lastError": "slack rate limited, retry after 30000ms",
+			"sentParts": 0,
+			"replyTs": null
+		}
+	],
+	"feedback": [
+		{
+			"channel": "D1",
+			"ts": "1800000000.000002",
+			"delivery_id": 1,
+			"origin_key": "slack/dm/D1",
+			"verdict": "up",
+			"last_event_ts": "1800000100.000001"
+		}
+	]
+}

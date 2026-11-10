@@ -84,6 +84,62 @@ export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[])
 	});
 }
 
+/** Short node names of the `task-flow-viewer.md` flow graph, in flow order. */
+const NODE_NAMES: Record<string, string> = {
+	spec: "스펙",
+	review: "떡 검토",
+	dispatch: "위임",
+	register: "등록",
+	worktree: "워크트리",
+	agent: "워커 기동",
+	build: "구현",
+	progress: "진행 기록",
+	ac: "수락기준",
+	integrity: "무결성",
+	signals: "check 재실행",
+	outcome: "Outcome",
+	ownerReview: "오너 리뷰",
+	land: "머지·반영",
+};
+const NODE_ORDER = Object.keys(NODE_NAMES);
+
+export type TaskStageTone = "run" | "fail" | "wait" | "done" | "off";
+export interface TaskStage {
+	label: string;
+	msg: string;
+	tone: TaskStageTone;
+}
+
+/** `MM-DD HH:mm` in KST. */
+const kstShort = (ms: number): string => new Date(ms + 9 * 3_600_000).toISOString().slice(5, 16).replace("T", " ");
+
+/**
+ * Where a task is now, from its {@link taskFlowStatus} lines (`statuses` may hold other tasks' lines): closed states
+ * first, then its earliest unresolved failure in flow order, then review, else the running node.
+ */
+export function taskStage(
+	task: Pick<TaskRow, "taskId" | "status" | "progressAt" | "closedAt">,
+	statuses: FlowStatus[],
+): TaskStage {
+	if (task.status === "cancelled") return { label: "취소", msg: "", tone: "off" };
+	if (task.status === "done") {
+		return { label: "완료", msg: task.closedAt === null ? "" : `close ${kstShort(task.closedAt)}`, tone: "done" };
+	}
+	const mine = statuses.filter((line) => line.task === task.taskId);
+	const fail = mine
+		.filter((line) => line.status === "fail")
+		.sort((a, b) => NODE_ORDER.indexOf(a.node) - NODE_ORDER.indexOf(b.node))[0];
+	if (fail !== undefined)
+		return { label: `${NODE_NAMES[fail.node] ?? fail.node}에서 막힘`, msg: fail.msg, tone: "fail" };
+	if (task.status === "review") return { label: "오너 리뷰 차례", msg: "Outcome 도달 · 머지 대기", tone: "wait" };
+	const running = mine.find((line) => line.status === "running");
+	return {
+		label: running === undefined ? "진행 중" : `${NODE_NAMES[running.node] ?? running.node} 중`,
+		msg: task.progressAt === null ? "" : `진행 기록 ${kstShort(task.progressAt)}`,
+		tone: "run",
+	};
+}
+
 const VIEWER = new URL("./viewer.html", import.meta.url);
 const jsonBlock = (id: string) => new RegExp(`(<script type="application/json" id="${id}">)([\\s\\S]*?)(</script>)`);
 /** JSON safe inside a `<script>` element: `<` never starts a closing tag. */

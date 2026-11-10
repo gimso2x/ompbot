@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { INTERRUPTED_NOTICE } from "../src/daemon/recovery";
-import { REDELIVERED_PREFIX } from "../src/slack/format";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import {
 	expectNoProcessesMentioning,

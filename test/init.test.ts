@@ -65,7 +65,11 @@ describe("ompbot init", () => {
 		writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
 		writeFileSync(join(home, "secrets", "slack-app-token"), "xapp-TEST-0\n", { mode: 0o600 });
 		const config = loadConfig(home);
-		expect(config.ownerSlackUserId).toBe(OWNER);
+		expect(config.channels.slack.ownerUserId).toBe(OWNER);
+		expect(config.deprecated ?? []).toEqual([]);
+		const raw = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+		expect(raw.channels).toEqual({ slack: { ownerUserId: OWNER } });
+		expect("ownerSlackUserId" in raw).toBe(false);
 		expect(config.ompExecutable).toBe(process.execPath);
 		expect(config.workspaceDir).toBe(join(home, "workspace"));
 		expect(config.slack.botTokenFile).toBe(join(home, "secrets", "slack-bot-token"));

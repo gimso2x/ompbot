@@ -13,6 +13,7 @@ import { renderStatusText } from "../src/daemon/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
@@ -46,7 +47,7 @@ async function boot(holdTurns: boolean): Promise<Daemon> {
 	transport = new WaitingTransport();
 	const started = new Daemon({
 		config: home.config,
-		slack: new SlackChannel(transport),
+		channels: [new SlackBinding(new SlackChannel(transport))],
 		clock,
 		log: createLogger({
 			sink: (line) => {

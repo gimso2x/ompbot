@@ -199,7 +199,12 @@ const SNAPSHOT: DashboardSnapshot = {
 	},
 	lanes: { ok: true, items: [] },
 	herdr: { ok: true, hosts: [{ host: "local", ok: true, agents: [] }] },
-	approvals: { ok: true, items: [] },
+	approvals: {
+		ok: true,
+		items: [],
+		recent: [],
+		stats: { days: 7, approved: 0, denied: 0, expired: 0, replied: 0, medianAnswerMs: null },
+	},
 	monitors: { ok: true, items: [] },
 	alerts: { ok: true, items: [] },
 	gates: { ok: true, items: [] },

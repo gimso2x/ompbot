@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { BoardCard, BoardView } from "../src/dashboard/board";
-import { renderDashboardMain, renderDashboardPage } from "../src/dashboard/html";
+import { renderDashboardMain, renderDashboardPage, renderItemDetail, renderTaskDetail } from "../src/dashboard/html";
+import { renderMarkdown } from "../src/dashboard/markdown";
 import { startDashboardServer } from "../src/dashboard/server";
 import type { DashboardSnapshot, TaskInfo } from "../src/dashboard/snapshot";
 import { STYLE } from "../src/dashboard/style";
@@ -183,6 +184,8 @@ const SNAPSHOT: DashboardSnapshot = {
 				originLabel: "DM",
 			},
 		],
+		recent: [],
+		stats: { days: 7, approved: 0, denied: 0, expired: 0, replied: 0, medianAnswerMs: null },
 	},
 	monitors: { ok: true, items: [] },
 	alerts: {
@@ -268,7 +271,7 @@ describe("dashboard inbox", () => {
 		expect(html).toMatch(/<input[^>]*type="search"/);
 		const nav = /<nav class="sidenav"[^>]*>([\s\S]*?)<\/nav>/.exec(html)?.[1] ?? "";
 		for (const [view, label, count] of [
-			["inbox", "인박스", 3],
+			["inbox", "인박스", 1],
 			["turns", "턴", 1],
 			["lanes", "레인", 0],
 			["approvals", "승인 대기", 1],
@@ -399,6 +402,75 @@ describe("dashboard inbox", () => {
 	});
 });
 
+describe("dashboard: Discord", () => {
+	const DISCORD_DM = "discord/dm/123456789012345678";
+	const turns = SNAPSHOT.turns.ok ? SNAPSHOT.turns : undefined;
+	const thread = turns?.threads[0];
+	if (turns === undefined || thread === undefined) throw new Error("no fixture thread");
+	const running = (heartbeat: Record<string, unknown>): DashboardSnapshot => ({
+		...SNAPSHOT,
+		daemon: {
+			ok: true,
+			running: true,
+			ompVersion: "1",
+			origins: 1,
+			busy: 0,
+			ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
+			inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
+			monitors: { count: 0, next: null },
+			openGates: [],
+			heartbeat: { at: "2026-11-04T09:59:50+09:00", ageMs: 10_000, ...heartbeat },
+		},
+	});
+	const systemCards = (html: string): string[] =>
+		[...html.matchAll(/class="sys-card[^"]*" data-card="([a-z]+)"/g)].map((match) => match[1] ?? "");
+	const sysCard = (html: string, id: string): string => {
+		const start = html.indexOf(`data-card="${id}"`);
+		return html.slice(start, html.indexOf("</section>", start));
+	};
+	const SOCKET = { state: "up", since: "2026-11-04T09:00:00+09:00" };
+
+	test("a Discord DM conversation is labelled DM on its card", () => {
+		const html = renderDashboardMain(
+			{ ...SNAPSHOT, turns: { ...turns, threads: [{ ...thread, originKey: DISCORD_DM }] } },
+			BOARD,
+			NOW,
+			{ view: "turns" },
+		);
+		const at = html.indexOf(`data-row="${DISCORD_DM}"`);
+		expect(at).toBeGreaterThan(-1);
+		const start = html.indexOf('<p class="card-eyebrow">', at);
+		expect(html.slice(start, html.indexOf("</p>", start))).toContain("<span>DM</span>");
+	});
+
+	test("the system view has a Discord card showing up or down next to Slack's", () => {
+		const up = renderDashboardMain(
+			running({ socket: SOCKET, discord: { state: "up", since: "2026-11-04T09:30:00+09:00" } }),
+			BOARD,
+			NOW,
+			{ view: "system" },
+		);
+		expect(systemCards(up).slice(0, 3)).toEqual(["daemon", "slack", "discord"]);
+		expect(sysCard(up, "discord")).toContain("연결");
+		expect(sysCard(up, "discord")).toContain("is-success");
+
+		const down = renderDashboardMain(
+			running({ socket: SOCKET, discord: { state: "down", since: "2026-11-04T09:55:00+09:00" } }),
+			BOARD,
+			NOW,
+			{ view: "system" },
+		);
+		expect(sysCard(down, "discord")).toContain("끊김");
+		expect(sysCard(down, "discord")).toContain("is-danger");
+	});
+
+	test("an install without Discord has no Discord card", () => {
+		const html = renderDashboardMain(running({ socket: SOCKET }), BOARD, NOW, { view: "system" });
+		expect(systemCards(html)).not.toContain("discord");
+		expect(systemCards(html)).toContain("slack");
+	});
+});
+
 describe("dashboard polish", () => {
 	const luminance = (hex: string): number => {
 		const raw = hex.replace("#", "");
@@ -453,6 +525,7 @@ describe("dashboard polish", () => {
 		const noMatch = renderDashboardMain(SNAPSHOT, BOARD, NOW, { q: "없는검색어123" });
 		expect(noMatch).toContain("'없는검색어123'와 맞는 항목이 없어요.");
 		expect(noMatch).toContain("data-clear-search");
+		expect(noMatch).not.toContain('id="col-working"');
 
 		const down = renderDashboardMain(
 			{
@@ -477,5 +550,55 @@ describe("dashboard polish", () => {
 		expect(down).toContain("에이전트 보드 연결 안 됨");
 		expect(down).toContain("herdr-web-ui 서비스");
 		expect(STYLE).toContain("@media (prefers-reduced-motion: reduce)");
+	});
+
+	test("UX QA fixes: sticky detail tabs/title, contextual Board/List, non-gate alert records, system search, closed task AC and nested markdown ol", () => {
+		// UX-001: sticky #detail-tabs and #detail-bar-title shown on non-head tabs (e.g. turns conversation tab).
+		const turnPage = markup(renderDashboardPage(SNAPSHOT, { view: "turns", item: "slack/dm/U1" }));
+		expect(turnPage).toContain('<span id="detail-bar-title" class="detail-bar-title">인박스 셸 손봐 줘</span>');
+		const cardPage = markup(renderDashboardPage(SNAPSHOT, { board: BOARD, card: "w1:p1" }));
+		expect(cardPage).toContain('<span id="detail-bar-title" class="detail-bar-title" hidden>pane w1:p1</span>');
+		expect(STYLE).toMatch(/\.tabs\s*\{[^}]*position:\s*sticky/);
+
+		// UX-002: g f and Command Palette include flow view while keeping data-view="flow" out of sidenav.
+		const fullPage = renderDashboardPage(SNAPSHOT, { board: BOARD });
+		expect(fullPage).toContain('label: "보기: 흐름"');
+		expect(fullPage).toContain('f: "flow"');
+		expect(markup(fullPage)).not.toContain('data-view="flow"');
+
+		// UX-003: Board | List segmented control appears only on inbox, list, and turns views.
+		for (const v of ["inbox", "list", "turns"]) {
+			expect(renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: v })).toContain('data-layout="board"');
+		}
+		for (const v of ["monitors", "alerts", "system", "lanes", "approvals", "flow"]) {
+			expect(renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: v })).not.toContain('data-layout="board"');
+		}
+
+		// UX-004: non-gate alert records (gateState === undefined) read 기록만 남음 without warning tone.
+		const alertsHtml = renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: "alerts" });
+		expect(alertsHtml).toContain("기록만 남음");
+		expect(alertsHtml).not.toContain(">상태 모름<");
+		expect(renderItemDetail(SNAPSHOT, "alerts", "1")).toContain("기록만 남음 · 기록 alerted");
+
+		// UX-005: system view filters by q and shows empty-box when nothing matches; active q shows clear button in head.
+		const sysHit = renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: "system", q: "백업" });
+		expect(sysHit).toContain('data-card="backup"');
+		expect(sysHit).not.toContain('data-card="ledger"');
+		expect(sysHit).toContain("data-clear-search");
+		const sysMiss = renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: "system", q: "없는시스템항목" });
+		expect(sysMiss).toContain("'없는시스템항목'와 맞는 항목이 없어요.");
+
+		// UX-006: closed task detail displays AC count without -/N or 0% meter; nested markdown <ol> preserves top-level numbering.
+		const closedDetail = renderTaskDetail(
+			"T-20261103-09",
+			task("T-20261103-09", { title: "어제 닫힘", status: "done", open: false, acTotal: 7 }),
+		);
+		expect(closedDetail).toContain('<p class="lead">AC 7개</p>');
+		expect(closedDetail).toContain("<dt>AC 충족</dt><dd>7개</dd>");
+		expect(closedDetail).not.toContain("-/7");
+		const md = renderMarkdown("1. 첫 단계\n   - 하위 A\n   - 하위 B\n2. 둘째 단계");
+		expect(md).toContain('<li class="md-d0">첫 단계</li>');
+		expect(md).toContain('<li class="md-d1">하위 A</li>');
+		expect(md).toContain('<li class="md-d0" value="2">둘째 단계</li>');
 	});
 });

@@ -86,7 +86,7 @@ beforeEach(() => {
 	closed = 0;
 	watchFails = undefined;
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, ownerSlackUserId: "UOWNER" });
+	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: "UOWNER" });
 	scheduler = new MonitorScheduler({
 		store,
 		router: {
