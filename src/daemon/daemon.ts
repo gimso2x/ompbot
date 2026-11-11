@@ -12,6 +12,8 @@ import { OriginRouter, sessionDirFor } from "../core/origin";
 import { type ChatPlatform, type IdPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { stuckStopText } from "../core/stuck";
 import { COMMAND_OP_REF, COMMAND_TEXT, type MailboxClock } from "../core/types";
+import { briefingSummaryLine, kstFileName, renderBriefingHtml } from "../dashboard/briefing";
+import { snapshotReader } from "../dashboard/snapshot-assembly";
 import { escapeDiscordMarkdown } from "../discord/format";
 import { createDispatchAudit, installProcessAudit } from "../dispatch/audit";
 import { boardCardLink } from "../dispatch/board";
@@ -64,6 +66,7 @@ import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
 import { pruneMediaFiles } from "../ops/media";
+import { BRIEFING_TIMEOUT_MS, BRIEFING_WIDTH, renderPng } from "../ops/screenshot";
 import { allSessionFiles, conversationSessionFiles, renderUsage, summarizeSessionFiles } from "../ops/usage";
 import { redact } from "../redact";
 import {
@@ -79,6 +82,7 @@ import { answerDialogOnSlack } from "../safety/choice";
 import { buildHostTools, type HostToolDef } from "../safety/host-tools";
 import type { FloorsSurface } from "../safety/prompt";
 import { type DeliveryRow, INTERIM_INFIX, type InboundRow, LOG_COPY_SUFFIX, Store } from "../store/db";
+import { formatKst } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
 import type { TaskRow } from "../tasks/ledger";
@@ -226,6 +230,8 @@ export interface DaemonOptions {
 	landLane?: LandLane;
 	/** Test seam for the [TASK] sweep's herdr calls (remind, agent status, board pane); default runs the real herdr. */
 	herdrRun?: ProcessRunner;
+	/** Test seam for `!brief`'s chromium capture; default runs the real chromium. */
+	briefingRun?: ProcessRunner;
 }
 
 export interface InjectRequest {
@@ -719,6 +725,7 @@ export class Daemon {
 			recallEnabled: () => this.#options.config.recallEnabled !== false,
 			costCap: () => this.#options.config.costCap,
 			budgetProvider: (arg) => this.#budgetCommand(arg),
+			briefingProvider: (originKey, threadRef) => this.#brief(originKey, threadRef),
 			distillProvider: (originKey) => this.#distill(originKey),
 			threadSource: this.#threadSources(),
 			idleStopMs: config.idleTimeoutMinutes === undefined ? undefined : config.idleTimeoutMinutes * 60_000,
@@ -1707,6 +1714,51 @@ export class Daemon {
 		store.setCursor(dailyNoticeKey(state.day), String(this.#clock.now()));
 		this.#log.warn("cost_cap_daily_stop", { day: state.day, cost: breach.cost, cap: breach.cap });
 		void adapter.postNotice(store.ownerChannel(), dailyCapNotice(breach.cap, breach.cost));
+	}
+
+	/**
+	 * `!brief` (doc/plans/briefing-image.md §D): the same status the page shows, drawn as one PNG and uploaded to the
+	 * asking thread — no model call. The snapshot is assembled the way the dashboard CLI assembles it, except that the
+	 * daemon answers its own `status` op instead of calling its socket, and no herdr board is started here.
+	 */
+	async #brief(originKey: string, threadRef: string): Promise<void> {
+		const store = this.#store;
+		if (store === undefined) throw new Error("장부가 아직 열리지 않았습니다");
+		const config = this.#options.config;
+		const route = this.#channels.forThreadRef(threadRef);
+		if (route === undefined) throw new Error("이 대화의 채널을 찾지 못했습니다");
+		const now = this.#clock.now();
+		// The daemon's own line to itself: the same shape the socket returns, so the snapshot sections read the same.
+		const snapshot = await snapshotReader({
+			homeDir: config.homeDir,
+			config,
+			now: () => this.#clock.now(),
+			callDaemon: async () => ({ ok: true, status: this.status() }),
+			// The snapshot's own herdr/ssh/git calls always use the real runner: `briefingRun` is the capture seam only.
+			run: realProcessRunner,
+		})();
+		const html = renderBriefingHtml(snapshot, now);
+		const dir = join(config.homeDir, "media", "briefing");
+		mkdirSync(dir, { recursive: true });
+		// `<KST YYYYMMDD-HHmmss>-<suffix>`: the suffix is per render, so two briefings in the same second never collide.
+		const out = join(dir, `${kstFileName(now)}-${randomUUID().slice(0, 8)}.png`);
+		const startedAt = Date.now();
+		const size = await renderPng(html, out, {
+			chromium: config.briefing?.chromium ?? "chromium",
+			width: BRIEFING_WIDTH,
+			timeoutMs: BRIEFING_TIMEOUT_MS,
+			...(this.#options.briefingRun === undefined ? {} : { run: this.#options.briefingRun }),
+		});
+		await route.port.uploadFile(route.target, {
+			path: out,
+			title: `ompbot 브리핑 ${formatKst(now).slice(11, 16)}`,
+			comment: briefingSummaryLine(snapshot),
+		});
+		this.#log.info("briefing_rendered", {
+			origin: originKey,
+			ms: Date.now() - startedAt,
+			height: size.height,
+		});
 	}
 
 	/**

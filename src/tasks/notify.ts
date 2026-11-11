@@ -473,9 +473,20 @@ const WAIT_SCREEN_LINES = 12;
 const WAIT_SCREEN_LINE_MAX = 200;
 
 /**
+ * A provider refusal on the screen tail: rate or usage limit, 429, quota, overload. Phrased as errors, so a bare
+ * `429` or the word `overloaded` in the work on screen does not count. Gaps are `\s+` because a narrow pane wraps the
+ * error line (omp at 80 columns breaks `… will reset at` / `2026-11-09 18:00:46]` over two lines).
+ */
+const PROVIDER_LIMIT_PATTERN =
+	/\b429\b[\s\S]{0,40}(?:error|limit|too\s+many)|rate.?limit(?:ed|_error|\s+exceeded|\s+reached)|usage\s+limit|too\s+many\s+requests|quota\s+exceeded|exceeded\s+(?:your\s+)?(?:current\s+)?quota|overloaded_error|is\s+overloaded/i;
+/** The reset time a usage-limit message names (`… will reset at 2026-11-09 18:00:46`). */
+const LIMIT_RESET_PATTERN = /reset\s+at\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)/i;
+
+/**
  * The task's herdr agent waits on a question or an approval, or stopped on an error (herdr `blocked`): herdr refuses
  * new prompts to it (`agent_blocked`), so only the owner answering in the herdr pane unblocks it. Carries the screen
- * tail (masked, fences neutralized) so the owner sees what it waits on.
+ * tail (masked, fences neutralized) so the owner sees what it waits on. A tail that shows a provider limit says so:
+ * omp has used up its retries and fallbacks there, and the worker stays stopped until someone types in its pane.
  */
 export function buildAgentWaitingCard(
 	row: TaskRow,
@@ -489,12 +500,20 @@ export function buildAgentWaitingCard(
 		.slice(-WAIT_SCREEN_LINES)
 		// Masked before the cut, so a clipped secret never escapes the shape match.
 		.map((line) => redact(line).slice(0, WAIT_SCREEN_LINE_MAX).replaceAll("```", "ʼʼʼ"));
-	const waiting = `herdr 에이전트 \`${row.agent}\`가 입력을 기다리거나 오류로 멈췄습니다.`;
+	const tail = lines.join("\n");
+	const limited = screen.ok && PROVIDER_LIMIT_PATTERN.test(tail);
+	const resetAt = limited ? LIMIT_RESET_PATTERN.exec(tail)?.[1] : undefined;
+	const waiting = limited
+		? `herdr 에이전트 \`${row.agent}\`가 공급자 한도(요청 제한·사용량)로 멈췄습니다. 재시도와 폴백을 다 써서 저절로 이어지지 않습니다.`
+		: `herdr 에이전트 \`${row.agent}\`가 입력을 기다리거나 오류로 멈췄습니다.`;
+	const howTo = limited
+		? `*이어가는 법*: ${resetAt === undefined ? "한도가 풀린 뒤" : `한도가 풀리는 ${resetAt} 뒤`} 작업 보드의 herdr 화면에 \`이어서\`라고 입력합니다. 멈춘 동안은 herdr가 새 프롬프트를 거부합니다(agent_blocked).`
+		: "*답하는 법*: 작업 보드의 herdr 화면에서 직접 답합니다. 대기 중인 에이전트는 herdr가 새 프롬프트를 거부합니다(agent_blocked).";
 	const details = [
 		...(screen.ok
 			? ["*화면 끝부분*:", "```", ...lines, "```"]
 			: [`*화면*: 읽지 못함 (${redact(screen.error ?? "unknown").slice(0, 120)})`]),
-		"*답하는 법*: 작업 보드의 herdr 화면에서 직접 답합니다. 대기 중인 에이전트는 herdr가 새 프롬프트를 거부합니다(agent_blocked).",
+		howTo,
 	];
 	const note = cardNote(link);
 	return {

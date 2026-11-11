@@ -76,6 +76,11 @@
 				"description": "오늘 비용과 상한 보기·오늘 상한 끄기",
 				"usage_hint": "[off|on]",
 				"should_escape": false
+			},
+			{
+				"command": "/brief-ompbot",
+				"description": "지금 상태를 한 장 이미지로 받기",
+				"should_escape": false
 			}
 		]
 	},

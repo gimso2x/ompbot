@@ -679,6 +679,56 @@ describe("TaskSweeper", () => {
 		expect(tail).not.toContain("줄8\n");
 	});
 
+	test("a wait notice whose screen shows a provider limit says the worker will not resume by itself, with the reset time", async () => {
+		const r = rig();
+		const row = r.ledger.require(r.row.taskId);
+		const limited = formatAgentWaitingNotice(
+			row,
+			{
+				ok: true,
+				output:
+					"edit src/a.ts\nError: 429 Usage limit reached for 5 hour. Your limit will reset at 2026-11-09 18:00:46 (type=1308)\n",
+			},
+			"UOWN",
+		);
+		expect(limited.split("\n")[0]).toContain("공급자 한도(요청 제한·사용량)로 멈췄습니다");
+		expect(limited).toContain(
+			"*이어가는 법*: 한도가 풀리는 2026-11-09 18:00:46 뒤 작업 보드의 herdr 화면에 `이어서`라고 입력합니다.",
+		);
+		expect(limited).not.toContain("*답하는 법*");
+
+		// omp 18.18.7 at 80 columns, captured from tmux against a provider that answers 429.
+		const wrapped = formatAgentWaitingNotice(
+			row,
+			{
+				ok: true,
+				output: [
+					" hello",
+					"─".repeat(80),
+					" ✘ 429 [1308][Usage limit reached for 5 hour. Your limit will reset at",
+					"   2026-11-09 18:00:46] (type=rate_limit_error param=1308)",
+					" Dismissed when you send your next message.",
+					"─".repeat(80),
+				].join("\n"),
+			},
+			"UOWN",
+		);
+		expect(wrapped).toContain("*이어가는 법*: 한도가 풀리는 2026-11-09 18:00:46 뒤");
+
+		const noReset = formatAgentWaitingNotice(
+			row,
+			{ ok: true, output: '{"type":"error","error":{"type":"rate_limit_error","message":"Please try again later."}}' },
+			"UOWN",
+		);
+		expect(noReset).toContain("*이어가는 법*: 한도가 풀린 뒤 작업 보드의 herdr 화면에");
+
+		for (const output of ["› 429줄짜리 파일을 지울까요? [y/n]", "overloaded 함수 시그니처를 고칠까요?"]) {
+			const question = formatAgentWaitingNotice(row, { ok: true, output }, "UOWN");
+			expect(question).toContain("입력을 기다리거나 오류로 멈췄습니다");
+			expect(question).toContain("*답하는 법*: 작업 보드의 herdr 화면에서 직접 답합니다.");
+		}
+	});
+
 	test("an unanswerable herdr keeps the wait: blocked, failed lookup, blocked again posts nothing new", async () => {
 		const r = rig();
 		r.agent.value = { ok: true, status: "blocked" };

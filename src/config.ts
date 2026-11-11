@@ -183,6 +183,11 @@ export interface OmpbotConfig {
 	 * address for the agent board's "herdr에서 답하기" links (absent = no link).
 	 */
 	dashboard?: { port: number; bind?: "127.0.0.1" | "::1"; herdrWebUrl?: string };
+	/**
+	 * `!brief`/`ompbot briefing`: the chromium that draws the picture. `chromium` is a name on PATH or an absolute path
+	 * (default `chromium`). No existence check at load: a missing browser is reported by the briefing's failure line.
+	 */
+	briefing?: { chromium?: string };
 }
 
 export interface SlackTokens {
@@ -440,8 +445,15 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
-	} catch {
-		throw new ConfigError("config_invalid_json", configPath);
+	} catch (error) {
+		// The parser names what it expected but not where; the usual culprits are named so the file can be scanned.
+		// Quoted text in its message can be file content (a token pasted into the wrong place), so it is masked.
+		const reason = (error instanceof Error ? error.message : String(error)).replace(/(["'])[^"']{2,}\1/g, "…");
+		throw new ConfigError(
+			"config_invalid_json",
+			configPath,
+			`${reason}; look for a trailing comma, a missing comma between keys, or unquoted keys`,
+		);
 	}
 
 	const root = asRecord(parsed);
@@ -653,6 +665,16 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		turnSnapshot = { repos: (repos as string[] | undefined) ?? [] };
 	}
 
+	const briefingRaw = root.briefing;
+	let briefing: { chromium?: string } | undefined;
+	if (briefingRaw !== undefined) {
+		const record = asRecord(briefingRaw);
+		if (record === undefined) invalid(configPath, "briefing");
+		for (const key of Object.keys(record)) if (key !== "chromium") invalid(configPath, `briefing.${key}`);
+		const chromium = optionalString(configPath, record, "chromium", "briefing.chromium");
+		briefing = chromium === undefined ? {} : { chromium };
+	}
+
 	const webhook = root.webhook;
 	if (webhook !== undefined) {
 		const record = asRecord(webhook);
@@ -740,6 +762,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (recallEnabled !== undefined) config.recallEnabled = recallEnabled;
 	if (watcherRoots !== undefined) config.watcherRoots = (watcherRoots as string[]).map((r) => resolve(r));
 	if (turnSnapshot !== undefined) config.turnSnapshot = { repos: turnSnapshot.repos.map((repo) => resolve(repo)) };
+	if (briefing !== undefined) config.briefing = briefing;
 	if (webhook !== undefined) config.webhook = webhook as { port: number; bind?: "127.0.0.1" | "::1" };
 	if (dashboard !== undefined) config.dashboard = dashboard as NonNullable<OmpbotConfig["dashboard"]>;
 	if (herdr !== undefined) config.herdr = herdr;

@@ -140,11 +140,14 @@ describe("ompbot units render --instance", () => {
 	test("rejects a missing OMPBOT_HOME and a bad name with exit 2", () => {
 		const home = tempDir("ompbot-units-home-");
 		expect(render(["--instance", "tteok", "--dry-run"], home).code).toBe(2);
-		for (const bad of ["Tteok", "1a", "a_b", "a".repeat(25), ""]) {
+		for (const bad of ["Tteok", "1a", "a_b", "a".repeat(25), "", "backup", "gc", "dashboard"]) {
 			const run = render(["--instance", bad, "--dry-run"], home, join(home, "h"));
 			expect(run.code).toBe(2);
 			expect(run.out).toBe("");
 		}
+		const empty = render(["--dry-run"], home, "");
+		expect(empty.code).toBe(2);
+		expect(empty.err).toContain("OMPBOT_HOME is set but empty");
 	});
 
 	test("--out writes the instance files", () => {

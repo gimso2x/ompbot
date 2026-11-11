@@ -1335,6 +1335,33 @@ describe("ompbot doctor omp runtime check", () => {
 		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(`fail omp runtime: ${folder} unreadable (`);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
 	});
+
+	test("token file problems get one line each with the fix, and every later check still runs", async () => {
+		rmSync(join(dir, "secrets", "slack-bot-token"));
+		chmodSync(join(dir, "secrets", "slack-app-token"), 0o644);
+		await runtimeLine(process.execPath);
+		const lines: string[] = [];
+		await runDoctor(dir, (line) => lines.push(line));
+		const bot = join(dir, "secrets", "slack-bot-token");
+		const app = join(dir, "secrets", "slack-app-token");
+		expect(lines).toContain(`ok config: ${join(dir, "config.json")}`);
+		expect(lines).toContain(`fail secret slack-bot-token: missing (write it: umask 077; cat > ${bot})`);
+		expect(lines).toContain(`fail secret slack-app-token: mode=0644 expected=0600 (fix: chmod 600 ${app})`);
+		expect(lines).toContain("fail slack auth.test: skipped: fix the secret lines above first");
+		expect(lines.some((line) => /^(ok|fail) omp: /.test(line))).toBe(true);
+		expect(
+			lines.some((line) => line.startsWith("fail backup bundle: stamp=missing (expected on a first install")),
+		).toBe(true);
+
+		writeFileSync(bot, "xapp-WRONG-0\n", { mode: 0o600 });
+		chmodSync(app, 0o600);
+		const swapped: string[] = [];
+		await runDoctor(dir, (line) => swapped.push(line));
+		expect(swapped.find((line) => line.startsWith("fail secret slack-bot-token"))).toContain(
+			"does not start with xoxb-",
+		);
+		for (const line of swapped) expect(line).not.toContain("WRONG");
+	});
 });
 
 describe("ompbot doctor backup bundle check", () => {

@@ -128,6 +128,17 @@ describe("command parsing", () => {
 		expect(parseCommand("undo 해줘")).toBeUndefined();
 	});
 
+	test("!brief, /brief-ompbot and !브리핑 parse as the brief command and take no argument", () => {
+		expect(parseCommand("!brief")).toEqual({ kind: "brief", arg: "" });
+		expect(parseCommand("/brief-ompbot")).toEqual({ kind: "brief", arg: "" });
+		expect(parseCommand("!브리핑")).toEqual({ kind: "brief", arg: "" });
+		expect(parseCommand("  !brief  ")).toEqual({ kind: "brief", arg: "" });
+		// No argument: anything after the word is a prompt, not this command.
+		expect(parseCommand("!brief x")).toBeUndefined();
+		expect(parseCommand("/brief-ompbot now")).toBeUndefined();
+		expect(parseCommand("브리핑 해줘")).toBeUndefined();
+	});
+
 	test("!budget and /budget-ompbot take an argument, so off/on reach the command and bare !budget answers totals", () => {
 		expect(parseCommand("!budget")).toEqual({ kind: "budget", arg: "" });
 		expect(parseCommand("!budget off")).toEqual({ kind: "budget", arg: "off" });

@@ -1520,6 +1520,29 @@ export function slackThreadHref(team: string | null | undefined, threadRef: stri
 }
 
 /**
+ * The `https://discord.com/channels/…` link that opens a Discord conversation: a DM at its message
+ * (`discord/dm/…`, `<dm>:<message>`), a server thread or a lane (`<parent>:<thread>`) at the thread, a server channel
+ * at its message. "" for a ref that is not two snowflakes, or a server conversation without the one server id (a DM
+ * needs none). Self-contained (shipped to the page).
+ */
+export function discordThreadHref(
+	guild: string | null | undefined,
+	originKey: string | null | undefined,
+	threadRef: string | null | undefined,
+): string {
+	const ref = /^(\d{17,20}):(\d{17,20})$/.exec(threadRef ?? "");
+	if (ref === null) return "";
+	const key = originKey ?? "";
+	if (key.startsWith("discord/dm/")) return `https://discord.com/channels/@me/${ref[1]}/${ref[2]}`;
+	if (!guild) return "";
+	if (/^discord\/ch\/\d+\/t\/\d+$/.test(key) || key.startsWith("ompbot/work/")) {
+		return `https://discord.com/channels/${guild}/${ref[2]}`;
+	}
+	if (key.startsWith("discord/ch/")) return `https://discord.com/channels/${guild}/${ref[1]}/${ref[2]}`;
+	return "";
+}
+
+/**
  * A request's TASK chain: the `지금` line and the row of boxes, 요청 first. `focus` marks one TASK box as selected.
  * In the flow view (`panel` false) a TASK box opens its panel in place; inside another view's detail panel (`panel`
  * true) the chain comes in its own section with the `n/m 끝남` count and the boxes go to the flow view's page, since
@@ -2274,6 +2297,7 @@ const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderFlowChain = ${renderFlowChain.toString()};
 const slackThreadHref = ${slackThreadHref.toString()};
+const discordThreadHref = ${discordThreadHref.toString()};
 const renderTaskDetail = ${renderTaskDetail.toString()};
 const renderDetailHead = ${renderDetailHead.toString()};
 const renderItemDetail = ${renderItemDetail.toString()};
@@ -2555,14 +2579,27 @@ function boot() {
 		if (!snapshot || !snapshot.flows || !snapshot.flows.ok) return undefined;
 		return snapshot.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === id));
 	}
-	/** The bar's 슬랙 스레드에서 답하기 link follows the open conversation, on every tab. */
+	/** The bar's 슬랙 스레드에서 답하기 / 디스코드에서 답하기 links follow the open conversation, on every tab. */
 	function syncSlack() {
-		const link = document.getElementById("detail-slack");
-		if (!link) return;
 		const thread = threadOpen() ? threadOf(open.id) : undefined;
-		const href = thread && snapshot ? slackThreadHref(snapshot.slackTeam, thread.threadRef) : "";
-		link.hidden = href === "";
-		if (href !== "") link.setAttribute("href", href);
+		const links = [
+			["detail-slack", thread && snapshot ? slackThreadHref(snapshot.slackTeam, thread.threadRef) : ""],
+			[
+				"detail-discord",
+				thread && snapshot ? discordThreadHref(snapshot.discordGuild, thread.originKey, thread.threadRef) : "",
+			],
+		];
+		for (const [id, href] of links) {
+			const link = document.getElementById(id);
+			if (!link) continue;
+			link.hidden = href === "";
+			if (href !== "") link.setAttribute("href", href);
+			// Only the Discord link leaves for another site (a new tab); \`slack://\` hands over to the app.
+			if (href !== "" && id === "detail-discord") {
+				link.setAttribute("target", "_blank");
+				link.setAttribute("rel", "noopener noreferrer");
+			}
+		}
 	}
 	/** The bar's context title shows the open conversation or card title while on non-head tabs. */
 	function syncBarTitle() {
@@ -3394,6 +3431,8 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 			: undefined;
 	const tab = open?.kind === "card" ? "head" : thread ? (oldTurn ? "trace" : "conv") : undefined;
 	const slackHref = found === undefined ? "" : slackThreadHref(snapshot.slackTeam, found.threadRef);
+	const discordHref =
+		found === undefined ? "" : discordThreadHref(snapshot.discordGuild, found.originKey, found.threadRef);
 	const barTitle = /<h2 class="detail-title"[^>]*>([\s\S]*?)<\/h2>/.exec(headHtml)?.[1] ?? "";
 	const ui = {
 		...(view === undefined ? {} : { view }),
@@ -3424,7 +3463,9 @@ ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" 
 		tab === undefined || tab === "head" || barTitle === "" ? " hidden" : ""
 	}>${barTitle}</span><a id="detail-slack" class="button is-ghost detail-slack" href="${slackHref.replace(/&/g, "&amp;")}"${
 		slackHref === "" ? " hidden" : ""
-	}>슬랙 스레드에서 답하기</a><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
+	}>슬랙 스레드에서 답하기</a><a id="detail-discord" class="button is-ghost detail-slack" href="${discordHref}"${
+		discordHref === "" ? " hidden" : ' target="_blank" rel="noopener noreferrer"'
+	}>디스코드에서 답하기</a><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
 <div id="detail-tabs" class="tabs" role="tablist" aria-label="상세 보기"${tab === undefined ? " hidden" : ""}>${renderDetailTabs(
 		thread ? "thread" : "card",
 		tab ?? "head",

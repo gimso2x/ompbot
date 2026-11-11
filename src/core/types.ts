@@ -21,7 +21,8 @@ export type CommandKind =
 	| "distill"
 	| "btw"
 	| "undo"
-	| "budget";
+	| "budget"
+	| "brief";
 
 /**
  * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` and `btw` are typed
@@ -42,7 +43,14 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
 	btw: "/btw-ompbot",
 	undo: "/undo-ompbot",
 	budget: "/budget-ompbot",
+	brief: "/brief-ompbot",
 };
+
+/**
+ * The one extra word a kind answers to besides its `!<kind>` form. `!브리핑` is how the owner asks for the picture when
+ * typing Korean; no other kind gets an alias, so the command set stays one list (`COMMAND_TEXT`).
+ */
+export const COMMAND_ALIAS: Readonly<Partial<Record<CommandKind, string>>> = { brief: "!브리핑" };
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
 export const COMMAND_OP_REF = new RegExp(
@@ -78,7 +86,7 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 	const word = match[1] ?? "";
 	const arg = (match[2] ?? "").trim();
 	for (const kind of Object.keys(COMMAND_TEXT) as CommandKind[]) {
-		if (word !== COMMAND_TEXT[kind] && word !== `!${kind}`) continue;
+		if (word !== COMMAND_TEXT[kind] && word !== `!${kind}` && word !== COMMAND_ALIAS[kind]) continue;
 		if (arg !== "" && !TAKES_ARG.has(kind)) return undefined;
 		return { kind, arg };
 	}

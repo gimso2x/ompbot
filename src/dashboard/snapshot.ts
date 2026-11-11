@@ -637,6 +637,11 @@ export interface DashboardSnapshot {
 	 * it. Always built; optional only so hand-made snapshots still type.
 	 */
 	slackTeam?: string | null;
+	/**
+	 * The one Discord server (config `channels.discord.guildIds` with exactly one id) the turn panels' 디스코드에서
+	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `slackTeam`.
+	 */
+	discordGuild?: string | null;
 }
 
 export type DashboardConfig = Partial<
@@ -645,6 +650,8 @@ export type DashboardConfig = Partial<
 	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
 		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
 		slack?: { teamId?: string };
+		/** Only the server ids are read, for the Discord links of the turn panels. */
+		channels?: { discord?: { guildIds?: string[] } };
 	};
 
 export interface SnapshotDeps {
@@ -1729,6 +1736,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? processAlive) }));
 
 		const feedback = section(() => readFeedbackSummary(needDb(), now, { days: FEEDBACK_DAYS, limit: FEEDBACK_RECENT }));
+		const guildIds = deps.config?.channels?.discord?.guildIds;
 
 		return {
 			generatedAt: formatKst(now),
@@ -1746,6 +1754,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			backup: await backup,
 			jobs: await jobs,
 			slackTeam: deps.config?.slack?.teamId ?? null,
+			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
 		};
 	} finally {
 		db?.close();

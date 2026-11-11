@@ -1,22 +1,18 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import type { Server } from "bun";
-import { loadConfig, type OmpbotConfig } from "../config";
+import { loadConfig } from "../config";
 import type { LiveView } from "../core/live-turn";
 import { callDaemon } from "../daemon/ipc";
-import { readVersion } from "../daemon/tools";
-import { BoardSource } from "../dashboard/board";
 import { readMonitorDetail } from "../dashboard/monitor-detail";
 import { startDashboardServer } from "../dashboard/server";
-import { buildSnapshot, createSnapshotCache, readBoardTasks } from "../dashboard/snapshot";
+import { readBoardTasks } from "../dashboard/snapshot";
+import { boardSourceFor, hasConfig, snapshotReader } from "../dashboard/snapshot-assembly";
 import { readThreadConversation } from "../dashboard/thread-conversation";
 import { readTurnTrace } from "../dashboard/trace";
-import { DEFAULT_BOARD_API } from "../dispatch/board";
 import { realProcessRunner } from "../dispatch/omp";
 import { redact } from "../redact";
 import { indexEnvSecrets } from "../safety/secret-index";
-import { resolveTaskHost } from "../tasks/host";
 
 export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  read-only status page on a loopback port until SIGTERM: HTML at /, JSON at
@@ -30,15 +26,9 @@ export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  ?card=<key> detail with the pane's conversation and plan)
 `;
 
-/** The checkout this file belongs to (src/cli → repo root): its short HEAD is shown on the page. */
-const REPO_DIR = resolve(import.meta.dir, "..", "..");
 const LOOPBACK = ["127.0.0.1", "::1"] as const;
 
-/** The agent board source: only with config `herdrBoard` (read from its `api`, default the local herdr-web-ui). */
-export function boardSourceFor(config: Pick<OmpbotConfig, "herdrBoard"> | undefined): BoardSource | undefined {
-	if (config?.herdrBoard === undefined) return undefined;
-	return new BoardSource({ origin: config.herdrBoard.api ?? DEFAULT_BOARD_API });
-}
+export { boardSourceFor };
 
 function usage(message: string): number {
 	process.stderr.write(`dashboard: ${message}\n${DASHBOARD_USAGE}`);
@@ -65,7 +55,7 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 		return usage("--bind must be 127.0.0.1 or ::1");
 	}
 
-	const config = existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir, { checkTokens: false }) : undefined;
+	const config = hasConfig(homeDir) ? loadConfig(homeDir, { checkTokens: false }) : undefined;
 	const port = flagPort ?? config?.dashboard?.port;
 	if (port === undefined) return usage("no port: pass --port or set config dashboard.port");
 	const hostname = flagBind ?? config?.dashboard?.bind ?? "127.0.0.1";
@@ -74,22 +64,14 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 
 	const now = () => Date.now();
 	const board = boardSourceFor(config);
-	const snapshot = createSnapshotCache(
-		() =>
-			buildSnapshot({
-				homeDir,
-				repoDir: REPO_DIR,
-				config,
-				now,
-				callDaemon,
-				run: realProcessRunner,
-				ompVersion: async () =>
-					config === undefined ? "unknown" : await readVersion([config.ompExecutable, "--version"]),
-				hostOps: (host) => resolveTaskHost(host, config?.dispatchHosts, { run: realProcessRunner }),
-				...(board === undefined ? {} : { board: () => board.current() }),
-			}),
+	const snapshot = snapshotReader({
+		homeDir,
+		config,
 		now,
-	);
+		callDaemon,
+		run: realProcessRunner,
+		...(board === undefined ? {} : { board: () => board.current() }),
+	});
 
 	let server: Server<undefined>;
 	try {

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ import {
 	SECRET_MODE,
 } from "../config";
 import { DiscordRest } from "../discord/rest";
+import { buildChildEnv } from "../omp/env";
 import { checkOmpRuntime } from "../omp/runtime-check";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
@@ -32,6 +33,64 @@ function listening(host: string, port: number): Promise<boolean> {
 		});
 		socket.once("error", () => resolve(false));
 	});
+}
+
+/**
+ * How many chat models `omp models --json` lists, run with the env the RPC driver gives omp. Zero means no provider
+ * login and no API key: every turn would fail with "No default model selected", so doctor says so before the first DM.
+ * A string is the reason the count could not be read (timeout, exit code, unparsable output).
+ */
+export async function countOmpModels(ompExecutable: string, timeoutMs = 30_000): Promise<number | string> {
+	let proc: Bun.Subprocess<"ignore", "pipe", "ignore">;
+	try {
+		proc = Bun.spawn([ompExecutable, "models", "--json"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			stdin: "ignore",
+			env: buildChildEnv(),
+		});
+	} catch (error) {
+		return `cannot run ${ompExecutable} (${(error as NodeJS.ErrnoException).code ?? String(error)})`;
+	}
+	const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
+	try {
+		const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+		if (proc.signalCode === "SIGKILL") return `timeout after ${timeoutMs / 1000}s`;
+		if (code !== 0) return `omp models exited ${code}`;
+		const parsed = JSON.parse(out) as { models?: unknown };
+		return Array.isArray(parsed.models) ? parsed.models.length : "unparsable output";
+	} catch {
+		return "unparsable output";
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** Config errors that only concern the Slack token files; doctor reports those per file and keeps going. */
+const TOKEN_FILE_ERRORS: Record<string, true> = { secret_missing: true, secret_permissions: true, token_prefix: true };
+
+/**
+ * What is wrong with one token file, with the command that fixes it, or undefined when it is fine. Only the first
+ * characters are compared; the value is never printed.
+ */
+export function secretProblem(path: string, prefix: string): string | undefined {
+	let mode: number;
+	try {
+		mode = modeOf(path);
+	} catch {
+		return `missing (write it: umask 077; cat > ${path})`;
+	}
+	if (mode !== SECRET_MODE) return `mode=${octal(mode)} expected=${octal(SECRET_MODE)} (fix: chmod 600 ${path})`;
+	let head: string;
+	try {
+		head = readFileSync(path, "utf8").trimStart().slice(0, prefix.length);
+	} catch {
+		return `unreadable (fix: chmod 600 ${path} as the account that runs ompbot)`;
+	}
+	if (head !== prefix) {
+		return `does not start with ${prefix} (the bot token is xoxb-…, the app-level token is xapp-…; paste the right one)`;
+	}
+	return undefined;
 }
 
 const modeOf = (path: string): number => statSync(path).mode & 0o777;
@@ -93,27 +152,36 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 	} catch {
 		report(false, "home", `${homeDir} missing`);
 	}
+	// A token file problem is reported on its own `secret …` line below, so it must not hide every later check: the
+	// config is loaded again without the token files and the report goes on.
+	let tokensOk = true;
 	try {
 		config = loadConfig(homeDir);
 		report(true, "config", config.configPath);
 	} catch (error) {
-		report(false, "config", error instanceof ConfigError ? error.message : "unreadable");
+		if (error instanceof ConfigError && TOKEN_FILE_ERRORS[error.code] === true) {
+			try {
+				config = loadConfig(homeDir, { checkTokens: false });
+				report(true, "config", config.configPath);
+			} catch (retry) {
+				report(false, "config", retry instanceof ConfigError ? retry.message : "unreadable");
+			}
+		} else {
+			report(false, "config", error instanceof ConfigError ? error.message : "unreadable");
+		}
 	}
 	if (config) {
 		for (const [name, path, prefix] of [
 			["slack-bot-token", config.slack.botTokenFile, "xoxb-"],
 			["slack-app-token", config.slack.appTokenFile, "xapp-"],
 		] as const) {
-			try {
-				const mode = modeOf(path);
-				report(
-					mode === SECRET_MODE,
-					`secret ${name}`,
-					`mode=${octal(mode)} expected=${octal(SECRET_MODE)} prefix=${prefix}`,
-				);
-			} catch {
-				report(false, `secret ${name}`, "missing");
-			}
+			const problem = secretProblem(path, prefix);
+			if (problem !== undefined) tokensOk = false;
+			report(
+				problem === undefined,
+				`secret ${name}`,
+				problem ?? `mode=${octal(SECRET_MODE)} expected=${octal(SECRET_MODE)} prefix=${prefix}`,
+			);
 		}
 
 		try {
@@ -121,7 +189,11 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 			const version = await readVersion([config.ompExecutable, "--version"]);
 			report(version !== "unknown", "omp", `${config.ompExecutable} ${version}`);
 		} catch {
-			report(false, "omp", `${config.ompExecutable} not executable`);
+			report(
+				false,
+				"omp",
+				`${config.ompExecutable} not executable (set "ompExecutable" in ${config.configPath} to the output of: command -v omp)`,
+			);
 		}
 
 		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
@@ -145,6 +217,19 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 					`${config.ompExecutable} unreadable (${(error as NodeJS.ErrnoException).code ?? String(error)})`,
 				);
 			}
+		}
+
+		if ((config.agent ?? "omp") === "omp" && existsSync(config.ompExecutable)) {
+			const models = await countOmpModels(config.ompExecutable);
+			report(
+				typeof models === "number" && models > 0,
+				"omp models",
+				typeof models === "number"
+					? models > 0
+						? `available=${models}`
+						: "available=0 (run: omp login, or set a provider API key, as the account that runs ompbot)"
+					: models,
+			);
 		}
 
 		if (config.webhook !== undefined) {
@@ -213,7 +298,11 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 	const stamp = readStamp(join(homeDir, "backups"));
 	const bundleSources = BUNDLE_SOURCES.filter((name) => existsSync(join(homeDir, name)));
 	if (stamp === undefined) {
-		report(false, "backup bundle", "stamp=missing");
+		report(
+			false,
+			"backup bundle",
+			"stamp=missing (expected on a first install: start the daemon, then run backup once and enable ompbot-backup.timer)",
+		);
 	} else if (stamp.bundle === undefined && bundleSources.length > 0) {
 		report(false, "backup bundle", "bundle=none (run ompbot backup again)");
 	} else if (stamp.bundle === undefined) {
@@ -225,7 +314,9 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 		report(hours <= BACKUP_MAX_AGE_MS / 3_600_000, "backup bundle", `bundle=${stamp.bundle} hours=${hours.toFixed(1)}`);
 	}
 
-	if (config) {
+	if (config && !tokensOk) {
+		report(false, "slack auth.test", "skipped: fix the secret lines above first");
+	} else if (config) {
 		try {
 			const { botToken } = readSlackTokens(config);
 			const auth = await new WebClient(botToken).auth.test();
@@ -244,9 +335,15 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 				"error" in error.data
 					? String(error.data.error)
 					: "request_failed";
-			report(false, "slack auth.test", code);
+			report(
+				false,
+				"slack auth.test",
+				code === "invalid_auth" || code === "token_revoked" || code === "account_inactive"
+					? `${code} (Slack refused the bot token: copy the xoxb- token again from the app's Install App page; reinstalling the app issues a new one)`
+					: code,
+			);
 		}
-		await checkDiscord(config, report);
 	}
+	if (config) await checkDiscord(config, report);
 	return failures === 0 ? 0 : 1;
 }

@@ -8,6 +8,7 @@ import {
 	formatProviderLimitNotice,
 	formatStallNotice,
 	formatTurnEscalationNotice,
+	NO_BACKUP_YET_HINT,
 } from "../src/daemon/notices";
 import type { Gate } from "../src/ops/gates";
 
@@ -69,6 +70,21 @@ describe("formatGateOpenNotice", () => {
 		expect(text).toBe(
 			["🚨 [자가진단] 게이트 backup_age 열림", "상태: hours=40.0", "회복되면 다시 알립니다."].join("\n"),
 		);
+	});
+
+	test("a home never backed up (first install) gets the what-to-do line; an old backup does not", () => {
+		const now = 10 * HOUR;
+		const missing: Gate = { name: "backup_age", state: "open", detail: "stamp=missing" };
+		expect(formatGateOpenNotice(missing, now, now)).toBe(
+			[
+				"🚨 [자가진단] 게이트 backup_age 열림",
+				"상태: stamp=missing",
+				NO_BACKUP_YET_HINT,
+				"회복되면 다시 알립니다.",
+			].join("\n"),
+		);
+		expect(formatGateOpenNotice(gate(), now, now)).not.toContain(NO_BACKUP_YET_HINT);
+		expect(formatGateOpenNotice({ ...missing, name: "offsite_age" }, now, now)).not.toContain(NO_BACKUP_YET_HINT);
 	});
 
 	test("a gate still open past 24h says how many whole hours it has stood", () => {

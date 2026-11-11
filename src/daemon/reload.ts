@@ -24,6 +24,8 @@ export const LIVE_FIELDS = [
 	"peerHopLimit",
 	"turnSnapshot",
 	"costCap",
+	// The briefing renderer reads it on every `!brief` (a moved chromium applies without a restart).
+	"briefing",
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /** Bound when the daemon starts (tokens, socket, omp children, scheduler). */

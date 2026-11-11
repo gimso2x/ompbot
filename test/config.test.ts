@@ -182,6 +182,9 @@ describe("loadConfig", () => {
 		expect(err.code).toBe("config_invalid_json");
 		expect(err.message).not.toContain("xoxb-TEST-0");
 		expect(err.message).not.toContain("oops");
+		expect(err.message).toContain("look for a trailing comma");
+		writeFileSync(join(home, "config.json"), '{"schemaVersion": 1, "x": "xoxb-TEST-1" "y": 2}');
+		expect(catchError(() => loadConfig(home)).message).not.toContain("xoxb-TEST-1");
 	});
 
 	test.each([

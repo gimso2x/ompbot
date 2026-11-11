@@ -264,6 +264,11 @@ export interface MailboxDeps {
 	dialogs?: OpenDialogs;
 	/** Turn snapshots and `!undo`; absent = no snapshot is taken and `!undo` says it is not wired. */
 	turnUndo?: TurnUndoDeps;
+	/**
+	 * `!brief`: draws the origin's one-page status picture and uploads it to `threadRef`. Resolving = the image is in
+	 * the thread; throwing = nothing was uploaded and the reason becomes the one failure line. Absent = not wired.
+	 */
+	briefingProvider?: (originKey: string, threadRef: string) => Promise<void>;
 }
 
 /**
@@ -505,6 +510,12 @@ const PEER_FAILURE_MARK = "응답 실패(";
 const PEER_FAILURE_TAIL = "직접 검토해 주세요";
 /** Characters of the failure reason a peer failure notice keeps (after redaction). */
 const PEER_REASON_MAX = 80;
+
+/** omp's start-up error when no provider is logged in and no API key is set (a fresh install that skipped `omp login`). */
+const NO_MODEL_SIGN = /No default model selected/;
+/** The owner's notice for that error: the generic "send it again" would fail the same way until omp has a model. */
+export const NO_MODEL_NOTICE =
+	"[turn failed] omp_no_model — 봇을 돌리는 계정에서 omp가 쓸 모델을 찾지 못했습니다. 그 계정으로 `omp login`(또는 공급자 API 키 설정)을 한 뒤 다시 보내 주세요";
 
 /** The peer bot whose message opened a turn, and whether that message was itself a peer failure notice. */
 interface TurnPeer {
@@ -1441,11 +1452,15 @@ export class OriginMailbox {
 		log.error("dispatch_failed", { origin: originKey, id: row.platformMessageId, code, error: String(failure) });
 		const opRef = `failed:${row.platformMessageId}`;
 		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		const peer = turnPeerOf(row);
 		store.recordTurnFailure({
 			originKey,
 			opRef,
 			threadRef: row.threadRef,
-			notice: failedNotice(code, turnPeerOf(row), this.#threadSource()),
+			notice:
+				peer === undefined && NO_MODEL_SIGN.test(failureSign(failure))
+					? NO_MODEL_NOTICE
+					: failedNotice(code, peer, this.#threadSource()),
 		});
 		await this.#noteTurnFailure(row.threadRef, failureSign(failure));
 		return true;
@@ -1962,13 +1977,20 @@ export class OriginMailbox {
 			this.#startUndo(opRef, threadRef);
 			return;
 		}
+		if (command.kind === "brief") {
+			// Two chromium runs (up to 2x20s): like `!undo`, it must not hold the serial chain, so a message that comes
+			// while the picture is drawn still starts its turn.
+			this.#startBrief(row.platformMessageId, opRef, threadRef);
+			return;
+		}
 		let text: string;
 		try {
 			text = await this.#commandReply(command, opRef, threadRef);
 		} catch (error) {
 			const reason = error instanceof OmpDriverError ? error.message : String(error);
 			log.error("command_failed", { origin: originKey, command: command.kind, error: reason });
-			store.recordTurnFailure({ originKey, opRef, threadRef, notice: failedNotice(`${command.kind}: ${reason}`) });
+			const notice = NO_MODEL_SIGN.test(reason) ? NO_MODEL_NOTICE : failedNotice(`${command.kind}: ${reason}`);
+			store.recordTurnFailure({ originKey, opRef, threadRef, notice });
 			return;
 		}
 		store.recordAnswer({ originKey, opRef, threadRef, parts: [text] });
@@ -1994,6 +2016,47 @@ export class OriginMailbox {
 			)
 			.catch((error: unknown) => {
 				log.error("btw_settle_failed", { origin: originKey, opRef, error: String(error) });
+			});
+	}
+
+	/**
+	 * `!brief` (doc/plans/briefing-image.md §D): the origin's one-page status picture, uploaded to this thread. Outside
+	 * the serial chain for the same reason as `#askBtw`/`#startUndo` — the render takes seconds and the origin's next
+	 * message must not wait for it; the store writes here are synchronous. The row ends `discarded` (an upload instead
+	 * of a text answer, no delivery), so the restart settle never reports this success as a failed turn.
+	 */
+	#startBrief(platformMessageId: string, opRef: string, threadRef: string): void {
+		const { store, originKey, log } = this.#deps;
+		const provider = this.#deps.briefingProvider;
+		if (provider === undefined) {
+			store.recordAnswer({
+				originKey,
+				opRef,
+				threadRef,
+				parts: ["브리핑 이미지를 만들지 못했습니다: 브리핑이 연결되지 않았습니다"],
+			});
+			return;
+		}
+		const startedAt = Date.now();
+		provider(originKey, threadRef)
+			.then(
+				() => {
+					store.discard(platformMessageId, opRef);
+					log.info("briefing_rendered", { origin: originKey, ms: Date.now() - startedAt });
+				},
+				(error: unknown) => {
+					const reason = briefingReason(error);
+					log.warn("briefing_failed", { origin: originKey, error: reason });
+					store.recordAnswer({
+						originKey,
+						opRef,
+						threadRef,
+						parts: [`브리핑 이미지를 만들지 못했습니다: ${reason}`],
+					});
+				},
+			)
+			.catch((error: unknown) => {
+				log.error("briefing_settle_failed", { origin: originKey, opRef, error: String(error) });
 			});
 	}
 
@@ -2171,6 +2234,8 @@ export class OriginMailbox {
 				throw new Error("unreachable: /new is handled by #newEpoch");
 			case "undo":
 				throw new Error("unreachable: undo is handled by #startUndo");
+			case "brief":
+				throw new Error("unreachable: brief is handled by #startBrief");
 		}
 	}
 
@@ -2365,4 +2430,18 @@ export class OriginMailbox {
 		this.#deps.log.info("epoch_new", { origin: originKey, epoch });
 		store.recordAnswer({ originKey, opRef, threadRef, parts: ["🆕 새 대화를 시작했습니다."] });
 	}
+}
+
+/**
+ * The one line after `브리핑 이미지를 만들지 못했습니다:`: a busy render says why in its own message, anything else is
+ * its own text cut to one line (a stack trace never reaches the thread).
+ */
+function briefingReason(error: unknown): string {
+	const text = error instanceof Error ? error.message : String(error);
+	const line =
+		text
+			.split("\n")
+			.map((part) => part.trim())
+			.find((part) => part !== "") ?? "이유 없음";
+	return line.slice(0, 300);
 }

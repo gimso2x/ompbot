@@ -100,9 +100,13 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 	} catch (error) {
 		return usage(error instanceof Error ? error.message : String(error));
 	}
+	if (env.OMPBOT_HOME === "") return usage("OMPBOT_HOME is set but empty; unset it to use ~/.ompbot");
 	const instance = values.instance;
 	if (instance !== undefined) {
 		if (!INSTANCE_NAME.test(instance)) return usage(`--instance must match ${INSTANCE_NAME.source}`);
+		// `ompbot-backup.service` etc. already name the default install's units: such an instance would overwrite them.
+		if (["backup", "gc", "dashboard"].includes(instance))
+			return usage(`--instance ${instance} collides with the default install's ompbot-${instance} units`);
 		if (env.OMPBOT_HOME === undefined)
 			return usage("--instance needs OMPBOT_HOME (a second install needs its own home)");
 	}

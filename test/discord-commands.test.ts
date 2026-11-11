@@ -1,4 +1,4 @@
-// Discord slash commands (doc/plans/discord-channel.md §12): the thirteen COMMAND_TEXT commands are registered at start
+// Discord slash commands (doc/plans/discord-channel.md §12): the fourteen COMMAND_TEXT commands are registered at start
 // (globally, or per allowed server), and an owner's command interaction is acknowledged (type 5, ephemeral) before
 // the core's onCommand runs, then answered by filling or deleting the original response.
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -102,17 +102,18 @@ beforeEach(() => {
 });
 
 describe("command registration", () => {
-	test("start registers the thirteen commands globally, named without the slash; only the ones with an argument take text", async () => {
+	test("start registers the fourteen commands globally, named without the slash; only the ones with an argument take text", async () => {
 		await boot();
 		const [registered, ...more] = transport.commandSets;
 		expect(more).toHaveLength(0);
 		expect(registered?.guildId).toBeUndefined();
 		const byName = new Map(registered?.commands.map((command) => [command.name, command]));
 		expect([...byName.keys()].sort()).toEqual([...NAMES].sort());
-		expect(NAMES).toHaveLength(13);
+		expect(NAMES).toHaveLength(14);
 		expect(NAMES).toContain("new-ompbot");
 		expect(NAMES).toContain("distill-ompbot");
 		expect(NAMES).toContain("btw-ompbot");
+		expect(NAMES).toContain("brief-ompbot");
 		expect(byName.get("btw-ompbot")?.options).toEqual([
 			expect.objectContaining({ type: 3, name: "text", required: false }),
 		]);

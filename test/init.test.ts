@@ -129,6 +129,39 @@ describe("ompbot init", () => {
 		expect(existsSync(home)).toBe(false);
 	});
 
+	test("a directory as --omp, an empty --omp or --workspace, and an empty OMPBOT_HOME exit 2 and create nothing", () => {
+		const home = freshHome();
+		const cases: Array<[string[], string]> = [
+			[["--owner", OWNER, "--omp", tempDir("ompbot-init-dir-")], "is a directory"],
+			[["--owner", OWNER, "--omp", ""], "--omp is empty"],
+			[["--owner", OWNER, "--omp", process.execPath, "--workspace", ""], "--workspace is empty"],
+		];
+		for (const [args, message] of cases) {
+			const run = init(args, home);
+			expect(run.code).toBe(2);
+			expect(run.err).toContain(message);
+			expect(existsSync(home)).toBe(false);
+		}
+		const cwd = tempDir("ompbot-init-cwd-");
+		const empty = Bun.spawnSync([process.execPath, MAIN, "init", "--owner", OWNER, "--omp", process.execPath], {
+			env: { HOME: tempDir("ompbot-init-home-"), OMPBOT_HOME: "", PATH: "" },
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(empty.exitCode).toBe(2);
+		expect(empty.stderr.toString()).toContain("OMPBOT_HOME is set but empty");
+		expect(readdirSync(cwd)).toEqual([]);
+	});
+
+	test("--help prints the usage and exits 0", () => {
+		const home = freshHome();
+		const run = init(["--help"], home);
+		expect(run.code).toBe(0);
+		expect(run.out).toContain("init --owner <Slack member id>");
+		expect(existsSync(home)).toBe(false);
+	});
+
 	test("no omp on PATH and no --omp exits 2 and creates nothing", () => {
 		const home = freshHome();
 		const run = init(["--owner", OWNER], home, tempDir("ompbot-init-empty-path-"));

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { renderDashboardPage, slackThreadHref } from "../src/dashboard/html";
+import { discordThreadHref, renderDashboardPage, slackThreadHref } from "../src/dashboard/html";
 import {
 	buildSnapshot,
 	type DashboardSnapshot,
@@ -385,6 +385,49 @@ describe("flow view", () => {
 		);
 		expect(barOf(renderDashboardPage({ ...built, turns, slackTeam: "T1" }, { task: "T-A3" }))).toMatch(
 			/id="detail-slack"[^>]* hidden>/,
+		);
+	});
+
+	test("a Discord conversation's panel bar links to Discord: DMs always, server threads and lanes with the one server id", async () => {
+		const guild = "100000000000000001"; // gitleaks:allow (fake snowflake)
+		const ch = "100000000000000002"; // gitleaks:allow (fake snowflake)
+		const msg = "100000000000000003"; // gitleaks:allow (fake snowflake)
+		const web = "https://discord.com/channels";
+		expect(discordThreadHref(null, `discord/dm/${ch}`, `${ch}:${msg}`)).toBe(`${web}/@me/${ch}/${msg}`);
+		expect(discordThreadHref(guild, `discord/ch/${ch}/t/${msg}`, `${ch}:${msg}`)).toBe(`${web}/${guild}/${msg}`);
+		expect(discordThreadHref(guild, "ompbot/work/L-20261111-01", `${ch}:${msg}`)).toBe(`${web}/${guild}/${msg}`);
+		expect(discordThreadHref(guild, `discord/ch/${ch}`, `${ch}:${msg}`)).toBe(`${web}/${guild}/${ch}/${msg}`);
+		expect(discordThreadHref(null, `discord/ch/${ch}/t/${msg}`, `${ch}:${msg}`)).toBe("");
+		expect(discordThreadHref(guild, "monitor/m1", `${ch}:${msg}`)).toBe("");
+		expect(discordThreadHref(guild, "slack/ch/C1/t/A", "C1ABC:1794271582.056679")).toBe("");
+
+		// The one configured server becomes the snapshot's `discordGuild`; none or several leave it null.
+		const base = deps();
+		const withGuilds = (guildIds: string[]) =>
+			buildSnapshot({ ...base, config: { ...base.config, channels: { discord: { guildIds } } } });
+		expect((await withGuilds([guild])).discordGuild).toBe(guild);
+		expect((await withGuilds([guild, ch])).discordGuild).toBeNull();
+
+		const built = await buildSnapshot(deps());
+		if (!built.turns.ok) throw new Error(built.turns.error);
+		const key = `discord/ch/${ch}/t/${msg}`;
+		const turns = {
+			...built.turns,
+			threads: built.turns.threads.map((thread) =>
+				thread.originKey === "slack/ch/C1/t/A" ? { ...thread, originKey: key, threadRef: `${ch}:${msg}` } : thread,
+			),
+		};
+		const barOf = (page: string) => /<div class="detail-bar">([\s\S]*?)<\/div>/.exec(page)?.[1] ?? "";
+		const bar = barOf(
+			renderDashboardPage({ ...built, turns, slackTeam: "T1", discordGuild: guild }, { view: "turns", item: key }),
+		);
+		expect(bar).toContain(
+			`id="detail-discord" class="button is-ghost detail-slack" href="${web}/${guild}/${msg}" target="_blank" rel="noopener noreferrer">디스코드에서 답하기`,
+		);
+		// A Discord conversation has no Slack link; without the server id its Discord link is hidden too.
+		expect(bar).toMatch(/id="detail-slack"[^>]* hidden>/);
+		expect(barOf(renderDashboardPage({ ...built, turns }, { view: "turns", item: key }))).toMatch(
+			/id="detail-discord"[^>]* hidden>/,
 		);
 	});
 

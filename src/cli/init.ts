@@ -1,9 +1,9 @@
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultHomeDir, HOME_MODE, SECRET_MODE } from "../config";
 
-export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>]
+export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>] | --help
                                  create the home (0700), secrets/ (0700), the workspace and a minimal config.json (0600);
                                  --omp defaults to omp on PATH, --workspace to <home>/workspace; never writes tokens and
                                  never touches an existing config.json (exit 2)
@@ -18,21 +18,35 @@ function fail(message: string): number {
 
 /** `ompbot init`: every argument is checked before anything is created, so a refused run leaves no trace. */
 export function initCommand(args: string[], env: Record<string, string | undefined>): number {
-	let values: { owner?: string; omp?: string; workspace?: string };
+	let values: { owner?: string; omp?: string; workspace?: string; help?: boolean };
 	try {
 		({ values } = parseArgs({
 			args,
-			options: { owner: { type: "string" }, omp: { type: "string" }, workspace: { type: "string" } },
+			options: {
+				owner: { type: "string" },
+				omp: { type: "string" },
+				workspace: { type: "string" },
+				help: { type: "boolean", short: "h" },
+			},
 		}));
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
 	}
+	if (values.help === true) {
+		process.stdout.write(INIT_USAGE);
+		return 0;
+	}
 	if (values.owner === undefined || !OWNER_ID.test(values.owner)) {
 		return fail("--owner must be a Slack member id (U followed by 8+ uppercase letters or digits)");
 	}
+	// An empty value would resolve to the current directory; leave the option out to get the default instead.
+	if (values.omp === "") return fail("--omp is empty; leave it out to use omp on PATH");
+	if (values.workspace === "") return fail("--workspace is empty; leave it out to use <home>/workspace");
+	if (env.OMPBOT_HOME === "") return fail("OMPBOT_HOME is set but empty; unset it to use ~/.ompbot");
 	const omp = values.omp === undefined ? Bun.which("omp", { PATH: env.PATH ?? "" }) : resolve(values.omp);
 	if (omp === null) return fail("omp not found on PATH; pass --omp <absolute path to omp>");
 	if (!existsSync(omp)) return fail(`--omp ${omp} does not exist`);
+	if (!statSync(omp).isFile()) return fail(`--omp ${omp} is a directory, not the omp executable`);
 	try {
 		accessSync(omp, constants.X_OK);
 	} catch {

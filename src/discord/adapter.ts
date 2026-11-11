@@ -93,6 +93,7 @@ const COMMAND_DESCRIPTIONS: Record<CommandKind, string> = {
 	btw: "진행 중인 작업에 섞지 않고 곁질문에만 답하기",
 	undo: "최근 변경 턴 되돌리기",
 	budget: "오늘 비용과 상한 보기·오늘 상한 끄기",
+	brief: "지금 상태를 한 장 이미지로 받기",
 };
 
 /**

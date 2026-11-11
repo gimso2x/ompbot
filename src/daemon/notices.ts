@@ -87,9 +87,17 @@ export function formatGateOpenNotice(gate: Gate, firstAt: number, now: number): 
 	return [
 		`🚨 [자가진단] 게이트 ${gate.name} 열림${persist}`,
 		`상태: ${oneLine(gate.detail)}`,
+		...(gate.name === "backup_age" && gate.detail === "stamp=missing" ? [NO_BACKUP_YET_HINT] : []),
 		"회복되면 다시 알립니다.",
 	].join("\n");
 }
+
+/**
+ * A home that has never been backed up: right after a first install this alert is expected (the backup needs the
+ * ledger the daemon has just created), so the notice says what to do instead of reading like a failure.
+ */
+export const NO_BACKUP_YET_HINT =
+	"백업이 아직 한 번도 없습니다. 첫 설치 직후라면 정상입니다 — 서버에서 `ompbot backup`(체크아웃에서는 `bun src/main.ts backup`)을 한 번 돌리고 `ompbot-backup.timer`를 켜 두면 닫힙니다.";
 
 /** `✅ [자가진단] 게이트 … 회복`: sent only when the open period had actually alerted the owner. */
 export function formatGateClosedNotice(gate: Gate): string {

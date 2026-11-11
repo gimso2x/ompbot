@@ -16,6 +16,7 @@ import { collectGates, type GatesOptions } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
 import { OffsiteError, type OffsiteResult, runOffsite } from "../ops/offsite";
 import { APPLY_USAGE, applyCommand } from "./apply";
+import { BRIEFING_USAGE, briefingCommand } from "./briefing";
 import { DASHBOARD_USAGE, dashboardCommand } from "./dashboard";
 import { DRAIN_USAGE, drainCommand } from "./drain";
 import { FEEDBACK_USAGE, feedbackCommand } from "./feedback";
@@ -53,11 +54,12 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  gates: backup_age, offsite_age (only with config offsite), sweep_stalled, slack_disconnected,
                                  frozen, herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
                                  disk_low, host_pressure, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
-                                 monitors_failed, monitors_stalled, turns_failing, ledger_unreadable
+                                 monitors_failed, monitors_stalled, turns_failing, ledger_unreadable,
+                                 cost_cap (only with config costCap.dailyUsd)
   inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${FEEDBACK_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -476,6 +478,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return skillsCommand(rest, env);
 			case "dashboard":
 				return await dashboardCommand(rest, homeDir);
+			case "briefing":
+				return await briefingCommand(rest, homeDir);
 			case "feedback":
 				return feedbackCommand(rest, homeDir);
 			default:

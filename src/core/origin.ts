@@ -76,6 +76,8 @@ export interface OriginRouterDeps {
 	dialogs?: MailboxDeps["dialogs"];
 	/** Turn snapshots and `!undo`; passed to every mailbox (`MailboxDeps.turnUndo`). */
 	turnUndo?: MailboxDeps["turnUndo"];
+	/** `!brief` renderer; passed to every mailbox (`MailboxDeps.briefingProvider`). */
+	briefingProvider?: MailboxDeps["briefingProvider"];
 	/** Whether an origin's work is held (a paused lane); passed per mailbox (`MailboxDeps.isHeld`). */
 	isHeld?: (originKey: string) => boolean;
 	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */

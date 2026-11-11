@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
 	type CacheMissInfo,
 	type ColdCacheInfo,
+	NO_MODEL_NOTICE,
 	OriginMailbox,
 	type SessionMismatchInfo,
 	type StuckLoopInfo,
@@ -468,6 +469,23 @@ describe("mailbox: /new, /status, failures", () => {
 		driverOptions = {};
 		await router.route(msg("again"));
 		expect(drivers.at(-1)?.calls).toContain("prompt:again");
+	});
+
+	test("omp without any model (no login, no API key) tells the owner to run omp login instead of just resending", async () => {
+		driverOptions = {
+			startError: new OmpDriverError(
+				"not_started",
+				"Agent process exited with code 1. Stderr: No default model selected. Use /login, set an API key environment variable, or select a local model",
+			),
+		};
+		const a = msg("hi");
+		await router.route(a);
+		expect(store.getInbound(a.platformMessageId)?.state).toBe("failed_notified");
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([NO_MODEL_NOTICE]);
+		expect(NO_MODEL_NOTICE).toStartWith("[turn failed] omp_no_model");
+		const command = msg("!model");
+		await router.route(command);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([NO_MODEL_NOTICE, NO_MODEL_NOTICE]);
 	});
 });
 

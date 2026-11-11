@@ -187,7 +187,7 @@ export function buildFloorsPrompt(
 }
 
 /** `persona.md`: the owner's operating contract. Chat origins only (lanes, monitors and review origins never get it). */
-export const PERSONA_MAX_BYTES = 4096;
+export const PERSONA_MAX_BYTES = 8192;
 /** `soul.md`: the bot's name, relationship to the owner, voice and character. Chat and monitor origins. */
 export const SOUL_MAX_BYTES = 8192;
 /** `owner.md`: the owner-observation notes a monitor distills. Chat and monitor origins. */

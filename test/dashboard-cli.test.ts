@@ -23,6 +23,7 @@ const SNAPSHOT_KEYS = [
 	"backup",
 	"jobs",
 	"slackTeam",
+	"discordGuild",
 ];
 
 let home: TestHome;

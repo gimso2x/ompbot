@@ -1,9 +1,10 @@
 // `ompbot doctor`'s Discord lines (doc/plans/discord-channel.md TASK 4): token file mode, GET /users/@me and
 // GET /gateway/bot, on a fake fetch; nothing when Discord is off.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, readFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { OmpbotConfig } from "../src/config";
-import { checkDiscord } from "../src/daemon/doctor";
+import { checkDiscord, countOmpModels } from "../src/daemon/doctor";
 import { makeHome, type TestHome, withDiscord } from "./helpers/bot-home";
 
 let home: TestHome;
@@ -36,6 +37,28 @@ beforeEach(() => {
 });
 
 afterEach(() => home.remove());
+
+describe("doctor: omp models", () => {
+	/** A stand-in omp that answers `models --json` with the given script body. */
+	function fakeOmp(body: string): string {
+		const path = join(home.dir, "fake-omp");
+		writeFileSync(path, `#!/bin/sh\n${body}\n`);
+		chmodSync(path, 0o755);
+		return path;
+	}
+
+	test("counts the models a logged-in omp lists, and 0 when no provider is logged in", async () => {
+		expect(await countOmpModels(fakeOmp(`echo '{"models":[{"id":"a"},{"id":"b"}]}'`))).toBe(2);
+		expect(await countOmpModels(fakeOmp(`echo '{"models":[]}'`))).toBe(0);
+	});
+
+	test("a failing, garbled or hanging omp is a reason, not a count", async () => {
+		expect(await countOmpModels(fakeOmp("exit 3"))).toBe("omp models exited 3");
+		expect(await countOmpModels(fakeOmp("echo not-json"))).toBe("unparsable output");
+		expect(await countOmpModels(fakeOmp("exec sleep 5"), 200)).toBe("timeout after 0.2s");
+		expect(await countOmpModels(home.dir)).toBe(`cannot run ${home.dir} (EACCES)`);
+	});
+});
 
 describe("doctor: discord", () => {
 	test("on: token mode, the bot user and the gateway each give one ok discord line; the token never shows", async () => {
