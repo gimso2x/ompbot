@@ -13,6 +13,7 @@ import {
 	isExecutableFile,
 	isReportOrigin,
 	type PeerApply,
+	pidAlive,
 	REPORT_THREAD_PATTERN,
 	readLockStartedAt,
 	receiptPathFor,
@@ -24,15 +25,19 @@ import {
 import { backupStamp, runBackup } from "../ops/backup";
 import { collectGates } from "../ops/gates";
 import { socketDrainCall, waitForDrain } from "./drain";
+import { runProfileSync } from "./omp";
 
 export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D> --report-thread <ts>] [--json]
-                                 precheck (main, HEAD==main, clean src, bun) → backup + config copy → drain --wait (default
-                                 60 min) → systemctl --user restart <this home's unit> → wait for a fresh daemon (2 min) →
-                                 gates/doctor summary; on failure restores config and restarts once (code is not reverted).
+                                 precheck (main, HEAD==main, clean src, bun) → backup + config copy → with config ompProfile,
+                                 ompbot omp sync (a failure stops here) → drain --wait (default 60 min) → systemctl --user
+                                 restart <this home's unit> → wait for a fresh daemon (2 min) → gates/doctor summary; on
+                                 failure restores config and restarts once (code is not reverted).
                                  Then the same apply runs for every other active install on this checkout (ompbot-<instance>,
                                  own home and receipt); a failed one makes the exit 1. Receipt:
                                  <home>/logs/apply-<stamp>.json. --detach re-launches it as a systemd-run unit and returns.
                                  --stamp YYYYMMDD-HHMMSS: fix the receipt/backup stamp (--detach passes its own to the unit).
+                                 One apply per home at a time (<home>/apply.lock): a second one waits (step wait_apply) and
+                                 ends already_applied when the one it waited for finished ok on the same HEAD.
                                  --merged-at: skip when the daemon already started after that time. exit 0 ok/already
                                  applied, 1 failed, 2 usage, 3 precheck SKIP
 `;
@@ -120,11 +125,15 @@ export async function applyCommand(
 	return exitCode;
 }
 
-/** Everything `runApply` needs for one install: its home, socket, config-driven backup/gates and its unit. */
-function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
+/**
+ * Everything `runApply` needs for one install: its home, socket, config-driven backup/gates, its unit and, with config
+ * `ompProfile`, the profile sync.
+ */
+export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
 	const config = existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir) : undefined;
 	const socketPath = join(homeDir, "ompbot.sock");
 	const omp = config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
+	const profile = config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile };
 	return {
 		homeDir,
 		unit,
@@ -145,15 +154,33 @@ function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
 				homeDir,
 				now: Date.now(),
 				offsiteConfigured: config?.offsite !== undefined,
-				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
+				...(config?.costCap?.dailyUsd === undefined
+					? {}
+					: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
 				...omp,
+				...profile,
 			}),
 		doctor: async () => {
 			const lines: string[] = [];
 			const code = await runDoctor(homeDir, (line) => lines.push(line));
 			return { code, lines };
 		},
+		...(config?.ompProfile === undefined
+			? {}
+			: {
+					ompSync: () => ({
+						changed: runProfileSync({
+							homeDir,
+							profile: config.ompProfile,
+							env: process.env,
+							out: (line) => process.stderr.write(`omp sync: ${line}\n`),
+							now: () => Date.now(),
+						}),
+					}),
+				}),
 		lockStartedAt: () => readLockStartedAt(homeDir),
+		pid: process.pid,
+		isAlive: pidAlive,
 		isExecutable: isExecutableFile,
 		log: (line) => process.stderr.write(`${line}\n`),
 	};

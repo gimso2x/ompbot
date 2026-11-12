@@ -4,8 +4,10 @@ import { resolveScript, SCRIPT_TIMEOUT_MS } from "./spec";
 
 /** The payload handed to the agent is cut to this many chars (the script is not killed for it). */
 export const MAX_SCRIPT_OUTPUT_CHARS = 8000;
-/** Memory bound for the output that feeds the hash and the wake gate; the rest is dropped. */
+/** Memory bound for the head of the output kept for the payload; the hash still covers the whole stream. */
 const MAX_SCRIPT_COLLECT_CHARS = 4 * 1024 * 1024;
+/** The end of an output past the head bound kept for its last line (the wake gate) and the stderr tail. */
+const SCRIPT_TAIL_CHARS = 64 * 1024;
 /** The stderr tail attached to the monitor_script log event (stdout keeps the gate, the hash and the wake call). */
 export const MAX_SCRIPT_STDERR_TAIL_CHARS = 2000;
 /** How long the stdio streams may still take to close after "exit": a detached background child holding a pipe
@@ -65,16 +67,22 @@ export async function runScript(
 			...(options.monitorId === undefined ? {} : { OMPBOT_MONITOR_ID: options.monitorId }),
 		},
 	});
-	let stdout = "";
+	// stdout: the head (payload) up to the collect bound, then a rolling tail (last line); the hash takes every chunk.
+	let head = "";
+	let tail: string | undefined;
+	const hash = trimmedHash();
 	child.stdout?.setEncoding("utf8");
 	child.stdout?.on("data", (chunk: string) => {
-		if (stdout.length < MAX_SCRIPT_COLLECT_CHARS) stdout += chunk;
+		hash.update(chunk);
+		const room = MAX_SCRIPT_COLLECT_CHARS - head.length;
+		if (room > 0) head += chunk.slice(0, room);
+		if (chunk.length > room) tail = `${tail ?? ""}${chunk.slice(Math.max(room, 0))}`.slice(-SCRIPT_TAIL_CHARS);
 	});
-	// Bounded like stdout; only the last `MAX_SCRIPT_STDERR_TAIL_CHARS` chars reach the log.
+	// Only the last `MAX_SCRIPT_STDERR_TAIL_CHARS` chars reach the log: a rolling tail is enough.
 	let stderr = "";
 	child.stderr?.setEncoding("utf8");
 	child.stderr?.on("data", (chunk: string) => {
-		if (stderr.length < MAX_SCRIPT_COLLECT_CHARS) stderr += chunk;
+		stderr = `${stderr}${chunk}`.slice(-SCRIPT_TAIL_CHARS);
 	});
 	const done = Promise.withResolvers<{ code: number | null; spawnError?: string }>();
 	child.once("error", (error) => done.resolve({ code: null, spawnError: error.message }));
@@ -114,16 +122,44 @@ export async function runScript(
 			error: spawnError,
 		};
 	}
-	// Hash and wake gate come from the whole output; only the payload handed to the agent is cut.
-	const full = stdout.trim();
+	// Hash and wake gate come from the whole output; only the payload handed to the agent is cut. Past the collect
+	// bound the text is the head plus the tail's whole lines (its first line is cut off at the tail's start).
+	const newline = tail?.indexOf("\n") ?? -1;
+	const lastLines = tail === undefined ? "" : newline === -1 ? undefined : tail.slice(newline + 1);
+	const full = tail === undefined ? head.trim() : `${head.trimStart()}\n${(lastLines ?? tail).trimEnd()}`;
 	return {
 		fired: !timedOut && code === 0,
 		exitCode: code,
 		timedOut,
 		stdout: capPayload(full),
 		stderr: tailOf(stderr.trim()),
-		outputHash: createHash("sha256").update(full).digest("hex"),
-		wakeOff: isWakeGateOff(full),
+		outputHash: hash.digest(),
+		// A tail without a newline is the middle of one line longer than the tail: not the gate line.
+		wakeOff: lastLines !== undefined && isWakeGateOff(full),
+	};
+}
+
+/**
+ * sha256 of the stream's `trim()`med text, fed chunk by chunk: leading whitespace is skipped, trailing whitespace is
+ * held back until more text follows it (JS `trim` and `\s` strip the same characters).
+ */
+function trimmedHash(): { update(chunk: string): void; digest(): string } {
+	const sha = createHash("sha256");
+	let started = false;
+	let pending = "";
+	return {
+		update(chunk) {
+			const text = started ? chunk : chunk.replace(/^\s+/, "");
+			if (text === "") return;
+			started = true;
+			const joined = pending + text;
+			// A backward scan, not /\s+$/: that regex is quadratic on a long whitespace run followed by text.
+			let end = joined.length;
+			while (end > 0 && /\s/.test(joined[end - 1] as string)) end -= 1;
+			pending = joined.slice(end);
+			sha.update(joined.slice(0, end));
+		},
+		digest: () => sha.digest("hex"),
 	};
 }
 

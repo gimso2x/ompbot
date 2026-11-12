@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readdirSync, readSync, realpathSync, type Stats, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { ChannelRegistry } from "../channel/registry";
@@ -34,14 +34,60 @@ export const UPLOAD_SCAN_CARRY_CHARS = 4096;
  * as UTF-8 is full of short `sk-…` runs. Chat masking (`redact`) keeps the shorter shape.
  */
 const UPLOAD_SECRET_PATTERN = new RegExp(secretShapes("{20,}"));
+/** PEM private keys (`RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, bare): an upload-only check, chat masking does not use it. */
+const PRIVATE_KEY_HEADER = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/;
+/** How deep and how many files of one protected directory the hard-link check walks. */
+const HARD_LINK_SCAN_DEPTH = 3;
+const HARD_LINK_SCAN_FILES = 2000;
 
-/** The upload verdict on one scanned span: a token-shaped string or a fragment of an indexed secret value. */
+/**
+ * The upload verdict on one scanned span: a token-shaped string, a private key header or a fragment of an indexed
+ * secret value.
+ */
 export function hasUploadSecret(text: string): boolean {
-	return UPLOAD_SECRET_PATTERN.test(text) || maskKnownFragments(text) !== text;
+	return UPLOAD_SECRET_PATTERN.test(text) || PRIVATE_KEY_HEADER.test(text) || maskKnownFragments(text) !== text;
+}
+
+/**
+ * Whether a regular file under `root` (the root itself when it is a file; depth 3, at most 2,000 files, symlinks not
+ * followed) is the same inode as `target`. A missing or unreadable entry is simply not a match.
+ */
+function protectedInodeMatches(root: string, target: { dev: number; ino: number }): boolean {
+	let budget = HARD_LINK_SCAN_FILES;
+	const visit = (path: string, depth: number): boolean => {
+		let entry: Stats;
+		try {
+			entry = lstatSync(path);
+		} catch {
+			return false;
+		}
+		if (entry.isFile()) {
+			budget--;
+			return entry.dev === target.dev && entry.ino === target.ino;
+		}
+		if (!entry.isDirectory() || depth >= HARD_LINK_SCAN_DEPTH) return false;
+		let names: string[];
+		try {
+			names = readdirSync(path);
+		} catch {
+			return false;
+		}
+		for (const name of names) {
+			if (budget <= 0) return false;
+			if (visit(join(path, name), depth + 1)) return true;
+		}
+		return false;
+	};
+	return visit(root, 0);
 }
 
 /** How a tool description names each platform. */
-const PLATFORM_NAMES: Record<ChatPlatform, string> = { slack: "Slack", discord: "Discord", telegram: "Telegram" };
+const PLATFORM_NAMES: Record<ChatPlatform, string> = {
+	slack: "Slack",
+	discord: "Discord",
+	telegram: "Telegram",
+	teams: "Teams",
+};
 
 export interface HostToolDeps {
 	originKey: string;
@@ -62,6 +108,8 @@ export interface HostToolDeps {
 	threadTs?: () => string | undefined;
 	/** `omp` binary for the dispatch tool's simple mode; the tool is registered only for Slack chat origins. */
 	ompExecutable?: string;
+	/** Config `ompProfile` of the dispatch tool's simple `omp -p` run. */
+	ompProfile?: string;
 	/** Home of the user running the bot (tests override); default `os.homedir()`. */
 	userHome?: string;
 	/** Remote dispatch targets (config `dispatchHosts`) for the dispatch tool. */
@@ -72,6 +120,8 @@ export interface HostToolDeps {
 	herdrBoard?: DispatchToolDeps["herdrBoard"];
 	/** [TASK] state docs for the dispatch tool's `taskSpec`. */
 	tasks?: DispatchToolDeps["tasks"];
+	/** The dispatch tool's record of prompts herdr took (dashboard 마지막 지시). */
+	recordPrompt?: DispatchToolDeps["recordPrompt"];
 	/** Freeze switch for the dispatch tool (`<home>/FROZEN`). */
 	frozen?: DispatchToolDeps["frozen"];
 	/** Config `herdr`: absent → the dispatch tool is simple-only. */
@@ -119,6 +169,11 @@ export function checkUploadable(
 	const stat = statSync(real);
 	if (!stat.isFile()) throw new Error("upload refused: not a regular file");
 	if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`upload refused: file larger than ${MAX_UPLOAD_BYTES} bytes`);
+	// A hard link has no path in the protected directory, so compare inodes — only for linked files (link count 1 costs
+	// nothing), and never refuse on the count alone (pnpm stores and other tools hard-link ordinary files).
+	if (stat.nlink > 1 && forbidden.some((dir) => protectedInodeMatches(dir, stat))) {
+		throw new Error("upload refused: hard link to a file in a protected directory");
+	}
 	const fd = openSync(real, "r");
 	try {
 		const decoder = new TextDecoder();

@@ -1,8 +1,11 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, watch } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	dispatchEnv,
+	herdrAgentExists,
 	herdrAgentStatus,
 	herdrPromptExisting,
 	herdrRemoteStart,
@@ -10,12 +13,14 @@ import {
 	herdrStartAgent,
 	type ProcessRunner,
 	type RunProcessResult,
+	realProcessRunner,
 	remoteShellQuote,
 	runOmpPrint,
 	setLocalHerdrBin,
 } from "../src/dispatch/omp";
 import { buildDispatchTool, type DispatchToolDeps } from "../src/dispatch/tool";
 import type { ApprovalResult } from "../src/safety/approval";
+import { openStore } from "../src/store/db";
 
 function runner(routes: Array<{ match: (cmd: string[]) => boolean; respond: (cmd: string[]) => RunProcessResult }>) {
 	return async (cmd: string[]): Promise<RunProcessResult> => {
@@ -24,6 +29,77 @@ function runner(routes: Array<{ match: (cmd: string[]) => boolean; respond: (cmd
 		return hit.respond(cmd);
 	};
 }
+
+/** Rejects when `promise` has not settled within `ms` (a bound on the wait, never a fixed delay). */
+function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+	const limit = Promise.withResolvers<never>();
+	// Fires only on failure: the bound of the wait, the test never waits for it.
+	const timer = setTimeout(() => limit.reject(new Error(`${what} did not happen within ${ms} ms`)), ms);
+	return Promise.race([promise, limit.promise]).finally(() => clearTimeout(timer));
+}
+
+/** Resolves once `dir/name` exists (watched, not polled). */
+function fileAppears(dir: string, name: string): Promise<void> {
+	const done = Promise.withResolvers<void>();
+	const watcher = watch(dir, () => {
+		if (existsSync(join(dir, name))) done.resolve();
+	});
+	if (existsSync(join(dir, name))) done.resolve();
+	return done.promise.finally(() => watcher.close());
+}
+
+/** Whether `pid` is a live process (gone or a zombie waiting to be reaped = not alive). */
+function alive(pid: number): boolean {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Resolves once `pid` is gone. The runner returns when the shell exits, right after it sent SIGKILL to the whole
+ * group; the kernel finishes killing each member on its own schedule, so a grandchild can still read as alive for a
+ * moment. Yields to the event loop (no timer) and fails at `ms`.
+ */
+async function goneWithin(pid: number, ms: number): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (alive(pid)) {
+		if (Date.now() > deadline) throw new Error(`process ${pid} still alive after ${ms} ms`);
+		const tick = Promise.withResolvers<void>();
+		setImmediate(tick.resolve);
+		await tick.promise;
+	}
+}
+
+describe("realProcessRunner signal", () => {
+	test("an aborted signal kills the child's process group, grandchild included, and the run returns", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ompbot-abort-"));
+		let grandchild: number | undefined;
+		try {
+			const ready = fileAppears(dir, "pid");
+			const abort = new AbortController();
+			const run = realProcessRunner(["sh", "-c", "sleep 300 & echo $! > pid.tmp && mv pid.tmp pid; wait"], {
+				cwd: dir,
+				timeoutMs: 600_000,
+				signal: abort.signal,
+			});
+			await within(ready, 4_000, "the grandchild pid file");
+			grandchild = Number(readFileSync(join(dir, "pid"), "utf8").trim());
+			expect(alive(grandchild)).toBe(true);
+			abort.abort();
+			const result = await within(run, 4_000, "the aborted run returning");
+			expect(result.timedOut).toBe(false);
+			expect(result.code).toBeNull();
+			await goneWithin(grandchild, 4_000);
+		} finally {
+			// A runner that ignored the signal leaves the sleep behind: clean it up so the failure is the only effect.
+			if (grandchild !== undefined && alive(grandchild)) process.kill(grandchild, "SIGKILL");
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("dispatchEnv", () => {
 	test("drops Slack/bot/git prefixes, keeps the rest", () => {
@@ -56,11 +132,28 @@ describe("runOmpPrint (simple mode)", () => {
 		});
 		expect(seen[0]).toBe("/usr/local/bin/omp");
 		expect(seen[1]).toBe("-p");
-		expect(seen[2]).toBe("빌드 상태 요약");
+		expect(seen.slice(-2)).toEqual(["--", "빌드 상태 요약"]);
 		expect(seen).toContain("FLOORS");
 		expect(seen).toContain("--no-session");
 		expect(result.ok).toBe(true);
 		expect(result.output.length).toBeLessThanOrEqual(8_000);
+	});
+
+	test("a task that starts with '-' goes after `--`, so omp reads it as the prompt, not a flag (B-3)", async () => {
+		for (const task of ["- 빌드", "--version"]) {
+			let seen: string[] = [];
+			await runOmpPrint({
+				task,
+				cwd: "/ws",
+				systemPromptAppendix: "FLOORS",
+				ompBin: "/bin/omp",
+				run: async (cmd) => {
+					seen = cmd;
+					return { code: 0, stdout: "ok", timedOut: false };
+				},
+			});
+			expect(seen).toEqual(["/bin/omp", "-p", "--no-session", "--append-system-prompt", "FLOORS", "--", task]);
+		}
 	});
 
 	test("timeout and non-zero exit are reported, not thrown", async () => {
@@ -82,6 +175,74 @@ describe("runOmpPrint (simple mode)", () => {
 		});
 		expect(failed.ok).toBe(false);
 		expect(failed.output).toBe("boom");
+		expect(failed).toMatchObject({ code: 1, timedOut: false });
+		expect(timedOut).toMatchObject({ code: null, timedOut: true });
+	});
+
+	test("lane review: model, tools and signal reach the runner; without them the argv is unchanged", async () => {
+		const seen: { cmd: string[]; signal?: AbortSignal | undefined }[] = [];
+		const run = async (cmd: string[], opts: { signal?: AbortSignal }) => {
+			seen.push({ cmd, signal: opts.signal });
+			return { code: 0, stdout: "ok", timedOut: false };
+		};
+		const abort = new AbortController();
+		await runOmpPrint({
+			task: "t",
+			cwd: "/ws",
+			systemPromptAppendix: "F",
+			ompBin: "/bin/omp",
+			model: "anthropic/claude-sonnet-5-5:medium",
+			tools: "read,grep,glob",
+			signal: abort.signal,
+			run,
+		});
+		await runOmpPrint({ task: "t", cwd: "/ws", systemPromptAppendix: "F", ompBin: "/bin/omp", run });
+		expect(seen[0]?.cmd).toEqual([
+			"/bin/omp",
+			"-p",
+			"--no-session",
+			"--append-system-prompt",
+			"F",
+			"--model",
+			"anthropic/claude-sonnet-5-5:medium",
+			"--tools",
+			"read,grep,glob",
+			"--",
+			"t",
+		]);
+		expect(seen[0]?.signal).toBe(abort.signal);
+		expect(seen[1]?.cmd).toEqual(["/bin/omp", "-p", "--no-session", "--append-system-prompt", "F", "--", "t"]);
+		expect(seen[1]?.signal).toBeUndefined();
+	});
+
+	test("lane review isolation AC-1: --config <overlay> and the four --no-* flags follow --no-session; absent, the argv is unchanged", async () => {
+		const seen: string[][] = [];
+		const run = async (cmd: string[]) => {
+			seen.push(cmd);
+			return { code: 0, stdout: "ok", timedOut: false };
+		};
+		const base = { task: "-t", cwd: "/ws", systemPromptAppendix: "F", ompBin: "/bin/omp", run };
+		await runOmpPrint({ ...base, tools: "read,grep,glob", isolation: { configPath: "/r/L-1.omp.yml" } });
+		await runOmpPrint(base);
+		expect(seen[0]).toEqual([
+			"/bin/omp",
+			"-p",
+			"--no-session",
+			"--config",
+			"/r/L-1.omp.yml",
+			"--no-extensions",
+			"--no-skills",
+			"--no-rules",
+			"--no-context-files",
+			"--append-system-prompt",
+			"F",
+			"--tools",
+			"read,grep,glob",
+			"--",
+			"-t",
+		]);
+		expect(seen[0]?.at(-1)).toBe("-t");
+		expect(seen[1]).toEqual(["/bin/omp", "-p", "--no-session", "--append-system-prompt", "F", "--", "-t"]);
 	});
 });
 
@@ -133,7 +294,7 @@ describe("simple mode risk gate", () => {
 	test("high_risk + approved runs omp -p and ends with the approval line", async () => {
 		const { built, runs, approvals } = simpleTool("approved");
 		const out = await built.execute({ task: HIGH }, { signal });
-		expect(runs.map((cmd) => cmd.slice(0, 3))).toEqual([["omp", "-p", HIGH]]);
+		expect(runs.map((cmd) => [...cmd.slice(0, 2), ...cmd.slice(-2)])).toEqual([["omp", "-p", "--", HIGH]]);
 		expect(approvals).toEqual(["herdr 위임 지시문에 고위험 명령이 있습니다"]);
 		expect(out).toBe("결과 요약\n위험 검사: high_risk 승인됨 (git_push_force, git_push_protected)");
 	});
@@ -326,7 +487,7 @@ describe("herdr dispatch", () => {
 
 describe("herdr local start cleanup", () => {
 	/** A local start whose argv is recorded; `fail` names the step that exits 1. */
-	async function startWith(fail: "start" | "prompt") {
+	async function startWith(fail: "start" | "prompt", closeOnPromptFailure?: boolean) {
 		const calls: string[][] = [];
 		const run: ProcessRunner = async (cmd) => {
 			calls.push(cmd);
@@ -337,8 +498,9 @@ describe("herdr local start cleanup", () => {
 			if (cmd[1] === "agent" && cmd[2] === fail) return { code: 1, stdout: "", stderr: "boom", timedOut: false };
 			return { code: 0, stdout: "{}", timedOut: false };
 		};
-		const result = await herdrStartAgent({ name: "t-1", task: "지시", cwd: "/ws", options: { run } });
-		return { result, calls, closes: calls.filter((cmd) => cmd[1] === "workspace" && cmd[2] === "close") };
+		const extra = closeOnPromptFailure === undefined ? {} : { closeOnPromptFailure };
+		const result = await herdrStartAgent({ name: "t-1", task: "지시", cwd: "/ws", ...extra, options: { run } });
+		return { result, calls, closes: calls.filter((cmd) => cmd[2] === "close") };
 	}
 
 	test("workspace create passes --no-focus; a failed agent start closes that workspace exactly once", async () => {
@@ -350,9 +512,71 @@ describe("herdr local start cleanup", () => {
 	});
 
 	test("a failed first prompt leaves the started agent and its workspace alone", async () => {
-		const { result, closes } = await startWith("prompt");
+		for (const flag of [undefined, false]) {
+			const { result, closes } = await startWith("prompt", flag);
+			expect(result).toEqual({ ok: false, error: "agent prompt failed: boom" });
+			expect(closes).toEqual([]);
+		}
+	});
+
+	test("closeOnPromptFailure: a failed first prompt closes the workspace this call created (B-4)", async () => {
+		const { result, closes } = await startWith("prompt", true);
 		expect(result).toEqual({ ok: false, error: "agent prompt failed: boom" });
-		expect(closes).toEqual([]);
+		expect(closes).toEqual([["herdr", "workspace", "close", "W7"]]);
+	});
+});
+
+describe("herdr remote start cleanup on a failed first prompt (B-4)", () => {
+	/** A remote start whose first prompt exits 1; `shared` = the owners workspace already exists on the host. */
+	async function remoteWith(shared: boolean, closeOnPromptFailure?: boolean) {
+		const words: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			const args = cmd.slice(cmd.indexOf("--") + 2).map((word) => word.slice(1, -1));
+			words.push(args);
+			const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), timedOut: false });
+			if (args[0] === "agent" && args[1] === "list") return ok({ agents: [] });
+			if (args[0] === "workspace" && args[1] === "list") {
+				return ok({ workspaces: shared ? [{ workspace_id: "WS-OWNERS", label: "ompbot-owners" }] : [] });
+			}
+			if (args[0] === "workspace" && args[1] === "create") {
+				return ok({ workspace: { workspace_id: "WS-NEW" }, tab: { tab_id: "T-NEW" }, root_pane: { pane_id: "P1" } });
+			}
+			if (args[0] === "tab" && args[1] === "create")
+				return ok({ tab: { tab_id: "T-MINE" }, root_pane: { pane_id: "P2" } });
+			if (args[0] === "agent" && args[1] === "prompt") return { code: 1, stdout: "", stderr: "boom", timedOut: false };
+			return ok({});
+		};
+		const extra = closeOnPromptFailure === undefined ? {} : { closeOnPromptFailure };
+		const result = await herdrRemoteStart({
+			sshTarget: "wsl",
+			name: "t-2",
+			task: "지시",
+			cwd: "/r",
+			...extra,
+			options: { run },
+		});
+		return { result, closes: words.filter((args) => args[1] === "close") };
+	}
+
+	test("shared owners workspace: only this call's tab is closed, the workspace never", async () => {
+		const { result, closes } = await remoteWith(true, true);
+		expect(result).toEqual({ ok: false, error: "agent prompt failed: boom" });
+		expect(closes).toEqual([["tab", "close", "T-MINE"]]);
+	});
+
+	test("a workspace this call created is closed whole", async () => {
+		const { closes } = await remoteWith(false, true);
+		expect(closes).toEqual([["workspace", "close", "WS-NEW"]]);
+	});
+
+	test("without the flag (default) nothing is closed", async () => {
+		for (const shared of [true, false]) {
+			for (const flag of [undefined, false]) {
+				const { result, closes } = await remoteWith(shared, flag);
+				expect(result).toEqual({ ok: false, error: "agent prompt failed: boom" });
+				expect(closes).toEqual([]);
+			}
+		}
 	});
 });
 
@@ -565,6 +789,15 @@ describe("herdrAgentStatus", () => {
 		expect((await ask({ code: 0, stdout: "not json", timedOut: false })).ok).toBe(false);
 	});
 
+	test("L-13 herdr printing JSON that is not an object (null, a number) is a failure, not a TypeError", async () => {
+		for (const stdout of ["null", "3", '"x"']) {
+			const answer: RunProcessResult = { code: 0, stdout, timedOut: false };
+			expect(await ask(answer)).toMatchObject({ ok: false });
+			const exists = await herdrAgentExists("t-1", { run: runner([{ match: () => true, respond: () => answer }]) });
+			expect(exists).toMatchObject({ ok: false });
+		}
+	});
+
 	test("with sshTarget the list runs as the herdrSshArgv ssh command", async () => {
 		const seen: string[][] = [];
 		const result = await herdrAgentStatus("t-1", {
@@ -660,6 +893,16 @@ describe("herdr optional (config herdr)", () => {
 		expect(calls[0]?.[0]).toBe("herdr");
 	});
 
+	test("L-12 a host named like an Object.prototype member is unknown, and nothing runs", async () => {
+		const { built, calls } = dispatchTool({ herdr: {}, dispatchHosts: { wsl: { ssh: "wsl" } } });
+		for (const host of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+			await expect(built.execute({ host, name: "x", task: "t" }, { signal })).rejects.toThrow(
+				`알 수 없는 호스트: ${host} (등록된 호스트: wsl)`,
+			);
+		}
+		expect(calls).toEqual([]);
+	});
+
 	test("a task to a name the remote host already runs is a follow-up prompt, not a second start", async () => {
 		const calls: string[][] = [];
 		const { built } = dispatchTool({
@@ -734,7 +977,7 @@ describe("worker omp arguments (agentArgs)", () => {
 		}
 		const r = recorder();
 		await runOmpPrint({ task: "t", cwd: "/ws", systemPromptAppendix: "F", ompBin: "/bin/omp", run: r.run });
-		expect(r.seen).toEqual([["/bin/omp", "-p", "t", "--no-session", "--append-system-prompt", "F"]]);
+		expect(r.seen).toEqual([["/bin/omp", "-p", "--no-session", "--append-system-prompt", "F", "--", "t"]]);
 	});
 
 	test("local agentArgs end the agent start argv after `--`; nothing else changes", async () => {
@@ -748,5 +991,287 @@ describe("worker omp arguments (agentArgs)", () => {
 		const start = seen.find((cmd) => cmd.includes("'start'"));
 		expect(start).toEqual([...REMOTE_START, "'--'", "'--prewalk'", "'--model=it'\\''s'"]);
 		expect(seen.filter((cmd) => cmd.includes("'--prewalk'"))).toHaveLength(1);
+	});
+});
+
+describe("qa50b lane H: local herdr start and pipe-holding children", () => {
+	const signal = new AbortController().signal;
+	/** A fake local herdr: `agent list` shows `agents`, a start adds one, a prompt to an unknown name fails. */
+	function fakeHerdr(agents: string[]) {
+		const calls: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			calls.push(cmd);
+			const [, group, verb, name] = cmd;
+			if (group === "agent" && verb === "list") {
+				return {
+					code: 0,
+					stdout: JSON.stringify({ result: { agents: agents.map((agent) => ({ name: agent })) } }),
+					timedOut: false,
+				};
+			}
+			if (group === "workspace" && verb === "create") {
+				return {
+					code: 0,
+					stdout: JSON.stringify({ result: { workspace: { workspace_id: "W9" }, root_pane: { pane_id: "P9" } } }),
+					timedOut: false,
+				};
+			}
+			if (group === "agent" && verb === "start") {
+				agents.push(name as string);
+				return { code: 0, stdout: "{}", timedOut: false };
+			}
+			if (group === "agent" && verb === "prompt" && !agents.includes(name as string)) {
+				return {
+					code: 1,
+					stdout: "",
+					stderr: JSON.stringify({ error: { code: "agent_not_found", message: `no agent named ${name}` } }),
+					timedOut: false,
+				};
+			}
+			return { code: 0, stdout: "{}", timedOut: false };
+		};
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			herdr: {},
+			log: { info() {}, warn() {} },
+			run,
+		});
+		return { built, calls };
+	}
+	const verbs = (calls: string[][]) => calls.map((cmd) => cmd.slice(1, 3).join(" "));
+
+	test("H-3 a name local herdr does not run is started in the main workspace, with the notice", async () => {
+		const { built, calls } = fakeHerdr([]);
+		const text = String(
+			await built.execute({ mode: "herdr", name: "brand-new", task: "긴 작업을 시작하라" }, { signal }),
+		);
+		expect(text).toContain("brand-new 에이전트를 시작했습니다 (cwd /h/workspace, pane P9)");
+		expect(text).toContain("메인 작업 디렉터리에서 작업합니다 — 저장소 작업은 taskSpec이나 cwd를 주세요");
+		expect(text).toContain('ompbot_dispatch {mode:"herdr", name:"brand-new"}');
+		expect(text).not.toContain("전달 실패");
+		expect(verbs(calls)).toEqual(["agent list", "workspace create", "agent start", "agent prompt"]);
+		expect(calls[1]).toContain("/h/workspace");
+		expect(calls[3]?.slice(1, 5)).toEqual(["agent", "prompt", "brand-new", "긴 작업을 시작하라"]);
+	});
+
+	test("H-3 a given cwd is where the new agent works, without the main-workspace notice", async () => {
+		const { built, calls } = fakeHerdr([]);
+		const text = String(
+			await built.execute({ mode: "herdr", name: "repo-work", task: "작업", cwd: "/h/work/repo" }, { signal }),
+		);
+		expect(text).toContain("repo-work 에이전트를 시작했습니다 (cwd /h/work/repo, pane P9)");
+		expect(text).not.toContain("메인 작업 디렉터리");
+		expect(calls[1]?.slice(1)).toEqual([
+			"workspace",
+			"create",
+			"--cwd",
+			"/h/work/repo",
+			"--label",
+			"ompbot · repo-work",
+			"--no-focus",
+		]);
+	});
+
+	test("H-3 a name local herdr already runs gets the task as a follow-up, TASKID names included", async () => {
+		for (const name of ["worker-1", "t-20261112-01"]) {
+			const { built, calls } = fakeHerdr([name]);
+			const text = String(await built.execute({ mode: "herdr", name, task: "다음 단계 진행" }, { signal }));
+			expect(text).toContain(`후속 지시를 ${name}에 전달했습니다`);
+			expect(verbs(calls)).toEqual(["agent list", "agent prompt"]);
+		}
+	});
+
+	test("H-3 a TASKID-shaped or malformed new name is refused before anything starts", async () => {
+		for (const [name, message] of [
+			["t-20261112-01", "TASKID"],
+			["T-20261112-01", "TASKID"],
+			["Bad Name", "name은 소문자"],
+		] as const) {
+			const { built, calls } = fakeHerdr([]);
+			await expect(built.execute({ mode: "herdr", name, task: "시작" }, { signal })).rejects.toThrow(message);
+			expect(verbs(calls)).toEqual(["agent list"]);
+		}
+	});
+
+	test("H-4 a child that leaves a setsid grandchild holding stdout still ends at the timeout", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ompbot-setsid-"));
+		let grandchild: number | undefined;
+		try {
+			const startedAt = Date.now();
+			const result = await within(
+				realProcessRunner(["sh", "-c", "setsid sleep 30 & echo $! > pid"], { cwd: dir, timeoutMs: 1_000 }),
+				3_000,
+				"the timed-out run returning",
+			);
+			expect(result.timedOut).toBe(true);
+			expect(Date.now() - startedAt).toBeLessThan(3_000);
+		} finally {
+			// The setsid grandchild is in its own session: the runner cannot kill it, so the test does (its own pid).
+			if (existsSync(join(dir, "pid"))) grandchild = Number(readFileSync(join(dir, "pid"), "utf8").trim());
+			if (grandchild !== undefined && alive(grandchild)) process.kill(grandchild, "SIGKILL");
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
+	const signal = new AbortController().signal;
+	const TOKEN = ["xox" + "b", "TEST", "0", "fakefake"].join("-");
+	/** A tool on fake herdr whose prompts go into a real store; `agents` already run, `promptFails` refuses prompts. */
+	function recorded(agents: string[], options: { promptFails?: boolean; host?: boolean } = {}) {
+		const dir = mkdtempSync(join(tmpdir(), "ompbot-herdr-prompts-"));
+		const path = join(dir, "ompbot.db");
+		const store = openStore({ timezone: "Asia/Seoul", path, clock: { now: () => 1_000 }, redact: (text) => text });
+		const run: ProcessRunner = async (cmd) => {
+			const words = cmd.join(" ");
+			if (words.includes("agent") && words.includes("list")) {
+				return {
+					code: 0,
+					stdout: JSON.stringify({ result: { agents: agents.map((name) => ({ name })) } }),
+					timedOut: false,
+				};
+			}
+			if (options.promptFails === true && words.includes("prompt")) {
+				return {
+					code: 1,
+					stdout: "",
+					stderr: JSON.stringify({ error: { code: "agent_blocked", message: "waiting on approval" } }),
+					timedOut: false,
+				};
+			}
+			return {
+				code: 0,
+				stdout: JSON.stringify({
+					result: { workspace: { workspace_id: "W1" }, tab: { tab_id: "T1" }, root_pane: { pane_id: "P1" } },
+				}),
+				timedOut: false,
+			};
+		};
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: dir,
+			workspaceDir: dir,
+			herdr: {},
+			dispatchHosts: { wsl: { ssh: "wsl" } },
+			log: { info() {}, warn() {} },
+			run,
+			recordPrompt: (input) => store.recordHerdrPrompt(input),
+		});
+		const rows = () => {
+			const db = new Database(path, { readonly: true });
+			try {
+				return db
+					.query("SELECT host, agent, kind, preview, origin_key AS originKey FROM herdr_prompts ORDER BY id")
+					.all();
+			} finally {
+				db.close();
+			}
+		};
+		const done = (): void => {
+			store.close();
+			rmSync(dir, { recursive: true, force: true });
+		};
+		return { built, rows, done };
+	}
+
+	test("AC-4: a local follow-up keeps a masked followup row; a failed one keeps none; a new start is start", async () => {
+		const ok = recorded(["worker-1"]);
+		await ok.built.execute({ mode: "herdr", name: "worker-1", task: `토큰 ${TOKEN} 로 다음 단계 진행` }, { signal });
+		const [row] = ok.rows() as Array<{ preview: string }>;
+		expect(ok.rows()).toEqual([
+			{ host: "", agent: "worker-1", kind: "followup", preview: row?.preview ?? "", originKey: "slack/dm/D0123456789" },
+		]);
+		expect(row?.preview).toContain("다음 단계 진행");
+		expect(row?.preview).not.toContain(TOKEN);
+		ok.done();
+
+		const failed = recorded(["worker-1"], { promptFails: true });
+		expect(String(await failed.built.execute({ mode: "herdr", name: "worker-1", task: "진행" }, { signal }))).toContain(
+			"전달 실패",
+		);
+		expect(failed.rows()).toEqual([]);
+		failed.done();
+
+		const fresh = recorded([]);
+		await fresh.built.execute({ mode: "herdr", name: "brand-new", task: "새 일 시작" }, { signal });
+		expect(fresh.rows()).toEqual([
+			{ host: "", agent: "brand-new", kind: "start", preview: "새 일 시작", originKey: "slack/dm/D0123456789" },
+		]);
+		fresh.done();
+	});
+
+	test("AC-5: a remote new start and a remote follow-up are kept under the host", async () => {
+		const start = recorded([]);
+		expect(
+			String(await start.built.execute({ host: "wsl", name: "remote-1", task: "원격 시작" }, { signal })),
+		).toContain("에이전트를 시작했습니다");
+		expect(start.rows()).toEqual([
+			{ host: "wsl", agent: "remote-1", kind: "start", preview: "원격 시작", originKey: "slack/dm/D0123456789" },
+		]);
+		start.done();
+
+		const follow = recorded(["remote-1"]);
+		await follow.built.execute({ host: "wsl", name: "remote-1", task: "원격 후속" }, { signal });
+		expect(follow.rows()).toEqual([
+			{ host: "wsl", agent: "remote-1", kind: "followup", preview: "원격 후속", originKey: "slack/dm/D0123456789" },
+		]);
+		follow.done();
+	});
+
+	test("AC-6: past 20 rows an agent keeps its newest 20; rows past 30 days go; a throwing recorder changes nothing", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ompbot-herdr-prompts-"));
+		let now = 1_000;
+		const store = openStore({
+			timezone: "Asia/Seoul",
+			path: join(dir, "ompbot.db"),
+			clock: { now: () => now },
+			redact: (text) => text,
+		});
+		for (let index = 1; index <= 21; index += 1) {
+			store.recordHerdrPrompt({ host: null, agent: "a", kind: "followup", text: `지시 ${index}`, originKey: null });
+		}
+		store.recordHerdrPrompt({ host: null, agent: "b", kind: "start", text: "b 시작", originKey: null });
+		const db = new Database(join(dir, "ompbot.db"), { readonly: true });
+		const previews = (agent: string) =>
+			(
+				db.query("SELECT preview FROM herdr_prompts WHERE agent = ? ORDER BY id").all(agent) as Array<{
+					preview: string;
+				}>
+			).map((row) => row.preview);
+		expect(previews("a")).toHaveLength(20);
+		expect(previews("a")[0]).toBe("지시 2");
+		expect(previews("b")).toEqual(["b 시작"]);
+		now += 31 * 24 * 60 * 60_000;
+		store.recordHerdrPrompt({ host: null, agent: "c", kind: "start", text: "c 시작", originKey: null });
+		expect([previews("a"), previews("b"), previews("c")]).toEqual([[], [], ["c 시작"]]);
+		db.close();
+		store.close();
+		rmSync(dir, { recursive: true, force: true });
+
+		const warned: string[] = [];
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			herdr: {},
+			log: { info() {}, warn: (event) => warned.push(event) },
+			run: async (cmd) => ({
+				code: 0,
+				stdout: cmd.includes("list") ? JSON.stringify({ result: { agents: [{ name: "w" }] } }) : "{}",
+				timedOut: false,
+			}),
+			recordPrompt: () => {
+				throw new Error("disk full");
+			},
+		});
+		expect(String(await built.execute({ mode: "herdr", name: "w", task: "진행" }, { signal }))).toContain(
+			"후속 지시를 w에 전달했습니다",
+		);
+		expect(warned).toEqual(["herdr_prompt_record_failed"]);
 	});
 });

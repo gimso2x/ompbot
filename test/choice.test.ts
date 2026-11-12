@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ActionButton, ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../src/channel/port";
+import { buttonRows } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import type { OmpDialogAnswerer, OmpDialogResponse } from "../src/omp/driver";
 import { tapExtensionUi } from "../src/omp/rpc-driver";
@@ -13,7 +14,9 @@ import {
 	parseChoiceActionId,
 } from "../src/safety/approval";
 import { answerDialogOnSlack } from "../src/safety/choice";
+import { SlackChannel } from "../src/slack/channel";
 import { registryOf } from "./helpers/channels";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "U_OWNER";
 const ORIGIN = { originKey: "slack/dm/D1", channel: "D1", threadTs: "100.1" };
@@ -169,12 +172,13 @@ function memoryStore(): ApprovalStore & {
 }
 
 /** omp's stdout as a live stream through `tapExtensionUi`, answered by real choice cards on a recording port. */
-function harness() {
+function harness(timezone = "Asia/Seoul") {
 	const port = new RecordingPort();
 	const timers = new ManualTimers();
 	const store = memoryStore();
 	const logs = new Seen<string>();
 	const broker = new ApprovalBroker({
+		timezone,
 		channels: registryOf(port),
 		ownerUserId: OWNER,
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
@@ -409,6 +413,114 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		await h.close();
 	});
 
+	test("ask deadline, partly answered: an out-of-range recommended is clamped like omp's own fallback", async () => {
+		const h = harness();
+		h.send({
+			method: "ask",
+			id: "t3c",
+			questions: [
+				{ id: "q1", question: "환경", options: [{ label: "dev" }, { label: "prod" }] },
+				{ id: "q2", question: "알림", options: [{ label: "on" }, { label: "off" }], recommended: 5 },
+				{ id: "q3", question: "로그", options: [{ label: "short" }, { label: "long" }], recommended: -2 },
+			],
+		});
+		const ask = await h.card(true);
+		expect(h.click(ask.msg.buttons?.[1])).toBe(true);
+		await h.port.writes.waitFor((w) => w.kind === "edit" && w.ts === ask.ts && w.msg.text.includes("→ prod"));
+		h.timers.fireAll();
+		expect(await h.replies.waitFor((r) => r.id === "t3c")).toEqual(
+			reply("t3c", {
+				answers: [
+					{ id: "q1", selectedOptions: ["prod"] },
+					{ id: "q2", selectedOptions: ["off"] },
+					{ id: "q3", selectedOptions: ["short"] },
+				],
+			}),
+		);
+		expect((await h.finalEdit(ask.ts)).msg.text).toContain("자동 선택 — 1) prod · 2) off · 3) short");
+		await h.close();
+	});
+
+	test("ask: each question's recommended button is primary (Slack primary, Discord PRIMARY=1), the rest default, kept on redraw", async () => {
+		const h = harness();
+		h.send({
+			method: "ask",
+			id: "r1",
+			questions: [
+				{ id: "q1", question: "환경", options: [{ label: "dev" }, { label: "prod" }], recommended: 1 },
+				{ id: "q2", question: "알림", options: [{ label: "on" }, { label: "off" }], recommended: 0 },
+				{ id: "q3", question: "로그", options: [{ label: "short" }, { label: "long" }] },
+			],
+		});
+		const ask = await h.card(true);
+		const styles = (buttons: readonly ActionButton[] | undefined) => (buttons ?? []).map((b) => b.style);
+		expect(ask.msg.buttons?.map((b) => b.label)).toEqual([
+			"1. dev",
+			"1. prod",
+			"2. on",
+			"2. off",
+			"3. short",
+			"3. long",
+		]);
+		expect(styles(ask.msg.buttons)).toEqual([undefined, "primary", "primary", undefined, undefined, undefined]);
+		// The platforms draw that style: Slack Block Kit `style: "primary"`, Discord button style 1; the rest unstyled / 2.
+		const slack = new FakeSlackTransport();
+		await new SlackChannel(slack).post({ conversationId: "D1" }, ask.msg);
+		const posted = slack.calls.find((c) => c.method === "postMessage");
+		const blocks = posted?.method === "postMessage" ? (posted.blocks ?? []) : [];
+		const actions = blocks.find((b) => typeof b === "object" && b !== null && "type" in b && b.type === "actions");
+		const elements =
+			typeof actions === "object" && actions !== null && "elements" in actions && Array.isArray(actions.elements)
+				? actions.elements
+				: [];
+		expect(elements.map((e) => (typeof e === "object" && e !== null && "style" in e ? e.style : undefined))).toEqual(
+			styles(ask.msg.buttons),
+		);
+		// buttonRows returns the wire shape as unknown[]: Action Rows of buttons with a numeric style.
+		const rows = buttonRows(ask.msg.buttons ?? []) as Array<{ components: Array<{ style: number }> }>;
+		expect(rows.flatMap((row) => row.components.map((c) => c.style))).toEqual([2, 1, 1, 2, 2, 2]);
+		// A partial answer redraws the card: the emphasis stays.
+		expect(h.click(ask.msg.buttons?.[0])).toBe(true);
+		const redrawn = await h.port.writes.waitFor(
+			(w) => w.kind === "edit" && w.ts === ask.ts && w.msg.text.includes("→ dev"),
+		);
+		expect(styles(redrawn.msg.buttons)).toEqual(styles(ask.msg.buttons));
+		h.timers.fireAll();
+		await h.replies.waitFor((r) => r.id === "r1");
+		await h.close();
+	});
+
+	test("select and confirm carry no recommendation: every button keeps the default style", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "고르기", options: ["A", "B"] });
+		const shown = await h.card(true);
+		expect(shown.msg.buttons?.map((b) => b.style)).toEqual([undefined, undefined]);
+		expect(h.click(shown.msg.buttons?.[0])).toBe(true);
+		await h.replies.waitFor((r) => r.id === "s1");
+		await h.close();
+	});
+
+	// doc/plans/qa50-low-fixes.md E-5: the deadline line threw RangeError for an unrepresentable date, so no card.
+	test("ask with timeout Number.MAX_SAFE_INTEGER still shows its card; the deadline is cut to the timer's limit", async () => {
+		const h = harness();
+		h.send({
+			method: "ask",
+			id: "h1",
+			questions: [{ id: "q1", question: "환경", options: [{ label: "dev" }, { label: "prod" }] }],
+			timeout: Number.MAX_SAFE_INTEGER,
+		});
+		const ask = await h.card(true);
+		expect(ask.msg.buttons?.map((b) => b.label)).toEqual(["dev", "prod"]);
+		expect(ask.msg.buttonsNote).toMatch(/^⏳ \d\d:\d\d까지 답이 없으면 /);
+		// setTimeout fires at once past 2^31-1 ms, which would end the card as soon as it shows.
+		expect([...h.timers.armed.values()].map((t) => t.ms)).toEqual([2 ** 31 - 1]);
+		expect(h.click(ask.msg.buttons?.[1])).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "h1")).toEqual(
+			reply("h1", { answers: [{ id: "q1", selectedOptions: ["prod"] }] }),
+		);
+		await h.close();
+	});
+
 	test("omp's cancel ends the waiting card; a later click writes nothing to omp", async () => {
 		const h = harness();
 		h.send({ method: "select", id: "x1", title: "고르기", options: ["A", "B"] });
@@ -555,6 +667,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 			(w) => w.kind === "edit" && w.ts !== choice.ts && (w.msg.buttons?.length ?? 0) > 0,
 		);
 		const rebooted = new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(h.port),
 			ownerUserId: OWNER,
 			log: createLogger({ sink: () => undefined, clock, redact }),
@@ -586,6 +699,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		h.send({ method: "select", id: "r1", title: "고르기", options: ["A", "B"] });
 		const shown = await h.card(true);
 		const rebooted = new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(h.port),
 			ownerUserId: OWNER,
 			log: createLogger({ sink: () => undefined, clock, redact }),
@@ -597,4 +711,13 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		expect(expired.msg.text).toContain("재시작으로 만료됨");
 		await h.close();
 	});
+});
+
+test("the card deadline is HH:MM in the configured timezone (America/New_York)", async () => {
+	// clock = 2027-01-15T08:00:00Z; the card closes 29 s later: 03:00 in New York (EST), 17:00 in Seoul.
+	const h = harness("America/New_York");
+	h.send({ method: "confirm", id: "tz1", title: "계속할까요", message: "?", timeout: 30_000 });
+	const card = await h.port.writes.waitFor((w) => w.kind === "edit" && (w.msg.buttons?.length ?? 0) > 0);
+	expect(card.msg.buttonsNote).toStartWith("⏳ 03:00까지 답이 없으면 아니오로 처리됩니다");
+	h.timers.fireAll();
 });

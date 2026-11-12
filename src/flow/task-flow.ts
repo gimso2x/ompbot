@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseTaskJson, type TaskRow, type TaskTransitionRow } from "../tasks/ledger";
+import { formatLocal } from "../time";
 
 export type FlowTask = Pick<TaskRow, "taskId" | "status" | "createdAt" | "progressAt" | "notices">;
 export type FlowTransition = Pick<TaskTransitionRow, "taskId" | "fromStatus" | "toStatus" | "actor" | "reason" | "at">;
@@ -20,9 +21,10 @@ const INTEGRITY_WORDS = ["diff", "무결성", "too large", "상한"];
 
 /**
  * Node states of each task: notices and transitions merged in time order and replayed, so a node shows the value
- * the last event left (a block, its resume and the next block each count).
+ * the last event left (a block, its resume and the next block each count). `review`: the install has peer bots
+ * (config `peerBots`) that cross-review specs; without them the review node is not part of the flow.
  */
-export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[]): FlowStatus[] {
+export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[], review: boolean): FlowStatus[] {
 	return tasks.flatMap((task) => {
 		const nodes = new Map<string, { status: FlowNodeStatus; msg: string; at: number }>();
 		const set = (node: string, status: FlowNodeStatus, msg: string, at: number) => nodes.set(node, { status, msg, at });
@@ -34,7 +36,9 @@ export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[])
 			for (const node of ["build", "progress"]) if (!nodes.has(node)) set(node, "pass", "", at);
 			if (nodes.get("ownerReview")?.status === "fail") set("ownerReview", "fixed", "리뷰 반려", at);
 		};
-		for (const node of ["spec", "review", "dispatch"]) set(node, "pass", "등록 전 단계 · 기록 없음", task.createdAt);
+		for (const node of review ? ["spec", "review", "dispatch"] : ["spec", "dispatch"]) {
+			set(node, "pass", "등록 전 단계 · 기록 없음", task.createdAt);
+		}
 		for (const node of ["register", "worktree", "agent"]) set(node, "pass", "", task.createdAt);
 		if (task.progressAt !== null) set("progress", "pass", "", task.progressAt);
 
@@ -87,7 +91,7 @@ export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[])
 /** Short node names of the `task-flow-viewer.md` flow graph, in flow order. */
 const NODE_NAMES: Record<string, string> = {
 	spec: "스펙",
-	review: "떡 검토",
+	review: "검토",
 	dispatch: "위임",
 	register: "등록",
 	worktree: "워크트리",
@@ -110,9 +114,6 @@ export interface TaskStage {
 	tone: TaskStageTone;
 }
 
-/** `MM-DD HH:mm` in KST. */
-const kstShort = (ms: number): string => new Date(ms + 9 * 3_600_000).toISOString().slice(5, 16).replace("T", " ");
-
 /**
  * Where a task is now, from its {@link taskFlowStatus} lines (`statuses` may hold other tasks' lines): closed states
  * first, then its earliest unresolved failure in flow order, then review, else the running node.
@@ -120,10 +121,13 @@ const kstShort = (ms: number): string => new Date(ms + 9 * 3_600_000).toISOStrin
 export function taskStage(
 	task: Pick<TaskRow, "taskId" | "status" | "progressAt" | "closedAt">,
 	statuses: FlowStatus[],
+	timezone: string,
 ): TaskStage {
+	/** `MM-DD HH:mm` in the bot's zone (`config.timezone`). */
+	const short = (ms: number): string => formatLocal(ms, timezone).slice(5, 16);
 	if (task.status === "cancelled") return { label: "취소", msg: "", tone: "off" };
 	if (task.status === "done") {
-		return { label: "완료", msg: task.closedAt === null ? "" : `close ${kstShort(task.closedAt)}`, tone: "done" };
+		return { label: "완료", msg: task.closedAt === null ? "" : `close ${short(task.closedAt)}`, tone: "done" };
 	}
 	const mine = statuses.filter((line) => line.task === task.taskId);
 	const fail = mine
@@ -135,7 +139,7 @@ export function taskStage(
 	const running = mine.find((line) => line.status === "running");
 	return {
 		label: running === undefined ? "진행 중" : `${NODE_NAMES[running.node] ?? running.node} 중`,
-		msg: task.progressAt === null ? "" : `진행 기록 ${kstShort(task.progressAt)}`,
+		msg: task.progressAt === null ? "" : `진행 기록 ${short(task.progressAt)}`,
 		tone: "run",
 	};
 }
@@ -145,8 +149,12 @@ const jsonBlock = (id: string) => new RegExp(`(<script type="application/json" i
 /** JSON safe inside a `<script>` element: `<` never starts a closing tag. */
 const embed = (value: unknown) => JSON.stringify(value).replace(/</g, "\\u003c");
 
-/** Tasks and transitions from a read-only handle; the database file is never written. */
+/**
+ * Tasks and transitions from a read-only handle; the database file is never written. A home without a ledger has no
+ * tasks (like `ompbot feedback`).
+ */
 function readFlow(dbPath: string): { tasks: (FlowTask & { updatedAt: number })[]; transitions: FlowTransition[] } {
+	if (!existsSync(dbPath)) return { tasks: [], transitions: [] };
 	const db = new Database(dbPath, { readonly: true, strict: true });
 	try {
 		const rows = db
@@ -179,32 +187,61 @@ function readFlow(dbPath: string): { tasks: (FlowTask & { updatedAt: number })[]
 	}
 }
 
-/** Writes `status.json` through a temporary file, so a polling viewer never reads half of it. */
-export function writeFlowStatus(dbPath: string, outDir: string): FlowStatus[] {
+/**
+ * Writes `target` through a new temporary file (`wx`: a link planted at the temporary name is removed, never followed)
+ * renamed over it, so a polling viewer never reads half of it and a link at `target` is replaced, not written through.
+ */
+function writeReplacing(target: string, text: string): void {
+	const tmp = `${target}.tmp`;
+	rmSync(tmp, { force: true });
+	writeFileSync(tmp, text, { flag: "wx" });
+	renameSync(tmp, target);
+}
+
+/** Writes `status.json` (see `writeReplacing`). */
+export function writeFlowStatus(dbPath: string, outDir: string, review: boolean): FlowStatus[] {
 	const { tasks, transitions } = readFlow(dbPath);
-	const status = taskFlowStatus(tasks, transitions);
-	const target = join(outDir, "status.json");
-	writeFileSync(`${target}.tmp`, JSON.stringify(status));
-	renameSync(`${target}.tmp`, target);
+	const status = taskFlowStatus(tasks, transitions, review);
+	writeReplacing(join(outDir, "status.json"), JSON.stringify(status));
 	return status;
 }
 
-/** `viewer.html` with the default graph, this package's version and the database snapshot, plus `status.json`. */
-export function exportFlow(dbPath: string, outDir: string, now = Date.now()): void {
+interface FlowEdge {
+	from: string;
+	to: string;
+}
+
+/** The default graph without the review node: its incoming edges are joined to its outgoing ones. */
+function withoutReview(graph: { nodes: { id: string }[]; edges: FlowEdge[] }): void {
+	const into = graph.edges.filter((e) => e.to === "review").map((e) => e.from);
+	const out = graph.edges.filter((e) => e.from === "review").map((e) => e.to);
+	graph.nodes = graph.nodes.filter((n) => n.id !== "review");
+	graph.edges = [
+		...graph.edges.filter((e) => e.from !== "review" && e.to !== "review"),
+		...into.flatMap((from) => out.map((to) => ({ from, to }))),
+	];
+}
+
+/**
+ * `viewer.html` with the default graph, this package's version and the database snapshot, plus `status.json`.
+ * `review`: see {@link taskFlowStatus}; false drops the review node from the graph too. `timezone` names the snapshot time.
+ */
+export function exportFlow(dbPath: string, outDir: string, review: boolean, timezone: string, now = Date.now()): void {
 	mkdirSync(outDir, { recursive: true });
 	const { tasks } = readFlow(dbPath);
-	const status = writeFlowStatus(dbPath, outDir);
+	const status = writeFlowStatus(dbPath, outDir, review);
 	const html = readFileSync(VIEWER, "utf8");
 	const graph = JSON.parse(jsonBlock("flow-default").exec(html)?.[2] ?? "{}");
+	if (!review) withoutReview(graph);
 	const { version } = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
-	const kst = new Date(now + 9 * 3_600_000).toISOString().slice(0, 16).replace("T", " ");
+
 	Object.assign(graph, {
 		version,
-		memo: `ompbot.db 스냅샷 ${kst} KST`,
+		memo: `ompbot.db 스냅샷 ${formatLocal(now, timezone).slice(0, 16)} ${timezone}`,
 		items: tasks.map((t) => ({ id: t.taskId, status: t.status, at: new Date(t.updatedAt).toISOString() })),
 	});
 	const filled = html
 		.replace(jsonBlock("flow-data"), (_, open, _old, close) => open + embed(graph) + close)
 		.replace(jsonBlock("flow-status"), (_, open, _old, close) => open + embed(status) + close);
-	writeFileSync(join(outDir, "viewer.html"), filled);
+	writeReplacing(join(outDir, "viewer.html"), filled);
 }

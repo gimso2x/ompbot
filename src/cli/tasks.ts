@@ -1,12 +1,14 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { loadConfig } from "../config";
-import { callDaemon } from "../daemon/ipc";
+import { loadConfig, timezoneOfHome } from "../config";
+import { callDaemon, IpcNoResponse } from "../daemon/ipc";
 import { exportFlow, writeFlowStatus } from "../flow/task-flow";
-import { summarizeJudgement } from "../tasks/checker";
+import { summarizeJudgement, taskChecksOf } from "../tasks/checker";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
 import { openTaskLedger, type TaskRow, TaskTransitionError } from "../tasks/ledger";
+import { CHECK_TIMEOUT_MS } from "../tasks/signals";
 
 export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
   tasks show <id>                registry row, transition history and the current Outcome judgement
@@ -32,21 +34,57 @@ function dispatchHostsOf(homeDir: string): Record<string, { ssh: string }> | und
 	}
 }
 
-/** Asks the running daemon to act on a task (post, react); `undefined` when no daemon answers. */
+/** Whether the flow has the spec review node: config `peerBots` names at least one peer bot. */
+function hasPeerReview(homeDir: string): boolean {
+	if (!existsSync(join(homeDir, "config.json"))) return false;
+	try {
+		return (loadConfig(homeDir, { checkTokens: false }).peerBots?.length ?? 0) > 0;
+	} catch (error) {
+		process.stderr.write(`tasks flow: config unreadable, review node left out: ${String(error)}\n`);
+		return false;
+	}
+}
+
+/** The IPC wait of every request but `check`. */
+const IPC_TIMEOUT_MS = 60_000;
+
+/**
+ * How long `tasks check` waits for the daemon: its check runs every `[check: …]` signal of the task one after another,
+ * each bounded by `CHECK_TIMEOUT_MS`, plus the plain wait for the reads and posts around them.
+ */
+export function checkIpcTimeoutMs(row: TaskRow): number {
+	return taskChecksOf(row.acceptance).length * CHECK_TIMEOUT_MS + IPC_TIMEOUT_MS;
+}
+
+/** Test seam of `tasksCommand`. */
+export interface TasksCommandOptions {
+	/** Overrides `checkIpcTimeoutMs` for `check`. */
+	checkTimeoutMs?: number;
+}
+
+/**
+ * Asks the running daemon to act on a task (post, react). `unreachable`: nothing listens, so nothing was done;
+ * `no_response`: the request went out but no answer came in `timeoutMs`, so the daemon may still be acting on it.
+ */
 async function askDaemon(
 	homeDir: string,
 	request: Record<string, unknown>,
-): Promise<Record<string, unknown> | undefined> {
+	timeoutMs = IPC_TIMEOUT_MS,
+): Promise<Record<string, unknown> | "unreachable" | "no_response"> {
 	try {
-		const response = await callDaemon(join(homeDir, "ompbot.sock"), request, 60_000);
-		return typeof response === "object" && response !== null ? (response as Record<string, unknown>) : undefined;
-	} catch {
-		return undefined;
+		const response = await callDaemon(join(homeDir, "ompbot.sock"), request, timeoutMs);
+		return typeof response === "object" && response !== null ? (response as Record<string, unknown>) : "no_response";
+	} catch (error) {
+		return error instanceof IpcNoResponse ? "no_response" : "unreachable";
 	}
 }
 
 /** `ompbot tasks ...` against the ledger file directly; Slack side effects go through the running daemon. */
-export async function tasksCommand(args: string[], homeDir: string): Promise<number> {
+export async function tasksCommand(
+	args: string[],
+	homeDir: string,
+	options: TasksCommandOptions = {},
+): Promise<number> {
 	const [sub, ...rest] = args;
 	if (
 		sub !== "list" &&
@@ -67,20 +105,37 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 	});
 	if (sub === "flow") {
 		// Before the ledger: opening it migrates the schema, and the flow export must never write the database.
-		const seconds = values.watch === undefined ? 0 : Number(values.watch);
-		if (values.out === undefined || !(seconds >= 0)) {
-			process.stderr.write("tasks flow: --out <dir> required, --watch takes seconds\n");
+		// setInterval holds at most 2^31-1 ms; a longer period fires every 1 ms instead.
+		const seconds = values.watch === undefined ? 0 : /^\d+(\.\d+)?$/.test(values.watch) ? Number(values.watch) : 0;
+		if (values.out === undefined || (values.watch !== undefined && !(seconds >= 1 && seconds <= 2_147_483))) {
+			process.stderr.write("tasks flow: --out <dir> required, --watch takes 1 to 2147483 seconds\n");
 			return 2;
 		}
 		const dbPath = join(homeDir, "ompbot.db");
 		const outDir = values.out;
-		exportFlow(dbPath, outDir);
+		const review = hasPeerReview(homeDir);
+		const timezone = timezoneOfHome(homeDir);
+		exportFlow(dbPath, outDir, review, timezone);
 		process.stdout.write(`${join(outDir, "viewer.html")}\n`);
 		if (seconds === 0) return 0;
-		setInterval(() => writeFlowStatus(dbPath, outDir), seconds * 1000);
-		return await new Promise<number>(() => {});
+		// A home without ompbot.db exports an empty flow, but a database that was there and went away ends the watch.
+		const hadDb = existsSync(dbPath);
+		const { promise, resolve } = Promise.withResolvers<number>();
+		const timer = setInterval(() => {
+			try {
+				if (hadDb && !existsSync(dbPath)) throw new Error(`database went away: ${dbPath}`);
+				writeFlowStatus(dbPath, outDir, review);
+			} catch (error) {
+				// The same failure would repeat every period (a database that went away): report it once and stop.
+				clearInterval(timer);
+				const reason = error instanceof Error ? error.message : String(error);
+				process.stderr.write(`tasks flow: status.json not rewritten: ${reason.split("\n")[0]}\n`);
+				resolve(1);
+			}
+		}, seconds * 1000);
+		return await promise;
 	}
-	const ledger = openTaskLedger(join(homeDir, "ompbot.db"));
+	const ledger = openTaskLedger(join(homeDir, "ompbot.db"), timezoneOfHome(homeDir));
 	try {
 		const out = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 		if (sub === "list") {
@@ -104,7 +159,8 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 			const closed = ledger.transition(row.taskId, values.as, "human", `close --as ${values.as}`);
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
-			if (synced?.ok !== true) process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
+			if (typeof synced === "string" || synced.ok !== true)
+				process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
 			return 0;
 		}
 		if (sub === "pause" || sub === "resume") {
@@ -112,7 +168,7 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 				op: sub === "pause" ? "tasks_pause" : "tasks_resume",
 				id: row.taskId,
 			});
-			if (answered !== undefined) {
+			if (typeof answered !== "string") {
 				out(answered);
 				return answered.ok === true ? 0 : 1;
 			}
@@ -124,8 +180,16 @@ export async function tasksCommand(args: string[], homeDir: string): Promise<num
 			return 0;
 		}
 		if (sub === "check" && (row.status === "working" || row.status === "blocked")) {
-			const checked = await askDaemon(homeDir, { op: "tasks_check", id: row.taskId });
-			if (checked?.ok === true) {
+			const timeoutMs = options.checkTimeoutMs ?? checkIpcTimeoutMs(row);
+			const checked = await askDaemon(homeDir, { op: "tasks_check", id: row.taskId }, timeoutMs);
+			if (checked === "no_response") {
+				// The daemon has the request and may still post: a local verdict here could contradict it.
+				process.stderr.write(
+					`tasks check: no daemon answer in ${Math.round(timeoutMs / 1000)}s — 응답 지연 — 게시 여부 모름 (posting unknown; not judged locally)\n`,
+				);
+				return 1;
+			}
+			if (checked !== "unreachable" && checked.ok === true) {
 				out(checked);
 				return 0;
 			}

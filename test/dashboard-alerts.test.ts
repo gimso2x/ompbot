@@ -56,6 +56,7 @@ const gatesWith = (...open: string[]): Gate[] =>
 
 const STATUS: StatusReport = {
 	ompVersion: "omp 9.9.9",
+	timezone: "Asia/Seoul",
 	daemonRunning: true,
 	origins: [{ originKey: "slack/dm/U1", epoch: 1, ompPid: 42, busy: false }],
 	ledger: { pending: 0, inflight: 0, confirmed: 5, ambiguous: 0, expired: 0 },
@@ -70,7 +71,7 @@ let clock: { t: number; now: () => number };
 
 /** Alert rows: a closed-gate record with a hash signature, an open-gate record, a chat-turn record, a resolved one. */
 function seedAlerts(): void {
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	const add = (scope: string, signature: string, status: string, count: number, first: number, last: number) =>
 		db.run(
@@ -97,6 +98,7 @@ function deps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
 	return {
 		homeDir: home.dir,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: { ompExecutable: home.config.ompExecutable },
 		now: clock.now,
 		callDaemon: async () => ({ ok: true, status: STATUS }),
@@ -297,7 +299,33 @@ describe("dashboard alerts & system screens", () => {
 		const calm = renderDashboardMain(quiet, undefined, NOW, { view: "alerts" });
 		expect(calm).toContain("지금 열린 알림은 없습니다. 아래는 아직 정리되지 않은 기록입니다");
 		expect(calm).not.toContain("지금 열림");
-		expect(navChip(calm, "alerts")).toBe("nav-count");
+		// No open alert: the badge carries no number (the records stay in the list).
+		expect(navChip(calm, "alerts")).toBe("");
+	});
+
+	test("AC-2: the alerts tab badge counts open alerts only: no number for one closed record, 1 for one open", async () => {
+		const quiet = await buildSnapshot(deps({ collectGates: () => gatesWith() }));
+		if (!quiet.alerts.ok) throw new Error(quiet.alerts.error);
+		const record = quiet.alerts.items.find((alert) => alert.gateState === "closed");
+		if (record === undefined) throw new Error("no closed alert record");
+		const badgeOf = (gateState: "open" | "closed"): string => {
+			const html = renderDashboardMain(
+				{ ...quiet, alerts: { ok: true, items: [{ ...record, gateState }] } },
+				undefined,
+				NOW,
+				{ view: "alerts" },
+			);
+			return (
+				/data-view="alerts"[^>]*><span>[^<]*<\/span>(<span class="nav-count[^"]*">[^<]*<\/span>)?/.exec(html)?.[1] ?? ""
+			);
+		};
+		expect(badgeOf("closed")).toBe("");
+		expect(badgeOf("open")).toBe('<span class="nav-count is-warn">1</span>');
+		// The closed record stays in the tab's list.
+		const calm = renderDashboardMain({ ...quiet, alerts: { ok: true, items: [record] } }, undefined, NOW, {
+			view: "alerts",
+		});
+		expect(calm).toContain("지금은 닫힘 · 기록만 남음");
 	});
 
 	test("AC-5: seven system cards, fifteen gate lines (real collectGates), backup past its age is a warning", async () => {

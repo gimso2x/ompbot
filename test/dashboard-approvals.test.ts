@@ -32,6 +32,7 @@ function deps(): SnapshotDeps {
 	return {
 		homeDir: home.dir,
 		repoDir: home.dir,
+		timezone: "Asia/Seoul",
 		config: undefined,
 		now: () => NOW,
 		callDaemon: async () => Promise.reject(new Error("no daemon")),
@@ -45,7 +46,7 @@ function deps(): SnapshotDeps {
 
 /** Four pending rows: full detail and links, a broken row, a bare channel row and a lane row. */
 function seed(): void {
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	const insert = db.query(
 		`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, detail_json, card_url, origin_url)
@@ -245,7 +246,7 @@ describe("dashboard approvals", () => {
 	});
 
 	test("AC-8: settled approvals list newest first with outcome and answer time; 7-day counts and median; their panel", async () => {
-		openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+		openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 		const db = new Database(dbPath, { strict: true });
 		const insert = db.query(
 			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at, origin_key, detail_json, card_url)

@@ -6,7 +6,6 @@ import type { ChannelBinding } from "../src/channel/adapter";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
-import type { FakeDiscordCall } from "../src/discord/fake-transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
@@ -30,6 +29,7 @@ import {
 	WaitingTransport,
 	withDiscord,
 } from "./helpers/bot-home";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 
 const GUILD = "300000000000000001";
 const CH = "111111111111111111";

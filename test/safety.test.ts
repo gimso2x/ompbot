@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
@@ -27,16 +37,16 @@ import {
 import {
 	backgroundResumeLine,
 	buildFloorsPrompt,
-	floorsArgs,
 	floorsSystemPrompt,
+	OMPBOT_BUN,
 	OMPBOT_MAIN,
 	WAIT_INTERIM_LINE,
 } from "../src/safety/prompt";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const CHANNEL = "D1";
 const ORIGIN = `slack/dm/${CHANNEL}`;
@@ -161,14 +171,16 @@ function click(ts: string, decision: "approve" | "deny", user = OWNER) {
 	};
 }
 
+/** The owner's zone: the base-commit prompt fixtures were taken with it. */
+const SEOUL = { timezone: { name: "Asia/Seoul", offset: "+09:00" } };
+
 describe("prompt and child environment", () => {
-	test("--append-system-prompt carries the floors and names this bot home's secrets directory", () => {
-		const args = floorsArgs("/bot/home/secrets");
-		expect(args[0]).toBe("--append-system-prompt");
-		expect(args[1]).toBe(buildFloorsPrompt("/bot/home/secrets"));
-		expect(args[1]).toContain("/bot/home/secrets");
-		expect(args[1]).toContain("ompbot_request_approval");
-		expect(args[1]).toContain("slack_send_file");
+	test("the appended system prompt carries the floors and names this bot home's secrets directory", () => {
+		const prompt = floorsSystemPrompt("/bot/home/secrets");
+		expect(prompt).toBe(buildFloorsPrompt("/bot/home/secrets"));
+		expect(prompt).toContain("/bot/home/secrets");
+		expect(prompt).toContain("ompbot_request_approval");
+		expect(prompt).toContain("slack_send_file");
 	});
 
 	test("the child env loses SLACK_*/OMPBOT_* keys and refuses them as extras", () => {
@@ -215,10 +227,13 @@ describe("floors prompt answer format", () => {
 		] as const;
 		for (const [originKey, target] of cases) {
 			const line = backgroundResumeLine(originKey);
-			expect(line).toContain(`bun ${OMPBOT_MAIN} inject ${target} --text '[자동 후속]`);
+			expect(line).toContain(`\`${OMPBOT_BUN} ${OMPBOT_MAIN} inject ${target} --text '[자동 후속]`);
 			expect(buildFloorsPrompt("/s", originKey)).toContain(line as string);
 		}
 		expect(OMPBOT_MAIN).toBe(join(import.meta.dir, "..", "src", "main.ts"));
+		// A detached systemd unit has no ~/.bun/bin on PATH: the line names this bun by absolute path (11-11 exit 127).
+		expect(OMPBOT_BUN).toBe(process.execPath);
+		expect(isAbsolute(OMPBOT_BUN)).toBe(true);
 		// `inject` addresses Slack and Discord conversations only: no line where it could not reach (monitors, lanes).
 		for (const originKey of ["telegram/dm/1", "monitor/3", "ompbot/work/lane1", "slack/thread/C1:1.2"]) {
 			expect(backgroundResumeLine(originKey)).toBeUndefined();
@@ -231,18 +246,18 @@ describe("floors prompt answer format", () => {
 			prompts: Record<string, string>;
 		};
 		// The fixture keeps the checkout-dependent CLI path as a placeholder.
-		const fixed = (prompt: string): string => prompt.replaceAll(OMPBOT_MAIN, "<ompbot>/src/main.ts");
+		const fixed = (prompt: string): string =>
+			prompt.replaceAll(`${OMPBOT_BUN} ${OMPBOT_MAIN}`, "<bun> <ompbot>/src/main.ts");
 		const origins = Object.keys(base.prompts);
 		expect(origins.length).toBe(3);
 		for (const originKey of origins) {
 			expect(buildFloorsPrompt("/h/secrets", originKey)).not.toContain("herdr");
 			expect(floorsSystemPrompt("/h/secrets", originKey)).not.toContain("herdr");
-			expect(floorsArgs("/h/secrets", originKey)[1]).not.toContain("herdr");
-			expect(fixed(buildFloorsPrompt("/h/secrets", originKey, true))).toBe(base.prompts[originKey] as string);
-			expect(fixed(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true))).toBe(
+			// The owner's `timezone: "Asia/Seoul"` gives the base commit's text byte for byte.
+			expect(fixed(buildFloorsPrompt("/h/secrets", originKey, true, false, false, SEOUL))).toBe(
 				base.prompts[originKey] as string,
 			);
-			expect(fixed(floorsArgs("/h/secrets", originKey, undefined, undefined, true)[1] as string)).toBe(
+			expect(fixed(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true, false, false, SEOUL))).toBe(
 				base.prompts[originKey] as string,
 			);
 		}
@@ -257,7 +272,7 @@ describe("floors prompt answer format", () => {
 			expect(prompt).toContain("추천 선택지(없으면 첫 선택지)가 자동 선택");
 			expect(prompt).not.toContain(FORBIDDEN);
 			// The daemon's omp child of the same origin, with an answerer (run.ts passes `answerDialogsFor(origin)`).
-			expect(floorsArgs("/s", originKey, undefined, undefined, false, true)[1]).toContain(ALLOWED);
+			expect(floorsSystemPrompt("/s", originKey, undefined, undefined, false, true)).toContain(ALLOWED);
 		}
 		for (const originKey of ["monitor/3", "review/skills", undefined]) {
 			const prompt = buildFloorsPrompt("/s", originKey, false, true);
@@ -305,6 +320,7 @@ describe("ApprovalBroker", () => {
 
 	const make = (extra: Partial<ApprovalBrokerOptions> = {}) =>
 		new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
@@ -553,6 +569,7 @@ describe("host tools", () => {
 			originKey,
 			channels: registryOf(new SlackChannel(transport)),
 			broker: new ApprovalBroker({
+				timezone: "Asia/Seoul",
 				channels: registryOf(new SlackChannel(transport)),
 				ownerUserId: OWNER,
 				log: quietLog(),
@@ -690,6 +707,56 @@ describe("host tools", () => {
 		expect(() => checkUploadable(join(userHome, ".ssh", "id_ed25519"), { homeDir, workspaceDir, userHome })).toThrow();
 	});
 
+	describe("checkUploadable: private keys moved out of a protected directory", () => {
+		// Assembled at run time so no key-shaped literal sits in the source (gitleaks).
+		const keyText = () =>
+			[`-----BEGIN OPENSSH ${"PRIVATE"} KEY-----`, "b3BlbnNzaC1rZXktdjE", "-----END KEY-----", ""].join("\n");
+		const deps = () => ({ homeDir, workspaceDir, userHome });
+		const sshKey = () => {
+			mkdirSync(join(userHome, ".ssh"), { recursive: true });
+			const key = join(userHome, ".ssh", "id_ed25519");
+			writeFileSync(key, keyText());
+			return key;
+		};
+
+		test("(a) a hard link of a protected private key is refused by inode", () => {
+			const link = join(workspaceDir, "harmless.txt");
+			linkSync(sshKey(), link);
+			expect(statSync(link).nlink).toBe(2);
+			expect(() => checkUploadable(link, deps())).toThrow(/hard link to a file in a protected directory/);
+		});
+
+		test("(b) a copy of the private key is refused by its content", () => {
+			const copy = join(workspaceDir, "copy.txt");
+			copyFileSync(sshKey(), copy);
+			expect(statSync(copy).nlink).toBe(1);
+			expect(() => checkUploadable(copy, deps())).toThrow(/token-like secret/);
+		});
+
+		test("(c) hard links between files outside protected directories pass", () => {
+			sshKey();
+			const a = join(workspaceDir, "a.txt");
+			const b = join(workspaceDir, "b.txt");
+			writeFileSync(a, "ordinary\n");
+			linkSync(a, b);
+			expect(statSync(b).nlink).toBe(2);
+			expect(checkUploadable(b, deps())).toBe(b);
+		});
+
+		test("(d) a plain file with link count 1 passes", () => {
+			const plain = join(workspaceDir, "plain.txt");
+			writeFileSync(plain, "ordinary\n");
+			expect(statSync(plain).nlink).toBe(1);
+			expect(checkUploadable(plain, deps())).toBe(plain);
+		});
+
+		test("(e) a file holding an xoxc- token is refused", () => {
+			const file = join(workspaceDir, "cookie.txt");
+			writeFileSync(file, `token ${["xo", "xc-", "1234567890", "-abcdefghijKLMNOP"].join("")}\n`);
+			expect(() => checkUploadable(file, deps())).toThrow(/token-like secret/);
+		});
+	});
+
 	test("checkUploadable protects the hub, git credentials, netrc and gh config, and token-shaped GitHub content", () => {
 		const deps = { homeDir, workspaceDir, userHome };
 		const files = [
@@ -784,6 +851,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval returns approved / denied / denied (timeout) from the buttons", async () => {
 		const broker = new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
@@ -813,6 +881,7 @@ describe("host tools", () => {
 
 	test("ompbot_request_approval forwards the optional sections; unfilled ones never appear", async () => {
 		const broker = new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
@@ -966,10 +1035,17 @@ describe("file upload thread routing (daemon)", () => {
 		const transport = new WaitingTransport();
 		const sessions = new FakeSessionStore();
 		const drivers: FakeOmpDriver[] = [];
+		const steerDelivered = Promise.withResolvers<void>();
 		daemon = new Daemon({
 			config: home.config,
 			channels: [new SlackBinding(new SlackChannel(transport))],
-			log: quietLog(),
+			log: createLogger({
+				sink: (line) => {
+					if (line.includes("event=steer_delivered")) steerDelivered.resolve();
+				},
+				clock,
+				redact,
+			}),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
 			driverFactory: (_origin, sessionDir) => {
@@ -985,6 +1061,8 @@ describe("file upload thread routing (daemon)", () => {
 		// "newest inbound" and "the running turn's thread" diverge exactly here.
 		const steered = await daemon.inject({ origin: ORIGIN, asOwner: true, text: "meanwhile" });
 		await transport.waitForPosts((text) => text.startsWith("⏳"), 2);
+		// Released only after the steer landed: a turn ending before it would run "meanwhile" as a new (held) turn.
+		await steerDelivered.promise;
 		expect(steered.threadRef).not.toBe(running.threadRef);
 
 		const file = join(home.config.workspaceDir, "diagram.svg");

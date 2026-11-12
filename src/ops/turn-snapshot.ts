@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, realpathSync, rmSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { join } from "node:path";
 import type { Logger } from "../log";
 import type { TurnSnapshotInput, TurnSnapshotRow } from "../store/db";
 
@@ -64,7 +64,22 @@ export interface RepoPlan {
 	source: string;
 	/** The turn committed: no file is touched, only this advice line is shown. */
 	commit?: { before: string; after: string; advice: string };
+	/**
+	 * An overlapping turn's paths could not be read, so every changed file here is `overlap`: set when nothing can be
+	 * told apart, and shown as its own line.
+	 */
+	overlapFailed?: string;
 	files: PlannedFile[];
+}
+
+/** What `applyUndo` did to one repository. */
+export interface UndoApplied {
+	/** `revert` files put back or deleted. */
+	reverted: number;
+	/** `revert` files left alone because a directory now stands where a created file was to be deleted. */
+	conflicts: string[];
+	/** The file whose revert failed: the undo stopped there, the files before it stay reverted, the rest untouched. */
+	failed?: { path: string; reason: string };
 }
 
 /** The ledger operations `recordTurn` needs (a `Store` satisfies it). */
@@ -74,8 +89,6 @@ export interface TurnSnapshotStore {
 
 /** How long one repository's capture may take before that repository is skipped. */
 export const TURN_SNAPSHOT_TIMEOUT_MS = 5_000;
-/** Ledger rows kept per origin; the oldest row and its refs go when one more arrives. */
-export const TURN_SNAPSHOT_KEEP = 20;
 /** `ompbot gc` removes turn snapshots (rows and their refs) older than this. */
 export const TURN_SNAPSHOT_RETENTION_DAYS = 7;
 
@@ -91,12 +104,15 @@ export function turnRefName(id: number, which: "before" | "after"): string {
 	return `refs/ompbot/turns/${id}/${which}`;
 }
 
+/** No call here means a pathspec pattern: a file named `:(glob)**` is that one file, not every file (qa-d M-1). */
+const LITERAL_PATHSPECS = { GIT_LITERAL_PATHSPECS: "1" };
+
 /** Runs git in `repo`; a timeout is a non-zero outcome, never a throw (the caller decides what a failure means). */
 export const runGit: GitRunner = async (repo, args, options = {}) => {
 	const timeoutMs = options.timeoutMs ?? TURN_SNAPSHOT_TIMEOUT_MS;
 	try {
 		const proc = Bun.spawn(["git", "-C", repo, ...args], {
-			env: { ...process.env, ...options.env },
+			env: { ...process.env, ...options.env, ...LITERAL_PATHSPECS },
 			stdout: "pipe",
 			stderr: "pipe",
 			signal: AbortSignal.timeout(timeoutMs),
@@ -125,7 +141,7 @@ async function required(
 function temporaryIndexPath(repo: string): string {
 	const base = realpathSync(tmpdir());
 	const root = realpathSync(repo);
-	const chosen = base.startsWith(`${root}/`) ? "/tmp" : base;
+	const chosen = base === root || base.startsWith(`${root}/`) ? "/tmp" : base;
 	return join(chosen, `ompbot-turn-index-${randomUUID()}`);
 }
 
@@ -152,23 +168,30 @@ export async function captureTree(repo: string, options: { run?: GitRunner } = {
 
 /**
  * `captureTree` for several repositories in parallel. A repository that fails (not a git work tree, git too slow) is
- * logged as `turn_snapshot_failed` and missing from the result; the turn goes on with the others.
+ * logged as `turn_snapshot_failed` and reported in `failed`; the turn goes on with the others, and the caller can tell
+ * the owner that this repository has no snapshot for the turn.
  */
 export async function captureTrees(
 	repos: readonly string[],
 	options: { run?: GitRunner; log?: Logger } = {},
-): Promise<Map<string, TreeSnapshot>> {
+): Promise<{ trees: Map<string, TreeSnapshot>; failed: Map<string, string> }> {
 	const captured = await Promise.all(
 		repos.map(async (repo) => {
 			try {
-				return [repo, await captureTree(repo, options)] as const;
+				return { repo, tree: await captureTree(repo, options) };
 			} catch (error) {
 				options.log?.warn("turn_snapshot_failed", { repo, error: String(error) });
-				return undefined;
+				return { repo, failed: String(error) };
 			}
 		}),
 	);
-	return new Map(captured.filter((entry) => entry !== undefined));
+	const trees = new Map<string, TreeSnapshot>();
+	const failed = new Map<string, string>();
+	for (const entry of captured) {
+		if (entry.tree !== undefined) trees.set(entry.repo, entry.tree);
+		else failed.set(entry.repo, entry.failed ?? "unknown");
+	}
+	return { trees, failed };
 }
 
 /** Wraps a tree in a commit and points `refs/ompbot/turns/<id>/<which>` at it, so `git gc` keeps it. */
@@ -236,7 +259,13 @@ export async function recordTurn(options: {
 	return written;
 }
 
-/** Paths of one tree: mode and blob of every file (`ls-tree -r -z`, so no path is quoted or split). */
+/** The tree mode of a nested repository (a submodule or an embedded checkout): `!undo` never moves one. */
+const GITLINK_MODE = "160000";
+
+/**
+ * Paths of one tree: mode and blob (or commit, for a gitlink) of every file (`ls-tree -r -z`, so no path is quoted or
+ * split).
+ */
 async function treeEntries(
 	run: GitRunner,
 	repo: string,
@@ -249,7 +278,7 @@ async function treeEntries(
 		const tab = record.indexOf("\t");
 		if (tab < 0) continue;
 		const [mode, type, blob] = record.slice(0, tab).split(" ");
-		if (mode === undefined || type !== "blob" || blob === undefined) continue;
+		if (mode === undefined || (type !== "blob" && mode !== GITLINK_MODE) || blob === undefined) continue;
 		entries.set(record.slice(tab + 1), { mode, blob });
 	}
 	return entries;
@@ -296,8 +325,15 @@ async function stillMatches(
 	const mode = workTreeMode(full);
 	if (entry === undefined) return mode === undefined;
 	if (mode !== entry.mode) return false;
-	const hash = await required(run, repo, ["hash-object", "--", path]);
-	return hash === entry.blob;
+	if (mode !== "120000") return (await required(run, repo, ["hash-object", "--", path])) === entry.blob;
+	// A symlink's blob is its target string; hash-object on the path would hash the file it points to instead.
+	const scratch = temporaryIndexPath(repo);
+	writeFileSync(scratch, readlinkSync(full));
+	try {
+		return (await required(run, repo, ["hash-object", "--no-filters", "--", scratch])) === entry.blob;
+	} finally {
+		rmSync(scratch, { force: true });
+	}
 }
 
 /** Files another turn changed too while its window overlapped this one's. */
@@ -305,7 +341,7 @@ async function overlapPaths(
 	run: GitRunner,
 	row: TurnSnapshotRow,
 	others: readonly TurnSnapshotRow[],
-): Promise<Set<string>> {
+): Promise<{ paths: Set<string>; failed?: string }> {
 	const overlapping = others.filter(
 		(other) =>
 			other.id !== row.id &&
@@ -314,10 +350,21 @@ async function overlapPaths(
 			other.startedAt < row.endedAt &&
 			row.startedAt < other.endedAt,
 	);
-	const sets = await Promise.all(
-		overlapping.map((other) => changedPaths(run, row.repo, other.treeBefore, other.treeAfter).catch(() => [])),
+	if (overlapping.length === 0) return { paths: new Set() };
+	// A turn that overlapped this one changed paths this row's own diff cannot separate: when that listing fails the
+	// whole repository is ambiguous, never "no overlap".
+	const settled = await Promise.all(
+		overlapping.map(async (other) => {
+			try {
+				return { paths: await changedPaths(run, row.repo, other.treeBefore, other.treeAfter) };
+			} catch (error) {
+				return { failed: String(error) };
+			}
+		}),
 	);
-	return new Set(sets.flat());
+	const failed = settled.find((entry) => entry.failed !== undefined);
+	if (failed !== undefined) return { paths: new Set(), failed: failed.failed };
+	return { paths: new Set(settled.flatMap((entry) => entry.paths ?? [])) };
 }
 
 /** What `!undo` would do to one row's repository. Never writes: the card and the re-check both read this. */
@@ -349,35 +396,63 @@ export async function planUndo(options: {
 	]);
 	const files: PlannedFile[] = [];
 	for (const path of paths) {
-		if (overlap.has(path)) {
+		if (overlap.failed !== undefined || overlap.paths.has(path)) {
 			files.push({ path, kind: "overlap" });
 			continue;
 		}
-		if (!(await stillMatches(run, row.repo, after, path))) {
+		// A nested repository's checkout is its own history: it is reported, never restored or deleted.
+		const gitlink = before.get(path)?.mode === GITLINK_MODE || after.get(path)?.mode === GITLINK_MODE;
+		if (gitlink || !(await stillMatches(run, row.repo, after, path))) {
 			files.push({ path, kind: "conflict" });
 			continue;
 		}
 		const entry = before.get(path);
 		files.push(entry === undefined ? { path, kind: "revert" } : { path, kind: "revert", ...entry });
 	}
-	return { repo: row.repo, source: row.treeBefore, files };
+	const plan: RepoPlan = { repo: row.repo, source: row.treeBefore, files };
+	if (overlap.failed !== undefined) plan.overlapFailed = overlap.failed;
+	return plan;
+}
+
+/**
+ * The lines a plan adds beside its per-kind file lists: a repository whose overlap check failed cannot tell its files
+ * apart, so the card and the answer say so instead of reading like a complete undo.
+ */
+export function undoPlanNotes(plan: RepoPlan): string[] {
+	if (plan.overlapFailed === undefined) return [];
+	return [`겹침 확인 실패: ${plan.repo} — ${plan.overlapFailed}`];
 }
 
 /**
  * Performs a plan's `revert` files: `git restore --source=<before-tree> --worktree` (mode and executable bit come from
  * the tree, the real index is untouched) or, for a file the turn created, a plain delete. Conflicts and overlaps are
- * left exactly as they are.
+ * left exactly as they are, and so is a directory where a created file was to be deleted: it is returned in
+ * `conflicts`. Never throws: the first file that fails ends the run as `failed`.
  */
-export async function applyUndo(plan: RepoPlan, options: { run?: GitRunner } = {}): Promise<void> {
+export async function applyUndo(plan: RepoPlan, options: { run?: GitRunner } = {}): Promise<UndoApplied> {
 	const run = options.run ?? runGit;
+	const done: UndoApplied = { reverted: 0, conflicts: [] };
 	for (const file of plan.files) {
 		if (file.kind !== "revert") continue;
-		if (file.mode === undefined) {
-			rmSync(join(plan.repo, file.path), { force: true });
-			continue;
+		try {
+			if (file.mode === undefined) {
+				const full = join(plan.repo, file.path);
+				const stat = lstatSync(full, { throwIfNoEntry: false });
+				if (stat !== undefined && !stat.isFile() && !stat.isSymbolicLink()) {
+					done.conflicts.push(file.path);
+					continue;
+				}
+				rmSync(full, { force: true });
+			} else {
+				await required(run, plan.repo, ["restore", `--source=${plan.source}`, "--worktree", "--", file.path]);
+			}
+		} catch (error) {
+			done.failed = { path: file.path, reason: String(error) };
+			return done;
 		}
-		await required(run, plan.repo, ["restore", `--source=${plan.source}`, "--worktree", "--", file.path]);
+		done.reverted += 1;
 	}
+	return done;
 }
 
 /** Deletes the refs of rows that are leaving the ledger; returns the ref names it removed. */
@@ -408,6 +483,7 @@ export function removeTurnRefsSync(rows: readonly Pick<TurnSnapshotRow, "id" | "
 		for (const which of ["before", "after"] as const) {
 			const ref = turnRefName(row.id, which);
 			const outcome = Bun.spawnSync(["git", "-C", row.repo, "update-ref", "-d", ref], {
+				env: { ...process.env, ...LITERAL_PATHSPECS },
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -415,17 +491,4 @@ export function removeTurnRefsSync(rows: readonly Pick<TurnSnapshotRow, "id" | "
 		}
 	}
 	return removed;
-}
-
-/** Whether `repos` names a git work tree: absolute and holding a `.git` (a directory, or a file in a linked worktree). */
-export function isGitWorkTree(repo: string): boolean {
-	if (!isAbsolute(repo)) return false;
-	const root = resolve(repo);
-	const rel = relative(root, resolve(root, ".git"));
-	if (rel === "" || rel.startsWith("..")) return false;
-	try {
-		return lstatSync(join(root, ".git")).isDirectory() || lstatSync(join(root, ".git")).isFile();
-	} catch {
-		return false;
-	}
 }

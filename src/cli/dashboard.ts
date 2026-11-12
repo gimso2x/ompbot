@@ -6,13 +6,14 @@ import type { LiveView } from "../core/live-turn";
 import { callDaemon } from "../daemon/ipc";
 import { readMonitorDetail } from "../dashboard/monitor-detail";
 import { startDashboardServer } from "../dashboard/server";
-import { readBoardTasks } from "../dashboard/snapshot";
+import { readBoardPrompts, readBoardTasks } from "../dashboard/snapshot";
 import { boardSourceFor, hasConfig, snapshotReader } from "../dashboard/snapshot-assembly";
 import { readThreadConversation } from "../dashboard/thread-conversation";
 import { readTurnTrace } from "../dashboard/trace";
 import { realProcessRunner } from "../dispatch/omp";
 import { redact } from "../redact";
 import { indexEnvSecrets } from "../safety/secret-index";
+import { hostTimezone } from "../time";
 
 export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  read-only status page on a loopback port until SIGTERM: HTML at /, JSON at
@@ -63,7 +64,7 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 	indexEnvSecrets(process.env);
 
 	const now = () => Date.now();
-	const board = boardSourceFor(config);
+	const board = boardSourceFor(config, homeDir);
 	const snapshot = snapshotReader({
 		homeDir,
 		config,
@@ -83,7 +84,15 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 			conversation: (origin, before) => readThreadConversation(homeDir, origin, before),
 			// The daemon's procedure file roots (MonitorScheduler in daemon.ts).
 			monitorDetail: (id) =>
-				readMonitorDetail(homeDir, { workspaceDir: config?.workspaceDir, scriptsRoot: join(homeDir, "scripts") }, id),
+				readMonitorDetail(
+					homeDir,
+					{
+						workspaceDir: config?.workspaceDir,
+						scriptsRoot: join(homeDir, "scripts"),
+						timezone: config?.timezone ?? hostTimezone(),
+					},
+					id,
+				),
 			// 800 ms bound: a wedged daemon must not hold a read past the next tick (callDaemon defaults to 120 s).
 			live: async (origin) => {
 				const answer = await callDaemon(join(homeDir, "ompbot.sock"), { op: "live", origin }, 800);
@@ -107,6 +116,16 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 								} catch (error) {
 									process.stderr.write(
 										`dashboard board_tasks_failed: ${redact(error instanceof Error ? error.message : String(error))}\n`,
+									);
+									return [];
+								}
+							},
+							prompts: () => {
+								try {
+									return readBoardPrompts(homeDir);
+								} catch (error) {
+									process.stderr.write(
+										`dashboard board_prompts_failed: ${redact(error instanceof Error ? error.message : String(error))}\n`,
 									);
 									return [];
 								}

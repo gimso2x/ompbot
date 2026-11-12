@@ -748,7 +748,7 @@ describe("memory-audit audit.py find", () => {
 });
 
 describe("memory-audit monitor.json", () => {
-	test("AC-6: with @OMPBOT_HOME@ replaced by a temp home it parses; Sunday 05:00 KST cron, sonnet, one procedure file", () => {
+	test("AC-6: with @OMPBOT_HOME@ replaced by a temp home it parses; Sunday 05:00 KST cron, bot model, one procedure file", () => {
 		const home = tempDir("memory-audit-install-");
 		const scriptsRoot = join(home, "scripts");
 		mkdirSync(scriptsRoot);
@@ -758,9 +758,9 @@ describe("memory-audit monitor.json", () => {
 		expect(JSON.parse(template).procedureFiles).toEqual(["@OMPBOT_HOME@/scripts/memory-audit-procedure.md"]);
 		const raw = JSON.parse(template.replaceAll("@OMPBOT_HOME@", home));
 		expect(raw.procedureFiles).toEqual([installed]);
-		const spec = parseMonitorSpec(raw, { scriptsRoot });
+		const spec = parseMonitorSpec(raw, { scriptsRoot, defaultTimezone: "Asia/Seoul" });
 		expect(spec.trigger).toEqual({ kind: "cron", schedule: "0 5 * * 0", timezone: "Asia/Seoul" });
-		expect(spec.model).toBe("anthropic/claude-sonnet-5-5");
+		expect(spec.model).toBeUndefined(); // doc/plans/first-install-defaults.md: the bot's default model
 		expect(spec.procedureFiles).toHaveLength(1);
 		expect("channel" in spec).toBe(false);
 	});

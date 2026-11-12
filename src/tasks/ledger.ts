@@ -1,13 +1,6 @@
 import { Database } from "bun:sqlite";
-import {
-	type AcceptanceItem,
-	agentNameOf,
-	branchOf,
-	formatTaskId,
-	kstDay,
-	type TaskRisk,
-	worktreePathOf,
-} from "./docs";
+import { localDay } from "../time";
+import { type AcceptanceItem, agentNameOf, branchOf, formatTaskId, type TaskRisk, worktreePathOf } from "./docs";
 
 export const TASK_STATUSES = ["working", "blocked", "review", "done", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -231,18 +224,21 @@ const TASK_ORDER = "substr(task_id, 1, 11), CAST(substr(task_id, 12) AS INTEGER)
 export class TaskLedger {
 	readonly #db: Database;
 	readonly #clock: TaskClock;
+	/** The bot's zone (`config.timezone`): a task id carries the date of this zone's calendar day. */
+	readonly #timezone: string;
 
-	constructor(db: Database, options: { clock: TaskClock }) {
+	constructor(db: Database, options: { clock: TaskClock; timezone: string }) {
 		this.#db = db;
 		this.#clock = options.clock;
+		this.#timezone = options.timezone;
 		migrateTaskSchema(db);
 	}
 
-	/** Allocates the next `T-YYYYMMDD-NN` of the KST day and inserts the row as `working`, in one transaction. */
+	/** Allocates the next `T-YYYYMMDD-NN` of the bot zone's day and inserts the row as `working`, in one transaction. */
 	register(input: NewTask): TaskRow {
 		return this.#db.transaction(() => {
 			const now = this.#clock.now();
-			const day = kstDay(now);
+			const day = localDay(now, this.#timezone);
 			const prefix = `T-${day}-`;
 			// Numeric max: as text, `-99` sorts after `-100`, and the 101st id would collide.
 			const { last } = this.#db
@@ -462,9 +458,13 @@ export class TaskLedger {
 }
 
 /** Standalone connection for the CLI. */
-export function openTaskLedger(path: string, clock: TaskClock = { now: () => Date.now() }): TaskLedger {
+export function openTaskLedger(
+	path: string,
+	timezone: string,
+	clock: TaskClock = { now: () => Date.now() },
+): TaskLedger {
 	const db = new Database(path, { create: true, strict: true });
 	db.run("PRAGMA journal_mode = WAL");
 	db.run("PRAGMA busy_timeout = 5000");
-	return new TaskLedger(db, { clock });
+	return new TaskLedger(db, { clock, timezone });
 }

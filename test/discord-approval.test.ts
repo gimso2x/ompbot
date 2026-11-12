@@ -6,7 +6,6 @@ import type { ChannelBinding } from "../src/channel/adapter";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
-import type { FakeDiscordCall } from "../src/discord/fake-transport";
 import type { DiscordInteraction } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
@@ -22,6 +21,7 @@ import {
 	WaitingTransport,
 	withDiscord,
 } from "./helpers/bot-home";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 
 const ESCALATION = "C0ESCALATE1";
 const DM = "123456789012345678";
@@ -181,5 +181,42 @@ describe("choice card on Discord", () => {
 		await click(choiceActionId(1, DM, card), card);
 		expect(await choice).toEqual({ value: "production" });
 		expect((await settledCard(card)).content).toContain("production");
+	});
+
+	test("an ask dialog goes out with buttons (recommended PRIMARY=1, the rest 2) and a click answers with that option", async () => {
+		await boot();
+		const answerer = daemon?.answerDialogsFor(ORIGIN);
+		if (answerer === undefined) throw new Error("no dialog answerer");
+		const answer = answerer(
+			{
+				method: "ask",
+				id: "dlg-2",
+				questions: [
+					{
+						id: "q1",
+						question: "어디에 배포할까요?",
+						options: [{ label: "staging" }, { label: "production" }],
+						recommended: 0,
+					},
+				],
+			},
+			new AbortController().signal,
+		);
+		const card = await shownCard();
+		const shown = discord.calls.find((c) => isEdit(c) && buttonCount(c) > 0) as Edit;
+		// The wire shape of Discord components: Action Rows of buttons.
+		const rows = shown.components as ReadonlyArray<{
+			components: ReadonlyArray<{ style: number; label: string; custom_id: string }>;
+		}>;
+		const buttons = rows.flatMap((row) => row.components);
+		expect(buttons.map((b) => [b.label, b.style])).toEqual([
+			["staging", 1],
+			["production", 2],
+		]);
+		expect(buttons.map((b) => b.custom_id)).toEqual([0, 1].map((n) => choiceActionId(n, DM, card)));
+		await click(choiceActionId(1, DM, card), card);
+		expect(await answer).toEqual({ answers: [{ id: "q1", selectedOptions: ["production"] }] });
+		expect((await settledCard(card)).content).toContain("✅ 답: 1) production");
+		expectSlackUntouched();
 	});
 });

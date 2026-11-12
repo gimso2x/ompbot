@@ -67,7 +67,7 @@ const stopLogs = (): string[] => lines.filter((line) => line.includes("event=cos
 describe("AC-4: daily cap notice", () => {
 	test("the day's first breach posts one owner notice and later sweeps the same day stay quiet", async () => {
 		const d = await boot({ dailyUsd: 10 });
-		const day = ledgerDay(clock.t);
+		const day = ledgerDay(clock.t, "Asia/Seoul");
 		d.store.addDailyUsage({ day, originKey: ORIGIN, cost: 12, calls: 3 });
 
 		await d.sweep();
@@ -85,13 +85,13 @@ describe("AC-4: daily cap notice", () => {
 
 	test("!budget answers today's total, its top origins and both ceilings", async () => {
 		const d = await boot({ turnUsd: 20, dailyUsd: 300 });
-		d.store.addDailyUsage({ day: ledgerDay(clock.t), originKey: ORIGIN, cost: 12.5, calls: 3 });
-		d.store.addDailyUsage({ day: ledgerDay(clock.t), originKey: "monitor/daily", cost: 1.25, calls: 1 });
+		d.store.addDailyUsage({ day: ledgerDay(clock.t, "Asia/Seoul"), originKey: ORIGIN, cost: 12.5, calls: 3 });
+		d.store.addDailyUsage({ day: ledgerDay(clock.t, "Asia/Seoul"), originKey: "monitor/daily", cost: 1.25, calls: 1 });
 
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "!budget" });
 		await transport.waitForPosts((text) => text.includes("하루 $300.00"));
 		const reply = transport.posts((text) => text.includes("하루 $300.00"))[0]?.text ?? "";
-		expect(reply).toContain(`오늘(${ledgerDay(clock.t)}) 비용(정가 환산) $13.75`);
+		expect(reply).toContain(`오늘(${ledgerDay(clock.t, "Asia/Seoul")}) 비용(정가 환산) $13.75`);
 		expect(reply).toContain("턴 $20.00");
 		expect(reply).toContain(`${ORIGIN} $12.50`);
 		expect(reply).toContain("상한까지 $286.25 남았습니다");
@@ -102,7 +102,7 @@ describe("AC-4: !budget off/on and the day boundary", () => {
 	/** A daemon over `dailyUsd: 10` that already spent $12 today and has a per-minute monitor. */
 	async function overCap(): Promise<{ daemon: Daemon; monitorId: string; day: string }> {
 		const d = await boot({ dailyUsd: 10 });
-		const day = ledgerDay(clock.t);
+		const day = ledgerDay(clock.t, "Asia/Seoul");
 		d.store.addDailyUsage({ day, originKey: ORIGIN, cost: 12, calls: 3 });
 		const monitor = d.store.monitors.addMonitor({
 			name: "watch",
@@ -139,7 +139,7 @@ describe("AC-4: !budget off/on and the day boundary", () => {
 		expect(budgetBreach(dailyBudgetState({ store: d.store, day, cap: 10 }))).toBeUndefined();
 
 		// A restart is a new Store over the same ledger: the day's off flag is still there, so the hook stays undefined.
-		const reopened = openStore({ path: join(home.dir, "ompbot.db"), clock, redact });
+		const reopened = openStore({ timezone: "Asia/Seoul", path: join(home.dir, "ompbot.db"), clock, redact });
 		try {
 			const state = dailyBudgetState({ store: reopened, day, cap: 10 });
 			expect(state.off).toBe(true);
@@ -169,7 +169,7 @@ describe("AC-4: !budget off/on and the day boundary", () => {
 		const { daemon: d, monitorId, day } = await overCap();
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "!budget off" });
 		await transport.waitForPosts((text) => text.includes("하루 상한을 껐습니다"));
-		const next = ledgerDay(Date.parse("2026-11-11T00:00:00+09:00"));
+		const next = ledgerDay(Date.parse("2026-11-11T00:00:00+09:00"), "Asia/Seoul");
 		expect(next).not.toBe(day);
 
 		clock.t = Date.parse("2026-11-11T00:00:00+09:00");

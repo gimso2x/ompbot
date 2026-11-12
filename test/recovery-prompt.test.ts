@@ -40,10 +40,11 @@ let drivers: Map<string, DyingDaemonDriver>;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-recovery-prompt-"));
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	sessions = new FakeSessionStore();
 	drivers = new Map();
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(dir, "sessions"),

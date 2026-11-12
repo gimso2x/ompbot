@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { resolve, sep } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
 import { MAX_INBOUND_FILES, saveInboundAttachment } from "../channel/attachments";
 import { DeliveryPump, type DeliverySender, type DeliverySendResult } from "../channel/pump";
@@ -40,6 +40,7 @@ import {
 	plainHeaderText,
 	renderMarkdownParts,
 	renderParts,
+	type SlackAttachment,
 } from "./format";
 import {
 	type SlackBlockActionPayload,
@@ -249,16 +250,19 @@ export class SlackAdapter implements ChannelAdapter {
 	async ingestOwner(input: OwnerIngest): Promise<IngestOutcome> {
 		const inChannel = input.kind === "ch";
 		const mention = inChannel && this.#botUserId !== undefined ? `<@${this.#botUserId}> ` : "";
-		return this.processMessage({
-			type: "message",
-			channel: input.conversationId,
-			channel_type: inChannel ? "channel" : "im",
-			user: this.ownerUserId,
-			text: `${mention}${escapeMrkdwn(input.text)}`,
-			ts: input.messageId,
-			...(input.threadId === undefined ? {} : { thread_ts: input.threadId }),
-			attachments: input.quoted?.map((text) => ({ text: escapeMrkdwn(text) })),
-		});
+		return this.processMessage(
+			{
+				type: "message",
+				channel: input.conversationId,
+				channel_type: inChannel ? "channel" : "im",
+				user: this.ownerUserId,
+				text: `${mention}${escapeMrkdwn(input.text)}`,
+				ts: input.messageId,
+				...(input.threadId === undefined ? {} : { thread_ts: input.threadId }),
+				attachments: input.quoted?.map((text) => ({ text: escapeMrkdwn(text) })),
+			},
+			input.injected === true,
+		);
 	}
 
 	// ---- Slack API calls with per-method Retry-After blocking ----
@@ -298,7 +302,8 @@ export class SlackAdapter implements ChannelAdapter {
 		}
 	}
 
-	private async processMessage(event: SlackMessageEvent): Promise<IngestOutcome> {
+	/** `injected`: an `ompbot inject` message (`OwnerIngest.injected`), which may not answer a card. */
+	private async processMessage(event: SlackMessageEvent, injected = false): Promise<IngestOutcome> {
 		const inChannel = event.channel_type !== undefined && CHANNEL_TYPES.has(event.channel_type);
 		if (event.channel_type !== "im" && !inChannel) return "dropped";
 		// #log is a ledger, not a conversation: nothing said there reaches omp.
@@ -308,7 +313,7 @@ export class SlackAdapter implements ChannelAdapter {
 		}
 		const botUserId = await this.ready;
 		if (botUserId === undefined) return "dropped";
-		const cardReply = await this.#processCardReply(event, botUserId);
+		const cardReply = await this.#processCardReply(event, botUserId, injected);
 		if (cardReply !== undefined) return cardReply;
 		const peer = event.user === botUserId ? undefined : this.peerBots.find((p) => p.userId === event.user);
 		if (peer !== undefined) return this.#processPeerMessage(event, botUserId, peer, inChannel);
@@ -317,11 +322,13 @@ export class SlackAdapter implements ChannelAdapter {
 			return "dropped";
 		}
 		// A file message is un-subtyped (the subtype rejection must not drop it) only for file_share itself: an edit or
-		// delete event that merely carries `files` stays rejected.
+		// delete event that merely carries `files` stays rejected. A file_share whose files Slack left out (deleted or
+		// not accessible) keeps its text, with a note in place of the files.
 		const files = event.files ?? [];
-		const fileMessage =
-			files.length > 0 && (event.subtype === undefined || event.subtype === "" || event.subtype === "file_share");
-		const subtype = fileMessage && event.subtype === "file_share" ? undefined : event.subtype;
+		const fileShare = event.subtype === "file_share";
+		const fileMessage = files.length > 0 && (event.subtype === undefined || event.subtype === "" || fileShare);
+		const filesMissing = fileShare && files.length === 0;
+		const subtype = fileShare ? undefined : event.subtype;
 		let text = unescapeSlackText(event.text ?? "");
 		let muteContext:
 			| { ref: string; mentioned: boolean; muted: boolean; command: ThreadMuteCommand | undefined }
@@ -373,7 +380,10 @@ export class SlackAdapter implements ChannelAdapter {
 		};
 		// Authorization and addressing are settled BEFORE any disk or network work: a non-owner's (or unaddressed) file
 		// is never downloaded. The placeholder only stands in for the notes the download will add to an empty text.
-		const gate = normalizeInbound({ ...normalizeArgs, text: fileMessage && text.trim() === "" ? "[file]" : text });
+		const gate = normalizeInbound({
+			...normalizeArgs,
+			text: (fileMessage || filesMissing) && text.trim() === "" ? "[file]" : text,
+		});
 		if (!gate.accept) {
 			this.log.info("inbound_dropped", { reason: gate.reason, channel: event.channel, ts: event.ts });
 			return "dropped";
@@ -401,6 +411,10 @@ export class SlackAdapter implements ChannelAdapter {
 		if (fileMessage) {
 			const notes = await this.#collectAttachments(event, files);
 			text = [text.trim(), ...notes].filter((line) => line !== "").join("\n");
+		} else if (filesMissing) {
+			text = [text.trim(), "[첨부 실패: Slack이 파일 정보를 보내지 않았습니다(삭제됐거나 볼 수 없는 파일)]"]
+				.filter((line) => line !== "")
+				.join("\n");
 		}
 		const result = normalizeInbound({ ...normalizeArgs, text });
 		if (!result.accept) {
@@ -502,7 +516,11 @@ export class SlackAdapter implements ChannelAdapter {
 	 * reply goes to the asking conversation with the card thread as its thread. Non-owner replies fall through (and
 	 * are ignored there).
 	 */
-	async #processCardReply(event: SlackMessageEvent, botUserId: string): Promise<IngestOutcome | undefined> {
+	async #processCardReply(
+		event: SlackMessageEvent,
+		botUserId: string,
+		injected: boolean,
+	): Promise<IngestOutcome | undefined> {
 		if (this.core.onCardReply === undefined) return undefined;
 		if (event.thread_ts === undefined || event.thread_ts === "" || event.thread_ts === event.ts) return undefined;
 		if (!isOwner(event.user, this.ownerUserId) || (event.subtype !== undefined && event.subtype !== ""))
@@ -514,8 +532,9 @@ export class SlackAdapter implements ChannelAdapter {
 		if (text === "") return undefined;
 		const threadRef = `${event.channel}:${event.thread_ts}`;
 		const platformMessageId = `${event.channel}:${event.ts}`;
-		const result = this.core.onCardReply({ threadRef, platformMessageId, text });
+		const result = this.core.onCardReply({ threadRef, platformMessageId, text, injected });
 		if (result === undefined) return undefined;
+		if (result.kind === "injected_rejected") return "card_rejected";
 		if (result.kind === "duplicate") {
 			this.log.info("inbound_duplicate", { id: platformMessageId });
 			return "duplicate";
@@ -537,8 +556,11 @@ export class SlackAdapter implements ChannelAdapter {
 	}
 
 	/** Backfill entry: the exact live path, but reporting the outcome so the caller can count recovered messages. */
-	ingestRecovered(event: SlackMessageEvent): Promise<IngestOutcome> {
-		return this.processMessage(event);
+	async ingestRecovered(event: SlackMessageEvent): Promise<Exclude<IngestOutcome, "card_rejected">> {
+		const outcome = await this.processMessage(event);
+		// Only an injected owner message is refused at a card; a recovered Slack event never is one.
+		if (outcome === "card_rejected") throw new Error("unreachable: a recovered event is not injected");
+		return outcome;
 	}
 
 	/**
@@ -643,11 +665,18 @@ export class SlackAdapter implements ChannelAdapter {
 		if (mediaRoot === undefined) {
 			return [`[첨부 실패: ${files.length}개 — 미디어 저장이 구성되지 않았습니다]`];
 		}
+		// The message ts names the download directory: anything but Slack's `<seconds>.<micros>` could leave mediaRoot.
+		const inboundRoot = resolve(mediaRoot, "inbound");
+		const dir = resolve(inboundRoot, event.ts.replace(".", "_"));
+		if (!/^\d+\.\d+$/.test(event.ts) || !dir.startsWith(inboundRoot + sep)) {
+			this.log.warn("attachment_bad_ts", { channel: event.channel, files: files.length });
+			return [`[첨부 실패: ${files.length}개 — 메시지 ts가 올바르지 않아 저장하지 않았습니다]`];
+		}
 		// Downloads run in parallel: destinations are per-file (fileKey hash) and downloadAttachment writes through a
 		// unique tmp path per call, so nothing collides, and Promise.all preserves the note order. Worst-case
 		// turn-start latency is the slowest single file instead of the sum of all of them.
 		const notes = await Promise.all(
-			files.slice(0, MAX_INBOUND_FILES).map((file) => this.#saveAttachment(file, event, mediaRoot)),
+			files.slice(0, MAX_INBOUND_FILES).map((file) => this.#saveAttachment(file, event, dir)),
 		);
 		if (files.length > MAX_INBOUND_FILES) {
 			notes.push(`[첨부 생략: ${files.length - MAX_INBOUND_FILES}개 — 메시지당 최대 ${MAX_INBOUND_FILES}개]`);
@@ -655,8 +684,8 @@ export class SlackAdapter implements ChannelAdapter {
 		return notes;
 	}
 
-	/** Downloads one file into `<mediaRoot>/inbound/<ts>/`; failures become a notice line, never a dropped message. */
-	#saveAttachment(file: SlackInboundFile, event: SlackMessageEvent, mediaRoot: string): Promise<string> {
+	/** Downloads one file into `dir` (`<mediaRoot>/inbound/<ts>/`); failures become a notice line, never a dropped message. */
+	#saveAttachment(file: SlackInboundFile, event: SlackMessageEvent, dir: string): Promise<string> {
 		return saveInboundAttachment({
 			file: {
 				id: file.id,
@@ -664,7 +693,7 @@ export class SlackAdapter implements ChannelAdapter {
 				mimetype: file.mimetype,
 				url: file.url_private_download ?? file.url_private,
 			},
-			dir: join(mediaRoot, "inbound", event.ts.replace(".", "_")),
+			dir,
 			where: { channel: event.channel, ts: event.ts },
 			log: this.log,
 			download: (args) => this.call("downloadAttachment", () => this.transport.downloadAttachment(args)),
@@ -1048,7 +1077,12 @@ export class SlackAdapter implements ChannelAdapter {
 				? undefined
 				: this.#footerOf(delivery.threadRef, outcome);
 		let path = this.#deliveryPaths.get(delivery.deliveryId) ?? (this.#markdownBlocksOff ? "plain" : "markdown");
-		let parts: ReadonlyArray<{ text: string; blocks?: readonly unknown[]; card?: CardFallback }>;
+		let parts: ReadonlyArray<{
+			text: string;
+			blocks?: readonly unknown[];
+			attachments?: readonly SlackAttachment[];
+			card?: CardFallback;
+		}>;
 		for (;;) {
 			const markdown =
 				path === "markdown"
@@ -1074,13 +1108,14 @@ export class SlackAdapter implements ChannelAdapter {
 			let threadTs =
 				target.threadTs === TOP_LEVEL_TS ? (sent > 0 ? (delivery.replyTs ?? undefined) : undefined) : target.threadTs;
 			try {
-				const post = (text: string, blocks: readonly unknown[] | undefined) =>
+				const post = (text: string, blocks: readonly unknown[] | undefined, attachments?: readonly SlackAttachment[]) =>
 					this.call("chat.postMessage", () =>
 						this.transport.postMessage({
 							channel: target.channel,
 							text,
 							...(threadTs === undefined ? {} : { threadTs }),
 							...(blocks === undefined ? {} : { blocks }),
+							...(attachments === undefined ? {} : { attachments }),
 						}),
 					);
 				// Whether a text part of this answer is already in Slack as a `markdown` block, and whether text parts now go
@@ -1192,24 +1227,57 @@ export class SlackAdapter implements ChannelAdapter {
 
 	/**
 	 * Posts a card part. A definitive `invalid_blocks`/`invalid_arguments` refusal is retried at once, never touching
-	 * `#markdownBlocksOff`: a card with a native chart next goes with ASCII charts (turning `#chartBlocksOff` on, so later
-	 * cards and a resume start there), then any card as its fence's code block without blocks. The text step's error,
-	 * and any other error, goes to the caller's catch.
+	 * `#markdownBlocksOff`: a card with a `tone` first goes as its coloured attachment (`attachment`), then as the same
+	 * blocks at the top level without the colour (`top_blocks`); a card with a native chart next goes with ASCII charts
+	 * (`ascii`, inside the coloured attachment for a toned card; turning `#chartBlocksOff` on, so later cards and a resume
+	 * start there), then any card as its fence's code block without blocks. The text step's error, and any other error,
+	 * goes to the caller's catch.
 	 */
 	async #postCard<T>(
 		id: number,
 		index: number,
-		part: { text: string; blocks?: readonly unknown[] },
+		part: { text: string; blocks?: readonly unknown[]; attachments?: readonly SlackAttachment[] },
 		card: CardFallback,
-		post: (text: string, blocks: readonly unknown[] | undefined) => Promise<T>,
+		post: (
+			text: string,
+			blocks: readonly unknown[] | undefined,
+			attachments?: readonly SlackAttachment[],
+		) => Promise<T>,
 	): Promise<T> {
-		const steps: Array<{ step: "blocks" | "ascii"; blocks: readonly unknown[] | undefined }> = [];
+		type Step = {
+			step: "blocks" | "attachment" | "top_blocks" | "ascii";
+			blocks: readonly unknown[] | undefined;
+			attachments?: readonly SlackAttachment[];
+		};
+		const color = part.attachments?.[0]?.color;
+		const steps: Step[] = [];
 		// Charts turned off by an earlier card of this answer: its ASCII form goes first.
-		if (card.asciiBlocks === undefined || !this.#chartBlocksOff) steps.push({ step: "blocks", blocks: part.blocks });
-		if (card.asciiBlocks !== undefined) steps.push({ step: "ascii", blocks: card.asciiBlocks });
-		for (const { step, blocks } of steps) {
+		if (card.asciiBlocks === undefined || !this.#chartBlocksOff) {
+			if (part.attachments === undefined) steps.push({ step: "blocks", blocks: part.blocks });
+			else {
+				steps.push({ step: "attachment", blocks: undefined, attachments: part.attachments });
+				steps.push({ step: "top_blocks", blocks: part.blocks });
+			}
+		}
+		if (card.asciiBlocks !== undefined) {
+			steps.push(
+				color === undefined
+					? { step: "ascii", blocks: card.asciiBlocks }
+					: { step: "ascii", blocks: undefined, attachments: [{ color, blocks: card.asciiBlocks }] },
+			);
+		}
+		for (const { step, blocks, attachments } of steps) {
 			try {
-				return await post(part.text, blocks);
+				// Without top-level blocks Slack shows `text` above the attachment: the card would read twice. The
+				// notification text moves into the attachment's `fallback`.
+				if (attachments !== undefined) {
+					return await post(
+						"",
+						blocks,
+						attachments.map((attachment) => ({ ...attachment, fallback: part.text })),
+					);
+				}
+				return await post(part.text, blocks, attachments);
 			} catch (err) {
 				const refused =
 					err instanceof SlackCallError &&
@@ -1217,7 +1285,8 @@ export class SlackAdapter implements ChannelAdapter {
 					/invalid_blocks|invalid_arguments/.test(errorText(err));
 				if (!refused) throw err;
 				this.log.warn("card_blocks_rejected", { id, part: index, step, error: errorText(err) });
-				if (step === "blocks" && card.asciiBlocks !== undefined && !this.#chartBlocksOff) {
+				// The last native-chart step refused: charts are what Slack would not take.
+				if ((step === "blocks" || step === "top_blocks") && card.asciiBlocks !== undefined && !this.#chartBlocksOff) {
 					this.#chartBlocksOff = true;
 					this.log.warn("card_chart_blocks_disabled", { id, error: errorText(err) });
 				}

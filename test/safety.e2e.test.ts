@@ -26,7 +26,7 @@ const ORIGIN = "slack/dm/D1";
 const SCENARIO_TIMEOUT_MS = 420_000;
 const EVENT_TIMEOUT_MS = 240_000;
 const FAKE_TOKEN = "xoxb-TEST-SECRET-0";
-const TOKEN_PATTERN = /xox[abposre]-|xapp-|(?<![A-Za-z0-9])sk-[A-Za-z0-9]/;
+const TOKEN_PATTERN = /xox[a-z]-|xapp-|(?<![A-Za-z0-9])sk-[A-Za-z0-9]/;
 
 let home: TestHome | undefined;
 

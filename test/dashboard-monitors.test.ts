@@ -8,7 +8,7 @@ import { readMonitorDetail } from "../src/dashboard/monitor-detail";
 import { startDashboardServer } from "../src/dashboard/server";
 import { buildSnapshot, type DashboardSnapshot, type MonitorInfo, type SnapshotDeps } from "../src/dashboard/snapshot";
 import { openStore } from "../src/store/db";
-import { formatKst } from "../src/tasks/docs";
+import { localIso } from "../src/time";
 
 /** 2026-11-06 01:00 KST (a Friday). */
 const NOW = Date.parse("2026-11-05T16:00:00Z");
@@ -27,7 +27,12 @@ const cron = (schedule: string, timezone = "Asia/Seoul") => ({ kind: "cron", sch
 let home: string;
 beforeEach(() => {
 	home = mkdtempSync(join(tmpdir(), "ompbot-dash-monitors-"));
-	openStore({ path: join(home, "ompbot.db"), clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({
+		timezone: "Asia/Seoul",
+		path: join(home, "ompbot.db"),
+		clock: { now: () => NOW },
+		redact: (text) => text,
+	}).close();
 });
 afterEach(() => rmSync(home, { recursive: true, force: true }));
 
@@ -106,6 +111,7 @@ function deps(): SnapshotDeps {
 	return {
 		homeDir: home,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: { logChannel: "C0LOG", escalationChannel: "C0ESC" },
 		now: () => NOW,
 		callDaemon: async () => {
@@ -308,12 +314,14 @@ describe("dashboard monitors snapshot", () => {
 		const { snapshot, items } = await monitorsOf();
 		const mon = byName(items, "재시도");
 		expect(mon.recent).toEqual(
-			events.slice(2).map((e) => ({ stage: e.stage, manual: e.manual === true, at: formatKst(e.updatedAt) })),
+			events
+				.slice(2)
+				.map((e) => ({ stage: e.stage, manual: e.manual === true, at: localIso(e.updatedAt, "Asia/Seoul") })),
 		);
 		expect(mon.lastRun).toEqual({
 			stage: "delivered",
-			at: formatKst(NOW - 45 * MINUTE),
-			slotAt: formatKst(NOW - 7 * HOUR),
+			at: localIso(NOW - 45 * MINUTE, "Asia/Seoul"),
+			slotAt: localIso(NOW - 7 * HOUR, "Asia/Seoul"),
 			durationMs: 6 * HOUR + 15 * MINUTE,
 			attempts: 3,
 			manual: false,
@@ -394,7 +402,7 @@ describe("dashboard monitors view", () => {
 			for (const dot of dots) expect(dot).toMatch(/aria-label="[^"]+"/);
 		}
 		expect(quiet).toContain(
-			`aria-label="${formatKst(NOW - 2 * HOUR + 30_000)
+			`aria-label="${localIso(NOW - 2 * HOUR + 30_000, "Asia/Seoul")
 				.slice(5, 16)
 				.replace("T", " ")} 조용히 끝남"`,
 		);
@@ -428,7 +436,7 @@ describe("dashboard monitors view", () => {
 			...(index === 11 ? { error: `boom ${TOKEN} ${"x".repeat(200)}\nsecond line` } : {}),
 		}));
 		addEvents("mon-a", events);
-		const roots = { workspaceDir, scriptsRoot };
+		const roots = { workspaceDir, scriptsRoot, timezone: "Asia/Seoul" };
 		const detail = readMonitorDetail(home, roots, "mon-a");
 		if (!detail.ok) throw new Error(detail.error);
 		expect(detail.instruction.startsWith("점검한다. 토큰 [REDACTED]\n둘째 줄 ")).toBe(true);
@@ -443,8 +451,8 @@ describe("dashboard monitors view", () => {
 		expect(detail.procedures[1]).toEqual({ name: "missing.md", error: "unreadable" });
 		expect(detail.runs).toHaveLength(10);
 		expect(detail.runs[0]).toEqual({
-			slotAt: formatKst(NOW - HOUR),
-			at: formatKst(NOW - HOUR + 2 * MINUTE),
+			slotAt: localIso(NOW - HOUR, "Asia/Seoul"),
+			at: localIso(NOW - HOUR + 2 * MINUTE, "Asia/Seoul"),
 			stage: "failed",
 			manual: false,
 			attempts: 2,
@@ -456,7 +464,7 @@ describe("dashboard monitors view", () => {
 			events
 				.slice(2)
 				.reverse()
-				.map((e) => formatKst(e.slotAt)),
+				.map((e) => localIso(e.slotAt, "Asia/Seoul")),
 		);
 		const json = JSON.stringify(detail);
 		for (const leak of [TOKEN, "ANSWER-LEAK", "PAYLOAD-LEAK", "second line", join(workspaceDir, "procedures")]) {
@@ -537,7 +545,11 @@ describe("dashboard monitors view", () => {
 		]);
 		const { snapshot, items } = await monitorsOf();
 		expect(byName(items, "<img src=x onerror=alert(3)>").summary).toBe("<script>alert(1)</script> 를 본다.");
-		const detail = readMonitorDetail(home, { workspaceDir, scriptsRoot: join(home, "scripts") }, "xss");
+		const detail = readMonitorDetail(
+			home,
+			{ workspaceDir, scriptsRoot: join(home, "scripts"), timezone: "Asia/Seoul" },
+			"xss",
+		);
 		if (!detail.ok) throw new Error(detail.error);
 		const loading = renderItemDetail(snapshot, "monitors", "xss");
 		expect(loading).not.toContain("<script");

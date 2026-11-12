@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { BoardCard, BoardView } from "../src/dashboard/board";
-import { renderDashboardMain, renderDashboardPage, renderItemDetail, renderTaskDetail } from "../src/dashboard/html";
+import {
+	inboxAttention,
+	renderDashboardMain,
+	renderDashboardPage,
+	renderItemDetail,
+	renderTaskDetail,
+} from "../src/dashboard/html";
 import { renderMarkdown } from "../src/dashboard/markdown";
 import { startDashboardServer } from "../src/dashboard/server";
 import type { DashboardSnapshot, TaskInfo } from "../src/dashboard/snapshot";
@@ -64,6 +70,7 @@ const task = (taskId: string, extra: Partial<TaskInfo>): TaskInfo => ({
 
 const SNAPSHOT: DashboardSnapshot = {
 	generatedAt: "2026-11-04T10:00:00+09:00",
+	timezone: "Asia/Seoul",
 	daemon: { ok: false, error: "no daemon" },
 	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	turns: {
@@ -276,13 +283,14 @@ describe("dashboard inbox", () => {
 			["lanes", "레인", 0],
 			["approvals", "승인 대기", 1],
 			["monitors", "모니터", 0],
-			["alerts", "알림", 1],
 			["system", "시스템", 0],
 		] as const) {
 			expect(nav).toMatch(
 				new RegExp(`data-view="${view}"[^>]*><span>${label}</span><span class="nav-count[^"]*">${count}</span>`),
 			);
 		}
+		// The one alert is a record, not an open gate: the alerts item carries no number.
+		expect(nav).toMatch(/data-view="alerts"[^>]*><span>알림<\/span><svg/);
 		for (const [id, label, count] of [
 			["attention", "확인 필요", 1],
 			["working", "진행 중", 1],
@@ -317,7 +325,7 @@ describe("dashboard inbox", () => {
 		expect(merged).toMatch(/<span class="badge is-info">진행 중<\/span>/);
 		expect(merged).toContain("AC 3/13");
 		expect(merged).toContain("단계 2/7");
-		const lone = anchor(html, 'data-task="T-20261104-51"');
+		const lone = anchor(column(html, "attention"), 'data-task="T-20261104-51"');
 		expect(lone).toContain('<p class="card-title">막힌 작업</p>');
 		expect(lone).toMatch(/<span class="badge is-warning">막힘<\/span>/);
 		expect(lone).toContain("AC 1/2");
@@ -397,8 +405,46 @@ describe("dashboard inbox", () => {
 
 		const board = renderDashboardMain(SNAPSHOT, BOARD, NOW, { view: "list" });
 		const keys = [...board.matchAll(/<tr[^>]*data-row="([^"]+)"/g)].map((match) => match[1]);
-		expect(keys.slice(0, 3).sort()).toEqual(["T-20261104-51", "T-20261104-52", "w1:p2"]);
-		expect(keys.slice(3)).toEqual(["w1:p1", "m-ssh:w9:p1", "m-ssh:w9:p2"]);
+		// 확인 필요 in the one order: failed (worker gone), blocked, no agent card; a done pane with no TASK is 완료·대기.
+		expect(keys).toEqual(["T-20261104-51", "w1:p2", "T-20261104-52", "w1:p1", "m-ssh:w9:p1", "m-ssh:w9:p2"]);
+	});
+
+	test("AC-1 순번: failed first, then blocked by longest wait, then no agent card; the column and order-no agree", () => {
+		const snapshot: DashboardSnapshot = {
+			...SNAPSHOT,
+			tasks: {
+				ok: true,
+				items: [
+					task("T-20261104-60", {
+						error: "문서 판정 실패: outcome.md 없음",
+						progress: { status: "working", updated: "2026-11-04T09:58:00+09:00", current: "S2", blockedReason: "" },
+					}),
+					task("T-20261104-61", {
+						progress: { status: "working", updated: "2026-11-04T09:00:00+09:00", current: "S1", blockedReason: "" },
+					}),
+				],
+			},
+		};
+		const board: BoardView = {
+			...BOARD,
+			cards: [
+				card("w2:b10", "blocked", "attention", { since: NOW - 10 * 60_000 }),
+				card("w2:b30", "blocked", "attention", { since: NOW - 30 * 60_000 }),
+			],
+		};
+		const expected = ["T-20261104-60", "w2:b30", "w2:b10", "T-20261104-61"];
+		expect(inboxAttention(snapshot, board).map((entry) => entry.id)).toEqual(expected);
+		const attention = column(renderDashboardMain(snapshot, board, NOW), "attention");
+		expect([...attention.matchAll(/data-row="([^"]+)"/g)].map((match) => match[1])).toEqual(expected);
+		expect([...attention.matchAll(/data-row="([^"]+)" data-order="(\d)"/g)].map((m) => `${m[2]}:${m[1]}`)).toEqual(
+			expected.map((id, index) => `${index + 1}:${id}`),
+		);
+		expect([...attention.matchAll(/<span class="order-no">(\d)<\/span>/g)].map((match) => match[1])).toEqual([
+			"1",
+			"2",
+			"3",
+			"4",
+		]);
 	});
 });
 
@@ -468,6 +514,13 @@ describe("dashboard: Discord", () => {
 		const html = renderDashboardMain(running({ socket: SOCKET }), BOARD, NOW, { view: "system" });
 		expect(systemCards(html)).not.toContain("discord");
 		expect(systemCards(html)).toContain("slack");
+	});
+
+	test("an install without Slack shows the Slack card as 꺼짐, not as a missing socket", () => {
+		const html = renderDashboardMain({ ...running({}), slackOff: true }, BOARD, NOW, { view: "system" });
+		expect(sysCard(html, "slack")).toContain("꺼짐");
+		expect(sysCard(html, "slack")).toContain("is-success");
+		expect(sysCard(html, "slack")).not.toContain("소켓 상태 기록");
 	});
 });
 
@@ -560,11 +613,11 @@ describe("dashboard polish", () => {
 		expect(cardPage).toContain('<span id="detail-bar-title" class="detail-bar-title" hidden>pane w1:p1</span>');
 		expect(STYLE).toMatch(/\.tabs\s*\{[^}]*position:\s*sticky/);
 
-		// UX-002: g f and Command Palette include flow view while keeping data-view="flow" out of sidenav.
+		// UX-002: g f, the Command Palette and the side nav all reach the flow view.
 		const fullPage = renderDashboardPage(SNAPSHOT, { board: BOARD });
 		expect(fullPage).toContain('label: "보기: 흐름"');
 		expect(fullPage).toContain('f: "flow"');
-		expect(markup(fullPage)).not.toContain('data-view="flow"');
+		expect(markup(fullPage)).toContain('data-view="flow"');
 
 		// UX-003: Board | List segmented control appears only on inbox, list, and turns views.
 		for (const v of ["inbox", "list", "turns"]) {

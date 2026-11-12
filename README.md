@@ -19,7 +19,7 @@
 
 ---
 
-ompbot은 Slack DM·채널에서 받은 말을 내 서버의 [omp](https://github.com/can1357/oh-my-pi) 코딩 에이전트에게 넘기고, 답을 같은 스레드로 돌려줍니다. 여기까지는 여느 챗봇과 같습니다. 다른 점은 **그 뒤의 운영**입니다. 되돌릴 수 없는 일은 버튼으로 묻고, 긴 일은 워커에게 맡겨 증거로 완료를 판정하고, 재시작·끊김에도 메시지를 잃지 않고, 스스로 이상을 감지해 알립니다.
+ompbot은 Slack DM·채널에서 받은 말을 내 서버의 [omp](https://github.com/can1357/oh-my-pi) 코딩 에이전트에게 넘기고, 답을 같은 스레드로 돌려줍니다. 여기까지는 여느 챗봇과 같습니다. 다른 점은 **그 뒤의 운영**입니다. 되돌릴 수 없는 일은 버튼으로 묻고, 긴 일은 워커에게 맡겨 증거로 완료를 판정하고, 재시작·끊김에도 메시지를 잃지 않고, 스스로 이상을 감지해 알립니다. 봇의 안내·알림 문구와 문서는 한국어입니다.
 
 > omp는 한 줄도 고치지 않습니다. omp 위에 Slack · 장부 · 승인 · 운영 계층을 얹습니다.
 
@@ -38,7 +38,7 @@ ompbot은 Slack DM·채널에서 받은 말을 내 서버의 [omp](https://githu
        [ 승인 ]  [ 거부 ]                                   30분 안에 답이 없으면 거부로 처리합니다
 
 👤  매일 아침 9시에 밤사이 에러 로그 요약해줘
-🤖  모니터 '아침 에러 요약'을 등록했습니다 · 매일 09:00 (Asia/Seoul)
+🤖  모니터 '아침 에러 요약'을 등록했습니다 · 매일 09:00
        ⋯ 다음 날 아침, DM 최상위에
 🤖  ⏰ 아침 에러 요약
        밤사이 에러 2건 — 결제 webhook 타임아웃 1건, 디스크 경고 1건 …
@@ -82,13 +82,15 @@ cat > ~/.ompbot/secrets/slack-app-token   # 앱 토큰 붙여넣고 Ctrl-D
 **5. 점검하고 서비스로 띄우기**
 
 ```sh
-bun src/main.ts doctor     # omp login까지 마친 첫 설치에서는 'backup bundle: stamp=missing' 한 줄만 fail(exit 1)이 정상입니다
+bun src/main.ts doctor     # 모든 줄이 ok면 됩니다(첫 설치의 'warn backup bundle' 줄은 종료 코드에 들어가지 않습니다)
 bun src/main.ts units render
 systemctl --user daemon-reload && systemctl --user enable --now ompbot ompbot-backup.timer ompbot-gc.timer
 loginctl enable-linger "$USER"   # (선택) 로그아웃·재부팅 뒤에도 봇이 돌게
 ```
 
-`doctor`의 `omp models` 줄이 `available=0`이면 1단계의 `omp login`을 봇을 돌리는 계정에서 다시 합니다. 백업은 데몬이 처음 떠서 DB를 만든 뒤에만 됩니다. 그래서 서비스를 띄우자마자 DM으로 `🚨 [자가진단] 게이트 backup_age 열림`(백업이 아직 없음)이 오는 것이 정상이고, `bun src/main.ts backup`을 한 번 돌리면 그 게이트가 닫히고 doctor도 모두 `ok`가 됩니다.
+`doctor`의 `omp models` 줄이 `available=0`이면 1단계의 `omp login`을 봇을 돌리는 계정에서 다시 합니다. 첫 백업은 데몬이 처음 떠서 DB를 만들 때 스스로 만듭니다.
+
+시간대는 기본으로 서버 시간대를 씁니다. 바꾸려면 `config.json`에 `"timezone": "Asia/Seoul"`처럼 IANA 이름을 넣습니다.
 
 봇에게 DM을 보내 👀와 답이 오면 끝입니다. 설정 키 전체는 [사용 설명서 › 설정 파일](docs/guide.md#5-설정-파일-ompbotconfigjson)에 있습니다.
 
@@ -163,7 +165,7 @@ Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 �
 | `!model` · `!thinking` | 대화방별 모델·thinking 수준을 보거나 바꿉니다 |
 | `!compact` · `!resume` · `!new` | 컨텍스트 압축 · 옛 세션 이어가기 · 새 대화 |
 | `!queue` · `!status` · `!usage` | 대기열 · 상태 · 토큰·비용 사용량 |
-| `!budget` | 오늘 비용(정가 환산)·상위 오리진·턴/하루 상한을 봅니다. `!budget off`는 오늘만 하루 상한을 꺼 모니터를 다시 돌립니다(KST 자정에 자동으로 다시 켜짐), `!budget on`은 그날 일찍 다시 켭니다 |
+| `!budget` | 오늘 비용(정가 환산)·상위 오리진·턴/하루 상한을 봅니다. `!budget off`는 오늘만 하루 상한을 꺼 모니터를 다시 돌립니다(봇 시간대 자정에 자동으로 다시 켜짐), `!budget on`은 그날 일찍 다시 켭니다 |
 | `!distill` | 지금 대화로 스킬 리뷰를 바로 돌립니다(승인 카드로 제안, 슬래시 명령으로는 등록하지 않음) |
 | `!undo` | 이 대화의 가장 최근 변경 턴을 되돌립니다(`turnSnapshot.repos`가 있어야 하며, 승인 카드 뒤에 실행) |
 | `!brief` (`!브리핑`) | 지금 상태(주의·진행·모니터·백업)를 폭 1080px 한 장 PNG로 그려 이 스레드에 올립니다(모델 호출 없음, 작업 중에도 사용 가능) |
@@ -176,6 +178,7 @@ Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 �
 ompbot status | doctor | gates      # 상태 · 설치 점검(herdr omp 통합 포함) · 건강 판정(열리면 exit 1)
 ompbot apply                        # 검증 → 백업 → drain → 재시작 → 준비 확인 → 영수증
 ompbot reload                       # 재시작 없이 config.json 다시 읽기(바로 반영되는 키만)
+ompbot omp install|use|rollback|status|prune|sync   # 봇 전용 omp 버전 고정·프로필 동기화(config ompProfile)
 ompbot backup | restore | offsite   # 백업 · 복구 · 오프사이트 복제
 ompbot monitors … | tasks …         # 모니터 · [TASK] 관리
 ompbot dashboard [--port N]         # 읽기 전용 현황판(루프백 HTTP)
@@ -193,7 +196,7 @@ ompbot freeze | unfreeze            # 킬스위치
 | **시작하기** | [요구 사항](docs/guide.md#요구-사항) · [설치](docs/guide.md#설치) · [설정 파일](docs/guide.md#5-설정-파일-ompbotconfigjson) · [서비스 등록](docs/guide.md#7-서비스-등록) · [AI 에이전트에게 설치 맡기기](docs/guide.md#ai-에이전트에게-설치-맡기기) · [Discord 봇 만들기](docs/discord.md) |
 | **쓰기** | [대화](docs/guide.md#대화) · [명령](docs/guide.md#명령) · [승인](docs/guide.md#승인) · [질문 카드](docs/guide.md#질문-카드) · [답 피드백](docs/guide.md#답-피드백) · [페르소나와 답변 형식](docs/guide.md#페르소나와-답변-형식) · [claude 에이전트](docs/guide.md#claude-에이전트) · [Discord](docs/guide.md#discord선택) |
 | **맡기기** | [작업 위임](docs/guide.md#작업-위임) · [`[TASK]` 상태 문서](docs/guide.md#task-상태-문서) · [`[TASK]` 자동 머지](docs/guide.md#task-자동-머지) · [작업 레인](docs/guide.md#작업-레인) · [모니터](docs/guide.md#모니터) |
-| **운영** | [CLI](docs/guide.md#운영) · [현황판(dashboard)](docs/guide.md#현황판) · [재시작과 drain](docs/guide.md#재시작과-drain) · [건강 게이트](docs/guide.md#건강-게이트와-자가-보고) · [백업](docs/guide.md#백업) · [동결](docs/guide.md#동결킬스위치) |
+| **운영** | [CLI](docs/guide.md#운영) · [현황판(dashboard)](docs/guide.md#현황판) · [봇 전용 omp](docs/guide.md#봇-전용-omp-버전-고정과-프로필) · [재시작과 drain](docs/guide.md#재시작과-drain) · [건강 게이트](docs/guide.md#건강-게이트와-자가-보고) · [백업](docs/guide.md#백업) · [동결](docs/guide.md#동결킬스위치) |
 | **보안** | [보안 메모](docs/guide.md#보안-메모) — 오너 게이트, 비밀 마스킹, 격리의 한계 · [취약점 보고](SECURITY.md) |
 | **기여** | [CONTRIBUTING.md](CONTRIBUTING.md) |
 

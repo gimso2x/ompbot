@@ -12,8 +12,10 @@ import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { SlackCallError } from "../src/slack/transport";
+import type { TaskCheck, TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskRow } from "../src/tasks/ledger";
+import { autoLandBlockers } from "../src/tasks/notify";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const CHANNEL = "C1";
@@ -148,5 +150,33 @@ describe("daemon autoLand", () => {
 		expect(mergeInbounds()).toHaveLength(0);
 		expect(await daemon.autoLand(row)).toBe(true);
 		expect(mergeInbounds()).toHaveLength(1);
+	});
+});
+
+describe("autoLandBlockers: re-run checks", () => {
+	/** The judgement fields `autoLandBlockers` reads, with clean evidence: only the checks can hold the merge. */
+	const judgementWith = (checks: TaskCheck[]): TaskJudgement =>
+		({ checks, integrityWarnings: [], evidence: {}, steps: [] }) as Partial<TaskJudgement> as TaskJudgement;
+	const policy = { repos: ["/r/repo"], maxRisk: "L2" as const };
+	const pass: TaskCheck = { id: "AC-1", signal: 'command ["true"]', ok: true, detail: "exit 0" };
+	const fail: TaskCheck = { id: "AC-2", signal: 'command ["false"]', ok: false, detail: "exit 1" };
+	const timedOut: TaskCheck = {
+		id: "AC-3",
+		signal: 'command ["bun","test"]',
+		ok: false,
+		detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+		inconclusive: true,
+	};
+
+	test("failed and inconclusive checks are named apart, and either one holds the merge", () => {
+		const row = seedTask();
+		expect(autoLandBlockers(row, judgementWith([pass]), policy, true)).toEqual([]);
+		expect(autoLandBlockers(row, judgementWith([]), policy, true)).toEqual(["재실행 검사 없음"]);
+		expect(autoLandBlockers(row, judgementWith([pass, fail]), policy, true)).toEqual(["재실행 검사 실패 1/2"]);
+		expect(autoLandBlockers(row, judgementWith([pass, timedOut]), policy, true)).toEqual(["재실행 검사 확인 불가 1/2"]);
+		expect(autoLandBlockers(row, judgementWith([pass, fail, timedOut]), policy, true)).toEqual([
+			"재실행 검사 실패 1/3",
+			"재실행 검사 확인 불가 1/3",
+		]);
 	});
 });

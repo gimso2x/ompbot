@@ -11,8 +11,10 @@ import {
 	readdirSync,
 	readFileSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	rmSync,
+	type Stats,
 	statSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -132,8 +134,31 @@ export function writeStampAtomic(backupsDir: string, content: string, name: stri
 	return writeAtomic0600(join(backupsDir, name), content);
 }
 
+/** `dev:ino` of every regular file under `secrets/` (a missing directory has none). */
+function secretInodes(secretsReal: string): Set<string> {
+	const inodes = new Set<string>();
+	if (!existsSync(secretsReal)) return inodes;
+	const stack = [secretsReal];
+	while (stack.length > 0) {
+		const dir = stack.pop() as string;
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const stat = lstatSync(join(dir, entry.name));
+			if (stat.isDirectory()) stack.push(join(dir, entry.name));
+			else if (stat.isFile()) inodes.add(`${stat.dev}:${stat.ino}`);
+		}
+	}
+	return inodes;
+}
+
+/** A hard-linked regular file that shares its inode with a secret would carry the token's bytes into the tar. */
+function refuseSecretHardLink(stat: Stats, name: string, secrets: Set<string>): void {
+	if (stat.isFile() && stat.nlink > 1 && secrets.has(`${stat.dev}:${stat.ino}`)) {
+		throw new BackupError("bundle_failed", `${name} is a hard link to a secrets/ file`);
+	}
+}
+
 /** On-disk size of a directory tree (symlinks count as their own link size, never their target). */
-function treeBytes(root: string): number {
+function treeBytes(root: string, label: string, secrets: Set<string>): number {
 	let total = 0;
 	const stack = [root];
 	while (stack.length > 0) {
@@ -141,6 +166,7 @@ function treeBytes(root: string): number {
 		for (const entry of readdirSync(dir, { withFileTypes: true })) {
 			const path = join(dir, entry.name);
 			const stat = lstatSync(path);
+			refuseSecretHardLink(stat, `${label}${path.slice(root.length)}`, secrets);
 			if (stat.isDirectory()) stack.push(path);
 			else total += stat.size;
 		}
@@ -176,21 +202,74 @@ function createPendingBundle(
 	maxBytes: number,
 	tarBin: string,
 ): PendingBundle | undefined {
-	const sources = BUNDLE_SOURCES.filter((name) => existsSync(join(homeDir, name)));
+	// lstat, not existsSync: a dangling or cyclic top-level link is a source that must fail, not one to skip.
+	const sources = BUNDLE_SOURCES.filter((name) => lstatSync(join(homeDir, name), { throwIfNoEntry: false }));
 	if (sources.length === 0) return undefined;
 	let tmp: string | undefined;
 	try {
+		const secretsDir = join(homeDir, "secrets");
+		const secretsReal = existsSync(secretsDir) ? realpathSync(secretsDir) : secretsDir;
+		const secrets = secretInodes(secretsReal);
+		/** Top-level symlinked sources and their real targets: only that one link is followed, never links inside it. */
+		const linked = new Map<string, string>();
+		/** Directory sources that had entries before tar ran: their archive must carry at least one member below them. */
+		const nonEmpty = new Set<string>();
 		let bytes = 0;
 		for (const source of sources) {
-			const stat = lstatSync(join(homeDir, source));
-			bytes += stat.isDirectory() ? treeBytes(join(homeDir, source)) : stat.size;
+			const path = join(homeDir, source);
+			let stat = lstatSync(path);
+			let real = path;
+			if (stat.isSymbolicLink()) {
+				try {
+					real = realpathSync(path);
+				} catch (error) {
+					throw new BackupError("bundle_failed", `${source} link does not resolve: ${(error as Error).message}`);
+				}
+				const insideSecrets = real === secretsReal || real.startsWith(`${secretsReal}/`);
+				if (insideSecrets || secretsReal.startsWith(`${real}/`)) {
+					throw new BackupError("bundle_failed", `${source} links to or around secrets/`);
+				}
+				stat = statSync(real);
+				// A linked source must be what the plain one would be: config.json a file, the rest directories.
+				if (stat.isDirectory() !== (source !== "config.json")) {
+					throw new BackupError("bundle_failed", `${source} links to the wrong kind of file`);
+				}
+				for (const [other, otherReal] of linked) {
+					if (real === otherReal || real.startsWith(`${otherReal}/`) || otherReal.startsWith(`${real}/`)) {
+						throw new BackupError("bundle_failed", `${source} and ${other} link to overlapping paths`);
+					}
+				}
+				linked.set(source, real);
+			}
+			if (stat.isDirectory()) {
+				bytes += treeBytes(real, source, secrets);
+				if (readdirSync(real).length > 0) nonEmpty.add(source);
+			} else {
+				refuseSecretHardLink(stat, source, secrets);
+				bytes += stat.size;
+			}
 		}
 		if (bytes > maxBytes) throw new BackupError("bundle_too_large", `${bytes} > ${maxBytes}`);
 
 		const target = join(backupsDir, `ompbot-bundle-${stamp}.tar.gz`);
 		if (existsSync(target)) throw new BackupError("target_exists", target);
 		tmp = `${target}.tmp-${crypto.randomUUID()}`;
-		const create = Bun.spawnSync([tarBin, "-czf", tmp, "-C", homeDir, ...sources]);
+		// No global -h: that would follow links inside the sources too (out of home, into secrets/). A linked source is
+		// archived from / as `./<real path>` - a name no plain source under -C home can carry - and GNU tar's
+		// --transform (global, not positional) renames it back to the source name; S leaves symlink targets alone.
+		const transforms = [...linked].map(
+			([source, real]) =>
+				`--transform=s,^\\./${real.slice(1).replace(/[\\.[\]*^$,]/g, "\\$&")}\\(/\\|$\\),${source}\\1,S`,
+		);
+		const plain = sources.filter((source) => !linked.has(source));
+		const create = Bun.spawnSync([
+			tarBin,
+			"-czf",
+			tmp,
+			...transforms,
+			...(plain.length > 0 ? ["-C", homeDir, ...plain] : []),
+			...(linked.size > 0 ? ["-C", "/", ...[...linked.values()].map((real) => `.${real}`)] : []),
+		]);
 		if (!tarCreateSucceeded(create.exitCode, create.stderr.toString())) {
 			throw new BackupError("bundle_failed", create.stderr.toString().trim().slice(0, 200));
 		}
@@ -202,6 +281,12 @@ function createPendingBundle(
 		for (const source of sources) {
 			const listed = entries.some((line) => line === source || line.startsWith(`${source}/`));
 			if (!listed) throw new BackupError("bundle_failed", `archive is missing ${source}`);
+			if (
+				nonEmpty.has(source) &&
+				!entries.some((line) => line.startsWith(`${source}/`) && line.length > source.length + 1)
+			) {
+				throw new BackupError("bundle_failed", `archive is missing the contents of ${source}`);
+			}
 		}
 		chmodSync(tmp, 0o600);
 		return { tmp, target };

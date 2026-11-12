@@ -2,7 +2,7 @@
 // and after itself, and `!undo` restores the newest changed turn only after the owner approves — never while a turn
 // runs, never after the files changed again, and never for a turn that committed.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TurnUndoDeps } from "../src/core/mailbox";
@@ -10,7 +10,7 @@ import { OriginRouter } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import type { GitRunner } from "../src/ops/turn-snapshot";
+import { captureTree, type GitRunner } from "../src/ops/turn-snapshot";
 import { redact } from "../src/redact";
 import { type DeliveryRow, openStore, type Store } from "../src/store/db";
 import { git, makeRepo } from "./helpers/git-fixtures";
@@ -33,6 +33,9 @@ let driverOptions: FakeOmpDriverOptions;
 let repos: string[];
 let gitCalls: string[];
 let gitFails: boolean;
+let gitFailRepos: Set<string>;
+/** A git subcommand (`restore`) that fails while every other call runs. */
+let gitFailCommand: string | undefined;
 interface ApprovalCard {
 	summary: string;
 	settle: (approval: "approved" | "denied" | "timeout") => void;
@@ -42,12 +45,12 @@ let cardWaiter: (() => void) | undefined;
 let deliveries: DeliveryRow[];
 let deliveryWaiter: (() => void) | undefined;
 
-/** Counts every git call and can fail them all, so "no git when off" and "a failed snapshot never blocks a turn" are visible. */
+/** Counts every git call and can fail them all or one repository, so "no git when off" and "a failed snapshot" are visible. */
 const countingGit =
 	(real: GitRunner): GitRunner =>
 	async (repo, args, options) => {
 		gitCalls.push(args[0] ?? "");
-		if (gitFails) throw new Error("git exploded");
+		if (gitFails || gitFailRepos.has(repo) || args[0] === gitFailCommand) throw new Error("git exploded");
 		return real(repo, args, options);
 	};
 
@@ -56,6 +59,9 @@ const realGit: GitRunner = async (repo, args) => {
 	const run = Bun.spawnSync(["git", "-C", repo, ...args], { stdout: "pipe", stderr: "pipe" });
 	return { code: run.exitCode, stdout: run.stdout.toString(), stderr: run.stderr.toString() };
 };
+
+/** A real tree capture of a repository, outside the counted runner (the ledger rows of a test's own setup). */
+const captureTreeForTest = (repo: string) => captureTree(repo, { run: realGit });
 
 let sessionStore: FakeSessionStore;
 
@@ -71,6 +77,7 @@ function buildRouter(): OriginRouter {
 		run: countingGit(realGit),
 	};
 	return new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(home, "sessions"),
@@ -94,6 +101,7 @@ beforeEach(() => {
 	deliveryWaiter = undefined;
 	cardWaiter = undefined;
 	store = openStore({
+		timezone: "Asia/Seoul",
 		path: join(home, "ompbot.db"),
 		clock,
 		redact,
@@ -111,6 +119,8 @@ beforeEach(() => {
 	repos = [];
 	gitCalls = [];
 	gitFails = false;
+	gitFailRepos = new Set();
+	gitFailCommand = undefined;
 	approvals = [];
 	sessionStore = new FakeSessionStore();
 	router = buildRouter();
@@ -308,5 +318,160 @@ describe("!undo (AC-3)", () => {
 		expect(answer.body).not.toContain("되돌림:");
 		expect(readFileSync(join(repo, "touched.txt"), "utf8")).toBe("hand edited\n");
 		expect(store.listTurnSnapshots({ originKey: ORIGIN }).every((row) => row.revertedAt === null)).toBe(true);
+	});
+});
+
+describe("!undo of a turn that moved a nested repository or failed midway (#46)", () => {
+	test("a gitlink the turn moved is a conflict: the undo answers, keeps the nested checkout and reverts the rest", async () => {
+		const repo = makeRepo(repos);
+		const inner = join(repo, "vendor", "dep");
+		mkdirSync(inner, { recursive: true });
+		git(inner, "init", "-q");
+		writeFileSync(join(inner, "f.txt"), "one\n");
+		git(inner, "add", "f.txt");
+		git(inner, "commit", "-q", "-m", "one");
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(inner, "f.txt"), "two\n");
+				git(inner, "commit", "-qam", "two");
+				writeFileSync(join(repo, "touched.txt"), "by the turn\n");
+				return "고쳤습니다";
+			},
+		};
+		await runTurn("고쳐줘");
+		driverOptions = {};
+		const run = await undoStart();
+		expect(run.card.summary).toContain("conflict: vendor/dep");
+		const answer = await run.settle("approved");
+		expect(answer.body).toContain(`되돌림: ${repo} 파일 1개, 충돌 1개, 겹침 0개`);
+		expect(existsSync(join(repo, "touched.txt"))).toBe(false);
+		expect(readFileSync(join(inner, "f.txt"), "utf8")).toBe("two\n");
+		expect(store.listTurnSnapshots({ originKey: ORIGIN }).every((row) => row.revertedAt !== null)).toBe(true);
+	});
+
+	test("a revert failing midway answers how many files went back and why, and the turn stays undoable", async () => {
+		const repo = makeRepo(repos);
+		writeFileSync(join(repo, "b.txt"), "one\n");
+		git(repo, "add", "b.txt");
+		git(repo, "commit", "-q", "-m", "b");
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(repo, "a.txt"), "new\n");
+				writeFileSync(join(repo, "b.txt"), "two\n");
+				return "고쳤습니다";
+			},
+		};
+		await runTurn("고쳐줘");
+		driverOptions = {};
+		const run = await undoStart();
+		gitFailCommand = "restore";
+		const answer = await run.settle("approved");
+		expect(answer.body).toContain(`되돌림: ${repo} 파일 1개`);
+		expect(answer.body).toContain(`되돌리다 멈춤: ${repo} b.txt — Error: git exploded`);
+		expect(existsSync(join(repo, "a.txt"))).toBe(false);
+		expect(readFileSync(join(repo, "b.txt"), "utf8")).toBe("two\n");
+		expect(store.listTurnSnapshots({ originKey: ORIGIN }).every((row) => row.revertedAt === null)).toBe(true);
+	});
+});
+
+describe("a repository without a snapshot is named, never silently skipped (#92)", () => {
+	test("one of two repositories failing to capture: the answer names it and the other is reverted", async () => {
+		const good = makeRepo(repos);
+		const bad = makeRepo(repos);
+		// The bad repository cannot be captured at all, so the turn leaves a row only for the good one.
+		gitFailRepos = new Set([bad]);
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(good, "good.txt"), "by the turn\n");
+				writeFileSync(join(bad, "bad.txt"), "by the turn\n");
+				return "고쳤습니다";
+			},
+		};
+		await runTurn("고쳐줘");
+		gitFailRepos = new Set();
+		driverOptions = {};
+		expect(store.listTurnSnapshots({ originKey: ORIGIN }).map((row) => row.repo)).toEqual([good]);
+
+		const run = await undoStart();
+		expect(run.card.summary).toContain(`스냅샷 없음: ${bad}`);
+		expect(run.card.summary).toContain("직전 턴을 기록하지 못해 이 저장소는 되돌리지 않음");
+		const answer = await run.settle("approved");
+		expect(answer.body).toContain(`스냅샷 없음: ${bad}`);
+		expect(existsSync(join(good, "good.txt"))).toBe(false);
+		expect(readFileSync(join(bad, "bad.txt"), "utf8")).toBe("by the turn\n");
+	});
+
+	test("the newest turn's snapshot failed: an older turn of that repository is not reverted (AC-6b)", async () => {
+		const repo = makeRepo(repos);
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(repo, "a.txt"), "turn one\n");
+				return "첫 턴";
+			},
+		};
+		await runTurn("a를 만들어줘");
+		// Turn two changes b, but its capture fails: `!undo` must not walk back to turn one's a.
+		gitFails = true;
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(repo, "b.txt"), "turn two\n");
+				return "둘째 턴";
+			},
+		};
+		await runTurn("b를 만들어줘");
+		gitFails = false;
+		driverOptions = {};
+
+		const start = deliveries.length;
+		await router.route(msg("!undo"));
+		const answer = await undoReply(start);
+		expect(answer.body).toContain(`스냅샷 없음: ${repo}`);
+		expect(existsSync(join(repo, "a.txt"))).toBe(true);
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("turn one\n");
+		expect(approvals).toEqual([]);
+	});
+});
+
+describe("overlap with another conversation (AC-6c)", () => {
+	test("a file two overlapping conversations changed stays put; the one only this conversation changed comes back", async () => {
+		const repo = makeRepo(repos);
+		const other = "slack/dm/D2";
+		// The ledger rows of both turns are real captures of this work tree: A's window overlaps B's.
+		const before = await captureTreeForTest(repo);
+		writeFileSync(join(repo, "x.txt"), "by A\n");
+		writeFileSync(join(repo, "y.txt"), "by A\n");
+		const aAfter = await captureTreeForTest(repo);
+		writeFileSync(join(repo, "x.txt"), "by B\n");
+		const bAfter = await captureTreeForTest(repo);
+		const a = store.recordTurnSnapshot({
+			originKey: ORIGIN,
+			opRef: "a_req_1",
+			repo,
+			headBefore: before.head,
+			treeBefore: before.tree,
+			headAfter: aAfter.head,
+			treeAfter: aAfter.tree,
+			startedAt: 1_000_000,
+			endedAt: 1_000_100,
+		});
+		store.recordTurnSnapshot({
+			originKey: other,
+			opRef: "b_req_1",
+			repo,
+			headBefore: before.head,
+			treeBefore: aAfter.tree,
+			headAfter: bAfter.head,
+			treeAfter: bAfter.tree,
+			startedAt: 1_000_050,
+			endedAt: 1_000_200,
+		});
+		expect(a.id).toBeGreaterThan(0);
+
+		const run = await undoStart();
+		expect(run.card.summary).toContain(`· ${repo}: 되돌림 1개, 충돌 0개, 겹침 1개`);
+		const answer = await run.settle("approved");
+		expect(answer.body).toContain("겹침 1개");
+		expect(readFileSync(join(repo, "x.txt"), "utf8")).toBe("by B\n");
+		expect(existsSync(join(repo, "y.txt"))).toBe(false);
 	});
 });

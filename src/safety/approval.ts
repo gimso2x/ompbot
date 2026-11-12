@@ -3,7 +3,6 @@ import type { ChannelRegistry } from "../channel/registry";
 import { cutCodePointSafe } from "../channel/text";
 import { type ChatPlatform, platformOfConversationId } from "../core/origin-key";
 import type { Logger } from "../log";
-import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import { redact } from "../redact";
 
 export type ApprovalDecision = "approve" | "deny";
@@ -25,7 +24,9 @@ export type CardReplyResult =
 	| { kind: "settled" }
 	| { kind: "duplicate" }
 	/** The card is already settled: deliver the reply as a normal owner message of the asking conversation. */
-	| { kind: "route"; originKey: string };
+	| { kind: "route"; originKey: string }
+	/** An injected message (`ompbot inject`) in a card's thread: the card is not answered and nothing is routed. */
+	| { kind: "injected_rejected" };
 
 export const APPROVAL_ACTION_PREFIX = "ompbot:approval";
 export const CHOICE_ACTION_PREFIX = "ompbot:choice";
@@ -130,13 +131,18 @@ function retryButton(channel: string, ts: string): ActionButton {
 }
 
 /** The mirror's grey line: buttons only (a thread reply here is an ordinary message), the canonical card, the deadline. */
-function mirrorNote(cardChannel: string, cardUrl: string | undefined, expiresAt: number): string {
+function mirrorNote(
+	cardChannel: string,
+	cardUrl: string | undefined,
+	expiresAt: number,
+	deadline: Intl.DateTimeFormat,
+): string {
 	const canonical = cardUrl === undefined ? `<#${cardChannel}>` : `<${cardUrl}|#escalation에서 보기>`;
-	return `버튼으로 답해 주세요(이 스레드의 글 답장은 승인으로 세지 않음) · 정본 카드: ${canonical} · ⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 답이 없으면 거부로 처리됩니다`;
+	return `버튼으로 답해 주세요(이 스레드의 글 답장은 승인으로 세지 않음) · 정본 카드: ${canonical} · ⏳ ${deadline.format(expiresAt)}까지 답이 없으면 거부로 처리됩니다`;
 }
 
-function deadlineNote(expiresAt: number, timeoutMs: number): string {
-	return `⏳ ${DEADLINE_FORMAT.format(expiresAt)}까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(${Math.round(timeoutMs / 60_000)}분)`;
+function deadlineNote(expiresAt: number, timeoutMs: number, deadline: Intl.DateTimeFormat): string {
+	return `⏳ ${deadline.format(expiresAt)}까지 버튼이나 이 스레드 답장이 없으면 거부로 처리됩니다(${Math.round(timeoutMs / 60_000)}분)`;
 }
 
 /** `ompbot:choice:<n>:<channel>:<ts>`: button `n` of the choice card `<channel>:<ts>` (no colon in either, as above). */
@@ -235,6 +241,8 @@ export interface ApprovalBrokerOptions {
 	/** Durable ledger for approvals: survives restarts, double-click safe, expired rows are swept into cards. */
 	store: ApprovalStore;
 	clock?: { now(): number };
+	/** The bot's zone (`config.timezone`): card deadlines and result times are `HH:MM` in it. */
+	timezone: string;
 	timeoutMs?: number;
 	/** Injected so tests drive the timeout without waiting. */
 	timers?: ApprovalTimers;
@@ -254,6 +262,8 @@ export interface ChoiceCard {
 	text: string;
 	/** Button labels; button `n` carries `ompbot:choice:<n>:<channel>:<ts>`. Empty: the owner answers by reply only. */
 	buttons: readonly string[];
+	/** Indexes of the recommended buttons (one per `ask` question at most): drawn `primary`, the rest unstyled. */
+	recommended?: readonly number[] | undefined;
 	/** What an unanswered card turns into, for the deadline line (`…까지 답이 없으면 <fallback>로 처리됩니다`). */
 	fallback: string;
 	/** Deadline of this card; default: the broker's `timeoutMs`. */
@@ -315,13 +325,8 @@ const FINAL_TEXT: Record<ApprovalOutcome, string> = {
 /** The waiting tool call was aborted (daemon restart, stopped turn): nobody pressed anything, so it is not a denial. */
 const ABORTED_TEXT = "⌛ 기다리던 작업이 중단돼 만료됨(데몬 재시작 등) — 필요하면 다시 요청해 주세요";
 
-/** `HH:MM` in the owner's time zone for the deadline line under the buttons. */
-const DEADLINE_FORMAT = new Intl.DateTimeFormat("en-GB", {
-	timeZone: DEFAULT_TIMEZONE,
-	hour: "2-digit",
-	minute: "2-digit",
-	hourCycle: "h23",
-});
+/** The longest delay `setTimeout` keeps (2^31-1 ms, about 24.8 days); a longer one fires at once. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
  * Posts approve/deny buttons in the owner's DM and resolves when the owner clicks. Only the owner's click counts; any
@@ -332,6 +337,8 @@ export class ApprovalBroker {
 	readonly #options: ApprovalBrokerOptions;
 	readonly #timers: ApprovalTimers;
 	readonly #clock: { now(): number };
+	/** `HH:MM` in the bot's zone for the deadline line under the buttons and the result line. */
+	readonly #deadline: Intl.DateTimeFormat;
 	readonly #pending = new Map<string, Pending>();
 	readonly #choices = new Map<string, ChoicePending>();
 
@@ -339,6 +346,12 @@ export class ApprovalBroker {
 		this.#options = options;
 		this.#timers = options.timers ?? realTimers;
 		this.#clock = options.clock ?? { now: () => Date.now() };
+		this.#deadline = new Intl.DateTimeFormat("en-GB", {
+			timeZone: options.timezone,
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+		});
 	}
 
 	get pendingCount(): number {
@@ -479,7 +492,7 @@ export class ApprovalBroker {
 				text: header,
 				...cardShape,
 				buttons: approvalButtons(channel, card.messageId),
-				buttonsNote: deadlineNote(now + timeoutMs, timeoutMs),
+				buttonsNote: deadlineNote(now + timeoutMs, timeoutMs, this.#deadline),
 			});
 			log.info("approval_requested", { channel, ts: card.messageId });
 			if (escalated) {
@@ -490,7 +503,7 @@ export class ApprovalBroker {
 								text: renderCard(shown, sections, undefined),
 								...mirrorShape,
 								buttons: approvalButtons(channel, card.messageId),
-								buttonsNote: mirrorNote(channel, cardUrl, now + timeoutMs),
+								buttonsNote: mirrorNote(channel, cardUrl, now + timeoutMs, this.#deadline),
 							});
 				if (mirror === undefined) await this.#postPointer(origin, channel, cardUrl, shown);
 				else {
@@ -531,7 +544,7 @@ export class ApprovalBroker {
 				? FINAL_TEXT[result]
 				: `💬 답장으로 처리됨: ${replyLine(result.replied)}`;
 		// The buttons give way to the result line; title and fields stay so the card still says what was decided.
-		const resultLine = `${outcomeText} · ${DEADLINE_FORMAT.format(this.#clock.now())}`;
+		const resultLine = `${outcomeText} · ${this.#deadline.format(this.#clock.now())}`;
 		// A timed-out request from a thread offers one `다시 요청` (the daemon asks that thread again); no other outcome does.
 		const buttons =
 			result === "timeout" && recorded && origin?.threadTs !== undefined ? [retryButton(channel, card.messageId)] : [];
@@ -570,9 +583,14 @@ export class ApprovalBroker {
 		const { log, store } = this.#options;
 		const port = this.#port(origin.channel);
 		const now = this.#clock.now();
-		const timeoutMs = card.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+		// omp's dialog timeout is any number; past the timer limit setTimeout would fire at once and the deadline
+		// line could not format the date (RangeError), so the card is held open at most that long.
+		const timeoutMs = Math.min(
+			card.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS,
+			MAX_TIMER_DELAY_MS,
+		);
 		let body = cutCodePointSafe(redact(card.text), CARD_LIMIT);
-		const note = `⏳ ${DEADLINE_FORMAT.format(now + timeoutMs)}까지 답이 없으면 ${card.fallback}로 처리됩니다`;
+		const note = `⏳ ${this.#deadline.format(now + timeoutMs)}까지 답이 없으면 ${card.fallback}로 처리됩니다`;
 		const target = {
 			conversationId: origin.channel,
 			...(origin.threadTs === undefined ? {} : { threadId: origin.threadTs }),
@@ -591,6 +609,7 @@ export class ApprovalBroker {
 							actionId: choiceActionId(index, channel, ts),
 							label: cutCodePointSafe(redact(label), BUTTON_LABEL_LIMIT),
 							value: String(index),
+							...(card.recommended?.includes(index) ? { style: "primary" as const } : {}),
 						})),
 						buttonsNote: note,
 					};
@@ -781,9 +800,23 @@ export class ApprovalBroker {
 	 * The owner's reply in the thread of an approval card (`approvalId` = `<card channel>:<card ts>`). A still-pending
 	 * card is settled as `replied` (the waiting tool call returns the text); a settled one hands the reply back as a
 	 * `route` to the asking conversation. `undefined`: not a card this ledger knows (or nowhere to route a late reply).
+	 * An `injected` message (`ompbot inject`, which anyone with the socket can send) never answers a card: in the thread
+	 * of a real choice card or of any approval row (pending or settled) it is `injected_rejected`, the card untouched.
 	 */
-	handleCardReply(reply: { approvalId: string; ts: string; text: string }): CardReplyResult | undefined {
+	handleCardReply(reply: {
+		approvalId: string;
+		ts: string;
+		text: string;
+		injected?: boolean | undefined;
+	}): CardReplyResult | undefined {
 		const { store, log } = this.#options;
+		if (
+			reply.injected === true &&
+			(this.#choices.has(reply.approvalId) || store.getApproval(reply.approvalId) !== undefined)
+		) {
+			log.warn("inject_card_reply_refused", { id: reply.approvalId, ts: reply.ts });
+			return { kind: "injected_rejected" };
+		}
 		// An open choice card takes every reply in its thread as one more answer (an `ask` card may need several).
 		const choice = this.#choices.get(reply.approvalId);
 		if (choice?.replies.has(reply.ts)) return { kind: "duplicate" };

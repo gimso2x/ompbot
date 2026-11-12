@@ -11,7 +11,7 @@ import { callDaemon } from "../src/daemon/ipc";
 import { createLogger } from "../src/log";
 import type { OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import { redact } from "../src/redact";
+import { clearSecretIndex, indexSecretValue, redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import type { Store } from "../src/store/db";
@@ -135,6 +135,27 @@ describe("LiveTurn", () => {
 		expect(json).toContain("토큰은");
 		expect(json).not.toContain(token);
 	});
+
+	test("an indexed secret cut by the 120-char summary limit leaves no fragment in the summaries", () => {
+		// 40 chars matching no token pattern: only the secret index can mask it.
+		const secret = "QQ7mK2vR9xT4pL8nW3zB6yH1cF5dG0jS2aE7uI4o"; // gitleaks:allow (fake secret)
+		expect(indexSecretValue(secret)).toBe(true);
+		try {
+			for (let pad = 0; pad < 140; pad++) {
+				const args = { command: `curl -H "Authorization: Bearer ${"a".repeat(pad)}${secret}" https://example.test` };
+				const live = new LiveTurn(clock, "m1");
+				live.feed({ type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args });
+				live.feed(update([{ type: "toolCall", id: "c2", name: "bash", arguments: args }]));
+				const view = live.view();
+				for (const summary of [view?.running[0]?.summary ?? "", view?.toolCalls[0]?.summary ?? ""]) {
+					expect(summary.length).toBeLessThanOrEqual(120);
+					expect({ pad, leaked: summary.includes(secret.slice(0, 4)) }).toEqual({ pad, leaked: false });
+				}
+			}
+		} finally {
+			clearSecretIndex();
+		}
+	});
 });
 
 /** A fake child whose events the test sends at the moment it picks. */
@@ -172,6 +193,7 @@ describe("OriginMailbox live view", () => {
 	function liveMailbox(options: FakeOmpDriverOptions = { holdTurns: true }): OriginMailbox {
 		const sessions = new FakeSessionStore();
 		return new OriginMailbox({
+			timezone: "Asia/Seoul",
 			originKey: ORIGIN,
 			store,
 			clock,
@@ -198,7 +220,7 @@ describe("OriginMailbox live view", () => {
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-live-"));
-		store = openBotStore(join(dir, "ompbot.db"), clock);
+		store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 		drivers = [];
 		progress = [];
 		logLines = [];
@@ -325,5 +347,17 @@ describe("daemon live op", () => {
 		});
 		expect(await callDaemon(daemon.socketPath, { op: "live" })).toEqual({ ok: true, live: null });
 		drivers[0]?.release();
+	});
+});
+
+describe("LiveTurn summary cap (qa50b K-1)", () => {
+	test("a long intent is cut to 120 chars in both the running tool and the streaming tool call", () => {
+		const live = new LiveTurn(clock, "m1");
+		const intent = "가".repeat(300);
+		live.feed({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: {}, intent });
+		live.feed(update([{ type: "toolCall", id: "c1", name: "bash", arguments: { i: intent }, intent }]));
+		const view = live.view();
+		expect(view?.running[0]?.summary).toHaveLength(120);
+		expect(view?.toolCalls[0]?.summary).toHaveLength(120);
 	});
 });

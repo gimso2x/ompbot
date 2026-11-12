@@ -9,8 +9,8 @@ import { redact } from "../src/redact";
 import { approvalActionId } from "../src/safety/approval";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import type { FakeCall } from "../src/slack/fake-transport";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import type { FakeCall } from "./helpers/slack-fake-transport";
 
 const ESCALATION = "C0ESCALATE1";
 const DM = "D1";
@@ -206,22 +206,22 @@ describe("escalation channel", () => {
 		expect(daemon.store.getInbound(`${ESCALATION}:1800.000202`)?.originKey).toBe(ORIGIN);
 	});
 
-	test("inject --thread posts the marker and the owner message as replies in that thread", async () => {
+	// T-20261111-03: an inject may not answer a card (doc/plans/inject-card-guard-turn-undo-wiring.md §A). The marker
+	// still goes up as a reply in the card's thread; only the owner's own reply settles the card.
+	test("inject --thread into a card's thread posts the marker there but cannot answer the card", async () => {
 		await boot({ escalationChannel: ESCALATION });
 		await seedThread();
 		const result = ask();
 		const { ts } = await transport.shown.promise;
-		const injected = await daemon.inject({
-			origin: `slack/ch/${ESCALATION}`,
-			asOwner: true,
-			text: "진행해",
-			thread: ts,
-		});
-		expect(injected.threadRef).toBe(`${ESCALATION}:${ts}`);
-		expect(transport.posts((text) => text === `🧪 inject ${injected.nonce}\n> 진행해`)[0]).toMatchObject({
+		await expect(
+			daemon.inject({ origin: `slack/ch/${ESCALATION}`, asOwner: true, text: "진행해", thread: ts }),
+		).rejects.toThrow("approval/choice card");
+		expect(transport.posts((text) => text.startsWith("🧪 inject ") && text.endsWith("\n> 진행해"))[0]).toMatchObject({
 			channel: ESCALATION,
 			threadTs: ts,
 		});
+		expect(daemon.store.getApproval(`${ESCALATION}:${ts}`)?.status).toBe("pending");
+		await ownerReply(ESCALATION, ts, "1800.000302", "진행해");
 		expect(await result).toBe("replied: 진행해");
 	});
 });

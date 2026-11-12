@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { OmpbotConfig } from "../config";
-import { readDiscordToken, readSlackTokens } from "../config";
+import { readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
 import type { Logger } from "../log";
 import { indexSecretValue } from "../redact";
 
@@ -72,16 +72,25 @@ export function indexRuntimeSecrets(
 		if (indexSecretValue(candidate)) known += 1;
 	};
 
-	try {
-		const tokens = readSlackTokens(config);
-		index(tokens.botToken);
-		index(tokens.appToken);
-	} catch {
-		// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
+	if (config.slack !== undefined) {
+		try {
+			const tokens = readSlackTokens(config);
+			index(tokens.botToken);
+			index(tokens.appToken);
+		} catch {
+			// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
+		}
 	}
 	if (config.channels.discord !== undefined) {
 		try {
 			index(readDiscordToken(config));
+		} catch {
+			// Same as above: doctor reports it.
+		}
+	}
+	if (config.channels.teams !== undefined) {
+		try {
+			index(readTeamsClientSecret(config));
 		} catch {
 			// Same as above: doctor reports it.
 		}

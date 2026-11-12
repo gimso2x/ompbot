@@ -155,6 +155,11 @@ async function boot(options: { holdTurns?: boolean; briefingRun?: ProcessRunner 
 		sweepMs: 3_600_000,
 		gateSweepMs: 0,
 		taskSweepMs: 0,
+		// No boot backup: backup_age stays open, so the briefing always has a 주의 line (a boot stamp on the fixed
+		// clock would close it only until the real date passes 36h after that clock).
+		bootBackup: () => {
+			throw new Error("boot backup off in this test");
+		},
 		driverFactory: () => made,
 		...(options.briefingRun === undefined ? {} : { briefingRun: options.briefingRun }),
 	});

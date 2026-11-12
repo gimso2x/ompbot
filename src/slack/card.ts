@@ -7,7 +7,8 @@
  * buttons, selects, actions, and emoji placeholder conversion (identity here). The package itself is not a dependency.
  */
 import type { CardChild } from "chat";
-import { type CardElement, chartToAscii, tableToAscii, validateCard } from "../channel/card";
+import { type CardElement, type CardTone, chartToAscii, tableToAscii, validateCard } from "../channel/card";
+import { cutCodePointSafe } from "../channel/text";
 
 export type SlackBlock = Record<string, unknown>;
 
@@ -41,7 +42,9 @@ const LIMITS = {
 };
 const EMPTY_TEXT = " ";
 
-export type ParsedCard = { ok: true; card: CardElement; blocks: SlackBlock[] } | { ok: false; issues: string[] };
+export type ParsedCard =
+	| { ok: true; card: CardElement; blocks: SlackBlock[]; tone?: CardTone }
+	| { ok: false; issues: string[] };
 
 /**
  * A card fence's JSON as a validated card and its blocks; never throws. Bad JSON, a `CardSpecError` and a card over
@@ -50,13 +53,13 @@ export type ParsedCard = { ok: true; card: CardElement; blocks: SlackBlock[] } |
 export function parseCard(json: string, options: { charts: boolean } = { charts: true }): ParsedCard {
 	const validated = validateCard(json);
 	if (!validated.ok) return validated;
-	const { card } = validated;
+	const { card, tone } = validated;
 	try {
 		const blocks = cardToBlocks(card, options);
 		if (blocks.length > CARD_MAX_BLOCKS) {
 			return { ok: false, issues: [`the card needs ${blocks.length} blocks, at most ${CARD_MAX_BLOCKS}`] };
 		}
-		return { ok: true, card, blocks };
+		return tone === undefined ? { ok: true, card, blocks } : { ok: true, card, blocks, tone };
 	} catch (err) {
 		return { ok: false, issues: [err instanceof Error ? err.message : String(err)] };
 	}
@@ -104,7 +107,7 @@ function childToBlocks(child: CardChild, state: ConvertState): SlackBlock[] {
 		case "divider":
 			return [{ type: "divider" }];
 		case "fields":
-			return [fieldsToBlock(child)];
+			return fieldsToBlocks(child);
 		case "image":
 			return [
 				{
@@ -137,18 +140,15 @@ function textToBlock(element: TextChild): SlackBlock {
 	return { text: mrkdwn(element.style === "bold" ? `*${text}*` : text, LIMITS.sectionText), type: "section" };
 }
 
-function fieldsToBlock(element: FieldsChild): SlackBlock {
-	return {
-		fields: element.children
-			.slice(0, LIMITS.fields)
-			.map((field) =>
-				mrkdwn(
-					`*${markdownBoldToSlackMrkdwn(field.label)}*\n${markdownBoldToSlackMrkdwn(field.value)}`,
-					LIMITS.fieldText,
-				),
-			),
-		type: "section",
-	};
+/** One section per 10 fields (Slack's per-section limit), so no field is dropped. */
+function fieldsToBlocks(element: FieldsChild): SlackBlock[] {
+	const fields = element.children.map((field) =>
+		mrkdwn(`*${markdownBoldToSlackMrkdwn(field.label)}*\n${markdownBoldToSlackMrkdwn(field.value)}`, LIMITS.fieldText),
+	);
+	const blocks: SlackBlock[] = [];
+	for (let i = 0; i < fields.length; i += LIMITS.fields)
+		blocks.push({ fields: fields.slice(i, i + LIMITS.fields), type: "section" });
+	return blocks.length > 0 ? blocks : [{ fields: [], type: "section" }];
 }
 
 function tableToBlocks(element: TableChild, state: ConvertState): SlackBlock[] {
@@ -299,7 +299,7 @@ function rawText(text: string): { text: string; type: "raw_text" } {
 }
 
 function truncateText(text: string, maxLength: number): string {
-	return text.length > maxLength ? text.slice(0, maxLength) : text;
+	return cutCodePointSafe(text, maxLength);
 }
 
 function nonemptyText(text: string): string {

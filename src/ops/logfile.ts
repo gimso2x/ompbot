@@ -26,9 +26,13 @@ function rotate(path: string, files: number): void {
 		rmSync(path, { force: true });
 		return;
 	}
-	rmSync(`${path}.${files - 1}`, { force: true });
+	// recursive: a slot that became a directory is cleared too, instead of failing every rotation (and line) after it.
+	rmSync(`${path}.${files - 1}`, { recursive: true, force: true });
 	for (let index = files - 2; index >= 1; index--) {
-		if (existsSync(`${path}.${index}`)) renameSync(`${path}.${index}`, `${path}.${index + 1}`);
+		const from = `${path}.${index}`;
+		if (!existsSync(from)) continue;
+		rmSync(`${path}.${index + 1}`, { recursive: true, force: true });
+		renameSync(from, `${path}.${index + 1}`);
 	}
 	renameSync(path, `${path}.1`);
 }
@@ -41,7 +45,8 @@ export function rotatingFileSink(path: string, options: RotationOptions = {}): (
 	return (line) => {
 		const bytes = Buffer.byteLength(line) + 1;
 		if (size > 0 && size + bytes > maxBytes) {
-			rotate(path, files);
+			// A live file deleted from outside leaves nothing to rotate: start a fresh one and keep the archives as they are.
+			if (existsSync(path)) rotate(path, files);
 			size = 0;
 		}
 		appendFileSync(path, `${line}\n`, { mode: 0o600 });

@@ -54,6 +54,8 @@ export interface TaskCheckRequest {
 export interface TaskCheck extends TaskCheckRequest {
 	ok: boolean;
 	detail: string;
+	/** Timed out (`SignalCheck.inconclusive`): not ok, but no violation either. */
+	inconclusive?: true;
 }
 
 /** `deferred`: the checks were not run (e.g. uncommitted changes) and this is why; otherwise every result at `head`. */
@@ -94,6 +96,8 @@ export interface TaskJudgement {
 	/** Fingerprint of the spec's acceptance section — the dedup key of the spec-change notice. */
 	specKey: string;
 	blocked: boolean;
+	/** PROGRESS.md `needs_owner: yes` (the agent says only the owner can unblock it); `false` when absent. */
+	needsOwner: boolean;
 	blockedReason: string;
 	/** The decision request written beside `status: blocked` (each part `""` when not written). */
 	decision: { question: string; recommend: string; impact: string };
@@ -106,6 +110,11 @@ export interface TaskJudgement {
 	summary: string[];
 	/** `[check: …]` results the sweep ran for this judgement; `[]` when the task has none or they were not run. */
 	checks: TaskCheck[];
+	/**
+	 * HEAD at which every `[check: …]` passed although PROGRESS.md says `blocked` and nothing else is unmet — the block
+	 * may have been a check-environment failure that is gone now. Absent otherwise.
+	 */
+	blockedChecksPassHead?: string;
 	/** `무결성 <category>: <excerpt>` lines that do not hold the outcome but go on the card; `[]` without a diff read. */
 	integrityWarnings: string[];
 	/** Fingerprint of everything the judgement stands on — the dedup key of the "reached" notice. */
@@ -220,9 +229,16 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 	// The checks run last and only on an otherwise complete task: a run is a real process in the worktree.
 	const requests = taskChecksOf(input.snapshot);
 	let checkRun: { head: string; results: TaskCheck[] } | undefined;
-	if (requests.length > 0 && problems.length === 0 && input.runChecks !== undefined) {
+	let blockedChecksPassHead: string | undefined;
+	// A task blocked with nothing else unmet still gets its checks run (cached per HEAD): a block caused by the check
+	// environment (a tool missing on the check PATH) clears on its own once the checks pass, instead of waiting for a
+	// manual resume. The result only marks the judgement; the block itself stays the agent's to lift.
+	const blockedOnly = blocked && problems.length === 1;
+	if (requests.length > 0 && (problems.length === 0 || blockedOnly) && input.runChecks !== undefined) {
 		const run = await input.runChecks(requests);
-		if ("deferred" in run) problems.push(run.deferred);
+		if (blockedOnly) {
+			if (!("deferred" in run) && run.results.every((result) => result.ok)) blockedChecksPassHead = run.head;
+		} else if ("deferred" in run) problems.push(run.deferred);
 		else {
 			checkRun = run;
 			for (const check of run.results.filter((result) => !result.ok))
@@ -245,6 +261,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		specChanged,
 		specKey: digest(specDoc?.acceptance ?? null),
 		blocked,
+		needsOwner: progress?.needsOwner ?? false,
 		blockedReason: progress?.blockedReason ?? "",
 		decision: {
 			question: progress?.question ?? "",
@@ -256,6 +273,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 		evidence,
 		summary: outcome?.summary ?? [],
 		checks: checkRun?.results ?? [],
+		...(blockedChecksPassHead === undefined ? {} : { blockedChecksPassHead }),
 		integrityWarnings,
 		// `head`/`checks`/`integrityWarnings` are absent (dropped by JSON) without a check run or a warning, so such a
 		// task keeps its former key.

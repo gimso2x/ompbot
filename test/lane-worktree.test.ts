@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { LaneInputError } from "../src/lanes/manager";
 import { buildWorkStartTool } from "../src/lanes/tools";
-import { kstDay } from "../src/tasks/docs";
 import { createTaskHostOps } from "../src/tasks/host";
+import { localDay } from "../src/time";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { LANE_START, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
-const DAY = kstDay(LANE_START);
+const DAY = localDay(LANE_START, "Asia/Seoul");
 
 let home: TestHome;
 let repos: string[];
@@ -214,6 +214,8 @@ describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 		const cases: Record<string, unknown>[] = [
 			{ title: "bad-check", cwd: repo, acceptance: ["테스트가 통과한다 [check: bun test]"] },
 			{ title: "unclosed", cwd: repo, acceptance: ['열림 [check: command ["true"]'] },
+			{ title: "two-checks", cwd: repo, acceptance: ['x [check: command ["true"]] [check: command ["echo","ok"]]'] },
+			{ title: "text-after", cwd: repo, acceptance: ['통과 [check: command ["true"]] (근거는 outcome.md)'] },
 			{ title: "bad-risk", cwd: repo, risk: "L5" },
 			{ title: "numeric-risk", cwd: repo, risk: 2 },
 			{ title: "not-list", cwd: repo, acceptance: "README 고치기" },

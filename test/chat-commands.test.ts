@@ -7,6 +7,7 @@ import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import { listSavedSessions, pickSession } from "../src/core/sessions";
 import { type InboundRecord, parseCommand, promptTextOf } from "../src/core/types";
 import { createLogger } from "../src/log";
+import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { missingRpcMethods, REQUIRED_RPC_METHODS } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
@@ -29,6 +30,7 @@ const clock = { now: () => now };
 
 function makeRouter(): OriginRouter {
 	return new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot,
@@ -49,7 +51,7 @@ beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-cmd-"));
 	sessionsRoot = join(dir, "sessions");
 	now = 1_000_000;
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	drivers = [];
 	driverOptions = {};
 	sessionStore = new FakeSessionStore();
@@ -194,6 +196,28 @@ describe("② compact and resume", () => {
 		expect(lastDriver().calls).toContain("compact:결정 사항만 남겨");
 		expect(reply).toContain("압축했습니다");
 		expect(reply).toContain("400 토큰"); // seed(2) + user + assistant = 4 entries x 100
+	});
+
+	test("an agy compact refusal is answered as a notice, not a failed turn (qa50b L-4)", async () => {
+		await router.route(msg("hello"));
+		await router.mailbox(ORIGIN).sweepIdle();
+		lastDriver().compact = () =>
+			Promise.reject(new OmpDriverError("rpc_error", "agy 세션은 compact를 지원하지 않습니다"));
+		const reply = await send("/compact-ompbot");
+		expect(reply).toContain("agy 세션은 compact를 지원하지 않습니다");
+		expect(reply).not.toContain("[turn failed]");
+	});
+
+	test("resume in an agy session says the list is unsupported instead of 'no saved sessions' (qa50b L-4)", async () => {
+		await router.route(msg("hello"));
+		await router.mailbox(ORIGIN).sweepIdle();
+		const sessionDir = store.getOrigin(ORIGIN)?.sessionDir;
+		if (sessionDir === undefined) throw new Error("origin not created");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(sessionDir, "agy-conversation.json"), JSON.stringify({ conversationId: "c1" }));
+		const reply = await send("/resume-ompbot");
+		expect(reply).toContain("agy 세션은 저장된 세션 목록·이어가기를 지원하지 않습니다");
+		expect(reply).not.toContain("저장된 세션이 없습니다");
 	});
 
 	test("compact is refused while a turn runs", async () => {

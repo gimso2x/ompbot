@@ -13,7 +13,12 @@ let store: Store;
 beforeEach(() => {
 	home = makeHome("ompbot-cli-feedback-");
 	at = Date.now();
-	store = openStore({ path: join(home.dir, "ompbot.db"), clock: { now: () => at }, redact: (text) => text });
+	store = openStore({
+		timezone: "Asia/Seoul",
+		path: join(home.dir, "ompbot.db"),
+		clock: { now: () => at },
+		redact: (text) => text,
+	});
 });
 
 afterEach(() => {

@@ -1,4 +1,5 @@
-import { downloadDiscordAttachment } from "./attachments";
+import { downloadDiscordAttachment } from "../../src/discord/attachments";
+import { FAKE_ID_BASE } from "../../src/discord/test-transport";
 import {
 	type CreateMessageArgs,
 	DiscordCallError,
@@ -18,13 +19,10 @@ import {
 	type RespondInteractionArgs,
 	type StartThreadArgs,
 	type UploadFileArgs,
-} from "./transport";
+} from "../../src/discord/transport";
 
 /** Thread channel type Discord gives a thread started from a message in a text channel (PUBLIC_THREAD). */
 const PUBLIC_THREAD = 11;
-
-/** First id the fakes hand out; snowflake-sized so id handling sees realistic values. */
-export const FAKE_ID_BASE = 900_000_000_000_000_000n;
 
 export type FakeDiscordCall =
 	| ({ method: "createMessage"; id: string } & CreateMessageArgs)

@@ -286,20 +286,23 @@ const toEvent = (r: EventSql): MonitorEventRow => ({
 /** Events that still owe an authoring turn: a new fire behind them is queued (or skipped, per `overlap`). */
 const OWING = "('admitted','dispatched','failed')";
 
-/** The next time `row` can fire, or `null` (disabled, finished one-shot, no match). */
+/** The next time `row` can fire, or `null` (disabled, finished one-shot, no match, past the `Date` range). */
 export function nextFireOf(row: MonitorRow): number | null {
 	if (!row.enabled) return null;
 	const { trigger } = row;
 	if (trigger.kind === "cron") return nextFire(parseCron(trigger.schedule), trigger.timezone, row.cursorAt) ?? null;
-	if (trigger.kind === "at") return parseAt(trigger.at);
+	// A stored `at` is always a UTC ISO string (`…Z`), so the fallback zone is never consulted.
+	if (trigger.kind === "at") return parseAt(trigger.at, "UTC");
 	if (trigger.kind === "watcher" || trigger.kind === "webhook") return null;
-	return row.cursorAt + trigger.intervalMs;
+	const next = row.cursorAt + trigger.intervalMs;
+	// A row stored before `intervalMs` had an upper bound may point past what a `Date` can hold.
+	return Number.isFinite(new Date(next).getTime()) ? next : null;
 }
 
 /**
  * The `[...]` trigger text of a monitor row, shared by the CLI `monitors list` and the `ompbot_monitor_list` tool —
  * the single place a trigger kind is described. `formatAt` renders an `at` trigger's stored ISO instant (the CLI
- * keeps it raw; the tool shows Asia/Seoul wall clock) and a script monitor with fire=edge shows its last check state.
+ * keeps it raw; the tool shows the bot zone's wall clock) and a script monitor with fire=edge shows its last check state.
  */
 export function describeMonitorTrigger(row: MonitorRow, formatAt: (at: string) => string): string {
 	const { trigger } = row;
@@ -460,6 +463,8 @@ export class MonitorLedger {
 				now,
 				id,
 			);
+		// A disabled monitor's open incidents are over: re-enabled, the same failure alerts again.
+		if (!spec.enabled) resolveIncidents(this.#db, "monitor_incidents", id);
 		return this.requireMonitor(id);
 	}
 
@@ -482,6 +487,8 @@ export class MonitorLedger {
 		this.#db
 			.query("UPDATE monitors SET enabled = ?, updated_at = ? WHERE id = ?")
 			.run(enabled ? 1 : 0, this.#clock.now(), id);
+		// Like `updateMonitor`: disabling closes the monitor's open incidents.
+		if (!enabled) resolveIncidents(this.#db, "monitor_incidents", id);
 	}
 
 	private requireMonitor(id: string): MonitorRow {

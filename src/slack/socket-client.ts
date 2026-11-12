@@ -38,6 +38,9 @@ const FATAL_OPEN_ERRORS: Record<string, true> = {
 	not_allowed_token_type: true,
 };
 
+/** How long a handled envelope id is remembered against Slack's redelivery of it. */
+const ENVELOPE_MEMORY_MS = 10 * 60_000;
+
 class OpenError extends Error {
 	readonly fatal: boolean;
 	readonly retryAfterMs: number;
@@ -55,12 +58,17 @@ export class SocketClient {
 	private ws: WebSocket | undefined;
 	private stopped = true;
 	private attempt = 0;
+	/** Disconnect envelopes in a row on connections that carried nothing else and lived under `backoffMaxMs`. */
+	private disconnectStreak = 0;
+	private helloAt = 0;
 	private lastTrafficAt = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private watchdog: ReturnType<typeof setInterval> | undefined;
 	private firstHello: { resolve: () => void; reject: (e: Error) => void } | undefined;
 	/** Bumped whenever a socket is replaced; callbacks of older sockets compare against it and bail. */
 	private generation = 0;
+	/** Envelope ids handled recently, oldest first (`seenEnvelope`). */
+	private readonly envelopes = new Map<string, number>();
 
 	constructor(options: SocketClientOptions) {
 		this.opts = {
@@ -80,6 +88,7 @@ export class SocketClient {
 		if (!this.stopped) return Promise.reject(new Error("socket client already started"));
 		this.stopped = false;
 		this.attempt = 0;
+		this.disconnectStreak = 0;
 		const ready = new Promise<void>((resolve, reject) => {
 			this.firstHello = { resolve, reject };
 		});
@@ -132,16 +141,22 @@ export class SocketClient {
 			const retry = Number(res.headers.get("retry-after") ?? 1);
 			throw new OpenError("apps.connections.open rate limited", false, (Number.isFinite(retry) ? retry : 1) * 1000);
 		}
-		let body: { ok?: boolean; url?: string; error?: string };
+		let body: { ok?: boolean; url?: string; error?: string } | null;
 		try {
 			body = (await res.json()) as typeof body;
 		} catch {
 			throw new OpenError(`apps.connections.open returned HTTP ${res.status} without JSON`, false);
 		}
+		if (typeof body !== "object" || body === null || Array.isArray(body))
+			throw new OpenError(`apps.connections.open returned HTTP ${res.status} without a JSON object`, false);
 		if (!body.ok || !body.url) {
 			const code = body.error ?? `http_${res.status}`;
 			throw new OpenError(`apps.connections.open failed: ${code}`, FATAL_OPEN_ERRORS[code] === true);
 		}
+		// The url carries a connection ticket, so it is never quoted in the error.
+		const scheme = URL.parse(String(body.url))?.protocol;
+		if (scheme !== "wss:" && scheme !== "ws:")
+			throw new OpenError(`apps.connections.open returned a bad url (scheme ${scheme ?? "none"})`, false);
 		return body.url;
 	}
 
@@ -153,7 +168,7 @@ export class SocketClient {
 			url = await this.openUrl();
 		} catch (err) {
 			if (gen !== this.generation) return;
-			const open = err as OpenError;
+			const open = err instanceof OpenError ? err : new OpenError(String(err), false);
 			this.report(open);
 			if (open.fatal && this.firstHello) {
 				const first = this.firstHello;
@@ -167,7 +182,14 @@ export class SocketClient {
 		}
 		if (gen !== this.generation) return;
 
-		const ws = new WebSocket(url);
+		let ws: WebSocket;
+		try {
+			ws = new WebSocket(url);
+		} catch (err) {
+			this.report(new Error(`websocket open failed: ${err instanceof Error ? err.name : "error"}`));
+			this.scheduleReconnect(0);
+			return;
+		}
 		this.ws = ws;
 		this.lastTrafficAt = this.opts.now();
 		const current = (): boolean => gen === this.generation && this.ws === ws;
@@ -197,8 +219,13 @@ export class SocketClient {
 			this.report(new Error("unparseable websocket message"));
 			return;
 		}
+		if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
+			this.report(new Error("non-object websocket message"));
+			return;
+		}
 		if (msg.type === "hello") {
 			this.attempt = 0;
+			this.helloAt = this.opts.now();
 			this.opts.onHello?.();
 			const first = this.firstHello;
 			this.firstHello = undefined;
@@ -206,15 +233,29 @@ export class SocketClient {
 			return;
 		}
 		if (msg.type === "disconnect") {
-			this.reconnect(`disconnect:${msg.reason ?? "unknown"}`, true);
+			// A lone refresh reconnects at once; a server that keeps disconnecting right after hello gets the backoff.
+			if (this.opts.now() - this.helloAt >= this.opts.backoffMaxMs) this.disconnectStreak = 0;
+			this.disconnectStreak++;
+			const reason = `disconnect:${msg.reason ?? "unknown"}`;
+			if (this.disconnectStreak === 1) this.reconnect(reason, true);
+			else {
+				const delay = Math.min(this.opts.backoffMaxMs, this.opts.backoffBaseMs * 2 ** (this.disconnectStreak - 2));
+				this.reconnect(reason, false, delay);
+			}
 			return;
 		}
 		if (!msg.envelope_id) return;
+		this.disconnectStreak = 0;
 		const id = msg.envelope_id;
 		const ack = (payload?: object): void => {
 			if (ws.readyState !== WebSocket.OPEN) return;
 			ws.send(JSON.stringify(payload === undefined ? { envelope_id: id } : { envelope_id: id, payload }));
 		};
+		// Slack resends an envelope whose ack it missed: ack it again, but run its handler only once.
+		if (this.seenEnvelope(id)) {
+			ack();
+			return;
+		}
 		const h = this.opts.handlers;
 		switch (msg.type) {
 			case "events_api":
@@ -239,6 +280,18 @@ export class SocketClient {
 		}
 	}
 
+	/** Whether `id` was handled within `ENVELOPE_MEMORY_MS`; remembers it otherwise. */
+	private seenEnvelope(id: string): boolean {
+		const now = this.opts.now();
+		for (const [seen, at] of this.envelopes) {
+			if (now - at < ENVELOPE_MEMORY_MS) break;
+			this.envelopes.delete(seen);
+		}
+		if (this.envelopes.has(id)) return true;
+		this.envelopes.set(id, now);
+		return false;
+	}
+
 	private checkAlive(): void {
 		if (this.stopped || !this.ws) return;
 		const idle = this.opts.now() - this.lastTrafficAt;
@@ -250,7 +303,7 @@ export class SocketClient {
 		if (idle > this.opts.deadAfterMs / 2 && this.ws.readyState === WebSocket.OPEN) this.ws.ping();
 	}
 
-	private reconnect(reason: string, immediate: boolean): void {
+	private reconnect(reason: string, immediate: boolean, minDelayMs = 0): void {
 		if (this.stopped) return;
 		this.generation++; // detaches the old socket's callbacks
 		this.closeSocket();
@@ -259,7 +312,7 @@ export class SocketClient {
 			this.attempt = 0;
 			void this.connect();
 		} else {
-			this.scheduleReconnect(0);
+			this.scheduleReconnect(minDelayMs);
 		}
 	}
 
@@ -271,7 +324,7 @@ export class SocketClient {
 				this.reconnectTimer = undefined;
 				void this.connect();
 			},
-			Math.max(backoff, minDelayMs),
+			Math.max(backoff, Number.isFinite(minDelayMs) ? minDelayMs : 0),
 		);
 	}
 }

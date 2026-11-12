@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
@@ -26,6 +27,10 @@ afterEach(() => {
 });
 
 const monitors = (...args: string[]) => runMain(home.dir, ["monitors", ...args]);
+
+// Each CLI test spawns several `bun` processes one after another; on a loaded host (checks of other tasks running at
+// the same time) that alone passes bun's 5 s default. A bound, not a wait: a hung child still fails the test.
+setDefaultTimeout(30_000);
 
 function writeScript(name: string, body: string): string {
 	const path = join(home.dir, "scripts", name);
@@ -175,6 +180,60 @@ describe("ompbot monitors (CLI)", () => {
 		expect(unknown.code).toBe(1);
 		expect(unknown.stderr).toContain("monitor not found");
 		expect((await monitors("bogus")).code).toBe(2);
+	});
+
+	test("script intervalMs above 366 days is refused without a row; 366 days exactly is accepted", async () => {
+		const script = writeScript("rare.sh", "#!/bin/sh\nexit 0\n");
+		const add = (intervalMs: number) =>
+			monitors(
+				"add",
+				"--json",
+				JSON.stringify({ name: "rare", trigger: { kind: "script", command: [script], intervalMs }, instruction: "i" }),
+			);
+		for (const intervalMs of [31_622_400_001, 9e15]) {
+			const refused = await add(intervalMs);
+			expect(refused.code).toBe(1);
+			expect(refused.stderr).toContain("between 60000 and 31622400000");
+			expect((await monitors("list")).stdout).toBe("no monitors\n");
+		}
+		const accepted = await add(31_622_400_000);
+		expect(accepted.code).toBe(0);
+		expect(parse(accepted.stdout).monitor.trigger).toMatchObject({ intervalMs: 31_622_400_000 });
+	});
+
+	test("a stored row whose script interval is past the Date range: list, list --json and show still exit 0 with no next time", async () => {
+		const script = writeScript("old.sh", "#!/bin/sh\nexit 0\n");
+		const added = await monitors(
+			"add",
+			"--json",
+			JSON.stringify({
+				name: "old",
+				trigger: { kind: "script", command: [script], intervalMs: 60_000 },
+				instruction: "i",
+			}),
+		);
+		expect(added.code).toBe(0);
+		const { monitor } = parse(added.stdout);
+		// What a row written before the upper bound may hold.
+		const db = new Database(join(home.dir, "ompbot.db"));
+		try {
+			db.run("UPDATE monitors SET trigger_json = ? WHERE id = ?", [
+				JSON.stringify({ kind: "script", command: [script], intervalMs: 9e15 }),
+				monitor.id,
+			]);
+		} finally {
+			db.close();
+		}
+
+		const text = await monitors("list");
+		expect(text.code).toBe(0);
+		expect(text.stdout).toContain("next=-");
+		const listed = await monitors("list", "--json");
+		expect(listed.code).toBe(0);
+		expect(parse(listed.stdout).schedules[monitor.id]?.nextFireAt).toBeNull();
+		const shown = await monitors("show", "old");
+		expect(shown.code).toBe(0);
+		expect(JSON.parse(shown.stdout).schedule.nextFireAt).toBeNull();
 	});
 
 	test("deliver: verbatim on a script monitor shows in list and --json; bad values and non-script triggers exit 1", async () => {

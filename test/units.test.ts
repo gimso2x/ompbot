@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -145,9 +145,25 @@ describe("ompbot units render --instance", () => {
 			expect(run.code).toBe(2);
 			expect(run.out).toBe("");
 		}
+		// An empty OMPBOT_HOME is unset (config.ts): the default install's units, and no second install.
 		const empty = render(["--dry-run"], home, "");
-		expect(empty.code).toBe(2);
-		expect(empty.err).toContain("OMPBOT_HOME is set but empty");
+		expect(empty.err).toBe("");
+		expect(empty.code).toBe(0);
+		expect([...sections(empty.out).keys()].sort()).toEqual(UNITS);
+		expect(empty.out).not.toContain("Environment=OMPBOT_HOME");
+		const emptyInstance = render(["--instance", "tteok", "--dry-run"], home, "");
+		expect(emptyInstance.code).toBe(2);
+		expect(emptyInstance.err).toContain("--instance needs OMPBOT_HOME");
+	});
+
+	test("an instance named like another install's backup/gc/dashboard unit is refused by name", () => {
+		const home = tempDir("ompbot-units-home-");
+		for (const bad of ["a-backup", "a-gc", "a-dashboard"]) {
+			const run = render(["--instance", bad, "--dry-run"], home, join(home, "h"));
+			expect(run.code).toBe(2);
+			expect(run.out).toBe("");
+			expect(run.err).toContain(`ends in -${bad.split("-")[1]}`);
+		}
 	});
 
 	test("--out writes the instance files", () => {
@@ -208,5 +224,59 @@ describe("ompbot units render --out", () => {
 		expect(run.err).toContain(join(out, "ompbot.service"));
 		expect(readFileSync(join(out, "ompbot.service"), "utf8")).toBe(mine);
 		expect(existsSync(join(out, "ompbot-gc.timer"))).toBe(false);
+	});
+
+	test("--out '' is a usage error and writes nothing into the current directory", () => {
+		const home = tempDir("ompbot-units-home-");
+		const cwd = tempDir("ompbot-units-cwd-");
+		const run = Bun.spawnSync([process.execPath, MAIN, "units", "render", "--out", ""], {
+			env: { HOME: home, PATH: "/usr/bin:/bin" },
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(run.exitCode).toBe(2);
+		expect(run.stderr.toString()).toContain("--out is empty");
+		expect(readdirSync(cwd)).toEqual([]);
+	});
+
+	test("an --out that is a file, or a unit path that is a directory, is a usage error naming it", () => {
+		const home = tempDir("ompbot-units-home-");
+		const file = join(tempDir("ompbot-units-out-"), "plain-file");
+		writeFileSync(file, "x");
+		for (const out of [file, join(file, "user")]) {
+			const run = render(["--out", out], home);
+			expect(run.code).toBe(2);
+			expect(run.err).toContain(`--out ${out}`);
+			expect(run.err).not.toContain("Error:");
+		}
+		const out = tempDir("ompbot-units-out-");
+		mkdirSync(join(out, "ompbot.service"));
+		const run = render(["--out", out], home);
+		expect(run.code).toBe(2);
+		expect(run.err).toContain(`${join(out, "ompbot.service")} is not a file`);
+		expect(readdirSync(out)).toEqual(["ompbot.service"]);
+	});
+});
+
+describe("ompbot units render OMPBOT_HOME quoting", () => {
+	test("a home with a space, quote, backslash or % is one quoted Environment= assignment", () => {
+		const home = tempDir("ompbot-units-home-");
+		const ompbotHome = join(home, 'sp dir "q" \\b 100%');
+		const run = render(["--dry-run"], home, ompbotHome);
+		expect(run.code).toBe(0);
+		const line = sections(run.out)
+			.get("ompbot.service")
+			?.split("\n")
+			.find((l) => l.startsWith("Environment="));
+		expect(line).toBe(`Environment="OMPBOT_HOME=${home}/sp dir \\"q\\" \\\\b 100%%"`);
+	});
+
+	test("a home with a newline is refused", () => {
+		const home = tempDir("ompbot-units-home-");
+		const run = render(["--dry-run"], home, join(home, "a\n[Service]\nExecStartPre=/bin/false"));
+		expect(run.code).toBe(2);
+		expect(run.out).toBe("");
+		expect(run.err).toContain("OMPBOT_HOME");
 	});
 });

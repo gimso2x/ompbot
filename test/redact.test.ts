@@ -10,6 +10,8 @@ describe("redact", () => {
 		"xoxs-TEST-0",
 		"xoxr-TEST-0",
 		"xoxe-TEST-0",
+		"xoxc-TEST-0",
+		"xoxd-TEST-0",
 		"xapp-TEST-0",
 		"sk-TEST-0",
 		"sk-ant-TEST-0",
@@ -18,6 +20,7 @@ describe("redact", () => {
 		`ghu_${"C".repeat(20)}`,
 		`ghs_${"D".repeat(36)}`,
 		`ghr_${"e".repeat(36)}`,
+		`github_pat_${"F".repeat(22)}_${"g".repeat(59)}`,
 	])("%s is replaced", (token) => {
 		expect(redact(`before ${token} after`)).toBe(`before ${REDACTED} after`);
 	});
@@ -57,6 +60,21 @@ describe("redact", () => {
 	test("dotted words, versions, hosts and JWT-like headers are not Discord tokens", () => {
 		const plain = "v1.2.3 api.discord.com a.b.c ompbot.config.json eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abc";
 		expect(redact(plain)).toBe(plain);
+	});
+});
+
+describe("qa50b I-20: a token split by a line break", () => {
+	test("is masked whole, both halves", () => {
+		const out = redact("card: ghp_abcdefghijklmnop\nqrstuvwxyz0123456789 end");
+		expect(out).toBe(`card: ${REDACTED} end`);
+		const tail = redact(`x ghp_${"A".repeat(10)}\r\n${"B".repeat(26)} y`);
+		expect(tail).toBe(`x ${REDACTED} y`);
+	});
+
+	test("plain multi-line prose and the line after a complete token are untouched", () => {
+		expect(redact("line one\nline two")).toBe("line one\nline two");
+		expect(redact("a xoxb-TEST-0\nnext line")).toBe(`a ${REDACTED}\nnext line`);
+		expect(redact(`a ghp_${"A".repeat(36)}\nnext`)).toBe(`a ${REDACTED}\nnext`);
 	});
 });
 

@@ -43,6 +43,7 @@ export class FileFakeTransport implements SlackTransport {
 		text: string;
 		threadTs?: string | undefined;
 		blocks?: readonly unknown[] | undefined;
+		attachments?: readonly unknown[] | undefined;
 	}): Promise<{ ts: string }> {
 		this.#seq += 1;
 		const ts = `1800000000.${String(this.#seq).padStart(6, "0")}`;

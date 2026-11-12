@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
@@ -20,8 +21,10 @@ import {
 	MONITOR_INCIDENT_REPEAT_MS,
 	type MonitorEventRow,
 	monitorOrigin,
+	nextFireOf,
 	openMonitorLedger,
 } from "../src/monitors/ledger";
+import { specOfRow } from "../src/monitors/portable";
 import { CATCHUP_MAX_SLOTS, MonitorScheduler } from "../src/monitors/scheduler";
 import { MAX_SCRIPT_STDERR_TAIL_CHARS, runScript } from "../src/monitors/script";
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../src/monitors/spec";
@@ -80,8 +83,9 @@ beforeEach(() => {
 	budgetState = undefined;
 	const sessions = new FakeSessionStore();
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		log,
@@ -180,6 +184,25 @@ describe("monitors: exactly once", () => {
 describe("monitors: daily cost ceiling", () => {
 	const BUDGET = { day: "20260601", cost: 12, cap: 10 };
 
+	test("a script monitor held by the ceiling keeps its schedule current instead of looking stalled (qa50b M-14)", async () => {
+		const script = writeScript("held.sh", "#!/bin/sh\nexit 1\n");
+		const monitor = store.monitors.addMonitor({
+			name: "held",
+			trigger: { kind: "script", command: [script], intervalMs: MINUTE },
+			instruction: "x",
+			overlap: "queue",
+			enabled: true,
+		});
+		budgetState = BUDGET;
+		clock.advance(20 * MINUTE);
+		await run();
+		const row = store.monitors.getMonitor(monitor.id);
+		expect(row?.cursorAt).toBe(clock.now());
+		expect(row === undefined ? null : nextFireOf(row)).toBe(clock.now() + MINUTE);
+		// Nothing ran while held.
+		expect(logLines.some((line) => line.includes("event=monitor_script"))).toBe(false);
+	});
+
 	test("due slots become skipped `budget` events with nothing dispatched; lifting it fires again without replaying", async () => {
 		const monitor = cronMonitor("* * * * *");
 		budgetState = BUDGET;
@@ -230,8 +253,8 @@ describe("monitors: daily cost ceiling", () => {
 		clock.advance(MINUTE);
 		expect(await run()).toMatchObject({ claimed: 0, dispatched: 0 });
 		expect(store.monitors.listEvents()).toHaveLength(0);
-		// Not running the check leaves its cursor where it was: a held check never starts a turn.
-		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(T0);
+		// A held check never starts a turn; its due time is skipped like a cron slot (qa50b M-14), never replayed.
+		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(T0 + MINUTE);
 		expect(store.monitors.getMonitor(monitor.id)?.lastScriptState).toBeNull();
 
 		// Both holds at once: the freeze switch names the skip, so a frozen tick keeps its own reason.
@@ -730,7 +753,7 @@ describe("monitors: verbatim delivery", () => {
 		const raw = new Database(path);
 		raw.run("ALTER TABLE monitors DROP COLUMN deliver");
 		raw.close();
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		expect(store.monitors.getMonitor(added.id)?.deliver).toBe("turn");
 		const script = writeScript("relay.sh", "#!/bin/sh\nexit 0\n");
 		const relay = store.monitors.addMonitor({
@@ -745,7 +768,7 @@ describe("monitors: verbatim delivery", () => {
 	});
 
 	test("spec: deliver defaults to turn, takes only turn|verbatim, and verbatim needs a script trigger", () => {
-		const ctx = { scriptsRoot: scriptsRoot() };
+		const ctx = { scriptsRoot: scriptsRoot(), defaultTimezone: "Asia/Seoul" };
 		const script = writeScript("relay.sh", "#!/bin/sh\nexit 0\n");
 		const base = { name: "n", trigger: { kind: "script", command: [script], intervalMs: MINUTE }, instruction: "x" };
 		expect(parseMonitorSpec(base, ctx).deliver ?? "turn").toBe("turn");
@@ -846,6 +869,20 @@ describe("monitors: failure backoff", () => {
 		expect(store.listDeliveries({ originKey: monitorOrigin(monitor.id) })).toHaveLength(1);
 	});
 
+	test("disabling a monitor resolves its open incidents, by setEnabled and by an update (qa50b M-15)", () => {
+		const ledger = store.monitors;
+		const monitor = cronMonitor("* * * * *");
+		expect(ledger.recordMonitorIncident(monitor.id, "boom", 1_000).notify).toBe(true);
+		ledger.setEnabled(monitor.id, false);
+		ledger.setEnabled(monitor.id, true);
+		expect(ledger.recordMonitorIncident(monitor.id, "boom", 2_000).notify).toBe(true);
+		const row = ledger.getMonitor(monitor.id);
+		if (row === undefined) throw new Error("monitor gone");
+		ledger.updateMonitor(monitor.id, { ...specOfRow(row), enabled: false });
+		ledger.updateMonitor(monitor.id, { ...specOfRow(row), enabled: true });
+		expect(ledger.recordMonitorIncident(monitor.id, "boom", 3_000).notify).toBe(true);
+	});
+
 	test("incidents suppress repeats, reopen after a healthy run, and re-alert after the window", () => {
 		const ledger = store.monitors;
 		const signature = "timeout after 603s";
@@ -879,7 +916,7 @@ describe("monitors: schema migration", () => {
 		raw.run("DROP TABLE monitors");
 		raw.close();
 
-		const reopened = openStore({ path, clock, redact });
+		const reopened = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		try {
 			expect(reopened.listDeliveries().map((row) => row.body)).toEqual(["old answer"]);
 			expect(reopened.getInbound("D1:1.1")?.textRef).toBe("old");
@@ -895,7 +932,7 @@ describe("monitors: schema migration", () => {
 			reopened.close();
 		}
 		// The afterEach hooks close the original store again; reopen so that is a no-op on a live handle.
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 	});
 
 	test("model/thinking pins round-trip through add/update/list and a pre-pin table gains the columns", () => {
@@ -928,7 +965,7 @@ describe("monitors: schema migration", () => {
 		raw.run("ALTER TABLE monitors DROP COLUMN model");
 		raw.run("ALTER TABLE monitors DROP COLUMN thinking");
 		raw.close();
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		const migrated = store.monitors.listMonitors();
 		expect(migrated.map((m) => [m.name, m.model, m.thinking]).sort()).toEqual([
 			["pinned", null, null],
@@ -960,7 +997,7 @@ describe("monitors: schema migration", () => {
 		const raw = new Database(path);
 		raw.run("ALTER TABLE monitors DROP COLUMN copy_channel");
 		raw.close();
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		expect(
 			store.monitors
 				.listMonitors()
@@ -979,7 +1016,7 @@ describe("monitors: schema migration", () => {
 		cronMonitor("* * * * *");
 		const path = join(dir, "ompbot.db");
 		store.close();
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		expect(store.monitors.listMonitors().map((m) => m.name)).toEqual(["watch"]);
 	});
 });
@@ -1017,6 +1054,19 @@ describe("monitors: script runner", () => {
 		);
 		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
 		expect(result.stderr).toBe(`${"A".repeat(MAX_SCRIPT_STDERR_TAIL_CHARS - 8)}END-MARK`);
+	});
+
+	test("output past the collect bound keeps its tail: wake gate, hash and stderr reason see the whole stream (qa50b M-13)", async () => {
+		const script = writeScript(
+			"huge.sh",
+			"#!/bin/sh\nhead -c 5000000 /dev/zero | tr '\\0' A\necho\necho '{\"wakeAgent\": false}'\n{ head -c 5000000 /dev/zero | tr '\\0' B; echo; echo REASON-END; } >&2\nexit 0\n",
+		);
+		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
+		expect(result).toMatchObject({ fired: true, wakeOff: true });
+		const whole = `${"A".repeat(5_000_000)}\n{"wakeAgent": false}`;
+		expect(result.outputHash).toBe(createHash("sha256").update(whole).digest("hex"));
+		expect(result.stdout.endsWith('{"wakeAgent": false}')).toBe(true);
+		expect(result.stderr.endsWith("REASON-END")).toBe(true);
 	});
 
 	test("a background child holding the stderr pipe does not push the run to the timeout", async () => {
@@ -1170,7 +1220,7 @@ describe("monitors: script edge triggering", () => {
 					trigger: { kind: "script", command: [flagScript(), flag()], intervalMs: MINUTE, ...extra },
 					instruction: "report the flag",
 				},
-				{ scriptsRoot: scriptsRoot() },
+				{ scriptsRoot: scriptsRoot(), defaultTimezone: "Asia/Seoul" },
 			),
 		);
 	const events = () => store.monitors.listEvents().length;
@@ -1231,7 +1281,13 @@ describe("monitors: script edge triggering", () => {
 		await scheduler.idle();
 
 		// A second process on the same database file: only the durable state carries over.
-		const reopened = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
+		const reopened = openStore({
+			timezone: "Asia/Seoul",
+			path: join(dir, "ompbot.db"),
+			clock,
+			redact,
+			slackOwnerUserId: OWNER,
+		});
 		const restarted = new MonitorScheduler({
 			store: reopened,
 			router: { route: async () => {}, newEpochIfIdle: async () => false },
@@ -1321,7 +1377,7 @@ describe("monitors: script edge triggering", () => {
 	});
 
 	test("spec: fire defaults to edge, once to false; merge inherits; bad values are rejected", () => {
-		const ctx = { scriptsRoot: scriptsRoot() };
+		const ctx = { scriptsRoot: scriptsRoot(), defaultTimezone: "Asia/Seoul" };
 		const script = flagScript();
 		const base = { name: "n", trigger: { kind: "script", command: [script], intervalMs: MINUTE }, instruction: "x" };
 		const spec = parseMonitorSpec(base, ctx);
@@ -1342,7 +1398,7 @@ describe("monitors: script edge triggering", () => {
 });
 
 describe("monitors: spec validation", () => {
-	const ctx = () => ({ scriptsRoot: scriptsRoot() });
+	const ctx = () => ({ scriptsRoot: scriptsRoot(), defaultTimezone: "Asia/Seoul" });
 
 	test("defaults: queue overlap, enabled, Asia/Seoul", () => {
 		const spec = parseMonitorSpec(

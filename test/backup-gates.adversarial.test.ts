@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type GatesCommandDeps, gatesCommand } from "../src/cli/index";
 import {
 	BACKUP_FILE_PATTERN,
 	BackupError,
@@ -36,10 +37,15 @@ import {
 	LANE_STUCK_MS,
 	MONITOR_FAILURE_WINDOW_MS,
 } from "../src/ops/gates";
+import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { MEDIA_MAX_AGE_MS, pruneMediaFiles } from "../src/ops/media";
 import { dailyBackupNames, seedDb } from "./helpers/backup-fixtures";
 
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
+
+// runBackup does real VACUUM INTO and tar work; on a loaded host (other tasks' checks running, 2026-11-11 load 14)
+// that alone passed bun's 5 s default. A bound, not a wait: a hung backup still fails the test.
+setDefaultTimeout(30_000);
 
 let home: string;
 /** Paths whose permissions the test lowered; restored before the temp dir is removed. */
@@ -69,7 +75,8 @@ function tmpLeftovers(homeDir: string): string[] {
 
 async function cli(args: string[], homeDir: string): Promise<{ out: string; err: string; code: number }> {
 	const proc = Bun.spawn(["bun", MAIN, ...args], {
-		env: { ...process.env, OMPBOT_HOME: homeDir },
+		// Test hooks give the gates an idle host, so host_pressure never depends on this machine's load.
+		env: { ...process.env, OMPBOT_HOME: homeDir, OMPBOT_TEST_HOOKS: "1", OMPBOT_TEST_HOST_LOAD: "idle" },
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -738,9 +745,8 @@ describe("collectGates adversarial", () => {
 		db.run("INSERT INTO inbound VALUES ('x', 'dispatched', ?)", [old]);
 		db.close();
 		// Host resources injected calm, so only the ledger decides the states below.
-		const calm = { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => undefined };
 		const byName = Object.fromEntries(
-			collectGates({ homeDir: home, now, diskPaths: [], hostLoad: calm }).map((g) => [g.name, g.state]),
+			collectGates({ homeDir: home, now, diskPaths: [], hostLoad: IDLE_HOST_LOAD }).map((g) => [g.name, g.state]),
 		);
 		expect(byName).toEqual({
 			backup_age: "closed",
@@ -818,11 +824,30 @@ describe("collectGates adversarial", () => {
 		expect(gateOf(crash, now, "inbound_starved")).toEqual({ state: "open", detail: "silent_old=1" });
 	});
 
-	test("CLI gates: exit code, grep-able last line and --json agree for stale and healthy homes", async () => {
+	test("CLI gates: exit code, grep-able last line and --json agree for stale and healthy homes", () => {
 		const now = Date.now();
+		// In process with disk and host load injected calm: this machine's live load must not open host_pressure here.
+		const calm: GatesCommandDeps = {
+			now: () => now,
+			statfs: () => ({ bavail: 50 * 262_144, blocks: 100 * 262_144, bsize: 4096 }),
+			hostLoad: { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => undefined },
+		};
+		const gates = (args: string[]): { out: string; code: number } => {
+			const out: string[] = [];
+			const write = process.stdout.write.bind(process.stdout);
+			process.stdout.write = ((chunk: string) => {
+				out.push(String(chunk));
+				return true;
+			}) as typeof process.stdout.write;
+			try {
+				return { code: gatesCommand(args, home, calm), out: out.join("") };
+			} finally {
+				process.stdout.write = write;
+			}
+		};
 		writeStampAt(home, new Date(now - 37 * 3_600_000));
 		seedLedger(home);
-		const stale = await cli(["gates"], home);
+		const stale = gates([]);
 		expect(stale.code).toBe(1);
 		const lines = stale.out.trimEnd().split("\n");
 		expect(lines).toHaveLength(14);
@@ -830,7 +855,7 @@ describe("collectGates adversarial", () => {
 		expect(lines[lines.length - 1]).toMatch(
 			/^gates_done open=1 unknown=2 total=13 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,slack_disconnected$/,
 		);
-		const json = await cli(["gates", "--json"], home);
+		const json = gates(["--json"]);
 		expect(json.code).toBe(1);
 		const parsed = JSON.parse(json.out) as {
 			open: number;
@@ -856,7 +881,7 @@ describe("collectGates adversarial", () => {
 		]);
 
 		writeStampAt(home, new Date(now));
-		const healthy = await cli(["gates"], home);
+		const healthy = gates([]);
 		expect(healthy.code).toBe(0);
 		expect(healthy.out.trimEnd().split("\n").pop()).toBe(
 			"gates_done open=0 unknown=2 total=13 unknown_gates=sweep_stalled,slack_disconnected",

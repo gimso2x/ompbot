@@ -35,6 +35,7 @@ let seq = 0;
 function makeRouter(options: { recall?: boolean; holdTurns?: boolean } = {}): OriginRouter {
 	const sessionStore = new FakeSessionStore();
 	return new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(dir, "sessions"),
@@ -52,7 +53,7 @@ function makeRouter(options: { recall?: boolean; holdTurns?: boolean } = {}): Or
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-recall-wiring-"));
 	clock = new FakeClock();
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	drivers = new Map();
 	logs = [];
 	recallSetting = { enabled: true };

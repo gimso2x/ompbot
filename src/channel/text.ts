@@ -7,7 +7,10 @@ export const REDELIVERED_PREFIX = "(중복 가능: 재전송)";
 /** What a non-owner gets back for a command or a button click (ephemeral). */
 export const DENIED_TEXT = "권한 없음: 이 봇은 오너만 사용할 수 있습니다.";
 
-/** Room kept in every chunk so a code fence cut by a split can be closed ("\n```") and reopened ("```\n"). */
+/**
+ * Room kept in every chunk so a code fence cut by a split can be closed ("\n```") and reopened ("```\n"); `chunkText`
+ * keeps two more characters per extra backtick of the longest fence in the text.
+ */
 export const FENCE_RESERVE = 8;
 
 /** Minimum gap between two edits of one running status message. */
@@ -41,20 +44,54 @@ function splitAt(text: string, limit: number, keepWhole: (cut: number) => number
 		if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
 	}
 	cut = keepWhole(cut);
+	// The fence fix only moves the cut back; it is dropped when nothing would be left before it (the loop of
+	// `chunkText` must always advance) or when it lands inside a span kept whole.
+	const fenced = fenceSafeCut(text, cut);
+	if (fenced > 0 && keepWhole(fenced) === fenced) cut = fenced;
 	return [text.slice(0, cut), text.slice(cut).replace(/^\n+/, "")];
 }
 
 /**
+ * Moves a cut off a code fence mark: a cut inside a line opening with ``` goes to that line's start (the language tag
+ * stays on the fence), a cut inside a run of backticks to the run's start, and a cut inside the language tag right
+ * after a mid-line ``` run to that run's start.
+ */
+function fenceSafeCut(text: string, cut: number): number {
+	if (cut <= 0 || cut >= text.length) return cut;
+	const lineStart = text.lastIndexOf("\n", cut - 1) + 1;
+	const newline = text.indexOf("\n", lineStart);
+	const lineEnd = newline === -1 ? text.length : newline;
+	if (cut < lineEnd && /^[ \t]*```/.test(text.slice(lineStart, lineEnd))) return lineStart;
+	const runStart = (end: number): number => {
+		let start = end;
+		while (start > 0 && text[start - 1] === "`") start -= 1;
+		return start;
+	};
+	if (text[cut - 1] === "`" && text[cut] === "`") return runStart(cut - 1);
+	if (/\s/.test(text[cut] ?? " ")) return cut;
+	let tag = cut;
+	while (tag > lineStart && !/[\s`]/.test(text[tag - 1] ?? " ")) tag -= 1;
+	if (text[tag - 1] !== "`") return cut;
+	const start = runStart(tag);
+	return tag - start >= 3 ? start : cut;
+}
+
+/**
  * Splits into messages of at most `limit` characters, preferring paragraph/line boundaries and keeping code fences
- * balanced. A cut inside one of the `keepWhole` spans (each at most the limit) moves to the line break before it, or
- * past it when the span opens the message.
+ * balanced; a fence mark and a line opening a fence are never cut in two. A cut inside one of the `keepWhole` spans
+ * (each at most the limit) moves to the line break before it, or past it when the span opens the message.
  */
 export function chunkText(
 	text: string,
 	limit = CHUNK_LIMIT,
 	keepWhole: ReadonlyArray<readonly [number, number]> = [],
 ): string[] {
-	const budget = limit - FENCE_RESERVE;
+	let longest = 3;
+	for (const line of text.split("\n")) {
+		const run = fenceRun(line);
+		if (run !== undefined && run > longest) longest = run;
+	}
+	const budget = limit - FENCE_RESERVE - 2 * (longest - 3);
 	const raw: string[] = [];
 	let rest = text;
 	while (rest.length > 0) {
@@ -69,14 +106,43 @@ export function chunkText(
 		rest = tail;
 	}
 	if (raw.length === 0) return [""];
-	let open = false;
+	// The backtick count of the fence open at a chunk's end: 0 when none. A fence opened at a line's head closes only on
+	// a line of at least as many backticks alone; any other ``` (mid-line, or a run too long to track) toggles a
+	// three-backtick fence as before.
+	let open = 0;
+	let lineHead = false;
 	return raw.map((chunk) => {
-		let out = open ? `\`\`\`\n${chunk}` : chunk;
-		const fences = (chunk.match(/```/g) ?? []).length;
-		if (fences % 2 === 1) open = !open;
-		if (open) out = `${out}\n\`\`\``;
+		const mark = "`".repeat(open);
+		let out = open > 0 ? `${mark}\n${chunk}` : chunk;
+		for (const line of chunk.split("\n")) {
+			if (lineHead) {
+				const close = /^ {0,3}(`+)[ \t]*$/.exec(line);
+				if (close !== null && (close[1]?.length ?? 0) >= open) {
+					open = 0;
+					lineHead = false;
+				}
+				continue;
+			}
+			const run = open === 0 ? fenceRun(line) : undefined;
+			if (run !== undefined) {
+				open = run;
+				lineHead = true;
+				continue;
+			}
+			if ((line.match(/```/g) ?? []).length % 2 === 1) open = open > 0 ? 0 : 3;
+		}
+		if (open > 0) out = `${out}\n${"`".repeat(open)}`;
 		return out;
 	});
+}
+
+/** Longest fence `chunkText` closes and reopens with as many backticks; a longer run is treated as plain ```. */
+const MAX_FENCE_RUN = 16;
+
+/** The backtick count of a line opening a fence (up to 3 spaces, 3+ backticks, an info string without backticks). */
+function fenceRun(line: string): number | undefined {
+	const run = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length;
+	return run !== undefined && run <= MAX_FENCE_RUN ? run : undefined;
 }
 
 /** How a thread's ⏳ status message and 👀 reaction end: normal close, failure, or a cancelled wait. */
@@ -133,4 +199,28 @@ export function runningStatusText(stalled: boolean, elapsedMs: number, progress:
 		if (line !== "") lines.push(`· ${line}`);
 	}
 	return lines.join("\n");
+}
+
+/** Terminal-style width: East Asian wide/fullwidth and emoji count as 2 columns, everything else as 1. */
+export function displayWidth(text: string): number {
+	let width = 0;
+	for (const ch of text) {
+		const cp = ch.codePointAt(0) ?? 0;
+		const wide =
+			(cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+			(cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals and symbols
+			(cp >= 0x3041 && cp <= 0x33ff) || // Kana, CJK compatibility
+			(cp >= 0x3400 && cp <= 0x4dbf) || // CJK extension A
+			(cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+			(cp >= 0xa960 && cp <= 0xa97f) || // Hangul Jamo extended-A
+			(cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+			(cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+			(cp >= 0xfe30 && cp <= 0xfe6f) || // CJK compatibility forms
+			(cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
+			(cp >= 0xffe0 && cp <= 0xffe6) ||
+			(cp >= 0x1f300 && cp <= 0x1f9ff) || // emoji
+			(cp >= 0x20000 && cp <= 0x3fffd); // CJK extension B and beyond
+		width += wide ? 2 : 1;
+	}
+	return width;
 }

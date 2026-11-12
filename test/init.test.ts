@@ -65,6 +65,7 @@ describe("ompbot init", () => {
 		writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
 		writeFileSync(join(home, "secrets", "slack-app-token"), "xapp-TEST-0\n", { mode: 0o600 });
 		const config = loadConfig(home);
+		if (config.channels.slack === undefined || config.slack === undefined) throw new Error("expected Slack config");
 		expect(config.channels.slack.ownerUserId).toBe(OWNER);
 		expect(config.deprecated ?? []).toEqual([]);
 		const raw = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
@@ -129,7 +130,46 @@ describe("ompbot init", () => {
 		expect(existsSync(home)).toBe(false);
 	});
 
-	test("a directory as --omp, an empty --omp or --workspace, and an empty OMPBOT_HOME exit 2 and create nothing", () => {
+	test("a file where the home, the workspace or one of their parents goes exits 2 and creates nothing", () => {
+		const root = tempDir("ompbot-init-files-");
+		const file = join(root, "plain-file");
+		writeFileSync(file, "x");
+		const workspaceCases = [file, join(file, "ws")];
+		for (const workspace of workspaceCases) {
+			const home = join(root, "home");
+			const run = init(["--owner", OWNER, "--omp", process.execPath, "--workspace", workspace], home);
+			expect(run.code).toBe(2);
+			expect(run.err).toContain(`--workspace ${workspace}`);
+			expect(run.err).not.toContain("Error:");
+			expect(existsSync(home)).toBe(false);
+		}
+		for (const home of [file, join(file, ".ompbot")]) {
+			const run = init(["--owner", OWNER, "--omp", process.execPath], home);
+			expect(run.code).toBe(2);
+			expect(run.err).toContain(`home ${home}`);
+			expect(run.err).not.toContain("Error:");
+		}
+		// HOME is `root` here; `.bun` is the child bun's own cache, not something init made.
+		expect(readdirSync(root).filter((name) => name !== ".bun")).toEqual(["plain-file"]);
+	});
+
+	test("an empty OMPBOT_HOME is unset: the home is ~/.ompbot, nothing lands in the current directory", () => {
+		const cwd = tempDir("ompbot-init-cwd-");
+		const userHome = tempDir("ompbot-init-home-");
+		const empty = Bun.spawnSync([process.execPath, MAIN, "init", "--owner", OWNER, "--omp", process.execPath], {
+			env: { HOME: userHome, OMPBOT_HOME: "", PATH: "" },
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(empty.stderr.toString()).toBe("");
+		expect(empty.exitCode).toBe(0);
+		expect(existsSync(join(userHome, ".ompbot", "config.json"))).toBe(true);
+		expect(empty.stdout.toString()).not.toContain("OMPBOT_HOME=");
+		expect(readdirSync(cwd)).toEqual([]);
+	});
+
+	test("a directory as --omp and an empty --omp or --workspace exit 2 and create nothing", () => {
 		const home = freshHome();
 		const cases: Array<[string[], string]> = [
 			[["--owner", OWNER, "--omp", tempDir("ompbot-init-dir-")], "is a directory"],
@@ -142,16 +182,6 @@ describe("ompbot init", () => {
 			expect(run.err).toContain(message);
 			expect(existsSync(home)).toBe(false);
 		}
-		const cwd = tempDir("ompbot-init-cwd-");
-		const empty = Bun.spawnSync([process.execPath, MAIN, "init", "--owner", OWNER, "--omp", process.execPath], {
-			env: { HOME: tempDir("ompbot-init-home-"), OMPBOT_HOME: "", PATH: "" },
-			cwd,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(empty.exitCode).toBe(2);
-		expect(empty.stderr.toString()).toContain("OMPBOT_HOME is set but empty");
-		expect(readdirSync(cwd)).toEqual([]);
 	});
 
 	test("--help prints the usage and exits 0", () => {

@@ -28,7 +28,13 @@ const opened: Store[] = [];
 const maskTest = (s: string) => s.replace(/xoxb-TEST-0/g, "[REDACTED]");
 
 function open(hooks?: Parameters<typeof openStore>[0]["hooks"]): Store {
-	const store = openStore({ path: dbPath, clock, redact: maskTest, ...(hooks ? { hooks } : {}) });
+	const store = openStore({
+		timezone: "Asia/Seoul",
+		path: dbPath,
+		clock,
+		redact: maskTest,
+		...(hooks ? { hooks } : {}),
+	});
 	opened.push(store);
 	return store;
 }
@@ -221,6 +227,7 @@ describe("answer transaction", () => {
 	test("exception while storing a later part rolls back earlier parts and the answered state", () => {
 		let calls = 0;
 		const store = openStore({
+			timezone: "Asia/Seoul",
 			path: dbPath,
 			clock,
 			redact: (s) => {
@@ -404,7 +411,7 @@ describe("thread mutes", () => {
 
 describe("backfill thread targets", () => {
 	test("top-level posts (`<C>:-`: slash answers, log copies) are never thread targets", () => {
-		const store = openStore({ path: dbPath, clock, redact: maskTest, logChannel: "CLOG" });
+		const store = openStore({ timezone: "Asia/Seoul", path: dbPath, clock, redact: maskTest, logChannel: "CLOG" });
 		opened.push(store);
 		store.ensureOrigin("slack/ch/C1", "/s/c1");
 		// A completion answer in a thread also writes its log-channel copy on `CLOG:-`.

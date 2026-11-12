@@ -6,14 +6,15 @@ import { buildDispatchTool } from "../src/dispatch/tool";
 import type { ApprovalDetail, ApprovalResult } from "../src/safety/approval";
 import type { HostToolDef } from "../src/safety/host-tools";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
+import type { HerdrPromptInput } from "../src/store/db";
+import { taskChecksOf } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
 import type { HostResult, ProgressLag, TaskHostOps, TaskResumeOps } from "../src/tasks/host";
 import { TaskLedger } from "../src/tasks/ledger";
 import { registryOf } from "./helpers/channels";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const NOW = Date.parse("2026-10-26T06:00:00Z");
-const noop = { info() {}, warn() {} };
 const GOOD_SPEC = {
 	title: "로그 회전",
 	risk: "L2",
@@ -103,9 +104,16 @@ interface Harness {
 	herdr: string[][];
 	agents: Set<string>;
 	failAgentStart: { value: boolean };
+	/** The first prompt of a start (no `--wait`) exits 1 after the agent started. */
+	failFirstPrompt: { value: boolean };
 	/** Follow-up prompts (`--wait`) end in herdr's `agent_prompt_stalled`: delivered, start unseen. */
 	promptStalled: { value: boolean };
 	approvals: Array<{ summary: string; detail: ApprovalDetail }>;
+	db: Database;
+	/** Every log line the tool wrote (event and fields, JSON). */
+	logs: string[];
+	/** Every prompt the tool handed to `recordPrompt` (dashboard 마지막 지시). */
+	prompts: HerdrPromptInput[];
 }
 
 function harness(
@@ -121,16 +129,23 @@ function harness(
 		workerOmpArgs?: string[];
 		/** Config `dispatchHosts.wsl.ompArgs`. */
 		wslOmpArgs?: string[];
+		/** The inbound ledger has no [TASK] root text, so context.md takes `task`. */
+		noRoot?: boolean;
 	} = {},
 ): Harness {
-	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => NOW } });
+	const db = new Database(":memory:", { strict: true });
+	const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => NOW } });
 	const transport = new FakeSlackTransport();
 	const host = fakeHost();
+	const logs: string[] = [];
+	const record = (event: string, fields?: Record<string, unknown>) => logs.push(JSON.stringify({ event, fields }));
 	const approvals: Harness["approvals"] = [];
 	const herdr: string[][] = [];
 	const agents = new Set<string>();
 	const failAgentStart = { value: false };
+	const failFirstPrompt = { value: false };
 	const promptStalled = { value: false };
+	const prompts: HerdrPromptInput[] = [];
 	const run: ProcessRunner = async (cmd) => {
 		// Over ssh every remote word is single-quoted (or a bare `~`); record the words the remote shell would see.
 		const sshAt = cmd[0] === "ssh" ? cmd.indexOf("--") : -1;
@@ -151,6 +166,9 @@ function harness(
 		if (args[1] === "agent" && args[2] === "prompt" && args.includes("--wait") && promptStalled.value) {
 			const stderr = JSON.stringify({ error: { code: "agent_prompt_stalled", message: "no start seen" } });
 			return { code: 1, stdout: "", stderr, timedOut: false };
+		}
+		if (args[1] === "agent" && args[2] === "prompt" && !args.includes("--wait") && failFirstPrompt.value) {
+			return { code: 1, stdout: "", stderr: "boom", timedOut: false };
 		}
 		if (args[1] === "agent" && args[2] === "start") {
 			if (failAgentStart.value) return { code: 1, stdout: "boom", timedOut: false };
@@ -173,7 +191,8 @@ function harness(
 		},
 		...(options.workerOmpArgs === undefined ? {} : { workerOmpArgs: options.workerOmpArgs }),
 		run,
-		log: noop,
+		log: { info: record, warn: record },
+		recordPrompt: (input) => prompts.push(input),
 		...(options.board === undefined ? {} : { herdrBoard: options.board }),
 		...(options.approval === undefined
 			? {}
@@ -188,8 +207,9 @@ function harness(
 			: {
 					tasks: {
 						ledger,
+						timezone: "Asia/Seoul",
 						threadRef: () => ("threadRef" in options ? options.threadRef : "C1:100.1"),
-						rootText: () => "[TASK] L2 로그 회전\n목표: 회전",
+						rootText: () => (options.noRoot === true ? undefined : "[TASK] L2 로그 회전\n목표: 회전"),
 						channels: registryOf(new SlackChannel(transport)),
 						now: () => NOW,
 						hostOps: () => host,
@@ -205,7 +225,21 @@ function harness(
 					},
 				}),
 	});
-	return { tool, ledger, transport, host, herdr, agents, failAgentStart, promptStalled, approvals };
+	return {
+		tool,
+		ledger,
+		transport,
+		host,
+		herdr,
+		agents,
+		failAgentStart,
+		failFirstPrompt,
+		promptStalled,
+		approvals,
+		db,
+		logs,
+		prompts,
+	};
 }
 
 const call = (h: Harness, params: Record<string, unknown>) =>
@@ -380,12 +414,30 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		expect(occupied.ledger.list()).toEqual([]);
 	});
 
+	test("a failed first prompt closes what the start created, then rolls the registration back (B-4)", async () => {
+		for (const host of [undefined, "wsl"]) {
+			const h = harness();
+			h.failFirstPrompt.value = true;
+			const result = await call(h, { taskSpec: GOOD_SPEC, task: "go", ...(host === undefined ? {} : { host }) });
+			expect(result).toContain("시작 실패: agent prompt failed: boom");
+			const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd.slice(1));
+			// This start created workspace W1 (no owners workspace was listed on the host), so W1 is what closes.
+			expect(h.herdr.map(words).filter((args) => args[1] === "close")).toEqual([["workspace", "close", "W1"]]);
+			expect(h.ledger.list()).toEqual([]);
+			expect(h.host.calls.at(-1)).toBe("remove /r/repo-t-20261026-01");
+		}
+	});
+
 	test("refuses name, missing task, bad spec, unknown host, no thread and unsupported sessions", async () => {
 		const h = harness();
 		await expect(call(h, { taskSpec: GOOD_SPEC, task: "go", name: "x" })).rejects.toThrow("name");
 		await expect(call(h, { taskSpec: GOOD_SPEC })).rejects.toThrow("task(지시문)");
 		await expect(call(h, { taskSpec: { ...GOOD_SPEC, acceptance: [] }, task: "go" })).rejects.toThrow("acceptance");
 		await expect(call(h, { taskSpec: GOOD_SPEC, task: "go", host: "nope" })).rejects.toThrow("알 수 없는 호스트");
+		// qa50b M-1: a prototype key is not a configured host.
+		for (const host of ["constructor", "__proto__", "toString"]) {
+			await expect(call(h, { taskSpec: GOOD_SPEC, task: "go", host })).rejects.toThrow("알 수 없는 호스트");
+		}
 		await expect(call(harness({ threadRef: undefined }), { taskSpec: GOOD_SPEC, task: "go" })).rejects.toThrow(
 			"스레드",
 		);
@@ -399,6 +451,7 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 
 	test("without taskSpec nothing task-related happens", async () => {
 		const h = harness();
+		h.agents.add("plain");
 		const out = await call(h, { mode: "herdr", name: "plain", task: "후속" });
 		expect(out).toContain("후속 지시를 plain에 전달했습니다");
 		expect(h.ledger.list()).toEqual([]);
@@ -406,6 +459,118 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		expect(h.transport.calls).toEqual([]);
 		const read = await call(h, { mode: "herdr", name: "plain" });
 		expect(read).toBe("▸ plain 최근 출력:\n{}");
+	});
+});
+
+describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the documents or the card", () => {
+	// Fake token shapes only, built at run time.
+	const SLACK = ["xoxb", "TEST", "0", "ledger"].join("-");
+	const GH = `ghp_${"T".repeat(36)}`;
+	const CHECK = '[check: command ["bun","run","check"]]';
+	const dir = docsDirOf("/r/repo-t-20261026-01", "T-20261026-01");
+	const rowOf = (h: Harness) =>
+		h.db.query("SELECT title, acceptance_json FROM tasks").get() as { title: string; acceptance_json: string };
+	const refusal = (h: Harness, params: Record<string, unknown>) =>
+		call(h, params).then(
+			() => new Error("registered"),
+			(error: unknown) => error as Error,
+		);
+
+	test("AC-1: text fields and criterion prose are masked everywhere; the check block stays byte for byte", async () => {
+		const h = harness();
+		const spec = {
+			...GOOD_SPEC,
+			title: `로그 회전 ${SLACK}`,
+			goal: `회전을 넣는다 ${GH}`,
+			scope: [`src/log.ts ${SLACK}`],
+			exclusions: [`배포 ${GH}`],
+			background: `배경 ${SLACK}`,
+			assumptions: `가정 ${GH}`,
+			acceptance: [`토큰 ${SLACK} 없이 통과한다 ${CHECK}`, `README에 ${GH} 설명이 없다`],
+		};
+		const result = await call(h, { taskSpec: spec, task: "회전을 구현해" });
+		expect(result).toContain("T-20261026-01 등록·시작했습니다");
+		const row = rowOf(h);
+		const surfaces = [
+			row.title,
+			row.acceptance_json,
+			...h.host.files.values(),
+			JSON.stringify(h.transport.calls),
+			result,
+			...h.logs,
+		];
+		for (const text of surfaces) {
+			expect(text).not.toContain(SLACK);
+			expect(text).not.toContain(GH);
+		}
+		expect(row.title).toBe("로그 회전 [REDACTED]");
+		const specMd = h.host.files.get(`${dir}/spec.md`) ?? "";
+		for (const line of [
+			"title: 로그 회전 [REDACTED]",
+			"회전을 넣는다 [REDACTED]",
+			"- src/log.ts [REDACTED]",
+			"- 배포 [REDACTED]",
+			`- [ ] AC-1: 토큰 [REDACTED] 없이 통과한다 ${CHECK}`,
+			"- [ ] AC-2: README에 [REDACTED] 설명이 없다",
+		]) {
+			expect(specMd.split("\n")).toContain(line);
+		}
+		const context = h.host.files.get(`${dir}/context.md`) ?? "";
+		expect(context).toContain("## 배경\n배경 [REDACTED]\n## 가정\n가정 [REDACTED]");
+		const card = JSON.stringify(h.transport.calls.filter((c) => c.method === "postMessage"));
+		expect(card).toContain("로그 회전 [REDACTED]");
+		expect(card).toContain("[목표] 회전을 넣는다 [REDACTED]");
+		const acceptance = h.ledger.require("T-20261026-01").acceptance;
+		expect(acceptance[0]?.text).toEndWith(` ${CHECK}`);
+		expect(taskChecksOf(acceptance)).toEqual([{ id: "AC-1", signal: 'command ["bun","run","check"]' }]);
+	});
+
+	test("AC-2: a secret inside a check block refuses the registration without echoing it", async () => {
+		for (const acceptance of [
+			["회전", `API가 응답한다 [check: command ["curl","-H","Authorization: Bearer ${GH}","https://api.test"]]`],
+			["회전", `토큰이 맞다 [check: command ["sh","-c","test \\"$TOKEN\\" = ${SLACK}"]]`],
+		]) {
+			const h = harness();
+			const error = await refusal(h, { taskSpec: { ...GOOD_SPEC, acceptance }, task: "go" });
+			expect(error.message).toBe(
+				"taskSpec 수락기준 AC-2의 [check:] 명령에 비밀값으로 보이는 문자열이 있습니다 — 환경변수나 파일 경로로 넘기세요",
+			);
+			expect(h.db.query("SELECT COUNT(*) AS n FROM tasks").get()).toEqual({ n: 0 });
+			// No worktree, no branch, no document, no agent, no post.
+			expect(h.host.calls).toEqual([]);
+			expect(h.host.files.size).toBe(0);
+			expect(h.herdr).toEqual([]);
+			expect(h.transport.calls).toEqual([]);
+			expect(h.logs.join("\n")).not.toContain(GH);
+			expect(h.logs.join("\n")).not.toContain(SLACK);
+		}
+	});
+
+	test("AC-2: a malformed check block holding a secret is refused with the secret masked in the syntax error", async () => {
+		const h = harness();
+		const error = await refusal(h, { taskSpec: { ...GOOD_SPEC, acceptance: [`회전 [check: run ${GH}]`] }, task: "go" });
+		expect(error.message).toStartWith("taskSpec.acceptance[0]의 check 형식 오류");
+		expect(error.message).not.toContain(GH);
+		expect(h.db.query("SELECT COUNT(*) AS n FROM tasks").get()).toEqual({ n: 0 });
+	});
+
+	test("AC-2b: without a root text the task brief is masked before it reaches context.md", async () => {
+		const h = harness({ noRoot: true });
+		await call(h, { taskSpec: GOOD_SPEC, task: `회전을 구현해 ${SLACK}` });
+		const context = h.host.files.get(`${dir}/context.md`) ?? "";
+		expect(context).toContain("## 요청 원문\n회전을 구현해 [REDACTED]\n");
+		expect(context).not.toContain(SLACK);
+	});
+
+	test("AC-2c: hashes, absolute paths and test argv in a check block are not refused and stay as written", async () => {
+		const h = harness();
+		const acceptance = [
+			"파일이 그대로다 [check: file test/x.test.ts sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08]",
+			'절대 경로 테스트가 통과한다 [check: command ["bun","test","/home/owner/work/ompbot/test/x.test.ts"]]',
+			'가림 테스트가 통과한다 [check: command ["bun","test","test/redact.test.ts"]]',
+		];
+		expect(await call(h, { taskSpec: { ...GOOD_SPEC, acceptance }, task: "go" })).toContain("등록·시작했습니다");
+		expect(h.ledger.require("T-20261026-01").acceptance).toEqual(acceptanceItems(acceptance));
 	});
 });
 
@@ -452,6 +617,7 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 	test("an unconfirmed follow-up (local or remote) says it was delivered without a seen start", async () => {
 		const h = harness();
 		h.promptStalled.value = true;
+		h.agents.add("plain");
 		expect(await call(h, { mode: "herdr", name: "plain", task: "후속" })).toBe(
 			'전달은 했지만 작업 시작이 확인되지 않았습니다(agent_prompt_stalled). 진행 확인: ompbot_dispatch {mode:"herdr", name:"plain"}',
 		);
@@ -471,6 +637,36 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		h.host.existing.clear();
 		h.agents.clear();
 		expect(await call(h, { taskSpec: { id: "T-20261026-01" } })).toContain("워크트리가 없습니다");
+	});
+
+	test("AC-5: the start, a resume follow-up (unconfirmed too) and a resume that starts again are each recorded", async () => {
+		const h = harness();
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		const kinds = () => h.prompts.map((input) => [input.host, input.agent, input.kind, input.originKey]);
+		expect(kinds()).toEqual([[null, "t-20261026-01", "start", "slack/ch/C1/t/100.1"]]);
+		expect(h.prompts[0]?.text).toContain("T-20261026-01");
+		await call(h, { taskSpec: { id: "T-20261026-01" }, task: "리뷰 반영해" });
+		h.promptStalled.value = true;
+		await call(h, { taskSpec: { id: "T-20261026-01" }, task: "또" });
+		h.promptStalled.value = false;
+		h.agents.clear();
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		expect(kinds().slice(1)).toEqual([
+			[null, "t-20261026-01", "followup", "slack/ch/C1/t/100.1"],
+			[null, "t-20261026-01", "followup", "slack/ch/C1/t/100.1"],
+			[null, "t-20261026-01", "start", "slack/ch/C1/t/100.1"],
+		]);
+		expect(h.prompts[1]?.text).toEndWith("리뷰 반영해");
+	});
+
+	test("AC-5: a remote TASK start is recorded under its host; a failed agent start records nothing", async () => {
+		const h = harness();
+		await call(h, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
+		expect(h.prompts.map((input) => [input.host, input.kind])).toEqual([["wsl", "start"]]);
+		const failed = harness();
+		failed.failAgentStart.value = true;
+		await call(failed, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(failed.prompts).toEqual([]);
 	});
 
 	const lagOf = (over: Partial<ProgressLag>): HostResult<ProgressLag> => ({
@@ -542,9 +738,20 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		await call(h, { taskSpec: { id: "T-20261026-01" } });
 		const resumed = resumePrompt(h);
 		const rule =
-			"재개하면 다른 일보다 먼저 PROGRESS.md `restated`에 `과제 / 첫 next / 완료 조건`을 한 줄로 쓰고 `updated`를 고친다. 못 쓰면 `status: blocked`로 바꾸고 `blocked_reason`에 PROGRESS.md에서 빠진 것을 적는다.";
+			"재개하면 다른 일보다 먼저 PROGRESS.md `restated`에 `과제 / 첫 next / 완료 조건`을 한 줄로 쓰고 `updated`를 고친다. 못 쓰면 `status: blocked`·`needs_owner: yes`로 바꾸고 `blocked_reason`에 PROGRESS.md에서 빠진 것을 적는다.";
 		expect(resumed).toContain(rule);
 		expect(fresh).not.toContain("restated");
+	});
+
+	test("rule 4 asks for two other approaches written to blocked_reason, and needs_owner for the owner's blocks", async () => {
+		const h = harness();
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		const rule4 = resumePrompt(h)
+			.split("\n")
+			.find((line) => line.startsWith("4. "));
+		expect(rule4).toContain("2가지");
+		expect(rule4).toContain("`blocked_reason`");
+		expect(rule4).toContain("`needs_owner: yes`");
 	});
 
 	test("the restated value read at resume is kept beside the resume mark", async () => {
@@ -599,7 +806,14 @@ describe("ompbot_dispatch handoff risk scan", () => {
 			params: (task) => ({ taskSpec: { id: "T-20261026-01" }, task }),
 		},
 		{ name: "host remote start", params: (task) => ({ host: "wsl", name: "remote-x", task }) },
-		{ name: "herdr follow-up", params: (task) => ({ mode: "herdr", name: "plain", task }) },
+		{
+			name: "herdr follow-up",
+			setup: async (h) => {
+				h.agents.add("plain");
+			},
+			params: (task) => ({ mode: "herdr", name: "plain", task }),
+		},
+		{ name: "herdr local start", params: (task) => ({ mode: "herdr", name: "plain-new", task }) },
 	];
 	const REFUSALS: Array<[string, ApprovalResult | undefined, string]> = [
 		["denied", "denied", "denied"],
@@ -668,6 +882,7 @@ describe("ompbot_dispatch handoff risk scan", () => {
 
 	test("clear briefs never ask and return the unchanged result", async () => {
 		const h = harness({ approval: "denied" });
+		h.agents.add("plain");
 		const out = await call(h, { mode: "herdr", name: "plain", task: "로그 회전을 구현해" });
 		expect(out).toBe('후속 지시를 plain에 전달했습니다. 진행 확인: ompbot_dispatch {mode:"herdr", name:"plain"}');
 		expect(h.approvals).toEqual([]);
@@ -765,7 +980,15 @@ describe("worker omp arguments (workerOmpArgs, dispatchHosts.<h>.ompArgs)", () =
 		await call(h, { task: "빌드 상태 요약" });
 		const omp = h.herdr.filter((cmd) => cmd[0] === "omp");
 		expect(omp).toHaveLength(1);
-		expect(omp[0]?.slice(0, 4)).toEqual(["omp", "-p", "빌드 상태 요약", "--no-session"]);
+		expect(omp[0]).toEqual([
+			"omp",
+			"-p",
+			"--no-session",
+			"--append-system-prompt",
+			expect.any(String),
+			"--",
+			"빌드 상태 요약",
+		]);
 		expect(omp[0]).not.toContain("--prewalk");
 	});
 });

@@ -2,6 +2,7 @@ import {
 	chmodSync,
 	copyFileSync,
 	existsSync,
+	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -21,6 +22,9 @@ import type { Gate } from "./gates";
 export const READY_TIMEOUT_MS = 120_000;
 const READY_POLL_MS = 1_000;
 export const DEFAULT_DRAIN_TIMEOUT_MIN = 60;
+/** The `[자동 후속]` report inject is tried this many times while the daemon socket refuses connections. */
+export const REPORT_INJECT_ATTEMPTS = 6;
+export const REPORT_INJECT_RETRY_MS = 5_000;
 export const SYSTEMD_UNIT = "ompbot";
 
 /** The apply report goes to a Slack DM or channel origin (`slack/ch/<C>`, `slack/dm/<D>`), never a thread origin. */
@@ -71,8 +75,17 @@ export interface ApplyDeps {
 	backup: () => BackupResult;
 	gates: () => Gate[];
 	doctor: () => Promise<{ code: number; lines: string[] }>;
+	/**
+	 * `ompbot omp sync` of the bot profile (config `ompProfile`), run before the drain; absent without a profile. A
+	 * failure (thrown) ends the apply with nothing drained or restarted.
+	 */
+	ompSync?: () => { changed: number };
 	/** `startedAt` (ms) of the process holding `ompbot.lock`; undefined when there is no readable lock. */
 	lockStartedAt: () => number | undefined;
+	/** This process; recorded in `<home>/apply.lock`. */
+	pid: number;
+	/** Whether the process holding `<home>/apply.lock` still runs; a dead holder's lock is taken over. */
+	isAlive: (pid: number) => boolean;
 	isExecutable: (path: string) => boolean;
 	log: (line: string) => void;
 }
@@ -251,15 +264,179 @@ export function parseUnixTimestamp(text: string): number | undefined {
 	return m ? Number(m[1]) * 1000 : undefined;
 }
 
+const errorCode = (error: unknown): string | undefined =>
+	typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+		? error.code
+		: undefined;
+
+/** One `apply` per home at a time holds `<home>/apply.lock`; other installs on the checkout use their own home's. */
+export const APPLY_LOCK_FILE = "apply.lock";
+
+export interface ApplyLockInfo {
+	pid: number;
+	stamp: string;
+	startedAt: string;
+}
+
+/** The holder an apply lock names; undefined for anything that is not a complete lock (broken JSON included). */
+export function parseApplyLock(text: string): ApplyLockInfo | undefined {
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"pid" in parsed &&
+			typeof parsed.pid === "number" &&
+			Number.isInteger(parsed.pid) &&
+			parsed.pid > 0 &&
+			"stamp" in parsed &&
+			typeof parsed.stamp === "string" &&
+			STAMP_PATTERN.test(parsed.stamp) &&
+			"startedAt" in parsed &&
+			typeof parsed.startedAt === "string"
+		) {
+			return { pid: parsed.pid, stamp: parsed.stamp, startedAt: parsed.startedAt };
+		}
+	} catch {
+		// broken JSON: not a lock anyone can be waited on
+	}
+	return undefined;
+}
+
+/**
+ * Puts the lock in place whole: a fully written temp file is hard-linked to the lock name, so no reader ever sees
+ * an empty or half-written lock. false when another lock already holds the name.
+ */
+export function createApplyLock(lockPath: string, info: ApplyLockInfo): boolean {
+	const tmp = `${lockPath}.tmp-${info.pid}-${crypto.randomUUID().slice(0, 8)}`;
+	writeFileSync(tmp, `${JSON.stringify(info)}\n`, { mode: 0o600, flag: "wx" });
+	try {
+		linkSync(tmp, lockPath);
+		return true;
+	} catch (error) {
+		if (errorCode(error) === "EEXIST") return false;
+		throw error;
+	} finally {
+		rmSync(tmp, { force: true });
+	}
+}
+
+/**
+ * Takes a stale lock (dead holder, broken JSON) out of the way. Only the process whose rename succeeds reclaims it;
+ * when the moved file is not the one judged stale (another apply locked in between), it goes back under the lock
+ * name (`changed`, wait again). A new lock already there by then is `contention`: nothing more is touched.
+ */
+export function reclaimStaleApplyLock(
+	lockPath: string,
+	seen: string,
+	pid: number,
+): { outcome: "taken" | "changed" | "contention"; aside: string } {
+	const aside = `${lockPath}.stale-${pid}-${crypto.randomUUID().slice(0, 8)}`;
+	try {
+		renameSync(lockPath, aside);
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return { outcome: "changed", aside };
+		throw error;
+	}
+	if (readFileSync(aside, "utf8") === seen) {
+		rmSync(aside, { force: true });
+		return { outcome: "taken", aside };
+	}
+	try {
+		linkSync(aside, lockPath);
+	} catch (error) {
+		if (errorCode(error) === "EEXIST") return { outcome: "contention", aside };
+		throw error;
+	}
+	rmSync(aside, { force: true });
+	return { outcome: "changed", aside };
+}
+
+/** Removes the lock only while it is still this apply's (same pid and stamp); true when removed. */
+export function releaseApplyLock(lockPath: string, info: ApplyLockInfo): boolean {
+	let text: string;
+	try {
+		text = readFileSync(lockPath, "utf8");
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return false;
+		throw error;
+	}
+	const holder = parseApplyLock(text);
+	if (holder?.pid !== info.pid || holder.stamp !== info.stamp) return false;
+	rmSync(lockPath, { force: true });
+	return true;
+}
+
+/** `kill(pid, 0)`: EPERM still means a live process owned by someone else. */
+export function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return errorCode(error) === "EPERM";
+	}
+}
+
+/** Why the receipt of the apply waited on does not cover this one; undefined when it does (finished ok, same HEAD). */
+function priorReceiptGap(path: string, head: string | undefined): string | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		return `receipt unreadable: ${msg(error)}`;
+	}
+	if (typeof parsed !== "object" || parsed === null) return "receipt malformed";
+	const prior = parsed as Partial<ApplyReceipt>;
+	if (prior.status !== "ok" && prior.status !== "already_applied") return `status=${String(prior.status)}`;
+	if (head === undefined || prior.head !== head) return `head ${String(prior.head)} is not HEAD ${head ?? "(unknown)"}`;
+	if (typeof prior.finishedAt !== "string" || prior.finishedAt === "") return "receipt not finished";
+	return undefined;
+}
+
+/** Socket-level failures (nothing listening yet); a daemon that answered, even with a refusal, is not one. */
+const isConnectFailure = (error: unknown): boolean => {
+	const code = errorCode(error);
+	return code === "ECONNREFUSED" || code === "ENOENT" || /Failed to connect|ECONNREFUSED|ENOENT/.test(msg(error));
+};
+
+/**
+ * One apply per home at a time: takes `<home>/apply.lock` (waiting for a live holder, taking over a stale one), runs
+ * the apply and removes its own lock after the final receipt, so a waiter always finds that receipt complete.
+ */
+export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<ApplyOutcome> {
+	const stamp = options.stamp ?? backupStamp(new Date(deps.now()));
+	const lockPath = join(deps.homeDir, APPLY_LOCK_FILE);
+	const lock = {
+		info: { pid: deps.pid, stamp, startedAt: new Date(deps.now()).toISOString() },
+		held: false,
+	};
+	try {
+		return await applyUnderLock({ ...options, stamp }, deps, lockPath, lock);
+	} finally {
+		if (lock.held) {
+			try {
+				if (releaseApplyLock(lockPath, lock.info)) deps.log(`apply lock released ${lockPath}`);
+			} catch (error) {
+				deps.log(`apply lock release failed ${lockPath}: ${msg(error)}`);
+			}
+		}
+	}
+}
+
 /**
  * Applies a merged change to the running daemon in one auditable pass: precheck → backup (db + config copy) →
  * drain → restart → wait for a fresh daemon → record gates/doctor → roll back config and restart once on failure.
  * Code is never reverted automatically; the receipt carries the previous HEAD and the revert command instead.
  */
-export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<ApplyOutcome> {
+async function applyUnderLock(
+	options: ApplyOptions & { stamp: string },
+	deps: ApplyDeps,
+	lockPath: string,
+	lock: { info: ApplyLockInfo; held: boolean },
+): Promise<ApplyOutcome> {
 	const { homeDir, repoDir, unit } = deps;
 	const startedMs = deps.now();
-	const stamp = options.stamp ?? backupStamp(new Date(startedMs));
+	const { stamp } = options;
 	const receiptPath = receiptPathFor(homeDir, stamp);
 	const steps: StepRecord[] = [];
 	const receipt: ApplyReceipt = {
@@ -317,29 +494,102 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 			const text =
 				`[자동 후속] apply 결과 ${status}${summary ? ` (${summary})` : ""}. 영수증 ${receiptPath}를 읽고 ` +
 				"증거와 함께 이 스레드에 짧게 보고해줘(새 수정·재시작 금지).";
+			// A daemon restarting under someone else's apply (or by hand) refuses connections for a few seconds:
+			// retry those. A daemon that answered, even with a refusal, is not asked again.
 			let ok = false;
-			let detail: string;
-			try {
-				const response = await deps.callDaemon(
-					{
-						op: "inject",
-						origin: options.reportOrigin,
-						asOwner: true,
-						text,
-						thread: options.reportThread,
-					},
-					30_000,
-				);
-				ok = typeof response === "object" && response !== null && "ok" in response && response.ok === true;
-				detail = ok ? "injected" : `inject refused: ${JSON.stringify(response)}`;
-			} catch (error) {
-				detail = `inject failed: ${msg(error)}`;
+			let detail = "";
+			for (let attempt = 1; ; attempt += 1) {
+				try {
+					const response = await deps.callDaemon(
+						{
+							op: "inject",
+							origin: options.reportOrigin,
+							asOwner: true,
+							text,
+							thread: options.reportThread,
+						},
+						30_000,
+					);
+					ok = typeof response === "object" && response !== null && "ok" in response && response.ok === true;
+					detail = ok
+						? `injected attempts=${attempt}`
+						: `inject refused attempts=${attempt}: ${JSON.stringify(response)}`;
+					break;
+				} catch (error) {
+					if (isConnectFailure(error) && attempt < REPORT_INJECT_ATTEMPTS) {
+						await deps.sleep(REPORT_INJECT_RETRY_MS);
+						continue;
+					}
+					detail = `inject failed attempts=${attempt}: ${msg(error)}`;
+					break;
+				}
 			}
 			receipt.report = { origin: options.reportOrigin, thread: options.reportThread, ok, detail };
 			writeReceipt();
 		}
 		return { exitCode, receipt };
 	};
+
+	// 0. apply lock: a live holder is waited for (no drain, no restart meanwhile), a stale one taken over. Running
+	// past the limit changes nothing and fails, leaving the holder's lock alone.
+	let waitedFor: string | undefined;
+	const acquire = async (): Promise<StepResult & { noted: boolean }> => {
+		const limitMs = options.timeoutMin * 60_000 + READY_TIMEOUT_MS;
+		const deadline = deps.now() + limitMs;
+		const notes: string[] = [];
+		for (;;) {
+			if (createApplyLock(lockPath, lock.info)) {
+				lock.held = true;
+				deps.log(`apply lock taken ${lockPath}`);
+				if (waitedFor !== undefined) notes.push(`waited for apply ${waitedFor}`);
+				return { ok: true, detail: notes.join("; "), noted: notes.length > 0 };
+			}
+			let seen: string;
+			try {
+				seen = readFileSync(lockPath, "utf8");
+			} catch (error) {
+				if (errorCode(error) === "ENOENT") continue; // released between our link and read: try again
+				throw error;
+			}
+			const holder = parseApplyLock(seen);
+			// The outer apply of this very process (same stamp) already holds this home: waiting would wait on itself.
+			if (holder?.pid === deps.pid && holder.stamp === stamp) {
+				return { ok: false, detail: `${lockPath} is held by this apply ${stamp} itself`, noted: true };
+			}
+			// A dead holder, broken JSON, or this pid left by an earlier process (another stamp) is stale.
+			if (holder === undefined || holder.pid === deps.pid || !deps.isAlive(holder.pid)) {
+				const reclaim = reclaimStaleApplyLock(lockPath, seen, deps.pid);
+				if (reclaim.outcome === "contention") {
+					return { ok: false, detail: `lock contention (moved-aside lock left at ${reclaim.aside})`, noted: true };
+				}
+				if (reclaim.outcome === "taken") notes.push(`stale lock ${holder?.stamp ?? "(unreadable)"} taken over`);
+				continue;
+			}
+			if (waitedFor !== holder.stamp) deps.log(`apply wait_apply waiting for apply ${holder.stamp} pid=${holder.pid}`);
+			waitedFor = holder.stamp;
+			if (deps.now() >= deadline) {
+				return {
+					ok: false,
+					detail: `apply ${holder.stamp} still running after ${limitMs / 60_000} min`,
+					noted: true,
+				};
+			}
+			await deps.sleep(READY_POLL_MS);
+		}
+	};
+	// Recorded as a step only when there was someone to wait for or take over (or it failed).
+	const lockStartedMs = deps.now();
+	let acquired: StepResult & { noted: boolean };
+	try {
+		acquired = await acquire();
+	} catch (error) {
+		acquired = { ok: false, detail: msg(error), noted: true };
+	}
+	if (acquired.noted) {
+		steps.push({ name: "wait_apply", ok: acquired.ok, detail: acquired.detail, ms: deps.now() - lockStartedMs });
+		deps.log(`apply step=wait_apply ok=${acquired.ok} detail=${acquired.detail}`);
+	}
+	if (!acquired.ok) return finish("failed", 1);
 
 	// 1. precheck: anything wrong here changes nothing and ends as SKIP.
 	const skipReasons: string[] = [];
@@ -405,6 +655,21 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		});
 		return allOk ? finish(status, 0) : finish("failed", 1);
 	};
+	// After waiting, the apply waited for may already have put this HEAD in place (here and on the peers): its receipt
+	// decides. Anything short of a finished ok/already_applied receipt on this HEAD runs the full apply below.
+	if (waitedFor !== undefined) {
+		const prior = waitedFor;
+		let covered = false;
+		await step("prior_apply", () => {
+			const gap = priorReceiptGap(receiptPathFor(homeDir, prior), receipt.head);
+			covered = gap === undefined;
+			return {
+				ok: true,
+				detail: covered ? `applied by apply-${prior}` : `apply-${prior} not reused (${gap}): full apply`,
+			};
+		});
+		if (covered) return finish("already_applied", 0);
+	}
 	if (alreadyApplied !== undefined) return finishWithPeers("already_applied");
 
 	// 2. backup: ledger/bundle snapshot plus a config copy to roll back to.
@@ -437,6 +702,16 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 		return { ok: true, detail };
 	});
 	if (!backedUp) return finish("failed", 1);
+
+	// 2b. bot omp profile: the restarted daemon reads the synced settings; a failed sync leaves the running bot alone.
+	const { ompSync } = deps;
+	if (ompSync !== undefined) {
+		const synced = await step("omp_sync", () => ({
+			ok: true,
+			detail: `omp_profile_sync changed=${ompSync().changed}`,
+		}));
+		if (!synced) return finish("failed", 1);
+	}
 
 	// A path that ends without a verified new daemon leaves the old one draining: cancel it and record it.
 	const cancelDrain = async (): Promise<string> => {

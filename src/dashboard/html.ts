@@ -206,6 +206,211 @@ export function openTurnsText(thread: { openCount: number; runCount: number; pen
 	return parts.join(" · ");
 }
 
+export type InboxCol = "attention" | "working" | "wait";
+
+/** One inbox card: an agent pane (with its TASK merged in), or an open TASK no pane carries. */
+export interface InboxEntry {
+	id: string;
+	kind: "card" | "task";
+	col: InboxCol;
+	since: number;
+	title: string;
+	machine: string;
+	taskId: string;
+	card?: BoardCard;
+	task?: TaskInfo;
+}
+
+/**
+ * A board card with what its pane said merged in: the snapshot's `herdr.says` entry of the same host and pane, while
+ * the card still has the status it was read in. Self-contained (shipped to the page).
+ */
+export function cardWithSay(s: DashboardSnapshot | null | undefined, card: BoardCard): BoardCard {
+	const says = s?.herdr.ok ? (s.herdr.says ?? []) : [];
+	const host = card.local ? "local" : card.machineId;
+	const say = says.find((item) => item.host === host && item.paneId === card.paneId && item.status === card.status);
+	if (say === undefined) return card;
+	const { host: _host, paneId: _pane, status: _status, ...fields } = say;
+	return { ...card, ...fields };
+}
+
+/**
+ * The inbox cards of a snapshot and the live board, each in its column; no search, no order. Self-contained apart from
+ * `cardWithSay` (shipped to the page).
+ */
+export function inboxEntries(s: DashboardSnapshot, live?: BoardPanel | null): InboxEntry[] {
+	const board = live?.ok ? live : undefined;
+	const msOf = (iso: string | undefined): number => {
+		const ms = Date.parse(iso ?? "");
+		return Number.isNaN(ms) ? 0 : ms;
+	};
+	const tasks = s.tasks.ok ? s.tasks.items : [];
+	const trouble = (task: TaskInfo): boolean => task.status === "blocked" || task.error !== undefined;
+	const lone = (task: TaskInfo): InboxCol => {
+		// While the board is live, an open TASK whose pane is not on it has lost its agent: the owner should look.
+		if (board !== undefined || trouble(task)) return "attention";
+		const herdr = task.herdr;
+		if (herdr !== undefined && !herdr.ok) {
+			if (herdr.error !== "herdr is not configured") return "attention";
+			return task.status === "review" ? "wait" : "working";
+		}
+		if (herdr !== undefined && herdr.status !== "working" && herdr.status !== "idle" && herdr.status !== "done") {
+			return "attention";
+		}
+		if (task.status === "review") return "wait";
+		return herdr === undefined || herdr.status === "working" ? "working" : "wait";
+	};
+	const entries: InboxEntry[] = [];
+	for (const boardCard of board?.cards ?? []) {
+		const card = cardWithSay(s, boardCard);
+		const task = card.taskId === undefined ? undefined : tasks.find((item) => item.taskId === card.taskId);
+		// A finished pane, with or without a TASK, goes to 완료·대기; only trouble or a blocked pane asks the owner.
+		const col: InboxCol =
+			card.column === "attention" || (task !== undefined && trouble(task))
+				? "attention"
+				: card.column === "working"
+					? "working"
+					: "wait";
+		entries.push({
+			id: card.key,
+			kind: "card",
+			col,
+			since: card.since,
+			title: task?.title || card.paneLabel,
+			machine: card.machineName,
+			taskId: card.taskId ?? "",
+			card,
+			...(task === undefined ? {} : { task }),
+		});
+	}
+	for (const task of tasks) {
+		if (!task.open || entries.some((entry) => entry.taskId === task.taskId)) continue;
+		entries.push({
+			id: task.taskId,
+			kind: "task",
+			col: lone(task),
+			since: msOf(task.progress?.updated) || msOf(task.updatedAt),
+			title: task.title,
+			machine: task.host,
+			taskId: task.taskId,
+			task,
+		});
+	}
+	return entries;
+}
+
+/**
+ * The 확인 필요 group of an entry: 0 failed (TASK documents not judged, worker check failed or gone, unknown pane state),
+ * 1 blocked, 2 the rest (no agent card…). Self-contained (shipped).
+ */
+export function attentionGroup(entry: InboxEntry): number {
+	const task = entry.task;
+	const card = entry.card;
+	const herdr = task?.herdr;
+	if (task?.error !== undefined || (herdr !== undefined && (!herdr.ok || herdr.status === "gone")) || card?.unknown) {
+		return 0;
+	}
+	if (task?.status === "blocked" || card?.status === "blocked") return 1;
+	return 2;
+}
+
+/**
+ * The one 확인 필요 order: group, then the longest wait first (an unknown since, 0, after every known one), then id.
+ * Self-contained apart from `attentionGroup`.
+ */
+export function byAttention(a: InboxEntry, b: InboxEntry): number {
+	return (
+		attentionGroup(a) - attentionGroup(b) ||
+		Number(a.since === 0) - Number(b.since === 0) ||
+		a.since - b.since ||
+		(a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+	);
+}
+
+/**
+ * The 확인 필요 entries in the one order the next line, the number badges and keys and the tab title use; never
+ * filtered by the search. Self-contained apart from `inboxEntries`/`byAttention` (shipped beside it).
+ */
+export function inboxAttention(s: DashboardSnapshot, live?: BoardPanel | null): InboxEntry[] {
+	return inboxEntries(s, live)
+		.filter((entry) => entry.col === "attention")
+		.sort(byAttention);
+}
+
+/** Why the owner should look at a 확인 필요 entry, failure first, cut at 120 characters. Self-contained (shipped). */
+export function inboxNextReason(entry: InboxEntry, live: boolean): string {
+	const task = entry.task;
+	const card = entry.card;
+	const herdr = task?.herdr;
+	const reason =
+		task?.error ??
+		(herdr !== undefined && !herdr.ok
+			? herdr.error
+			: herdr?.status === "gone"
+				? "워커 사라짐"
+				: card?.unknown
+					? `알 수 없는 상태 ${card.status || "?"}`
+					: task?.progress?.blockedReason
+						? task.progress.blockedReason
+						: card?.status === "blocked"
+							? (card.question ?? card.blocked ?? "에이전트 입력 대기")
+							: entry.kind === "task" && live
+								? "에이전트 카드 없음"
+								: "확인 필요");
+	return reason.length > 120 ? `${reason.slice(0, 119)}…` : reason;
+}
+
+/** The tab icon for a state: the brand mark, the same with a red dot (확인 필요), all grey (이상). Self-contained. */
+export function faviconHref(state: "ok" | "attention" | "bad"): string {
+	const fill = state === "bad" ? "#525860" : "#0860CA";
+	const dot =
+		state === "attention" ? '<circle cx="25" cy="7" r="6" fill="#B91C1C" stroke="#FFFFFF" stroke-width="2"/>' : "";
+	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect x="2" y="4" width="26" height="26" rx="7" fill="${fill}"/><circle cx="15" cy="17" r="6.5" fill="none" stroke="#FFFFFF" stroke-width="3"/>${dot}</svg>`;
+	return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+/**
+ * The tab title and icon: `(!)` when the last refresh failed, the daemon is not running or the board is cut off;
+ * otherwise the 확인 필요 count. Self-contained apart from `inboxAttention`/`faviconHref` (shipped beside it).
+ */
+export function tabSignal(
+	s: DashboardSnapshot,
+	board: BoardPanel | null | undefined,
+	failed: boolean,
+): { count: number; bad: boolean; title: string; favicon: string } {
+	const bad = failed || !s.daemon.ok || !s.daemon.running || (board !== undefined && board !== null && !board.ok);
+	const count = inboxAttention(s, board).length;
+	const title = bad ? "(!) ompbot 현황판" : count > 0 ? `(${count}) 확인 필요 · ompbot 현황판` : "ompbot 현황판";
+	return { count, bad, title, favicon: faviconHref(bad ? "bad" : count > 0 ? "attention" : "ok") };
+}
+
+/** A key press as the number and reply keys see it. */
+export interface OrderKeyInput {
+	key: string;
+	meta?: boolean;
+	ctrl?: boolean;
+	alt?: boolean;
+	typing?: boolean;
+	modalOpen?: boolean;
+	view?: string;
+}
+
+/**
+ * The id key `1`…`9` opens: the card with that number on screen (`numberedIds` in number order), or null — typing,
+ * a modal open, a modifier held, a view other than the inbox, or no card with that number. Self-contained (shipped).
+ */
+export function orderKeyTarget(input: OrderKeyInput, numberedIds: string[]): string | null {
+	if (input.typing || input.modalOpen || input.meta || input.ctrl || input.alt || input.view !== "inbox") return null;
+	if (!/^[1-9]$/.test(input.key)) return null;
+	return numberedIds[Number(input.key) - 1] ?? null;
+}
+
+/** The address key `r` opens: the next line's reply link, under the same conditions as {@link orderKeyTarget}. */
+export function replyKeyTarget(input: OrderKeyInput, replyHref: string | null | undefined): string | null {
+	if (input.typing || input.modalOpen || input.meta || input.ctrl || input.alt || input.view !== "inbox") return null;
+	return input.key === "r" && replyHref ? replyHref : null;
+}
+
 export function renderDashboardMain(
 	s: DashboardSnapshot,
 	board?: BoardPanel,
@@ -219,7 +424,7 @@ export function renderDashboardMain(
 			.replace(/>/g, "&gt;")
 			.replace(/"/g, "&quot;")
 			.replace(/'/g, "&#39;");
-	/** `2026-11-04T09:02:53+09:00` → `11-04 09:02` (times arrive in KST). */
+	/** `2026-11-04T09:02:53-05:00` → `11-04 09:02` (times arrive with the offset of the snapshot's `timezone`). */
 	const at = (iso: string | null | undefined): string => (iso ? esc(iso.slice(5, 16).replace("T", " ")) : "-");
 	const dur = (ms: number | null | undefined): string => {
 		if (ms === null || ms === undefined) return "-";
@@ -338,73 +543,21 @@ export function renderDashboardMain(
 	const theme = ui.theme === "light" || ui.theme === "dark" ? ui.theme : "system";
 
 	// ---- the inbox: one entry per agent pane, plus the open TASKs no pane carries ----
-	type Col = "attention" | "working" | "wait";
-	interface Entry {
-		id: string;
-		kind: "card" | "task";
-		col: Col;
-		since: number;
-		title: string;
-		machine: string;
-		taskId: string;
-		card?: BoardCard;
-		task?: TaskInfo;
-	}
+	type Col = InboxCol;
+	type Entry = InboxEntry;
 	const tasks = s.tasks.ok ? s.tasks.items : [];
-	const taskTrouble = (task: TaskInfo): boolean => task.status === "blocked" || task.error !== undefined;
-	const loneColumn = (task: TaskInfo): Col => {
-		// While the board is live, an open TASK whose pane is not on it has lost its agent: the owner should look.
-		if (live !== undefined || taskTrouble(task)) return "attention";
-		const herdr = task.herdr;
-		if (herdr !== undefined && !herdr.ok) {
-			if (herdr.error !== "herdr is not configured") return "attention";
-			return task.status === "review" ? "wait" : "working";
-		}
-		if (herdr !== undefined && herdr.status !== "working" && herdr.status !== "idle" && herdr.status !== "done") {
-			return "attention";
-		}
-		if (task.status === "review") return "wait";
-		return herdr === undefined || herdr.status === "working" ? "working" : "wait";
-	};
-	const entries: Entry[] = [];
-	for (const card of live?.cards ?? []) {
-		const task = card.taskId === undefined ? undefined : tasks.find((item) => item.taskId === card.taskId);
-		const col: Col =
-			card.column === "attention" || (task !== undefined && taskTrouble(task))
-				? "attention"
-				: card.column === "working"
-					? "working"
-					: "wait";
-		entries.push({
-			id: card.key,
-			kind: "card",
-			col,
-			since: card.since,
-			title: task?.title || card.paneLabel,
-			machine: card.machineName,
-			taskId: card.taskId ?? "",
-			card,
-			...(task === undefined ? {} : { task }),
-		});
-	}
-	for (const task of tasks) {
-		if (!task.open || entries.some((entry) => entry.taskId === task.taskId)) continue;
-		entries.push({
-			id: task.taskId,
-			kind: "task",
-			col: loneColumn(task),
-			since: msOf(task.progress?.updated) || msOf(task.updatedAt),
-			title: task.title,
-			machine: task.host,
-			taskId: task.taskId,
-			task,
-		});
-	}
+	const entries = inboxEntries(s, live);
 	const RANK: Record<Col, number> = { attention: 0, working: 1, wait: 2 };
-	const byDefault = (a: Entry, b: Entry): number => RANK[a.col] - RANK[b.col] || b.since - a.since;
+	// 확인 필요 keeps the one order (longest wait first); the other columns show the newest first.
+	const byDefault = (a: Entry, b: Entry): number =>
+		RANK[a.col] - RANK[b.col] || (a.col === "attention" ? byAttention(a, b) : b.since - a.since);
 	const shown = entries.filter((entry) =>
 		hit(entry.title, entry.taskId, entry.machine, entry.card?.paneLabel, entry.card?.name),
 	);
+	// The next line and the tab count use every 확인 필요 entry, whatever the search hides.
+	const attention = entries.filter((entry) => entry.col === "attention").sort(byAttention);
+	const next = attention[0];
+	const signalBad = !s.daemon.ok || !s.daemon.running || (board !== undefined && !board.ok);
 	const closed = tasks.filter((task) => !task.open && hit(task.title, task.taskId, task.host));
 
 	const linkOf = (entry: { kind: string; id: string }): string =>
@@ -429,6 +582,11 @@ export function renderDashboardMain(
 	};
 	const summaryOf = (entry: Entry): string => {
 		const task = entry.task;
+		const said = entry.card;
+		// What the pane itself says comes first: its question or why it is blocked, a finished pane's last answer.
+		if (said?.status === "blocked" && said.question) return `묻는 말: ${said.question}`;
+		if (said?.status === "blocked" && said.blocked) return said.blocked;
+		if (said?.status === "done" && said.taskId === undefined && said.lastSay) return said.lastSay;
 		const parts: string[] = [];
 		if (task?.progress?.current) parts.push(task.progress.current);
 		if (task?.progress?.blockedReason) parts.push(`막힌 이유: ${task.progress.blockedReason}`);
@@ -451,16 +609,62 @@ export function renderDashboardMain(
 		return `<span class="card-worker">워커 ${esc(label)}</span>`;
 	};
 	const stateKeyOf = (entry: Entry): string => `${entry.col}:${entry.card?.status ?? ""}:${entry.task?.status ?? ""}`;
-	const cardOf = (entry: Entry): string => {
+	/** One inbox card; a 확인 필요 card carries its number on screen (1…9, `order`) and the next line's mark. */
+	const cardOf = (entry: Entry, order = 0): string => {
 		const eyebrow = entry.taskId ? `${entry.taskId} · ${entry.machine}` : entry.machine;
 		const meta = entry.task !== undefined ? progressOf(entry.task) : [entry.card?.agent ?? ""];
-		return `<a class="card${isSel(entry.id) ? " is-selected" : ""}" data-state="${esc(stateKeyOf(entry))}" ${linkOf(entry)} data-row="${esc(entry.id)}"${
-			isSel(entry.id) ? ' aria-current="true"' : ""
-		}><p class="card-eyebrow">${esc(eyebrow)}</p><p class="card-title">${esc(entry.title)}</p><p class="card-sum">${esc(
-			summaryOf(entry),
-		)}</p><div class="card-foot"><span class="badges">${badgesOf(entry)}</span>${workerOf(entry)}<span class="card-time">${ago(
+		const isNext = next !== undefined && next.kind === entry.kind && next.id === entry.id;
+		const classes = `card${isSel(entry.id) ? " is-selected" : ""}${isNext ? " is-next" : ""}${
+			entry.col === "attention" && attentionGroup(entry) === 0 ? " is-fail" : ""
+		}`;
+		return `<a class="${classes}" data-state="${esc(stateKeyOf(entry))}" ${linkOf(entry)} data-row="${esc(entry.id)}"${
+			order > 0 ? ` data-order="${order}"` : ""
+		}${isSel(entry.id) ? ' aria-current="true"' : ""}><p class="card-eyebrow">${
+			order > 0 ? `<span class="order-no">${order}</span>` : ""
+		}${esc(eyebrow)}</p><p class="card-title">${esc(entry.title)}</p><p class="card-sum">${esc(summaryOf(entry))}</p>${
+			entry.card?.status === "blocked" && entry.card.question && (entry.card.options ?? []).length > 0
+				? `<p class="card-options">${(entry.card.options ?? []).map((option) => esc(option)).join(" / ")}</p>`
+				: ""
+		}${
+			entry.card?.lastPrompt
+				? `<p class="card-prompt">마지막 지시 · ${entry.card.lastPrompt.kind === "remind" ? "리마인더 · " : ""}${ago(
+						entry.card.lastPrompt.at,
+					)}: ${esc(entry.card.lastPrompt.preview)}</p>`
+				: ""
+		}<div class="card-foot"><span class="badges">${badgesOf(entry)}</span>${workerOf(entry)}<span class="card-time">${ago(
 			entry.since,
-		)}</span><span class="card-meta">${meta.map((part) => `<span>${esc(part)}</span>`).join("")}</span></div></a>`;
+		)}</span><span class="card-meta">${meta.map((part) => `<span>${esc(part)}</span>`).join("")}</span>${
+			isNext ? '<span class="next-tag">다음</span>' : ""
+		}</div></a>`;
+	};
+	/** The next line: the first 확인 필요 entry (search or not), why, where and how long; a quiet line when none. */
+	const nextLine = (): string => {
+		if (next === undefined) {
+			return `<p class="next-quiet">${signalBad ? "다음 · 상태 모름 — 갱신 끊김" : "다음 · 기다리는 항목 없음"}</p>`;
+		}
+		const minutes = next.since ? Math.floor(Math.max(0, clock - next.since) / 60_000) : -1;
+		const [amount, unit] =
+			minutes < 0
+				? ["-", ""]
+				: minutes < 1
+					? ["방금", ""]
+					: minutes < 60
+						? [String(minutes), "분"]
+						: minutes < 1440
+							? [String(Math.floor(minutes / 60)), "시간"]
+							: [String(Math.floor(minutes / 1440)), "일"];
+		const title = next.title.length > 24 ? `${next.title.slice(0, 23)}…` : next.title;
+		const where = [next.machine, next.task?.branch || next.taskId].filter((part) => part).join(" · ");
+		const reply = next.card?.replyUrl;
+		return `<div class="next-line"><a class="next-up" ${linkOf(next)}><span class="next-label">다음</span><span class="next-title">${esc(
+			title,
+		)}</span><span class="next-why">${esc(inboxNextReason(next, live !== undefined))}${
+			where === "" ? "" : ` · ${esc(where)}`
+		}</span><span class="next-wait"><b>${amount}</b>${unit}</span></a>${
+			reply
+				? `<a class="next-reply" href="${esc(reply)}" target="_blank" rel="noopener noreferrer">herdr에서 답하기 ↗</a>`
+				: ""
+		}</div>`;
 	};
 
 	const banners: string[] = [];
@@ -518,10 +722,11 @@ export function renderDashboardMain(
 		).join("");
 		const columns = COLS.map(([id, label, none, hint]) => {
 			const cards = shown.filter((entry) => entry.col === id).sort(byDefault);
+			// Numbers go to the 확인 필요 cards on screen (after the search), 1…9 without gaps.
 			const body =
 				cards.length === 0
 					? `<div class="col-empty-wrap"><p class="col-empty">${esc(none)}</p><p class="col-empty-sub">${esc(hint)}</p></div>`
-					: cards.map(cardOf).join("");
+					: cards.map((entry, index) => cardOf(entry, id === "attention" && index < 9 ? index + 1 : 0)).join("");
 			const recent =
 				id !== "wait" || closed.length === 0
 					? ""
@@ -562,6 +767,12 @@ export function renderDashboardMain(
 																	(agent) =>
 																		`<div class="row"><div class="row-main"><div class="badges">${state(agent.agentStatus)}</div><p class="row-title">${esc(agent.name)}</p>${
 																			agent.terminalTitle ? `<p class="row-sub">${esc(agent.terminalTitle)}</p>` : ""
+																		}${
+																			agent.question
+																				? `<p class="row-sub">묻는 말: ${esc(agent.question)}</p>`
+																				: agent.blocked || agent.lastSay
+																					? `<p class="row-sub">${esc(agent.blocked || agent.lastSay)}</p>`
+																					: ""
 																		}<p class="row-sub">${agent.taskId ? `${esc(agent.taskId)} · ` : ""}${esc(agent.cwd)}</p></div></div>`,
 																)
 																.join("")}</div>`
@@ -573,9 +784,9 @@ export function renderDashboardMain(
 		// The head names what it counts: the 진행 중 column, the same number as the side nav.
 		const working = shown.filter((entry) => entry.col === "working").length;
 		if (q !== "" && shown.length === 0 && closed.length === 0) {
-			return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nothing}${agents}`;
+			return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nextLine()}${nothing}${agents}`;
 		}
-		return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${
+		return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nextLine()}${
 			shown.length === 0 ? nothing : ""
 		}<nav class="col-chips" aria-label="열로 이동">${chips}</nav><div class="inbox">${columns}</div>${agents}`;
 	};
@@ -762,6 +973,15 @@ export function renderDashboardMain(
 				].join("");
 			const byRecent = (a: (typeof threads)[number], b: (typeof threads)[number]): number =>
 				THREAD_RANK[a.column] - THREAD_RANK[b.column] || msOf(b.updatedAt) - msOf(a.updatedAt);
+			/** The session's model (provider cut) and thinking; a fallback model in the warning tone. Nothing when unknown. */
+			const modelChip = (model: (typeof threads)[number]["model"]): string => {
+				if (model === undefined) return "";
+				const name = model.model.slice(model.model.lastIndexOf("/") + 1);
+				const text = model.thinking === null ? name : `${name} · ${model.thinking}`;
+				return `<span class="badge model-chip${model.fallback ? " is-warning" : ""}" title="${esc(model.model)}">${
+					model.fallback ? "폴백 · " : ""
+				}${esc(text)}</span>`;
+			};
 			const threadCard = (thread: (typeof threads)[number]): string => {
 				const key = thread.originKey;
 				const place = placeOf(key);
@@ -784,7 +1004,7 @@ export function renderDashboardMain(
 					thread,
 				)}</span><span class="card-time">${ago(msOf(thread.updatedAt))}</span><span class="card-meta">${meta
 					.map((part) => `<span>${esc(part)}</span>`)
-					.join("")}</span></div></a>`;
+					.join("")}${modelChip(thread.model)}</span></div></a>`;
 			};
 			const lead = `${banners.join("")}${drainLine}${threads.length === 0 ? nothing : ""}`;
 			if (ui.layout === "list") {
@@ -892,7 +1112,7 @@ export function renderDashboardMain(
 				)}</p>${renderFlowChain(chain, selected, false)}</section>`;
 			});
 			const lead =
-				'<p class="lead flow-lead">요청 하나가 어떤 TASK를 거쳐 끝나는지 등록 순서대로 보여 줘요. 노란 테두리 상자가 다음에 풀 고리예요. 상자를 누르면 오른쪽에 TASK 상세가 열려요.</p>';
+				'<p class="lead flow-lead">요청 하나가 어떤 TASK를 거쳐 끝나는지 보여 줘요. 시간이 겹쳐 같이 돈 TASK는 한 묶음 상자에 쌓이고, 묶음 사이 노란 알약은 다음 묶음까지 기다린 시간이에요. 노란 테두리 상자가 다음에 풀 고리예요. 상자를 누르면 오른쪽에 TASK 상세가 열려요.</p>';
 			return `${head("흐름", flows.items.length)}${banners.join("")}${lead}${
 				cards.length === 0
 					? flows.items.length > 0
@@ -981,10 +1201,12 @@ export function renderDashboardMain(
 		if (view === "monitors") {
 			const monitors = s.monitors;
 			if (!monitors.ok) return `${head("모니터", undefined)}${banners.join("")}${failed(monitors.error)}`;
-			// Groups by the KST day of the next fire against the snapshot's own day.
+			// Groups by the day of the next fire against the snapshot's own day; both are written in the snapshot's zone
+			// (`s.timezone`), so the calendar date after `today` is plain date arithmetic, whatever the offset or DST.
 			const generated = Date.parse(s.generatedAt);
 			const today = s.generatedAt.slice(0, 10);
-			const tomorrow = new Date(generated + 9 * 3_600_000 + 86_400_000).toISOString().slice(0, 10);
+			const [year = 0, month = 1, day = 1] = today.split("-").map(Number);
+			const tomorrow = new Date(Date.UTC(year, month - 1, day + 1)).toISOString().slice(0, 10);
 			const dayOf = (monitor: MonitorInfo): string => {
 				const day = monitor.nextFireAt?.slice(0, 10);
 				return day === undefined ? "none" : day === today ? "today" : day === tomorrow ? "tomorrow" : "later";
@@ -1187,7 +1409,8 @@ export function renderDashboardMain(
 		}
 
 		const socket = d.ok ? d.heartbeat?.socket : undefined;
-		if (!d.ok) pushCard("slack", "Slack", "warn", noDaemon);
+		if (s.slackOff === true) pushCard("slack", "Slack", "ok", facts([["상태", "꺼짐 · channels.slack 없음"]]));
+		else if (!d.ok) pushCard("slack", "Slack", "warn", noDaemon);
 		else if (socket === undefined) pushCard("slack", "Slack", "warn", note("소켓 상태 기록이 아직 없어요."));
 		else {
 			pushCard(
@@ -1394,6 +1617,13 @@ export function renderDashboardMain(
 			warnOf(s.turns, s.turns.ok && s.turns.threads.some((thread) => thread.column === "attention")) ||
 				warnOf(s.jobs, s.jobs.ok && s.jobs.items.some((job) => job.health !== "ok")),
 		],
+		// Requests with an open TASK; a blocked TASK in any of them lights the warning.
+		flow: [
+			s.flows?.ok ? s.flows.items.filter((chain) => chain.here !== null).length : 0,
+			s.flows === undefined ||
+				!s.flows.ok ||
+				s.flows.items.some((chain) => chain.tasks.some((step) => step.status === "blocked")),
+		],
 		lanes: [count(s.lanes), !s.lanes.ok],
 		approvals: [count(s.approvals), warnOf(s.approvals, count(s.approvals) > 0)],
 		monitors: [
@@ -1403,19 +1633,19 @@ export function renderDashboardMain(
 				s.monitors.ok && s.monitors.items.some((monitor) => monitor.openIncidents > 0 || monitor.failStreak > 0),
 			),
 		],
-		alerts: openAlerts > 0 ? [openAlerts, true] : [count(s.alerts), !s.alerts.ok],
+		// Only open alerts count; closed-gate records stay in the tab's list without a number on the tab.
+		alerts: [openAlerts, openAlerts > 0 || !s.alerts.ok],
 		system: [d.ok ? d.openGates.length : 0, !d.ok || !d.running || d.openGates.length > 0 || d.frozen !== undefined],
 	};
-	// The flow view is reached from a conversation's or a TASK's detail panel, not the side nav.
-	const nav = VIEWS.filter(([id]) => id !== "flow")
-		.map(([id, label]) => {
-			const [n, warn] = NAV[id] ?? [0, false];
-			const current = id === view || (id === "inbox" && view === "list");
-			return `<a class="nav-item" href="${id === "inbox" ? "./" : `?view=${id}`}" data-view="${id}"${
-				current ? ' aria-current="page"' : ""
-			}><span>${esc(label)}</span><span class="nav-count${warn ? " is-warn" : ""}">${n}</span>${navIcon(id)}</a>`;
-		})
-		.join("");
+	const nav = VIEWS.map(([id, label]) => {
+		const [n, warn] = NAV[id] ?? [0, false];
+		const current = id === view || (id === "inbox" && view === "list");
+		return `<a class="nav-item" href="${id === "inbox" ? "./" : `?view=${id}`}" data-view="${id}"${
+			current ? ' aria-current="page"' : ""
+		}><span>${esc(label)}</span>${
+			id === "alerts" && n === 0 && !warn ? "" : `<span class="nav-count${warn ? " is-warn" : ""}">${n}</span>`
+		}${navIcon(id)}</a>`;
+	}).join("");
 	const hasLayout = view === "inbox" || view === "list" || view === "turns";
 	const layout = view === "list" || (view === "turns" && ui.layout === "list") ? "list" : "board";
 	// The turns view switches between its own board and table; inbox and list switch between theirs.
@@ -1504,7 +1734,66 @@ export function renderTaskFacts(task: TaskInfo): string {
 								: item(false, "남음", "", step.id, step.text),
 					)
 					.join("")}</ol>`;
-	return `<dl class="facts">${rows.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${value}</dd>`).join("")}</dl>${checks}${steps}`;
+	/**
+	 * The 스펙 → S1…Sn → 판정 → 리뷰 → 착지 band. Over 9 steps the unbroken done run before the current step folds
+	 * into one cell (the done step right before it stays), then, past 6 step cells, the steps after the second one
+	 * after the current step fold into `+m 남음`.
+	 */
+	const band = (): string => {
+		const list = task.steps ?? [];
+		if (list.length === 0) return "";
+		const finished = task.status === "done";
+		const review = task.status === "review";
+		const blocked = task.status === "blocked";
+		const cells: Array<{ text: string; state: "done" | "now" | "todo" }> = [];
+		const nowAt = review || finished ? -1 : list.findIndex((step) => step.id === now);
+		const firstOpen = list.findIndex((step) => !step.done);
+		const c = nowAt >= 0 ? nowAt + 1 : firstOpen >= 0 ? firstOpen + 1 : list.length;
+		let d = 0;
+		while (d < list.length && list[d]?.done) d += 1;
+		const n = list.length;
+		const k = n > 9 ? Math.min(d, c - 2) : 0;
+		const folded = k >= 2 ? k : 0;
+		const shown = (folded > 0 ? 1 : 0) + n - folded;
+		const keepTo = n > 9 && shown > 6 ? Math.min(n, c + 2) : n;
+		cells.push({ text: "스펙", state: "done" });
+		if (folded > 0) cells.push({ text: `${list[0]?.id}–${list[folded - 1]?.id} 끝남`, state: "done" });
+		for (let index = folded; index < keepTo; index += 1) {
+			const step = list[index];
+			if (step === undefined) continue;
+			cells.push({
+				text: step.id,
+				state: finished || step.done ? "done" : index === nowAt ? "now" : "todo",
+			});
+		}
+		if (keepTo < n) cells.push({ text: `+${n - keepTo} 남음`, state: finished ? "done" : "todo" });
+		cells.push({
+			text: `판정 ${task.acChecked ?? "-"}/${task.acTotal}`,
+			state: finished || review ? "done" : "todo",
+		});
+		cells.push({ text: "리뷰", state: finished ? "done" : review ? "now" : "todo" });
+		cells.push({ text: "착지", state: finished ? "done" : "todo" });
+		const nowCell = cells.findIndex((cell) => cell.state === "now");
+		const redAt = !blocked ? -1 : nowCell >= 0 ? nowCell : cells.findIndex((cell) => cell.text.startsWith("판정 "));
+		const items = cells
+			.map((cell, index) => {
+				const red = index === redAt;
+				const tone = red ? "is-blocked" : cell.state === "done" ? "is-done" : cell.state === "now" ? "is-now" : "";
+				const chip = red
+					? '<span class="band-chip">막힘</span>'
+					: cell.state === "now"
+						? '<span class="flow-here-chip">지금 여기</span>'
+						: "";
+				return `<li class="band-cell${tone === "" ? "" : ` ${tone}`}"${
+					cell.state === "now" ? ' aria-current="step"' : ""
+				}>${esc(cell.text)}${chip}</li>`;
+			})
+			.join("");
+		return `${blocked ? `<p class="band-blocked">막힘 ${esc(task.progress?.blockedReason ?? "")}</p>` : ""}<ol class="band${
+			task.status === "cancelled" ? " is-dim" : ""
+		}" aria-label="진행 띠">${items}</ol>`;
+	};
+	return `<dl class="facts">${rows.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${value}</dd>`).join("")}</dl>${band()}${checks}${steps}`;
 }
 
 /**
@@ -1573,29 +1862,83 @@ export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: bool
 		chain.originKey === ""
 			? `<div class="flow-box t-req">${request}</div>`
 			: `<a class="flow-box t-req" href="?view=turns&amp;item=${esc(encodeURIComponent(chain.originKey))}">${request}</a>`;
-	const boxes = chain.tasks
-		.map((step) => {
-			const [chip, chipTone] = CHIPS[step.status] ?? [step.status, "off"];
-			const here = step.taskId === chain.here;
-			const selected = step.taskId === focus;
-			const chars = Array.from(step.stage.msg.replace(/\s+/g, " ").trim());
-			const clipped = chars.length > 50 ? `${chars.slice(0, 49).join("")}…` : chars.join("");
-			const msg = clipped !== "" && step.stage.tone !== "done" ? ` · ${clipped}` : "";
-			const open = panel ? "" : ` data-item="${esc(step.taskId)}" data-row="${esc(step.taskId)}"`;
-			return `<span class="flow-arr" aria-hidden="true">→</span><a class="flow-box t-${esc(step.stage.tone)}${
-				here ? " is-here" : ""
-			}${selected ? " is-selected" : ""}" href="?view=flow&amp;item=${esc(encodeURIComponent(step.taskId))}"${open} data-state="${esc(
-				`${step.status}:${step.stage.label}`,
-			)}"${selected ? ' aria-current="true"' : ""}><span class="flow-bh"><b>${esc(
-				step.taskId,
-			)}</b><span class="flow-chip c-${chipTone}">${esc(chip)}</span>${
-				here ? '<span class="flow-here-chip">지금 여기</span>' : ""
-			}</span><span class="flow-bt">${esc(step.title)}</span><span class="flow-bs s-${esc(step.stage.tone)}">${esc(
-				step.stage.label,
-			)}${esc(msg)}</span></a>`;
+	const box = (step: FlowChainInfo["tasks"][number]): string => {
+		const [chip, chipTone] = CHIPS[step.status] ?? [step.status, "off"];
+		const here = step.taskId === chain.here;
+		const selected = step.taskId === focus;
+		const chars = Array.from(step.stage.msg.replace(/\s+/g, " ").trim());
+		const clipped = chars.length > 50 ? `${chars.slice(0, 49).join("")}…` : chars.join("");
+		const msg = clipped !== "" && step.stage.tone !== "done" ? ` · ${clipped}` : "";
+		const open = panel ? "" : ` data-item="${esc(step.taskId)}" data-row="${esc(step.taskId)}"`;
+		return `<a class="flow-box t-${esc(step.stage.tone)}${here ? " is-here" : ""}${
+			selected ? " is-selected" : ""
+		}" href="?view=flow&amp;item=${esc(encodeURIComponent(step.taskId))}"${open} data-state="${esc(
+			`${step.status}:${step.stage.label}`,
+		)}"${selected ? ' aria-current="true"' : ""}><span class="flow-bh"><b>${esc(
+			step.taskId,
+		)}</b><span class="flow-chip c-${chipTone}">${esc(chip)}</span>${
+			here ? '<span class="flow-here-chip">지금 여기</span>' : ""
+		}</span><span class="flow-bt">${esc(step.title)}</span><span class="flow-bs s-${esc(step.stage.tone)}">${esc(
+			step.stage.label,
+		)}${esc(msg)}</span></a>`;
+	};
+	/** An open TASK (or one whose close time does not parse) ends this long after its registration, for grouping. */
+	const OPEN_JOIN_MS = 10 * 60_000;
+	/** `N분` / `N시간 M분`, seconds and part minutes dropped. */
+	const span = (ms: number): string => {
+		const minutes = Math.floor(ms / 60_000);
+		const hours = Math.floor(minutes / 60);
+		return hours === 0 ? `${minutes}분` : `${hours}시간 ${minutes % 60}분`;
+	};
+	/**
+	 * Parallel groups: TASKs with a parsable registration time in registration order (stable), a TASK registered at
+	 * or after the current group's end opening a new group; TASKs whose registration time does not parse come last,
+	 * each its own group with no wait.
+	 */
+	const groupsOf = (
+		tasks: FlowChainInfo["tasks"],
+	): Array<{ tasks: FlowChainInfo["tasks"]; first: number; end: number; open: boolean }> => {
+		const timed = tasks
+			.map((step, index) => ({ step, index, created: Date.parse(step.createdAt) }))
+			.filter((item) => Number.isFinite(item.created))
+			.sort((a, b) => a.created - b.created || a.index - b.index);
+		const groups: Array<{ tasks: FlowChainInfo["tasks"]; first: number; end: number; open: boolean }> = [];
+		for (const { step, created } of timed) {
+			const closed = step.closedAt === undefined ? Number.NaN : Date.parse(step.closedAt);
+			const end = Number.isFinite(closed) ? closed : created + OPEN_JOIN_MS;
+			const last = groups[groups.length - 1];
+			if (last === undefined || created >= last.end) {
+				groups.push({ tasks: [step], first: created, end, open: step.closedAt === undefined });
+			} else {
+				last.tasks.push(step);
+				last.end = Math.max(last.end, end);
+				last.open = last.open || step.closedAt === undefined;
+			}
+		}
+		for (const step of tasks) {
+			if (Number.isFinite(Date.parse(step.createdAt))) continue;
+			groups.push({ tasks: [step], first: Number.NaN, end: Number.NaN, open: step.closedAt === undefined });
+		}
+		return groups;
+	};
+	const link = (gap: string): string =>
+		`<span class="flow-link">${gap === "" ? "" : `<span class="flow-gap">대기 ${esc(gap)}</span>`}<span class="flow-link-arr" aria-hidden="true"></span></span>`;
+	const groups = groupsOf(chain.tasks)
+		.map((group, index, all) => {
+			const before = all[index - 1];
+			const wait =
+				before === undefined || before.open || !Number.isFinite(group.first) || !Number.isFinite(before.end)
+					? Number.NaN
+					: group.first - before.end;
+			const gap = Number.isFinite(wait) && wait >= 60_000 ? span(wait) : "";
+			const name = group.tasks.length === 1 ? `${index + 1}차` : `${index + 1}차 · 병렬 ${group.tasks.length}`;
+			const took = !Number.isFinite(group.first) ? "" : group.open ? "진행 중" : span(group.end - group.first);
+			return `${link(gap)}<div class="flow-group" role="group" aria-label="${esc(name)}"><p class="flow-gh"><b>${esc(
+				name,
+			)}</b>${took === "" ? "" : `<span>${esc(took)}</span>`}</p>${group.tasks.map(box).join("")}</div>`;
 		})
 		.join("");
-	const body = `<p class="flow-now"><b>지금</b> ${esc(chain.now)}</p><div class="flow-row">${requestBox}${boxes}</div>`;
+	const body = `<p class="flow-now"><b>지금</b> ${esc(chain.now)}</p><div class="flow-row">${requestBox}${groups}</div>`;
 	return panel
 		? `<section class="detail-flow" aria-label="흐름"><h3 class="h3">흐름 <small>${chain.done}/${chain.total} 끝남</small></h3>${body}</section>`
 		: body;
@@ -1701,11 +2044,52 @@ export function renderDetailHead(
 	const lines = [
 		`${esc(card.machineName)} · ${esc(card.workspaceLabel)} · ${esc(card.tabLabel)} · ${esc(card.agent)}`,
 		card.cwd ? esc(card.cwd) : "",
-		`이 상태로 ${ago}부터 · 카드 ${esc(card.key)}`,
+		card.since === 0 ? `이 상태가 된 시각 - · 카드 ${esc(card.key)}` : `이 상태로 ${ago}부터 · 카드 ${esc(card.key)}`,
 	]
 		.filter((line) => line !== "")
 		.map((line) => `<p class="lead">${line}</p>`)
 		.join("");
+	// What the pane said: every pending question with all its choices, else why it is blocked, else its last answer.
+	const asks =
+		card.asks && card.asks.length > 0
+			? card.asks
+			: card.question
+				? [{ question: card.question, options: card.options ?? [] }]
+				: [];
+	const sayHtml =
+		asks.length > 0
+			? `<section class="detail-say" aria-label="묻는 말"><h3 class="h3">묻는 말</h3>${asks
+					.map(
+						(ask) =>
+							`<p class="lead">${esc(ask.question)}</p>${
+								ask.options.length > 0
+									? `<ul class="say-options">${ask.options.map((option) => `<li>${esc(option)}</li>`).join("")}</ul>`
+									: ""
+							}`,
+					)
+					.join("")}</section>`
+			: card.blocked
+				? `<section class="detail-say" aria-label="막힌 이유"><h3 class="h3">막힌 이유</h3><p class="lead">${esc(card.blocked)}</p></section>`
+				: card.lastSay
+					? `<section class="detail-say" aria-label="마지막 답"><h3 class="h3">마지막 답</h3><p class="lead">${esc(card.lastSay)}</p></section>`
+					: "";
+	const sayError = card.sayError ? `<p class="note-sub">${esc(card.sayError)}</p>` : "";
+	const prompt = card.lastPrompt;
+	const promptMinutes = prompt === undefined ? 0 : Math.floor(Math.max(0, now - prompt.at) / 60_000);
+	const promptHtml =
+		prompt === undefined
+			? ""
+			: `<section class="detail-say" aria-label="마지막 지시"><h3 class="h3">마지막 지시</h3><p class="lead">${esc(
+					prompt.preview,
+				)}</p><p class="note-sub">${prompt.kind === "remind" ? "리마인더 · " : prompt.kind === "start" ? "시작 지시 · " : ""}${
+					promptMinutes < 1
+						? "방금"
+						: promptMinutes < 60
+							? `${promptMinutes}분 전`
+							: promptMinutes < 1440
+								? `${Math.floor(promptMinutes / 60)}시간 전`
+								: `${Math.floor(promptMinutes / 1440)}일 전`
+				}</p></section>`;
 	const reply = /^https?:\/\//.test(card.replyUrl ?? "")
 		? `<a class="button" href="${esc(card.replyUrl)}" target="_blank" rel="noopener noreferrer">herdr에서 답하기</a>`
 		: "";
@@ -1717,7 +2101,7 @@ export function renderDetailHead(
 				)}" data-task="${esc(task.taskId)}">TASK만 보기</a></section>`;
 	return `<p class="eyebrow">${esc(card.machineName)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 		card.paneLabel,
-	)}</h2><div class="detail-actions">${badges.join("")}</div>${lines}${reply}${about}${
+	)}</h2><div class="detail-actions">${badges.join("")}</div>${lines}${sayHtml}${sayError}${promptHtml}${reply}${about}${
 		chain === undefined || task === undefined ? "" : renderFlowChain(chain, task.taskId, true)
 	}`;
 }
@@ -1805,8 +2189,20 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 						)}</span></button></li>`,
 				)
 				.join("");
+			const model = thread.model;
+			const modelName = model === undefined ? "" : model.model.slice(model.model.lastIndexOf("/") + 1);
 			return `${show(thread.title, [
 				["상태", esc(latest.state)],
+				...(model === undefined
+					? []
+					: ([
+							[
+								"모델",
+								`<span class="badge model-chip${model.fallback ? " is-warning" : ""}" title="${esc(model.model)}">${
+									model.fallback ? "폴백 · " : ""
+								}${esc(model.thinking === null ? modelName : `${modelName} · ${model.thinking}`)}</span>`,
+							],
+						] as Array<[string, string]>)),
 				["종류", esc(TURN_LABELS.kind[thread.kind])],
 				["대기 이유", latest.waitReason === null ? "-" : esc(TURN_LABELS.wait[latest.waitReason])],
 				["요청", latest.preview === null ? "-" : esc(latest.preview)],
@@ -2293,6 +2689,16 @@ const monitorTook = ${monitorTook.toString()};
 const gateText = ${gateText.toString()};
 const alertText = ${alertText.toString()};
 const openTurnsText = ${openTurnsText.toString()};
+const cardWithSay = ${cardWithSay.toString()};
+const inboxEntries = ${inboxEntries.toString()};
+const attentionGroup = ${attentionGroup.toString()};
+const byAttention = ${byAttention.toString()};
+const inboxAttention = ${inboxAttention.toString()};
+const inboxNextReason = ${inboxNextReason.toString()};
+const faviconHref = ${faviconHref.toString()};
+const tabSignal = ${tabSignal.toString()};
+const orderKeyTarget = ${orderKeyTarget.toString()};
+const replyKeyTarget = ${replyKeyTarget.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderFlowChain = ${renderFlowChain.toString()};
@@ -2370,6 +2776,8 @@ function boot() {
 	let prevFocus = null;
 	const prevStates = new Map();
 	const changedUntil = new Map();
+	// Cards that newly need the owner or moved column: a 1.6 s ring, once (not on the first draw).
+	const ringUntil = new Map();
 
 	const resolveTheme = (mode) => {
 		if (mode === "light" || mode === "dark") return mode;
@@ -2452,7 +2860,10 @@ function boot() {
 		url.hash = "";
 		return url;
 	};
-	const cardOf = (key) => (board && board.ok ? board.cards.find((card) => card.key === key) : undefined);
+	const cardOf = (key) => {
+		const card = board && board.ok ? board.cards.find((item) => item.key === key) : undefined;
+		return card ? cardWithSay(snapshot, card) : undefined;
+	};
 	/** A turn-board conversation is open (any turns-view item but a background job). */
 	const threadOpen = () => !!open && open.kind === "item" && ui.view === "turns" && !open.id.startsWith("job:");
 	/** The snapshot's thread by origin key, or the one holding inbound id \`id\` (the old one-turn address). */
@@ -2521,9 +2932,39 @@ function boot() {
 			if (hadPrev && prev !== undefined && prev !== state) {
 				changedUntil.set(id, now + 1300);
 			}
+			const col = state.split(":")[0];
+			if (hadPrev && (prev === undefined ? col === "attention" : prev.split(":")[0] !== col)) {
+				ringUntil.set(id, now + 1600);
+			}
 			prevStates.set(id, state);
 			const until = changedUntil.get(id) || 0;
 			if (until > now) el.classList.add("is-changed");
+			if ((ringUntil.get(id) || 0) > now) el.classList.add("is-ring");
+		}
+	}
+	/**
+	 * Tab title, tab icon and the quiet next line from the last snapshot and board; \`failed\` (or #stale showing) marks
+	 * the last refresh as failed. Every view, also while the tab is hidden.
+	 */
+	function updateTabSignal(failed) {
+		if (!snapshot) return;
+		const signal = tabSignal(snapshot, board, failed === true || !stale.hidden);
+		document.title = signal.title;
+		const icon = document.getElementById("favicon");
+		if (icon) icon.setAttribute("href", signal.favicon);
+		const quiet = main.querySelector(".next-quiet");
+		if (quiet) quiet.textContent = signal.bad ? "다음 · 상태 모름 — 갱신 끊김" : "다음 · 기다리는 항목 없음";
+	}
+	/** One snapshot read, given up after 8 seconds so a server that never answers shows as cut off too. */
+	async function getSnapshot() {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 8000);
+		try {
+			const response = await fetch("api/snapshot", { cache: "no-store", signal: controller.signal });
+			if (!response.ok) throw new Error("HTTP " + response.status);
+			return await response.json();
+		} finally {
+			clearTimeout(timer);
 		}
 	}
 
@@ -2551,6 +2992,7 @@ function boot() {
 		main.innerHTML = html;
 		drawnMain = html;
 		markChanges();
+		updateTabSignal();
 		scrollToHere(main);
 		const next = document.getElementById("view");
 		if (next) next.scrollTop = scroll;
@@ -3263,6 +3705,33 @@ function boot() {
 			}, 1000);
 			return;
 		}
+		// 1…9 open the 확인 필요 card with that number on screen; r opens the next line's reply link in a new tab.
+		const keyInput = {
+			key: event.key,
+			meta: event.metaKey,
+			ctrl: event.ctrlKey,
+			alt: event.altKey,
+			typing: typing,
+			modalOpen: (cmdModal && !cmdModal.hidden) || (helpModal && !helpModal.hidden),
+			view: ui.view,
+		};
+		const numbered = Array.from(main.querySelectorAll("a[data-order]"));
+		const orderId = orderKeyTarget(
+			keyInput,
+			numbered.map((el) => el.getAttribute("data-row")),
+		);
+		if (orderId) {
+			event.preventDefault();
+			const card = numbered.find((el) => el.getAttribute("data-row") === orderId);
+			return show({ kind: card && card.hasAttribute("data-task") ? "task" : "card", id: orderId }, "push");
+		}
+		const replyLink = main.querySelector(".next-reply");
+		const replyHref = replyKeyTarget(keyInput, replyLink ? replyLink.getAttribute("href") : null);
+		if (replyHref) {
+			event.preventDefault();
+			window.open(replyHref, "_blank", "noopener");
+			return;
+		}
 		if (event.key === "j" || event.key === "ArrowDown") {
 			event.preventDefault();
 			moveRow(1);
@@ -3307,9 +3776,7 @@ function boot() {
 	});
 	async function refresh() {
 		try {
-			const response = await fetch("api/snapshot", { cache: "no-store" });
-			if (!response.ok) throw new Error("HTTP " + response.status);
-			snapshot = await response.json();
+			snapshot = await getSnapshot();
 			adoptOldTurn();
 			drawMain(false);
 			// Without the board stream this is the only redraw: a ?card= deep link loads its conversation here too.
@@ -3320,9 +3787,11 @@ function boot() {
 			// A ?view=turns&item= deep link starts its waterfall here, and the root row picks up the request line.
 			syncTrace();
 			stale.hidden = true;
+			updateTabSignal();
 		} catch (error) {
 			stale.textContent = "갱신 실패: " + (error && error.message ? error.message : String(error)) + " · 15초 뒤 다시 시도해요";
 			stale.hidden = false;
+			updateTabSignal(true);
 		}
 	}
 	const start = fromUrl();
@@ -3342,6 +3811,16 @@ function boot() {
 	document.addEventListener("visibilitychange", () => {
 		if (document.visibilityState === "visible") refresh();
 	});
+	// A hidden tab reads a snapshot once a minute for the tab title and icon only; the page itself is not redrawn.
+	setInterval(() => {
+		if (document.visibilityState === "visible") return;
+		getSnapshot()
+			.then((next) => {
+				snapshot = next;
+				updateTabSignal();
+			})
+			.catch(() => updateTabSignal(true));
+	}, 60000);
 	setInterval(() => {
 		if (open && open.kind === "card" && loadedKey === open.id && !paged && document.visibilityState === "visible") {
 			loadConversation("refresh");
@@ -3359,6 +3838,7 @@ function boot() {
 			drawMain(false);
 			drawDetail();
 			sync();
+			updateTabSignal();
 		});
 	}
 }
@@ -3399,7 +3879,8 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 			: snapshot.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === id));
 	let headHtml = "";
 	if (open?.kind === "card") {
-		const found = live?.cards.find((entry) => entry.key === open.id);
+		const onBoard = live?.cards.find((entry) => entry.key === open.id);
+		const found = onBoard === undefined ? undefined : cardWithSay(snapshot, onBoard);
 		const owner = found?.taskId === undefined ? undefined : tasks.find((entry) => entry.taskId === found.taskId);
 		headHtml = renderDetailHead(open.id, found, owner, live?.generatedAt ?? 0, chainOf(found?.taskId));
 	} else if (open?.kind === "task") {
@@ -3439,14 +3920,15 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 		...(open === undefined ? {} : { selected: found?.originKey ?? open.id }),
 		...(turnsList ? { layout: "list" } : {}),
 	};
+	const signal = tabSignal(snapshot, board, false);
 	return `<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ompbot 현황판</title>
+<title>${signal.title}</title>
 <link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
-<link rel="icon" href="icons/icon-192.png">
+<link rel="icon" id="favicon" href="${signal.favicon}">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15181D" media="(prefers-color-scheme: dark)">
@@ -3475,10 +3957,10 @@ ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" 
 <section id="detail-conv" role="tabpanel" aria-labelledby="tab-conv"${tab === "conv" ? "" : " hidden"}></section>
 <section id="detail-trace" role="tabpanel" aria-labelledby="tab-trace" aria-label="턴 트레이스" hidden></section>
 </aside>
-<footer class="hint-bar" aria-label="단축키 안내"><span class="hint-item"><kbd>j</kbd><kbd>k</kbd><span>이동</span></span><span class="hint-item"><kbd>Enter</kbd><span>열기</span></span><span class="hint-item"><kbd>Esc</kbd><span>닫기</span></span><span class="hint-item"><kbd>/</kbd><span>검색</span></span><span class="hint-item"><kbd>g</kbd><kbd>i</kbd><span>인박스</span></span><span class="hint-item"><kbd>g</kbd><kbd>a</kbd><span>승인</span></span><button type="button" class="hint-btn" data-cmd-open><kbd>⌘K</kbd><span>명령 팔레트</span></button><button type="button" class="hint-btn" data-help-open><kbd>?</kbd><span>도움말</span></button></footer>
+<footer class="hint-bar" aria-label="단축키 안내"><span class="hint-item"><kbd>j</kbd><kbd>k</kbd><span>이동</span></span><span class="hint-item"><kbd>Enter</kbd><span>열기</span></span><span class="hint-item"><kbd>1–9</kbd><span>확인 필요 n번째 열기</span></span><span class="hint-item"><kbd>Esc</kbd><span>닫기</span></span><span class="hint-item"><kbd>/</kbd><span>검색</span></span><span class="hint-item"><kbd>g</kbd><kbd>i</kbd><span>인박스</span></span><span class="hint-item"><kbd>g</kbd><kbd>a</kbd><span>승인</span></span><button type="button" class="hint-btn" data-cmd-open><kbd>⌘K</kbd><span>명령 팔레트</span></button><button type="button" class="hint-btn" data-help-open><kbd>?</kbd><span>도움말</span></button></footer>
 </div>
 <div id="cmd-palette" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="명령 팔레트" hidden><div class="modal-card"><div class="cmd-head"><input id="cmd-input" type="text" placeholder="보기 전환, TASK ID·카드 이동, 테마 전환…" aria-label="명령 또는 TASK 검색" autocomplete="off"><button type="button" class="detail-close" data-cmd-close>닫기 <kbd>Esc</kbd></button></div><div id="cmd-list" class="cmd-list" role="listbox" aria-label="명령 목록"></div></div></div>
-<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>흐름</span><span><kbd>g</kbd> <kbd>f</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
+<div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>확인 필요 n번째 열기</span><span><kbd>1</kbd>–<kbd>9</kbd></span></div><div class="help-row"><span>다음 항목에 답하기(herdr)</span><kbd>r</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>흐름</span><span><kbd>g</kbd> <kbd>f</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <p id="stale" class="stale" role="status" hidden></p>
 ${board === undefined ? "" : `<script type="application/json" id="board-data">${JSON.stringify(board).replace(/</g, "\\u003c")}</script>\n`}<script>${SCRIPT}</script>

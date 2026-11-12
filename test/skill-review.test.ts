@@ -466,7 +466,7 @@ describe("ompbot skills rollback (CLI)", () => {
 		expect(backupSkillRevision(path, 1_700_000_500_000)).toBeDefined();
 		writeFileSync(join(path, "SKILL.md"), "v2", { mode: 0o600 });
 
-		const env = { OMPBOT_TEST_HOOKS: "1", OMPBOT_SKILLS_DIR: join(dir, ".omp", "agent", "skills") };
+		const env = { OMPBOT_TEST_HOOKS: "1", OMPBOT_SKILLS_DIR: join(dir, ".omp", "agent", "managed-skills") };
 		const run = await runMain(dir, ["skills", "rollback", "release-checklist"], env);
 		expect(run.code, run.stderr).toBe(0);
 		expect(run.stdout).toMatch(/^skill rollback name=release-checklist revision=\S+\.md\n$/);

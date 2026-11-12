@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaneHistoryEntry, LaneMeta, LaneStatus } from "../src/lanes/status";
-import { kstDay } from "../src/tasks/docs";
+import { localDay } from "../src/time";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import {
 	expectNoProcessesMentioning,
@@ -81,7 +81,7 @@ async function makeRepo(blockCommits: boolean): Promise<string> {
 const realRepoPath = (path: string): string => Bun.spawnSync(["realpath", path]).stdout.toString().trim();
 
 /** The worktree the first lane of a fresh bot home gets beside `repo` (`<repo>-l-<today KST>-01`). */
-const firstLaneWorktree = (repo: string): string => `${repo}-l-${kstDay(Date.now())}-01`;
+const firstLaneWorktree = (repo: string): string => `${repo}-l-${localDay(Date.now(), "Asia/Seoul")}-01`;
 
 function newHome(): TestHome {
 	const made = makeHome("ompbot-e2e-lane-", REAL);

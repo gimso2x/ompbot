@@ -9,6 +9,7 @@ import { makeHome, type TestHome } from "./helpers/bot-home";
 const MAIN = join(resolve(import.meta.dir, ".."), "src", "main.ts");
 const SNAPSHOT_KEYS = [
 	"generatedAt",
+	"timezone",
 	"daemon",
 	"turns",
 	"feedback",
@@ -23,6 +24,7 @@ const SNAPSHOT_KEYS = [
 	"backup",
 	"jobs",
 	"slackTeam",
+	"slackOff",
 	"discordGuild",
 ];
 
@@ -31,7 +33,12 @@ let proc: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
 
 beforeEach(() => {
 	home = makeHome("ompbot-dash-cli-");
-	openStore({ path: join(home.dir, "ompbot.db"), clock: { now: () => Date.now() }, redact: (text) => text }).close();
+	openStore({
+		timezone: "Asia/Seoul",
+		path: join(home.dir, "ompbot.db"),
+		clock: { now: () => Date.now() },
+		redact: (text) => text,
+	}).close();
 });
 afterEach(async () => {
 	if (proc !== undefined) {

@@ -9,12 +9,12 @@ import { join } from "node:path";
 import type { CoreSink, DeliverySource } from "../src/channel/types";
 import { DiscordAdapter } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import type { DiscordReactionEvent } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 import { readTurnVerdicts, slackTsMicros } from "../src/store/feedback";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -89,7 +89,7 @@ function reaction(type: "add" | "remove", messageId: string, emoji: string, user
 beforeEach(async () => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-discord-feedback-"));
 	now = 1_800_000_000_000;
-	store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => now }, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => now }, redact });
 	transport = new FakeDiscordTransport({ botUserId: BOT });
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	feedback = [];

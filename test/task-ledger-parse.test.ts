@@ -7,7 +7,7 @@ let ledger: TaskLedger;
 
 beforeEach(() => {
 	db = new Database(":memory:", { strict: true });
-	ledger = new TaskLedger(db, { clock: { now: () => Date.parse("2026-11-04T00:00:00Z") } });
+	ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => Date.parse("2026-11-04T00:00:00Z") } });
 	const insert = (id: string, acceptance: string, notices: string) =>
 		db.run(
 			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,

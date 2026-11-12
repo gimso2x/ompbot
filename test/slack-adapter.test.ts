@@ -2,12 +2,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CHUNK_LIMIT, chunkText, DENIED_TEXT, REDELIVERED_PREFIX, STALL_STATUS_TEXT } from "../src/channel/text";
+import {
+	CHUNK_LIMIT,
+	chunkText,
+	DENIED_TEXT,
+	FENCE_RESERVE,
+	REDELIVERED_PREFIX,
+	STALL_STATUS_TEXT,
+} from "../src/channel/text";
 import type { CoreSink, DeliveryItem, DeliverySource } from "../src/channel/types";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { SlackAdapter, type SlackAdapterOptions } from "../src/slack/adapter";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import {
 	MARKDOWN_CHUNK_LIMIT,
 	type MarkdownPart,
@@ -19,6 +25,7 @@ import { mapWebApiError } from "../src/slack/socket-transport";
 import { SlackCallError, SlackRateLimitedError } from "../src/slack/transport";
 import { INTERIM_INFIX, openStore, type Store } from "../src/store/db";
 import { FRESHNESS_MS } from "../src/store/transitions";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "UOWNER";
 const TS = "1800000000.000100";
@@ -37,7 +44,7 @@ let inboundError: unknown;
 const clock = { now: () => now };
 
 function makeStore(): Store {
-	return openStore({ path: join(dir, "bot.db"), clock, redact });
+	return openStore({ timezone: "Asia/Seoul", path: join(dir, "bot.db"), clock, redact });
 }
 
 function makeCore(): CoreSink {
@@ -1095,6 +1102,99 @@ describe("card answers", () => {
 		);
 		expect(logs.some((l) => l.includes("event=card_spec_invalid"))).toBe(false);
 	});
+
+	describe("tone (colour bar)", () => {
+		const fields = (props: Record<string, unknown>) =>
+			spec({
+				c: el("Card", { title: "배포할까요?", ...props }, ["f"]),
+				f: el("Fields", {}, ["r", "o"]),
+				r: el("Field", { label: "✅ 추천", value: "staging 먼저" }),
+				o: el("Field", { label: "선택지", value: "1. staging\n2. production" }),
+			});
+		const CARD_BLOCKS = [
+			{ text: { emoji: true, text: "배포할까요?", type: "plain_text" }, type: "header" },
+			{
+				fields: [
+					{ text: "*✅ 추천*\nstaging 먼저", type: "mrkdwn" },
+					{ text: "*선택지*\n1. staging\n2. production", type: "mrkdwn" },
+				],
+				type: "section",
+			},
+		];
+		const TEXT = "*배포할까요?*\n✅ 추천: staging 먼저\n선택지: 1. staging\n2. production";
+		type Sent = { blocks?: readonly unknown[]; attachments?: ReadonlyArray<{ color: string; blocks: unknown[] }> };
+
+		test("a card without tone posts exactly as before: top-level blocks, no attachments", async () => {
+			await buildQueue([item(1, fence(fields({})))]);
+			await adapter.pumpDeliveries();
+			expect(posts().map(({ ts: _ts, ...args }) => args)).toEqual([
+				{ method: "postMessage", channel: "D1", text: TEXT, threadTs: TS, blocks: CARD_BLOCKS },
+			]);
+		});
+
+		test("tone danger: one attachment of #E01E5A holds the header and fields; no card block at the top level", async () => {
+			await buildQueue([item(1, fence(fields({ tone: "danger" })), true)]);
+			await adapter.pumpDeliveries();
+			expect(posts()).toHaveLength(1);
+			const post = posts()[0] as Sent & { text: string };
+			expect(post.blocks).toBeUndefined();
+			// No top-level text: Slack would show it above the attachment, the card twice. It is the notification fallback.
+			expect(post.text).toBe("");
+			expect(post.attachments).toHaveLength(1);
+			expect(post.attachments?.[0]?.color).toBe("#E01E5A");
+			expect((post.attachments?.[0] as { fallback?: string } | undefined)?.fallback).toBe(
+				`${REDELIVERED_PREFIX}\n${TEXT}`,
+			);
+			// The redelivered marker goes inside the attachment, before the card's blocks.
+			expect(post.attachments?.[0]?.blocks).toEqual([
+				{ type: "context", elements: [{ type: "mrkdwn", text: REDELIVERED_PREFIX }] },
+				...CARD_BLOCKS,
+			]);
+			expect(typesOf(post.attachments?.[0]?.blocks)).toContain("header");
+			expect(hasFields(post.attachments?.[0]?.blocks)).toBe(true);
+		});
+
+		test("an unknown tone is not refused: the card goes without colour, exactly like a card without tone", async () => {
+			await buildQueue([item(1, fence(fields({ tone: "purple" })))]);
+			await adapter.pumpDeliveries();
+			expect(posts().map(({ ts: _ts, ...args }) => args)).toEqual([
+				{ method: "postMessage", channel: "D1", text: TEXT, threadTs: TS, blocks: CARD_BLOCKS },
+			]);
+			expect(logs.some((l) => l.includes("event=card_spec_invalid"))).toBe(false);
+		});
+
+		test("refusals step down attachment → top_blocks → ascii (in the coloured attachment) → the fence as text", async () => {
+			const chart = spec({ c: el("Card", { title: "추이", tone: "warn" }, ["g"]), g: barChart("일별 턴") });
+			await buildQueue([item(1, fence(chart))]);
+			const refused = failPosts({ 1: INVALID(), 2: INVALID(), 3: INVALID() }) as Sent[];
+			await adapter.pumpDeliveries();
+			expect(refused).toHaveLength(3);
+			const [attachment, top, ascii] = refused;
+			expect(attachment?.blocks).toBeUndefined();
+			expect(attachment?.attachments?.[0]?.color).toBe("#ECB22E");
+			expect(typesOf(attachment?.attachments?.[0]?.blocks)).toContain("data_visualization");
+			expect(top?.attachments).toBeUndefined();
+			expect(typesOf(top?.blocks)).toContain("data_visualization");
+			expect(ascii?.blocks).toBeUndefined();
+			expect(ascii?.attachments?.[0]?.color).toBe("#ECB22E");
+			expect(typesOf(ascii?.attachments?.[0]?.blocks)).not.toContain("data_visualization");
+			expect(posts()).toHaveLength(1);
+			expect(posts()[0]?.blocks).toBeUndefined();
+			expect(posts()[0]?.attachments).toBeUndefined();
+			expect(posts()[0]?.text).toContain("```card");
+			const steps = logs.filter((l) => l.includes("event=card_blocks_rejected")).map((l) => /step=(\w+)/.exec(l)?.[1]);
+			expect(steps).toEqual(["attachment", "top_blocks", "ascii"]);
+		});
+
+		test("an attachment refused alone: the same blocks go at the top level without colour", async () => {
+			await buildQueue([item(1, fence(fields({ tone: "ok" })))]);
+			failPosts({ 1: INVALID() });
+			await adapter.pumpDeliveries();
+			expect(posts()).toHaveLength(1);
+			expect(posts()[0]?.attachments).toBeUndefined();
+			expect(posts()[0]?.blocks).toEqual(CARD_BLOCKS);
+		});
+	});
 });
 
 describe("system notices", () => {
@@ -1354,6 +1454,79 @@ describe("format", () => {
 		expect(chunkText("가".repeat(9000)).every((c) => c.length <= CHUNK_LIMIT)).toBe(true);
 	});
 
+	const fenceBody = (at: number) => `${"a".repeat(at)}\`\`\`js\nconst x = 1;\n\`\`\`\nend`;
+	/** Chunks without the fence closers/openers `chunkText` added: the raw pieces the split produced. */
+	const rawPieces = (chunks: string[]): string[] => {
+		let open = false;
+		return chunks.map((chunk) => {
+			const raw = open ? chunk.slice(4) : chunk;
+			const closed = raw.endsWith("\n```") ? raw.slice(0, -4) : raw;
+			open = open !== ((closed.match(/```/g) ?? []).length % 2 === 1);
+			return open ? closed : raw;
+		});
+	};
+	const expectFencesWhole = (chunks: string[], limit: number, label: string) => {
+		for (const [i, raw] of rawPieces(chunks).entries()) {
+			const chunk = chunks[i] as string;
+			expect(chunk.length, label).toBeLessThanOrEqual(limit);
+			expect((chunk.match(/```/g) ?? []).length % 2, `${label} #${i} fences`).toBe(0);
+			expect(raw.endsWith("`"), `${label} #${i} ends in a cut fence: ${JSON.stringify(raw.slice(-8))}`).toBe(false);
+			expect(/^`{1,2}js/.test(raw), `${label} #${i} starts with a cut fence`).toBe(false);
+			expect(/^js\b/.test(raw), `${label} #${i} starts with the fence's tag`).toBe(false);
+		}
+		expect(
+			chunks.some((c) => c.includes("```js\n")),
+			`${label}: js tag on the opening fence's line`,
+		).toBe(true);
+	};
+
+	test("a fence at the chunk limit is never cut: the 3891-a reproduction", () => {
+		expectFencesWhole(chunkText(fenceBody(3891), CHUNK_LIMIT), CHUNK_LIMIT, "3891");
+	});
+
+	test("a fence sliding across the cut: every position keeps the mark and its js tag whole", () => {
+		for (let at = CHUNK_LIMIT - FENCE_RESERVE - 6; at <= CHUNK_LIMIT - FENCE_RESERVE + 2; at++) {
+			const chunks = chunkText(fenceBody(at), CHUNK_LIMIT);
+			expectFencesWhole(chunks, CHUNK_LIMIT, `at ${at}`);
+			expect(rawPieces(chunks).join("").replace(/\n/g, ""), `at ${at}: no text lost`).toBe(
+				fenceBody(at).replace(/\n/g, ""),
+			);
+		}
+	});
+
+	test("all-backtick text and a chunk opening on a fence line still finish and lose no characters", () => {
+		const ticks = "`".repeat(5000);
+		const tickChunks = chunkText(ticks);
+		expect(tickChunks.length).toBeGreaterThanOrEqual(2);
+		expect(rawPieces(tickChunks).join("")).toBe(ticks);
+		const fenceLine = `\`\`\`js ${"word ".repeat(1500)}\nconst y = 2;\n\`\`\``;
+		const lineChunks = chunkText(fenceLine);
+		expect(lineChunks.length).toBeGreaterThanOrEqual(2);
+		const joined = lineChunks.join("");
+		expect(joined.match(/word/g)?.length).toBe(1500);
+		expect(joined).toStartWith("```js word");
+		expect(joined).toContain("const y = 2;");
+	}, 1000);
+
+	test("a four-backtick fence split across chunks is closed and reopened with four backticks (#67)", () => {
+		const inner = "```js\nconst x = 1;\n```\n";
+		for (const limit of [CHUNK_LIMIT, 150]) {
+			const text = `\`\`\`\`md\nintro\n${inner}${"body line\n".repeat(1500)}${inner}\`\`\`\`\nafter`;
+			const chunks = chunkText(text, limit);
+			expect(chunks.length).toBeGreaterThanOrEqual(2);
+			for (const [i, chunk] of chunks.entries()) {
+				expect(chunk.length, `limit ${limit} #${i} length`).toBeLessThanOrEqual(limit);
+				const lines = chunk.split("\n");
+				if (i > 0 && i < chunks.length - 1) expect(lines[0], `limit ${limit} #${i} opens`).toBe("````");
+				if (i < chunks.length - 1) expect(lines.at(-1), `limit ${limit} #${i} closes`).toBe("````");
+			}
+			expect(chunks.at(-1)).toEndWith("````\nafter");
+			const joined = chunks.join("\n");
+			expect(joined.match(/body line/g)?.length).toBe(1500);
+			expect(joined.match(/const x = 1;/g)?.length).toBe(2);
+		}
+	});
+
 	const markdownOf = (part: MarkdownPart): string =>
 		part.blocks.flatMap((b) => (b.type === "markdown" ? [b.text] : [])).join("");
 
@@ -1449,5 +1622,15 @@ describe("thread sessions", () => {
 		expect(store.listInbound().map((r) => [r.originKey, r.textRef])).toEqual([
 			["slack/ch/C1/t/1800000000.000100", "백필된 답글"],
 		]);
+	});
+});
+
+describe("qa50b K-6: a file_share message without files", () => {
+	test("its text is taken with a note instead of being dropped as a subtype", async () => {
+		await transport.emitMessage(dm({ text: "이 파일 봐", subtype: "file_share", files: [] }));
+		const rows = store.listInbound();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.textRef).toContain("이 파일 봐");
+		expect(rows[0]?.textRef).toContain("[첨부 실패:");
 	});
 });

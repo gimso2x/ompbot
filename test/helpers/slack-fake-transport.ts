@@ -11,7 +11,7 @@ import type {
 	SlackSlashPayload,
 	SlackTransport,
 	SlashAck,
-} from "./transport";
+} from "../../src/slack/transport";
 
 export type FakeCall =
 	| { method: "addReaction" | "removeReaction"; channel: string; timestamp: string; name: string }
@@ -21,6 +21,7 @@ export type FakeCall =
 			text: string;
 			threadTs?: string | undefined;
 			blocks?: readonly unknown[] | undefined;
+			attachments?: readonly unknown[] | undefined;
 			ts: string;
 	  }
 	| { method: "updateMessage"; channel: string; ts: string; text: string; blocks?: readonly unknown[] | undefined }
@@ -80,6 +81,7 @@ export class FakeSlackTransport implements SlackTransport {
 		text: string;
 		threadTs?: string | undefined;
 		blocks?: readonly unknown[] | undefined;
+		attachments?: readonly unknown[] | undefined;
 	}): Promise<{ ts: string }> {
 		this.seq += 1;
 		const ts = `1800000000.${String(this.seq).padStart(6, "0")}`;

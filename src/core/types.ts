@@ -54,8 +54,23 @@ export const COMMAND_ALIAS: Readonly<Partial<Record<CommandKind, string>>> = { b
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
 export const COMMAND_OP_REF = new RegExp(
-	`^(failed|lane|task|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
+	`^(failed|lane|task|home|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
 );
+
+/**
+ * `!home`: makes the conversation it is typed in the owner's notice home (`Store.ownerHome()`). Typed text only, like
+ * `!shutup`: it has no slash name, so the Slack manifests and the Discord command set stay as they are. Only the bare
+ * word counts.
+ */
+export const HOME_COMMAND = "!home";
+
+/** `!home` in a Teams group chat: other people read it, so it cannot be the notice home. */
+export const TEAMS_GROUP_HOME_REFUSED_TEXT =
+	"⚠️ 그룹 채팅은 알림 받을 곳이 될 수 없습니다. 봇과의 1:1 대화에서 `!home`을 보내 주세요.";
+
+export function isHomeCommand(text: string): boolean {
+	return text.trim() === HOME_COMMAND;
+}
 
 /** Kinds that take an argument after the command word; the others only count when they are the whole message. */
 export const TAKES_ARG: ReadonlySet<CommandKind> = new Set([

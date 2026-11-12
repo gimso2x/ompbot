@@ -1,4 +1,4 @@
-import { type FSWatcher, watch } from "node:fs";
+import { type FSWatcher, statSync, watch } from "node:fs";
 import { sep } from "node:path";
 import type { Logger } from "../log";
 import type { MonitorRow } from "./ledger";
@@ -29,8 +29,19 @@ export const fsWatchStarter: WatchStarter = (root, onChange, onError) => {
 	return watcher;
 };
 
+/**
+ * Which directory `real` is: dev and inode, plus the birth time because a deleted tree's inode is often handed
+ * straight to the next `mkdir` of the same name (birth time is 0 where the filesystem does not keep it).
+ */
+function rootIdentity(real: string): string {
+	const stat = statSync(real);
+	return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+}
+
 interface Entry {
 	root: string;
+	/** `rootIdentity` of the resolved root when the watch started: a deleted or replaced root no longer matches it. */
+	identity: string;
 	handle: WatchHandle;
 	paths: Set<string>;
 	overflow: number;
@@ -67,6 +78,8 @@ export class WatcherSet {
 		for (const monitor of monitors) {
 			if (monitor.enabled && monitor.trigger.kind === "watcher") wanted.set(monitor.id, monitor);
 		}
+		/** Closed this round because the root died; reopened on the next reconcile, not right away. */
+		const deadRoots = new Set<string>();
 		for (const [id, entry] of this.#entries) {
 			const monitor = wanted.get(id);
 			if (
@@ -76,11 +89,21 @@ export class WatcherSet {
 				monitor.trigger.root !== entry.root
 			) {
 				this.#close(id);
+				continue;
+			}
+			// fs.watch emits no error when its root is deleted or replaced, so the root is checked here.
+			const dead = this.#rootDeath(entry);
+			if (dead !== undefined) {
+				this.#fail(id, dead);
+				this.#close(id);
+				deadRoots.add(id);
 			}
 		}
 		for (const id of this.#lastError.keys()) if (!wanted.has(id)) this.#lastError.delete(id);
 		for (const [id, monitor] of wanted) {
-			if (!this.#entries.has(id) && monitor.trigger.kind === "watcher") this.#start(id, monitor.trigger.root);
+			if (!this.#entries.has(id) && !deadRoots.has(id) && monitor.trigger.kind === "watcher") {
+				this.#start(id, monitor.trigger.root);
+			}
 		}
 	}
 
@@ -113,6 +136,17 @@ export class WatcherSet {
 		}
 	}
 
+	/** Why the watched root is no longer the one the watch started on; `undefined` while it still is. */
+	#rootDeath(entry: Entry): string | undefined {
+		let identity: string;
+		try {
+			identity = rootIdentity(resolveWatchRoot(entry.root, this.deps.watchRoots()));
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+		return identity === entry.identity ? undefined : `trigger.root was replaced: ${entry.root}`;
+	}
+
 	#fail(id: string, error: unknown): void {
 		const text = error instanceof Error ? error.message : String(error);
 		if (this.#lastError.get(id) !== text) {
@@ -126,6 +160,7 @@ export class WatcherSet {
 			const real = resolveWatchRoot(root, this.deps.watchRoots());
 			const entry: Entry = {
 				root,
+				identity: rootIdentity(real),
 				handle: { close() {} },
 				paths: new Set(),
 				overflow: 0,

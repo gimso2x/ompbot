@@ -16,20 +16,24 @@ const UNCOMMITTED = "미커밋 변경이 있어 check를 미룹니다";
 
 /**
  * Runs the checks at `worktree`'s HEAD; uncommitted changes defer them. `resultsAt(head)` hands back the signal
- * results already known at that HEAD (filled in place as signals run), so the same commit is never checked twice.
- * Shared by the task sweep and the work lanes; host failures throw.
+ * results already known at that HEAD (filled in place as signals run, except inconclusive ones), so the same commit is
+ * never checked twice — a timed-out signal is run again.
+ * Shared by the task sweep and the work lanes; host failures throw. An aborted `signal` kills the running check and
+ * throws before the next one (what ran is then no verdict).
  */
 export async function runWorktreeChecks(
 	ops: TaskHostOps,
 	worktree: string,
 	resultsAt: (head: string) => Map<string, SignalCheck>,
 	requests: readonly TaskCheckRequest[],
+	signal?: AbortSignal,
 ): Promise<TaskChecksRun> {
 	const head = await ops.headOf(worktree);
 	if (!head.clean) return { deferred: UNCOMMITTED };
 	const known = resultsAt(head.sha);
 	const io = {
-		runCheck: (argv: string[]) => ops.runCheck({ worktree, argv, timeoutMs: CHECK_TIMEOUT_MS }),
+		runCheck: (argv: string[]) =>
+			ops.runCheck({ worktree, argv, timeoutMs: CHECK_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }),
 		readFile: async (path: string) => {
 			const read = await ops.readFile(`${worktree}/${path}`);
 			if (!read.ok) throw new Error(`cannot read ${path}: ${read.error}`);
@@ -41,10 +45,20 @@ export async function runWorktreeChecks(
 	for (const request of requests) {
 		let result = known.get(request.signal);
 		if (result === undefined) {
+			signal?.throwIfAborted();
 			result = await runSignal(request.signal, io);
-			known.set(request.signal, result);
+			// A killed check is no verdict: it must not reach the known results.
+			signal?.throwIfAborted();
+			// A timed-out run proves nothing either way: the next judgement runs it again.
+			if (!result.inconclusive) known.set(request.signal, result);
 		}
-		results.push({ id: request.id, signal: request.signal, ok: result.ok, detail: result.detail });
+		results.push({
+			id: request.id,
+			signal: request.signal,
+			ok: result.ok,
+			detail: result.detail,
+			...(result.inconclusive ? { inconclusive: true as const } : {}),
+		});
 	}
 	return { head: head.sha, results };
 }

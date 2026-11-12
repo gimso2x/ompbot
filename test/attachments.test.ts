@@ -9,8 +9,8 @@ import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { SlackAdapter } from "../src/slack/adapter";
 import { downloadAttachmentFile, hostAllowed } from "../src/slack/attachments";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackMessageEvent } from "../src/slack/transport";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 let dir: string;
 
@@ -338,6 +338,23 @@ describe("attachment injection flag (adapter)", () => {
 		await adapter.stop();
 		expect(inbound).toHaveLength(2);
 		for (const text of inbound) expect(text).toContain("⚠️ 지시처럼 보이는 대목");
+	});
+
+	test("a file_share whose ts holds .. saves nothing and writes nothing outside mediaRoot", async () => {
+		const { transport, adapter, inbound, logs } = await build();
+		transport.downloads.set(textFile().url_private_download, new TextEncoder().encode("payload"));
+		await transport.emitMessage(fileShare("../../../../escaped.000100", [textFile()]));
+		await adapter.stop();
+		const mediaRoot = join(dir, "media");
+		const files = readdirSync(dir, { recursive: true, withFileTypes: true })
+			.filter((entry) => entry.isFile())
+			.map((entry) => join(entry.parentPath, entry.name));
+		for (const file of files) expect(file.startsWith(`${mediaRoot}/`)).toBe(true);
+		expect(existsSync(join(dir, "escaped_000100"))).toBe(false);
+		expect(files).toEqual([]);
+		expect(logs.some((l) => l.includes("event=attachment_bad_ts"))).toBe(true);
+		expect(inbound).toHaveLength(1);
+		expect(inbound[0]).toContain("[첨부 실패: 1개");
 	});
 
 	test("clean text and non-text attachments keep their plain note", async () => {

@@ -1,11 +1,19 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { BoardSource, type BoardTaskRef, type BoardView, deepLink } from "../src/dashboard/board";
+import {
+	type BoardPromptRef,
+	BoardSource,
+	type BoardTaskRef,
+	type BoardView,
+	boardView,
+	deepLink,
+} from "../src/dashboard/board";
 import { renderConversation, renderDashboardMain, renderDetailHead, renderPlan } from "../src/dashboard/html";
 import { renderMarkdown } from "../src/dashboard/markdown";
 import { type DashboardBoardOptions, startDashboardServer } from "../src/dashboard/server";
-import { buildSnapshot, type DashboardSnapshot, readBoardTasks } from "../src/dashboard/snapshot";
+import { buildSnapshot, type DashboardSnapshot, readBoardPrompts, readBoardTasks } from "../src/dashboard/snapshot";
 import { openStore } from "../src/store/db";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 
@@ -176,6 +184,7 @@ function boardWhen(source: BoardSource, check: () => boolean, what: string): Pro
 
 const SNAPSHOT: DashboardSnapshot = {
 	generatedAt: "2026-11-04T09:00:00+09:00",
+	timezone: "Asia/Seoul",
 	daemon: { ok: false, error: "no daemon" },
 	turns: { ok: true, items: [], threads: [] },
 	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
@@ -230,7 +239,7 @@ afterEach(() => {
 
 /** Fake herdr-web-ui, a board source on it and a dashboard on a temporary port; the machines list is sent. */
 async function setup(
-	options: { tasks?: BoardTaskRef[]; herdrWebUrl?: string; sendList?: boolean } = {},
+	options: { tasks?: BoardTaskRef[]; prompts?: BoardPromptRef[]; herdrWebUrl?: string; sendList?: boolean } = {},
 ): Promise<{ base: string; upstream: FakeHerdrWeb; source: BoardSource }> {
 	const fake = new FakeHerdrWeb();
 	fake.start();
@@ -240,6 +249,7 @@ async function setup(
 	const boardOptions: DashboardBoardOptions = {
 		source: board,
 		tasks: () => options.tasks ?? [],
+		...(options.prompts === undefined ? {} : { prompts: () => options.prompts ?? [] }),
 		...(options.herdrWebUrl === undefined ? {} : { herdrWebUrl: options.herdrWebUrl }),
 	};
 	dashboard = startDashboardServer({
@@ -437,7 +447,7 @@ describe("agent board", () => {
 	test("AC-7: a card gets the TASK whose agent is its name or whose worktree is its cwd", async () => {
 		home = makeHome("ompbot-board-");
 		const dbPath = join(home.dir, "ompbot.db");
-		openStore({ path: dbPath, clock: { now: () => 0 }, redact: (text) => text }).close();
+		openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => 0 }, redact: (text) => text }).close();
 		const db = new Database(dbPath, { strict: true });
 		const task = (id: string, agent: string, worktree: string, status: string) =>
 			db.run(
@@ -469,6 +479,72 @@ describe("agent board", () => {
 		expect(page).toContain('data-card="w1:p1" data-row="w1:p1"><p class="card-eyebrow">T-20261104-07 · oci</p>');
 	});
 
+	test("마지막 지시: a card gets its name's newest prompt (local cards local rows only) and the page draws the line", async () => {
+		home = makeHome("ompbot-board-");
+		const dbPath = join(home.dir, "ompbot.db");
+		expect(readBoardPrompts(home.dir)).toEqual([]);
+		let now = Date.parse("2026-11-12T01:00:00Z");
+		const store = openStore({
+			timezone: "Asia/Seoul",
+			path: dbPath,
+			clock: { now: () => now },
+			redact: (text) => text,
+		});
+		const record = (host: string | null, agent: string, kind: "start" | "followup" | "remind", text: string) => {
+			store.recordHerdrPrompt({ host, agent, kind, text, originKey: null });
+			now += 60_000;
+		};
+		record(null, "t-20261104-07", "start", "첫 지시");
+		record(null, "t-20261104-07", "followup", "로컬 후속 지시");
+		record("wsl", "t-20261104-07", "start", "같은 이름의 원격 지시");
+		record("wsl", "t-20261104-09", "remind", "원격 리마인더");
+		record("wsl", "side-1", "followup", "원격 첫 지시");
+		record("remote1", "side-1", "remind", "원격 다른 호스트 리마인더");
+		store.close();
+		const prompts = readBoardPrompts(home.dir);
+		expect(prompts).toHaveLength(5);
+
+		const { base } = await setup({ prompts });
+		const view = (await (await fetch(`${base}/api/board`)).json()) as BoardView;
+		const byKey = Object.fromEntries(view.cards.map((card) => [card.key, card.lastPrompt]));
+		const at0 = Date.parse("2026-11-12T01:00:00Z");
+		expect(byKey).toEqual({
+			"w1:p1": { preview: "로컬 후속 지시", at: at0 + 60_000, kind: "followup" },
+			"w2:p1": undefined,
+			"w1:p2": undefined,
+			"w1:p3": undefined,
+			"m-ssh:w9:p1": undefined,
+			"m-ssh:w9:p2": undefined,
+		});
+		const remote = view.cards.find((card) => card.key === "m-ssh:w9:p1");
+		if (remote === undefined) throw new Error("no remote card");
+		const named = boardView({ machines: [], cards: [{ ...remote, name: "side-1" }] }, { tasks: [], prompts, now })
+			.cards[0];
+		expect(named?.lastPrompt).toEqual({ preview: "원격 다른 호스트 리마인더", at: at0 + 5 * 60_000, kind: "remind" });
+
+		const html = renderDashboardMain(SNAPSHOT, view, at0 + 4 * 60_000);
+		expect(html).toContain('<p class="card-prompt">마지막 지시 · 3분 전: 로컬 후속 지시</p>');
+		expect(html.match(/class="card-prompt"/g)).toHaveLength(1);
+		const local = view.cards.find((card) => card.key === "w1:p1");
+		expect(renderDetailHead("w1:p1", local, undefined, at0 + 4 * 60_000)).toContain(
+			'<section class="detail-say" aria-label="마지막 지시"><h3 class="h3">마지막 지시</h3><p class="lead">로컬 후속 지시</p><p class="note-sub">3분 전</p></section>',
+		);
+		expect(
+			renderDetailHead(
+				"w2:p1",
+				view.cards.find((card) => card.key === "w2:p1"),
+				undefined,
+				now,
+			),
+		).not.toContain("마지막 지시");
+		const remind = renderDashboardMain(
+			SNAPSHOT,
+			{ ...view, cards: [{ ...remote, lastPrompt: named?.lastPrompt }] },
+			now,
+		);
+		expect(remind).toContain("마지막 지시 · 리마인더 · ");
+	});
+
 	test("AC-9: without a board the page keeps the herdr agent list block and no board block", async () => {
 		const html = renderDashboardMain(SNAPSHOT);
 		expect(html).toContain("herdr 에이전트");
@@ -484,6 +560,7 @@ describe("agent board", () => {
 		const snapshot = await buildSnapshot({
 			homeDir: home.dir,
 			repoDir: "/srv/ompbot",
+			timezone: "Asia/Seoul",
 			config: { herdr: {} },
 			now: () => 0,
 			callDaemon: async () => Promise.reject(new Error("no daemon")),
@@ -506,6 +583,7 @@ describe("agent board", () => {
 		const snapshot = await buildSnapshot({
 			homeDir: home.dir,
 			repoDir: "/srv/ompbot",
+			timezone: "Asia/Seoul",
 			config: { herdr: {} },
 			now: () => 0,
 			callDaemon: async () => Promise.reject(new Error("no daemon")),
@@ -574,6 +652,122 @@ describe("board stream watchdog", () => {
 		}, 25);
 		await sent;
 		expect([dropped, board.current() !== undefined, fake.connections]).toEqual([false, true, 1]);
+	});
+});
+
+describe("board since file", () => {
+	const T0 = Date.parse("2026-11-11T07:00:00Z");
+	const HOUR = 3_600_000;
+	const DAY = 24 * HOUR;
+	type Saved = Record<string, { status: string; since: number; gone?: number }>;
+
+	/** A board source on its own fake herdr-web-ui, the given since file and a fixed clock, after the machines list. */
+	async function restarted(
+		file: string,
+		at: number,
+		machines: unknown[] = MACHINES,
+	): Promise<{ fake: FakeHerdrWeb; board: BoardSource }> {
+		const fake = new FakeHerdrWeb();
+		fake.start();
+		const board = new BoardSource({ origin: fake.origin, retryMs: 10, sinceFile: file, now: () => at });
+		board.start();
+		await fake.connected(1);
+		fake.send({ type: "machines", machines });
+		await boardWhen(board, () => board.current() !== undefined, "the first machines list");
+		return { fake, board };
+	}
+	const sinceOf = (board: BoardSource, key: string): number | undefined =>
+		board.current()?.cards.find((card) => card.key === key)?.since;
+	const saved = (file: string): Saved => JSON.parse(readFileSync(file, "utf8")) as Saved;
+
+	test("AC-1: a new board source keeps a same-status card's since from the file; a live change starts now", async () => {
+		home = makeHome("ompbot-board-since-");
+		const file = join(home.dir, "dashboard-board-since.json");
+		writeFileSync(
+			file,
+			JSON.stringify({
+				"w1:p1": { status: "working", since: T0 - 5 * HOUR },
+				"w1:p2": { status: "working", since: T0 - 4 * HOUR },
+				"m-ssh:w9:p2": { status: "done", since: T0 - 3 * HOUR },
+				gone7: { status: "done", since: T0 - 9 * DAY, gone: T0 - 8 * DAY },
+				gone1: { status: "done", since: T0 - 2 * DAY, gone: T0 - DAY },
+			}),
+		);
+		const first = await restarted(file, T0);
+		upstream = first.fake;
+		source = first.board;
+		expect(sinceOf(first.board, "w1:p1")).toBe(T0 - 5 * HOUR);
+		expect(sinceOf(first.board, "m-ssh:w9:p2")).toBe(T0 - 3 * HOUR);
+		// Saved working, now blocked: the change happened while no board was watching, so its time is unknown.
+		expect(sinceOf(first.board, "w1:p2")).toBe(0);
+		// A pane the file does not know, seen in its machine's first list: unknown too.
+		expect(sinceOf(first.board, "w2:p1")).toBe(0);
+		expect(statSync(file).mode & 0o777).toBe(0o600);
+		expect(Object.keys(saved(file))).not.toContain("gone7");
+		expect(saved(file).gone1).toEqual({ status: "done", since: T0 - 2 * DAY, gone: T0 - DAY });
+
+		first.fake.send({
+			type: "machine-message",
+			machine_id: "local",
+			message: { type: "pane-status", pane_id: "w1:p1", agent_status: "done" },
+		});
+		await boardWhen(
+			first.board,
+			() => first.board.current()?.cards.find((card) => card.key === "w1:p1")?.status === "done",
+			"w1:p1 done",
+		);
+		expect(sinceOf(first.board, "w1:p1")).toBe(T0);
+		expect(saved(file)["w1:p1"]).toEqual({ status: "done", since: T0 });
+		first.board.stop();
+		first.fake.stop();
+
+		// The restart: a new source an hour later reads the file the first one left; w1:p1 is still done.
+		const local = MACHINES[0] as (typeof MACHINES)[number];
+		const stillDone = [
+			{
+				...local,
+				snapshot: {
+					...local.snapshot,
+					panes: local.snapshot.panes.map((pane) =>
+						pane.pane_id === "w1:p1" ? { ...pane, agent_status: "done" } : pane,
+					),
+				},
+			},
+			MACHINES[1],
+		];
+		const second = await restarted(file, T0 + HOUR, stillDone);
+		upstream = second.fake;
+		source = second.board;
+		expect(sinceOf(second.board, "w1:p1")).toBe(T0);
+		expect(sinceOf(second.board, "m-ssh:w9:p2")).toBe(T0 - 3 * HOUR);
+		expect(sinceOf(second.board, "w2:p1")).toBe(0);
+	});
+
+	test("AC-1: with no file or a broken one every first-seen card is since 0, and the file is written", async () => {
+		home = makeHome("ompbot-board-since-");
+		const file = join(home.dir, "dashboard-board-since.json");
+		for (const content of [undefined, "{not json"]) {
+			if (content !== undefined) writeFileSync(file, content);
+			const run = await restarted(file, T0);
+			upstream = run.fake;
+			source = run.board;
+			expect(run.board.current()?.cards.map((card) => card.since)).toEqual([0, 0, 0, 0, 0, 0]);
+			expect(Object.values(saved(file)).map((entry) => entry.since)).toEqual([0, 0, 0, 0, 0, 0]);
+			run.fake.send({
+				type: "machine-message",
+				machine_id: "m-ssh",
+				message: { type: "pane-status", pane_id: "w9:p1", agent_status: "working" },
+			});
+			await boardWhen(
+				run.board,
+				() => run.board.current()?.cards.find((card) => card.key === "m-ssh:w9:p1")?.status === "working",
+				"w9:p1 working",
+			);
+			expect(sinceOf(run.board, "m-ssh:w9:p1")).toBe(T0);
+			run.board.stop();
+			run.fake.stop();
+			rmSync(file, { force: true });
+		}
 	});
 });
 

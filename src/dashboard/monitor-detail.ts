@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { type MonitorSql, toMonitor } from "../monitors/ledger";
 import { resolveProcedureFile } from "../monitors/spec";
 import { redact } from "../redact";
-import { formatKst } from "../tasks/docs";
+import { localIso } from "../time";
 import { monitorDurationMs } from "./snapshot";
 
 /**
@@ -42,6 +42,8 @@ export type MonitorDetail =
 export interface MonitorDetailRoots {
 	workspaceDir: string | undefined;
 	scriptsRoot: string;
+	/** The bot's zone (`config.timezone`): run times are written in it. */
+	timezone: string;
 }
 
 /** Masked first, then cut to `limit` characters: a secret is never left half-visible by the cut. */
@@ -96,8 +98,8 @@ export function readMonitorDetail(homeDir: string, roots: MonitorDetailRoots, id
 			}
 		}),
 		runs: events.map((event) => ({
-			slotAt: formatKst(event.slot_at),
-			at: formatKst(event.updated_at),
+			slotAt: localIso(event.slot_at, roots.timezone),
+			at: localIso(event.updated_at, roots.timezone),
 			stage: event.stage,
 			manual: event.manual === 1,
 			attempts: event.attempts,

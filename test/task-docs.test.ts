@@ -4,9 +4,7 @@ import { type CommitCheck, checkTask, summarizeJudgement, type TaskJudgement } f
 import {
 	acceptanceItems,
 	agentNameOf,
-	formatKst,
 	formatTaskId,
-	kstDay,
 	type NewTaskSpec,
 	parseOutcome,
 	parseProgress,
@@ -19,6 +17,8 @@ import {
 	TaskSpecError,
 	worktreePathOf,
 } from "../src/tasks/docs";
+import { parseChecks } from "../src/tasks/signals";
+import { localDay, localIso } from "../src/time";
 
 const spec: NewTaskSpec = {
 	title: "로그 정리",
@@ -39,13 +39,14 @@ const meta = {
 	agent: agentNameOf("T-20261026-01"),
 	threadLink: "C1:1.2",
 	registeredAt: Date.parse("2026-10-26T06:04:05Z"),
+	timezone: "Asia/Seoul",
 };
 const snapshot = acceptanceItems(spec.acceptance);
 
 describe("ids and time", () => {
 	test("KST day and id/agent shapes", () => {
-		expect(kstDay(Date.parse("2026-10-25T16:00:00Z"))).toBe("20261026");
-		expect(formatKst(Date.parse("2026-10-26T06:04:05Z"))).toBe("2026-10-26T15:04:05+09:00");
+		expect(localDay(Date.parse("2026-10-25T16:00:00Z"), "Asia/Seoul")).toBe("20261026");
+		expect(localIso(Date.parse("2026-10-26T06:04:05Z"), "Asia/Seoul")).toBe("2026-10-26T15:04:05+09:00");
 		expect(formatTaskId("20261026", 3)).toBe("T-20261026-03");
 		expect(OWNER_NAME_PATTERN.test(agentNameOf("T-20261026-03"))).toBe(true);
 	});
@@ -79,6 +80,67 @@ describe("taskSpec input", () => {
 	});
 });
 
+describe("secret masking at the document boundaries", () => {
+	// Fake token shapes only, built at run time.
+	const SLACK = ["xoxb", "TEST", "0", "docs"].join("-");
+	const GH = `ghp_${"T".repeat(36)}`;
+
+	test("AC-5: a spec without secrets parses exactly as written (check block included)", () => {
+		const acceptance = ['회전 테스트가 통과한다 [check: command ["bun","test"]]', "README에 설명이 있다"];
+		const parsed = parseTaskSpecInput({ ...spec, acceptance, assumptions: "가정 한 줄" });
+		expect(parsed).toEqual({ kind: "new", spec: { ...spec, acceptance, assumptions: "가정 한 줄" } });
+	});
+
+	test("B-5: two spaces inside a check argv survive registration, the snapshot and the spec.md round trip", () => {
+		const block = '[check: command ["bun", "test",  "-t", "a  b"]]';
+		const criterion = `회전   테스트가\n통과한다 ${block}`;
+		const parsed = parseTaskSpecInput({ ...spec, acceptance: [criterion] });
+		if (parsed.kind !== "new") throw new Error("expected a new spec");
+		expect(parsed.spec.acceptance).toEqual([`회전 테스트가 통과한다 ${block}`]);
+		const items = acceptanceItems(parsed.spec.acceptance);
+		expect(items[0]?.text).toBe(`회전 테스트가 통과한다 ${block}`);
+		const back = parseSpec(renderSpec(meta, parsed.spec, items));
+		expect(back.acceptance[0]?.text).toBe(`회전 테스트가 통과한다 ${block}`);
+		expect(parseChecks(back.acceptance[0]?.text ?? "")).toEqual([
+			expect.objectContaining({ argv: ["bun", "test", "-t", "a  b"] }),
+		]);
+	});
+
+	test("AC-2b: PROGRESS prose fields and the outcome summary are masked as they are read", () => {
+		const progress = parseProgress(
+			[
+				"---",
+				"task: T-20261026-01",
+				"status: blocked",
+				"updated: 2026-10-26T15:04:05+09:00",
+				`current: S2 ${SLACK}`,
+				`next: ${GH} 기다린다`,
+				`restated: 과제 ${SLACK} / S2 / 테스트`,
+				`blocked_reason: 토큰 ${GH} 만료`,
+				`question: ${SLACK}를 바꿀까요?`,
+				`recommend: ${GH} 회전`,
+				`impact: ${SLACK} 무효`,
+				"---",
+				"# 단계",
+				"- [ ] S2: 구현 | 완료 조건: 테스트 | 증거:",
+			].join("\n"),
+		);
+		expect(progress).toMatchObject({
+			status: "blocked",
+			current: "S2 [REDACTED]",
+			next: "[REDACTED] 기다린다",
+			restated: "과제 [REDACTED] / S2 / 테스트",
+			blockedReason: "토큰 [REDACTED] 만료",
+			question: "[REDACTED]를 바꿀까요?",
+			recommend: "[REDACTED] 회전",
+			impact: "[REDACTED] 무효",
+		});
+		const outcome = parseOutcome(`## 요약\n- 토큰 ${GH} 회전 완료\n## AC-1\n- commit: abc1234 feat\n`);
+		expect(outcome.summary).toEqual(["토큰 [REDACTED] 회전 완료"]);
+		expect(outcome.sections.get("AC-1")?.commits).toEqual(["abc1234 feat"]);
+	});
+});
+
 describe("document round trip", () => {
 	test("spec renders and parses back to the same acceptance list, unchecked", () => {
 		const parsed = parseSpec(renderSpec(meta, spec, snapshot));
@@ -95,7 +157,7 @@ describe("document round trip", () => {
 	});
 
 	test("PROGRESS starts working with one placeholder step; steps and fields parse", () => {
-		const initial = parseProgress(renderProgress(meta.taskId, meta.registeredAt));
+		const initial = parseProgress(renderProgress(meta.taskId, meta.registeredAt, "Asia/Seoul"));
 		expect(initial).toMatchObject({ task: meta.taskId, status: "working", current: "S1", blockedReason: "" });
 		expect(initial.steps).toHaveLength(1);
 		const parsed = parseProgress(
@@ -123,13 +185,34 @@ describe("document round trip", () => {
 	});
 
 	test("PROGRESS carries an empty `restated:` key; a file without the key reads it as empty", () => {
-		const rendered = renderProgress(meta.taskId, meta.registeredAt);
+		const rendered = renderProgress(meta.taskId, meta.registeredAt, "Asia/Seoul");
 		expect(rendered.split("\n")).toContain("restated:");
 		expect(parseProgress(rendered).restated).toBe("");
 		const legacy = "---\ntask: T-20261026-01\nstatus: working\ncurrent: S1\nnext: 잇는다\n---\n# 단계\n";
 		expect(parseProgress(legacy).restated).toBe("");
 		const written = legacy.replace("next: 잇는다", "next: 잇는다\nrestated: 로그 회전 / S2 구현 / bun test 통과");
 		expect(parseProgress(written).restated).toBe("로그 회전 / S2 구현 / bun test 통과");
+	});
+
+	test("PROGRESS ends with an empty `# 결정` section; decision lines there are not read as steps", () => {
+		const rendered = renderProgress(meta.taskId, meta.registeredAt, meta.timezone);
+		expect(rendered.trimEnd().split("\n").at(-1)).toBe("# 결정");
+		const decided = `${rendered}- 파일 잠금 / 큐 / 의존성 없음\n`;
+		expect(parseProgress(decided).steps).toEqual(parseProgress(rendered).steps);
+		expect(parseProgress(decided).steps).toHaveLength(1);
+	});
+
+	test("PROGRESS carries an empty `needs_owner:` key before blocked_reason; yes/true in any case is true", () => {
+		const rendered = renderProgress(meta.taskId, meta.registeredAt, "Asia/Seoul").split("\n");
+		expect(rendered).toContain("needs_owner:");
+		expect(rendered.indexOf("needs_owner:")).toBe(rendered.indexOf("blocked_reason:") - 1);
+		const legacy = "---\ntask: T-20261026-01\nstatus: blocked\ncurrent: S1\nnext: 잇는다\n---\n# 단계\n";
+		const withValue = (value: string) => legacy.replace("next: 잇는다", `next: 잇는다\nneeds_owner:${value}`);
+		for (const value of [" yes", " YES", " true", " True"])
+			expect(parseProgress(withValue(value)).needsOwner).toBe(true);
+		for (const value of ["", " no", " 네", " 1"]) expect(parseProgress(withValue(value)).needsOwner).toBe(false);
+		expect(parseProgress(legacy).needsOwner).toBe(false);
+		expect(parseProgress(rendered.join("\n")).needsOwner).toBe(false);
 	});
 
 	test("outcome sections collect commit/test/file evidence per AC", () => {
@@ -215,6 +298,13 @@ describe("checkTask table", () => {
 		const written = await checkTask({ ...base, progress: front });
 		expect(written.restated).toBe("과제 / S2 / 완료 조건");
 		expect(written.reachKey).toBe(plain.reachKey);
+	});
+
+	test("the judgement carries PROGRESS `needs_owner`", async () => {
+		expect((await checkTask(base)).needsOwner).toBe(false);
+		const owner = progress("blocked").replace("---\n#", "needs_owner: yes\n---\n#");
+		const judged = await checkTask({ ...base, progress: owner });
+		expect(judged).toMatchObject({ blocked: true, needsOwner: true });
 	});
 
 	test("the reach key changes when evidence changes", async () => {

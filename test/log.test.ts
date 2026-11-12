@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger, fileSink } from "../src/log";
 import { createAggregatingLogger, startServiceAlive } from "../src/ops/log-hygiene";
-import { byteLength, redact } from "../src/redact";
+import { byteLength, clearSecretIndex, indexSecretValue, redact } from "../src/redact";
 
 const clock = { now: () => Date.UTC(2026, 9, 19, 12, 0, 0) };
 let dir: string;
@@ -66,6 +66,22 @@ describe("logger", () => {
 		});
 		log.info("evt", { secret: "xoxb-TEST-0" });
 		expect(lines).toEqual(["ts=2026-10-19T12:00:00.000Z level=error event=log_redact_failed"]);
+	});
+
+	test("an indexed secret split by a newline leaves no 16-char fragment in the escaped line", () => {
+		const secret = "Qz7Lm2Np9Rt4Vx8Wb3Kd6Hf1Jc5"; // gitleaks:allow (fake secret)
+		indexSecretValue(secret);
+		try {
+			const { lines, log } = capture();
+			log.info("evt", { text: `before ${secret.slice(0, 12)}\n${secret.slice(12)} after`, obj: { v: `${secret}` } });
+			const line = lines[0] ?? "";
+			expect(line).toContain("[REDACTED]");
+			for (let start = 0; start + 16 <= secret.length; start++)
+				expect(line).not.toContain(secret.slice(start, start + 16));
+			expect(line).not.toContain(secret.slice(0, 12));
+		} finally {
+			clearSecretIndex();
+		}
 	});
 
 	test("line byte budget (incl. newline) is applied after redaction", () => {

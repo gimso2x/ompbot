@@ -1,6 +1,17 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { restoreCommand } from "../src/cli/restore";
@@ -22,6 +33,7 @@ afterEach(() => {
 function seed(marker: string): void {
 	const db = new Database(join(home, "ompbot.db"), { create: true, strict: true });
 	db.run("PRAGMA journal_mode=WAL");
+	for (const table of ["origins", "inbound", "deliveries"]) db.run(`CREATE TABLE IF NOT EXISTS ${table} (id)`);
 	db.run("CREATE TABLE IF NOT EXISTS marker (v TEXT)");
 	db.run("DELETE FROM marker");
 	db.query("INSERT INTO marker VALUES (?)").run(marker);
@@ -155,6 +167,55 @@ describe("runRestore", () => {
 		expect(error.code).toBe("bad_source");
 		expect(error.message).toContain("-wal");
 		expect(markerOf(join(home, "ompbot.db"))).toBe("drifted");
+	});
+
+	test("a symlinked or hard-linked source cannot dodge the -wal refusal (J-6)", async () => {
+		goodBackupThenDrift();
+		// The live ledger has a -wal beside it; a link to it from elsewhere must be refused like the ledger itself.
+		const viaSymlink = join(home, "via-symlink.db");
+		symlinkSync(join(home, "ompbot.db"), viaSymlink);
+		const e1 = await runRestore({ homeDir: home, source: viaSymlink, yes: true, probeDaemon: noDaemon }).catch(
+			(e) => e,
+		);
+		expect(e1.code).toBe("bad_source");
+		expect(e1.message).toContain("-wal");
+		const viaHardlink = join(home, "via-hardlink.db");
+		linkSync(join(home, "ompbot.db"), viaHardlink);
+		const e2 = await runRestore({ homeDir: home, source: viaHardlink, yes: true, probeDaemon: noDaemon }).catch(
+			(e) => e,
+		);
+		expect(e2.code).toBe("bad_source");
+		expect(e2.message).toContain("hard link");
+		expect(markerOf(join(home, "ompbot.db"))).toBe("drifted");
+	});
+
+	test("an empty file or a sqlite db without the ompbot tables is refused (J-7)", async () => {
+		goodBackupThenDrift();
+		const empty = join(home, "empty.db");
+		writeFileSync(empty, "");
+		const e1 = await runRestore({ homeDir: home, source: empty, yes: true, probeDaemon: noDaemon }).catch((e) => e);
+		expect(e1).toBeInstanceOf(RestoreError);
+		expect(e1.code).toBe("integrity_check_failed");
+		const foreign = join(home, "foreign.db");
+		const db = new Database(foreign, { create: true });
+		db.run("CREATE TABLE other (x)");
+		db.close();
+		const e2 = await runRestore({ homeDir: home, source: foreign, yes: true, probeDaemon: noDaemon }).catch((e) => e);
+		expect(e2.code).toBe("integrity_check_failed");
+		expect(e2.message).toContain("origins");
+		expect(markerOf(join(home, "ompbot.db"))).toBe("drifted");
+		expect(readdirSync(home).filter((n) => n.includes(".tmp"))).toEqual([]);
+	});
+
+	test("two restores in the same second keep both pre-restore generations (J-8)", async () => {
+		const file = goodBackupThenDrift();
+		const now = new Date(2026, 10, 12, 10, 0, 0);
+		const first = await runRestore({ homeDir: home, source: file, yes: true, probeDaemon: noDaemon, now });
+		seed("second-drift");
+		const second = await runRestore({ homeDir: home, source: file, yes: true, probeDaemon: noDaemon, now });
+		expect(second.plan.preRestoreDir).not.toBe(first.plan.preRestoreDir);
+		expect(markerOf(join(first.plan.preRestoreDir, "ompbot.db"))).toBe("drifted");
+		expect(markerOf(join(second.plan.preRestoreDir, "ompbot.db"))).toBe("second-drift");
 	});
 
 	test("restores into a home that has no ledger yet", async () => {

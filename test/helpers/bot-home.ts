@@ -2,9 +2,9 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OmpbotConfig } from "../../src/config";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../../src/discord/fake-transport";
 import type { CreateMessageArgs, EditMessageArgs } from "../../src/discord/transport";
-import { type FakeCall, FakeSlackTransport } from "../../src/slack/fake-transport";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./discord-fake-transport";
+import { type FakeCall, FakeSlackTransport } from "./slack-fake-transport";
 
 export const OWNER = "UOWNER";
 
@@ -47,6 +47,7 @@ export function makeHome(
 			slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
 			ompExecutable,
 			workspaceDir: "workspace",
+			timezone: "Asia/Seoul",
 			...(real ? { model: real.model } : {}),
 		}),
 		{ mode: 0o600 },
@@ -62,6 +63,7 @@ export function makeHome(
 			slack: { botTokenFile, appTokenFile },
 			ompExecutable,
 			workspaceDir,
+			timezone: "Asia/Seoul",
 		},
 		remove: () => rmSync(dir, { recursive: true, force: true }),
 	};

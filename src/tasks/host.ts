@@ -57,9 +57,10 @@ export interface TaskHostOps {
 	commitDocs(input: { worktree: string; taskId: string }): Promise<HostResult<string>>;
 	/**
 	 * A `[check: command …]`: `argv` without a shell, cwd `worktree` (ssh: `cd` then each argument single-quoted),
-	 * killed after `timeoutMs`. `output` is stdout then stderr. Throws when the host cannot be reached.
+	 * killed after `timeoutMs` or when `signal` aborts. `output` is stdout then stderr. Throws when the host cannot be
+	 * reached.
 	 */
-	runCheck(input: { worktree: string; argv: string[]; timeoutMs: number }): Promise<CheckRun>;
+	runCheck(input: { worktree: string; argv: string[]; timeoutMs: number; signal?: AbortSignal }): Promise<CheckRun>;
 	/** The worktree's HEAD commit and whether `git status --porcelain` is empty; throws when git cannot answer. */
 	headOf(worktree: string): Promise<{ sha: string; clean: boolean }>;
 }
@@ -100,6 +101,9 @@ export interface TaskHostOptions {
 	run?: ProcessRunner;
 	inheritedEnv?: Record<string, string | undefined>;
 }
+
+/** PATH assignment a remote `[check:]` line exports first; double quotes so the remote shell expands `$HOME`/`$PATH`. */
+const REMOTE_CHECK_PATH = 'PATH="$HOME/.local/bin:$PATH"';
 
 export function sshCommand(sshTarget: string, remote: string[]): string[] {
 	return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", sshTarget, "--", ...remote];
@@ -273,6 +277,8 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 					"-c",
 					"core.quotepath=false",
 					"diff",
+					"--no-ext-diff",
+					"--no-textconv",
 					`${base.value}..${branch}`,
 					"--no-color",
 					"--unified=0",
@@ -315,16 +321,27 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			return { ok: true, value: hash };
 		},
 
-		async runCheck({ worktree, argv, timeoutMs }) {
+		async runCheck({ worktree, argv, timeoutMs, signal }) {
 			assertPath(worktree);
+			const stop = signal === undefined ? {} : { signal };
 			// Locally the argv is the process itself; ssh joins its arguments into one remote shell line, so every
-			// argument is single-quoted there and the shell only sees `cd <worktree> && <argv>`.
+			// argument is single-quoted there and the shell only sees `cd <worktree> && <argv>`. A non-interactive ssh
+			// shell skips the profile that puts `~/.local/bin` (npm, node, bun shims) on PATH, so the line adds it first.
 			const result =
 				sshTarget === undefined
-					? await run(argv, { cwd: worktree, timeoutMs, env })
-					: await run(sshCommand(sshTarget, ["cd", remoteShellQuote(worktree), "&&", ...argv.map(remoteShellQuote)]), {
-							timeoutMs,
-						});
+					? await run(argv, { cwd: worktree, timeoutMs, env, ...stop })
+					: await run(
+							sshCommand(sshTarget, [
+								"export",
+								REMOTE_CHECK_PATH,
+								"&&",
+								"cd",
+								remoteShellQuote(worktree),
+								"&&",
+								...argv.map(remoteShellQuote),
+							]),
+							{ timeoutMs, ...stop },
+						);
 			if (sshTarget !== undefined && !result.timedOut && (result.code === null || result.code === SSH_FAILURE))
 				throw new Error(`cannot run check: host unreachable: ${unreachableReason(result)}`);
 			const output = [result.stdout, result.stderr ?? ""].filter((part) => part.trim() !== "").join("\n");
@@ -397,7 +414,8 @@ export function resolveTaskHost(
 	options: Omit<TaskHostOptions, "sshTarget"> = {},
 ): TaskHostOps & TaskResumeOps {
 	if (host === null) return createTaskHostOps(options);
-	const entry = dispatchHosts?.[host];
+	// Own keys only: `constructor`/`__proto__` are not configured hosts.
+	const entry = dispatchHosts !== undefined && Object.hasOwn(dispatchHosts, host) ? dispatchHosts[host] : undefined;
 	if (entry === undefined) throw new Error(`알 수 없는 호스트: ${host}`);
 	return createTaskHostOps({ ...options, sshTarget: entry.ssh });
 }

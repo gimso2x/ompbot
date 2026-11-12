@@ -30,7 +30,7 @@ export interface LaneHarness {
 	drivers: Map<string, FakeOmpDriver>;
 	logs: string[];
 	advance(ms: number): void;
-	/** Resolves once every mailbox call and all background work the manager started has been handled. */
+	/** Resolves once every mailbox call, background verdict and other background work of the manager has been handled. */
 	settle(): Promise<void>;
 	/** `steer:` calls the lane's omp child received. */
 	steers(originKey: string): string[];
@@ -42,30 +42,33 @@ export interface LaneHarness {
 /** Builds the driver the router hands a lane session (tests substitute a never-settling fake here). */
 export type LaneDriverFactory = (originKey: string, sessionDir: string) => OmpSessionDriver;
 
+/** The manager seams a harness test may replace, plus the lane session's driver. */
+export type LaneHarnessExtra = Partial<
+	Pick<
+		LaneManagerDeps,
+		| "hostOps"
+		| "verify"
+		| "collectDiff"
+		| "frozen"
+		| "maxLanes"
+		| "land"
+		| "autoLandPolicy"
+		| "repoMatches"
+		| "integrity"
+		| "approvals"
+		| "ownerUserId"
+		| "laneBusy"
+		| "reviewer"
+		| "changesGit"
+	>
+> & { driver?: LaneDriverFactory };
+
 /** A `LaneManager` over a real store and router with held fake omp turns, a fake clock and a fake Slack. */
-export function laneHarness(
-	homeDir: string,
-	extra: Partial<
-		Pick<
-			LaneManagerDeps,
-			| "hostOps"
-			| "verify"
-			| "frozen"
-			| "maxLanes"
-			| "land"
-			| "autoLandPolicy"
-			| "repoMatches"
-			| "integrity"
-			| "approvals"
-			| "ownerUserId"
-			| "laneBusy"
-		>
-	> & { driver?: LaneDriverFactory } = {},
-): LaneHarness {
+export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): LaneHarness {
 	const { driver: laneDriver, ...managerExtra } = extra;
 	let now = LANE_START;
 	const clock = { now: () => now };
-	const store = openBotStore(join(homeDir, "ompbot.db"), clock);
+	const store = openBotStore(join(homeDir, "ompbot.db"), clock, "Asia/Seoul");
 	const transport = new WaitingTransport();
 	const sessions = new FakeSessionStore();
 	const drivers = new Map<string, FakeOmpDriver>();
@@ -75,6 +78,7 @@ export function laneHarness(
 	// Assigned right below the router: the router tells it when a held lane's child starts working again.
 	let manager!: LaneManager;
 	const router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		log,
@@ -93,6 +97,7 @@ export function laneHarness(
 	});
 	const pending: Promise<unknown>[] = [];
 	manager = new LaneManager({
+		timezone: "Asia/Seoul",
 		store,
 		channels: registryOf(new SlackChannel(transport)),
 		clock,
@@ -133,10 +138,12 @@ export function laneHarness(
 			now += ms;
 		},
 		settle: async () => {
-			// Background work (an Outcome card, an auto-merge) may route more messages: wait until neither is left.
+			// Background work (a verdict the tick started, an Outcome card, an auto-merge) may route more messages: wait
+			// until none is left.
 			for (let seen = -1; seen !== pending.length; ) {
 				seen = pending.length;
 				await Promise.all(pending);
+				await manager.settledInBackground();
 				await manager.idle();
 			}
 		},

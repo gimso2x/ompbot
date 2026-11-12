@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
+import { rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
 import { SlackAdapter } from "../src/slack/adapter";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { openStore, type Store } from "../src/store/db";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const LOG = "C0LOGCHAN01";
 const clock = { now: () => 1_000_000 };
@@ -17,7 +18,7 @@ let store: Store;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-log-routing-"));
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, logChannel: LOG });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact, logChannel: LOG });
 });
 
 afterEach(() => {
@@ -99,7 +100,7 @@ describe("completion copies to the log channel", () => {
 		store.recordAnswer({ originKey: "slack/dm/D1", opRef: "op1", threadRef: "D1:1.1", parts: ["✅ 완료 한 번"] });
 		expect(copies()).toHaveLength(1);
 
-		const plain = openStore({ path: join(dir, "plain.db"), clock, redact });
+		const plain = openStore({ timezone: "Asia/Seoul", path: join(dir, "plain.db"), clock, redact });
 		try {
 			plain.ensureOrigin("slack/dm/D1", "sess");
 			plain.recordAnswer({ originKey: "slack/dm/D1", opRef: "op1", threadRef: "D1:1.1", parts: ["✅ 완료"] });
@@ -209,5 +210,27 @@ describe("log channel in the Slack adapter", () => {
 		const posts = transport.calls.filter((c) => c.method === "postMessage");
 		const second = posts[1];
 		expect(second && "text" in second ? second.text : "").toBe("📒 완료 보고 사본 · <#C0WORK00001>\n✅ 완료");
+	});
+});
+
+describe("the live log file deleted from outside (#43)", () => {
+	test("writes keep landing and no archive is lost", () => {
+		const path = join(dir, "ompbot.log");
+		const sink = rotatingFileSink(path, { maxBytes: 100, files: 3 });
+		const line = (n: number) => `L${String(n).padStart(2, "0")}${"x".repeat(36)}`; // 39 bytes + newline = 40
+		for (let n = 1; n <= 6; n++) sink(line(n));
+		const logs = () => readdirSync(dir).filter((name) => name.startsWith("ompbot.log"));
+		expect(logs().sort()).toEqual(["ompbot.log", "ompbot.log.1", "ompbot.log.2"]);
+		const archived = [readFileSync(`${path}.1`, "utf8"), readFileSync(`${path}.2`, "utf8")];
+		rmSync(path);
+
+		// The counter still says the live file is full: the next write must start a fresh live file, not rotate.
+		sink(line(7));
+		expect(readFileSync(path, "utf8")).toBe(`${line(7)}\n`);
+		expect([readFileSync(`${path}.1`, "utf8"), readFileSync(`${path}.2`, "utf8")]).toEqual(archived);
+
+		for (let n = 8; n <= 12; n++) sink(line(n));
+		expect(logs().sort()).toEqual(["ompbot.log", "ompbot.log.1", "ompbot.log.2"]);
+		expect(readFileSync(path, "utf8")).toBe(`${line(11)}\n${line(12)}\n`);
 	});
 });

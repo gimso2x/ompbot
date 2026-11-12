@@ -3,7 +3,9 @@
  * for the files the agent edits. Renderer and parser live together so the format has one definition.
  */
 
-import { parseChecks, SignalSyntaxError } from "./signals";
+import { redact } from "../redact";
+import { localIso } from "../time";
+import { assertCheckPlacement, checkSignalsOf, parseChecks, type Signal, SignalSyntaxError } from "./signals";
 
 export const TASK_RISKS = ["L0", "L1", "L2", "L3", "L4"] as const;
 export type TaskRisk = (typeof TASK_RISKS)[number];
@@ -56,12 +58,17 @@ function requireText(record: Record<string, unknown>, key: string): string {
 	return oneLine(value);
 }
 
-function textList(record: Record<string, unknown>, key: string, min: number): string[] {
+function textList(
+	record: Record<string, unknown>,
+	key: string,
+	min: number,
+	normalize: (text: string) => string = oneLine,
+): string[] {
 	const value = record[key] ?? [];
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || oneLine(item) === "")) {
 		throw new TaskSpecError(`taskSpec.${key}는 비어 있지 않은 문자열 배열이어야 합니다`);
 	}
-	const list = (value as string[]).map(oneLine);
+	const list = (value as string[]).map(normalize);
 	if (list.length < min) throw new TaskSpecError(`taskSpec.${key}는 ${min}개 이상이어야 합니다`);
 	return list;
 }
@@ -91,45 +98,99 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const assumptions = record.assumptions;
 	if (assumptions !== undefined && typeof assumptions !== "string")
 		throw new TaskSpecError("taskSpec.assumptions는 문자열이어야 합니다");
-	const acceptance = textList(record, "acceptance", 1);
-	// A malformed `[check: …]` is refused here, not discovered at judgement time.
-	acceptance.forEach((text, index) => {
-		try {
-			parseChecks(text);
-		} catch (error) {
-			if (!(error instanceof SignalSyntaxError)) throw error;
-			throw new TaskSpecError(`taskSpec.acceptance[${index}]의 check 형식 오류: ${error.message}`);
-		}
-	});
+	// Masked here once: the ledger row, the four documents, the accepted card and the logs all take these values.
+	// Raw here: redactCriterion validates the check block as written, then collapses only the prose around it.
+	const acceptance = textList(record, "acceptance", 1, (text) => text).map(redactCriterion);
 	return {
 		kind: "new",
 		spec: {
-			title: requireText(record, "title"),
+			title: redact(requireText(record, "title")),
 			risk: risk as TaskRisk,
-			goal: requireText(record, "goal"),
-			scope: textList(record, "scope", 0),
-			exclusions: textList(record, "exclusions", 0),
+			goal: redact(requireText(record, "goal")),
+			scope: textList(record, "scope", 0).map(redact),
+			exclusions: textList(record, "exclusions", 0).map(redact),
 			acceptance,
 			repo: repo.replace(/\/+$/, ""),
-			...(background === undefined || oneLine(background) === "" ? {} : { background: background.trim() }),
-			...(assumptions === undefined || oneLine(assumptions) === "" ? {} : { assumptions: oneLine(assumptions) }),
+			...(background === undefined || oneLine(background) === "" ? {} : { background: redact(background.trim()) }),
+			...(assumptions === undefined || oneLine(assumptions) === ""
+				? {}
+				: { assumptions: redact(oneLine(assumptions)) }),
 		},
 	};
 }
 
-// ---- ids, time, paths ----
-
-const KST_OFFSET_MS = 9 * 60 * 60_000;
-
-/** `2026-10-26T15:04:05+09:00` for an epoch-ms instant. */
-export function formatKst(ms: number): string {
-	return `${new Date(ms + KST_OFFSET_MS).toISOString().slice(0, 19)}+09:00`;
+/** Start of the trailing `[check: …]` that `checkSignalsOf` reads in `text`; `-1` without one. */
+function checkBlockStart(text: string): number {
+	if (checkSignalsOf(text).length === 0) return -1;
+	// The block is the last `[check:` whose own suffix still ends in a block (a later one is a quoted argument).
+	for (let open = text.lastIndexOf("[check:"); open !== -1; open = text.lastIndexOf("[check:", open - 1)) {
+		try {
+			if (checkSignalsOf(text.slice(open)).length > 0) return open;
+		} catch {
+			// an unterminated quoted `[check:` inside the block; keep looking further left
+		}
+		if (open === 0) break;
+	}
+	return -1;
 }
 
-/** `YYYYMMDD` of the KST calendar day of `ms`. */
-export function kstDay(ms: number): string {
-	return new Date(ms + KST_OFFSET_MS).toISOString().slice(0, 10).replaceAll("-", "");
+/**
+ * `oneLine` for an acceptance criterion: the prose before a trailing `[check: …]` collapses, the block stays byte for
+ * byte (the sweep JSON-parses it into argv) except line breaks, which a valid block only holds between tokens.
+ */
+export function criterionLine(text: string): string {
+	let start = -1;
+	try {
+		start = checkBlockStart(text);
+	} catch (error) {
+		// A malformed block is refused at registration and reported by the checker; here it is just text.
+		if (!(error instanceof SignalSyntaxError)) throw error;
+	}
+	if (start === -1) return oneLine(text);
+	const prose = oneLine(text.slice(0, start));
+	const block = text
+		.slice(start)
+		.trim()
+		.replace(/[\r\n]+/g, " ");
+	return prose === "" ? block : `${prose} ${block}`;
 }
+
+/**
+ * One acceptance criterion at registration: a malformed `[check: …]` is refused here, not discovered at judgement
+ * time; the prose before the block is masked; the block itself is never changed (the sweep re-runs it as written), so
+ * a block `redact` would change is refused — without echoing it.
+ */
+function redactCriterion(text: string, index: number): string {
+	let signals: Signal[];
+	try {
+		assertCheckPlacement(text);
+		signals = parseChecks(text);
+	} catch (error) {
+		if (!(error instanceof SignalSyntaxError)) throw error;
+		throw new TaskSpecError(`taskSpec.acceptance[${index}]의 check 형식 오류: ${redact(error.message)}`);
+	}
+	const line = criterionLine(text);
+	const start = checkBlockStart(line);
+	if (start === -1) return redact(line);
+	const block = line.slice(start);
+	// The decoded values too: a JSON `\u` escape spells the token differently in the block than in the argv run.
+	const decoded = signals.flatMap((signal) =>
+		signal.kind === "command"
+			? [...signal.argv, signal.stdout?.source ?? ""]
+			: [
+					signal.path,
+					...(signal.json === undefined ? [] : [...signal.json.path.map(String), JSON.stringify(signal.json.value)]),
+				],
+	);
+	if (redact(block) !== block || decoded.some((value) => redact(value) !== value)) {
+		throw new TaskSpecError(
+			`taskSpec 수락기준 AC-${index + 1}의 [check:] 명령에 비밀값으로 보이는 문자열이 있습니다 — 환경변수나 파일 경로로 넘기세요`,
+		);
+	}
+	return redact(line.slice(0, start)) + block;
+}
+
+// ---- ids, paths ----
 
 export const formatTaskId = (day: string, seq: number): string => `T-${day}-${String(seq).padStart(2, "0")}`;
 
@@ -157,13 +218,15 @@ export interface TaskDocsMeta {
 	agent: string;
 	threadLink: string;
 	registeredAt: number;
+	/** The bot's zone (`config.timezone`): the registration time is written with its offset. */
+	timezone: string;
 }
 
 /** Drops a leading `AC-<n>:` the caller already wrote, so the generated id is not shown twice. */
 export const stripAcPrefix = (text: string): string => text.replace(/^AC-\d+\s*[:.)]\s*/, "");
 
 export const acceptanceItems = (texts: readonly string[]): AcceptanceItem[] =>
-	texts.map((text, index) => ({ id: `AC-${index + 1}`, text: stripAcPrefix(oneLine(text)) }));
+	texts.map((text, index) => ({ id: `AC-${index + 1}`, text: stripAcPrefix(criterionLine(text)) }));
 
 export function renderContext(meta: TaskDocsMeta, spec: NewTaskSpec, original: string): string {
 	return [
@@ -175,7 +238,7 @@ export function renderContext(meta: TaskDocsMeta, spec: NewTaskSpec, original: s
 		"## 가정",
 		spec.assumptions ?? "(없음)",
 		"## 메타",
-		`- 요청 위치: ${meta.threadLink} · 등록: ${formatKst(meta.registeredAt)} · 위험등급: ${spec.risk}`,
+		`- 요청 위치: ${meta.threadLink} · 등록: ${localIso(meta.registeredAt, meta.timezone)} · 위험등급: ${spec.risk}`,
 		`- 레포: ${meta.hostLabel}:${meta.repo} · 워크트리: ${meta.worktree} (branch ${meta.branch}) · 에이전트: ${meta.agent}`,
 		"",
 	].join("\n");
@@ -204,15 +267,16 @@ export function renderSpec(meta: TaskDocsMeta, spec: NewTaskSpec, acceptance: re
 	].join("\n");
 }
 
-export function renderProgress(taskId: string, now: number): string {
+export function renderProgress(taskId: string, now: number, timezone: string): string {
 	return [
 		"---",
 		`task: ${taskId}`,
 		"status: working",
-		`updated: ${formatKst(now)}`,
+		`updated: ${localIso(now, timezone)}`,
 		"current: S1",
 		"next: spec.md를 읽고 이 파일의 단계 목록을 채운다",
 		"restated:",
+		"needs_owner:",
 		"blocked_reason:",
 		"question:",
 		"recommend:",
@@ -220,6 +284,8 @@ export function renderProgress(taskId: string, now: number): string {
 		"---",
 		"# 단계",
 		"- [ ] S1: spec.md를 읽고 단계 목록을 채운다 | 완료 조건: 이 목록이 실제 작업 단계로 바뀌어 있다 | 증거:",
+		"",
+		"# 결정",
 		"",
 	].join("\n");
 }
@@ -281,7 +347,8 @@ export function parseSpec(text: string): ParsedSpec {
 		if (line === "") continue;
 		const match = AC_LINE.exec(line);
 		if (match === null) malformed.push(line);
-		else acceptance.push({ id: match[2] as string, text: oneLine(match[3] as string), checked: match[1] !== " " });
+		else
+			acceptance.push({ id: match[2] as string, text: criterionLine(match[3] as string), checked: match[1] !== " " });
 	}
 	return { task: front.get("task"), acceptance, malformed, hasAcceptanceSection: lines !== undefined };
 }
@@ -303,6 +370,8 @@ export interface ParsedProgress {
 	next: string;
 	/** `과제 / 첫 next / 완료 조건` the agent writes first on a resume; `""` when absent (files from before the key). */
 	restated: string;
+	/** `needs_owner: yes|true` (any case): the block is the owner's to decide, so the sweep skips the retry prompt. */
+	needsOwner: boolean;
 	blockedReason: string;
 	/** Decision request written with `status: blocked` (hub `[DECISION]`): the question, a recommendation, the impact. */
 	question: string;
@@ -332,17 +401,20 @@ export function parseProgress(text: string): ParsedProgress {
 			evidence: field("증거"),
 		});
 	}
+	// The worker's prose goes on to the ledger (notices, history) and the owner's cards: masked as it is read.
+	const prose = (key: string): string => redact(front.get(key) ?? "");
 	return {
 		task: front.get("task"),
 		status: (front.get("status") ?? "").toLowerCase(),
 		updated: front.get("updated") ?? "",
-		current: front.get("current") ?? "",
-		next: front.get("next") ?? "",
-		restated: front.get("restated") ?? "",
-		blockedReason: front.get("blocked_reason") ?? "",
-		question: front.get("question") ?? "",
-		recommend: front.get("recommend") ?? "",
-		impact: front.get("impact") ?? "",
+		current: prose("current"),
+		next: prose("next"),
+		restated: prose("restated"),
+		needsOwner: ["yes", "true"].includes((front.get("needs_owner") ?? "").trim().toLowerCase()),
+		blockedReason: prose("blocked_reason"),
+		question: prose("question"),
+		recommend: prose("recommend"),
+		impact: prose("impact"),
 		steps,
 	};
 }
@@ -382,7 +454,7 @@ export function parseOutcome(text: string): ParsedOutcome {
 		}
 		if (inSummary) {
 			const entry = line.replace(/^[-*•]\s+/, "");
-			if (entry !== "") summary.push(entry);
+			if (entry !== "") summary.push(redact(entry));
 			continue;
 		}
 		const item = /^- (commit|test|file):\s*(.*)$/.exec(line);

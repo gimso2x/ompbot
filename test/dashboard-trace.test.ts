@@ -33,7 +33,7 @@ const result = (callId: string, at: number, isError = false, text = "ok") => ({
 /** One conversation with turn 1 dispatched at T0 (in `state`) and, when given, turn 2 dispatched at `nextAt`. */
 function seed(state: string, nextAt?: number): void {
 	const dbPath = join(home, "ompbot.db");
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const sessionDir = join(home, "sessions", "o", "e1");
 	mkdirSync(sessionDir, { recursive: true });
 	sessionFile = join(sessionDir, "s.jsonl");

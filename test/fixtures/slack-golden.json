@@ -766,12 +766,12 @@
 				{
 					"method": "postMessage",
 					"channel": "D1",
-					"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing",
+					"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
 					"threadTs": "1700000000.000600",
 					"blocks": [
 						{
 							"type": "markdown",
-							"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing"
+							"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
 						}
 					],
 					"ts": "1800000000.000019"
@@ -791,7 +791,7 @@
 			],
 			"result": {
 				"response_type": "ephemeral",
-				"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/7/0/0\n입수 pending=0 dispatched=0 answered=7 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing"
+				"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/7/0/0\n입수 pending=0 dispatched=0 answered=7 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
 			}
 		},
 		{
@@ -1183,7 +1183,7 @@
 			"opRef": "status:D1:1700000000.000600",
 			"part": 0,
 			"threadRef": "D1:1700000000.000600",
-			"body": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 1개 열림\n• backup_age stamp=missing",
+			"body": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
 			"state": "confirmed",
 			"attempts": 0,
 			"redelivered": false,

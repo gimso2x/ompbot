@@ -9,13 +9,13 @@ import { DENIED_TEXT } from "../src/channel/text";
 import type { CoreSink, DeliverySource } from "../src/channel/types";
 import { DiscordAdapter } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
-import { FakeDiscordTransport } from "../src/discord/fake-transport";
 import type { DiscordInteraction } from "../src/discord/transport";
 import { lanePauseActionId } from "../src/lanes/card";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 import { taskRecommendActionId } from "../src/tasks/notify";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -100,7 +100,7 @@ async function threadCard(port: DiscordChannel): Promise<string> {
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-discord-interactions-"));
-	store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
 	transport = new FakeDiscordTransport({ botUserId: BOT, applicationId: APP });
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });

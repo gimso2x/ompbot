@@ -8,12 +8,27 @@ function redactMessage(msg: OutboundMessage): OutboundMessage {
 		...msg,
 		text: redact(msg.text),
 		...(msg.buttonsNote === undefined ? {} : { buttonsNote: redact(msg.buttonsNote) }),
+		...(msg.title === undefined ? {} : { title: redact(msg.title) }),
+		...(msg.body === undefined ? {} : { body: redact(msg.body) }),
+		...(msg.fields === undefined
+			? {}
+			: { fields: msg.fields.map((field) => ({ label: redact(field.label), value: redact(field.value) })) }),
+		...(msg.buttons === undefined
+			? {}
+			: {
+					buttons: msg.buttons.map((button) => ({
+						...button,
+						label: redact(button.label),
+						...(button.value === undefined ? {} : { value: redact(button.value) }),
+					})),
+				}),
 	};
 }
 
 /**
- * The single outbound writer: every text, upload title and comment is masked here before an adapter sees it, so no
- * caller can skip it. Callers may redact on their own as well (masking is idempotent).
+ * The single outbound writer: every text, card title/body/field, button label/value, upload title and comment is masked
+ * here before an
+ * adapter sees it, so no caller can skip it. Callers may redact on their own as well (masking is idempotent).
  */
 function redacting(port: ChannelPort): ChannelPort {
 	const openThread = port.openThread?.bind(port);

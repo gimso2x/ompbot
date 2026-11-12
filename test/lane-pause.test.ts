@@ -679,7 +679,7 @@ describe("the lanes CHECK constraint and the stuck gate (AC-8)", () => {
 
 	test("a pre-pause `lanes` table is rebuilt with its rows once `paused` arrives", () => {
 		const path = join(home.dir, "old-ledger.db");
-		const seed = openBotStore(path, clock);
+		const seed = openBotStore(path, clock, "Asia/Seoul");
 		seed.close();
 		const raw = new Database(path);
 		raw.run("DROP TABLE lanes");
@@ -702,7 +702,7 @@ describe("the lanes CHECK constraint and the stuck gate (AC-8)", () => {
 		);
 		raw.close();
 
-		const store = openBotStore(path, clock);
+		const store = openBotStore(path, clock, "Asia/Seoul");
 		expect(store.getLane("old")).toMatchObject({ name: "old", title: "옛 레인", status: "working" });
 		store.transitionLane("old", "paused", { event: "paused" }, { pausedFrom: "working" });
 		expect(store.getLane("old")?.status).toBe("paused");

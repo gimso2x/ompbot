@@ -22,8 +22,7 @@ export function skillsCommand(args: string[], env: Record<string, string | undef
 		return 2;
 	}
 	// The skills root is the real agent directory; the test-hook override follows the OMPBOT_SWEEP_MS pattern.
-	const root =
-		env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SKILLS_DIR !== undefined ? env.OMPBOT_SKILLS_DIR : agentSkillsRoot();
+	const root = env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SKILLS_DIR ? env.OMPBOT_SKILLS_DIR : agentSkillsRoot();
 	let revision: string;
 	try {
 		revision = rollbackSkill(join(root, name));

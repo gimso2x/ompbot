@@ -16,10 +16,10 @@ import { redact } from "../src/redact";
 import { PEER_HOP_NOTICE, SlackAdapter } from "../src/slack/adapter";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackMessageEvent } from "../src/slack/transport";
 import { openStore } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const BOT = "UBOT";
 const PEER = "UPEER00001";
@@ -318,7 +318,7 @@ describe("store: inbound.peer_user_id", () => {
 	test("(j) the migration adds the column once to an older ledger and leaves old rows NULL", () => {
 		const path = join(dir, "ompbot.db");
 		const clock = { now: () => 5_000 };
-		const first = openStore({ path, clock, redact });
+		const first = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		first.ensureOrigin("slack/dm/D1", join(dir, "s"));
 		first.recordInbound({
 			originKey: "slack/dm/D1",
@@ -334,7 +334,7 @@ describe("store: inbound.peer_user_id", () => {
 		).toBe(false);
 		raw.close();
 
-		const migrated = openStore({ path, clock, redact });
+		const migrated = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		expect(migrated.getInbound("D1:1.0")?.peerUserId).toBeNull();
 		migrated.recordInbound({
 			originKey: "slack/dm/D1",
@@ -347,7 +347,7 @@ describe("store: inbound.peer_user_id", () => {
 		expect(migrated.originHasPeerInbound("slack/dm/D1")).toBe(true);
 		migrated.close();
 
-		const again = openStore({ path, clock, redact }); // a second open must not try to add the column again
+		const again = openStore({ timezone: "Asia/Seoul", path, clock, redact }); // a second open must not try to add the column again
 		expect(again.getInbound("D1:1.0")?.peerUserId).toBeNull();
 		expect(again.getInbound("D1:2.0")?.peerUserId).toBe(PEER);
 		again.close();

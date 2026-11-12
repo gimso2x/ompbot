@@ -345,6 +345,7 @@ export class DiscordRest {
 			json: {
 				...(args.content === undefined ? {} : { content: args.content }),
 				...(args.components === undefined ? {} : { components: args.components }),
+				...mentions(args.allowedMentions),
 			},
 		});
 	}

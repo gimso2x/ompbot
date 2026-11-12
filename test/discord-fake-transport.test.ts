@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
 import { fromDiscordEmoji, toDiscordEmoji, UnknownEmojiError } from "../src/discord/emoji";
-import { FakeDiscordTransport } from "../src/discord/fake-transport";
 import { FileFakeDiscordTransport } from "../src/discord/test-transport";
 import type {
 	DiscordHandlers,
@@ -14,6 +13,7 @@ import type {
 } from "../src/discord/transport";
 import { DiscordCallError } from "../src/discord/transport";
 import { STATUS_REACTIONS } from "../src/tasks/notify";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const CHANNEL = "111111111111111111";
 

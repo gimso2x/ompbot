@@ -28,6 +28,11 @@ export interface OwnerIngest {
 	text: string;
 	/** Quoted attachments, fenced like any forwarded text. */
 	quoted?: readonly string[] | undefined;
+	/**
+	 * Put in by `ompbot inject` (anyone with the socket), not by a button the owner clicked: such a message may not
+	 * answer an approval or choice card. Absent/false for the daemon's own button paths.
+	 */
+	injected?: boolean | undefined;
 }
 
 export interface ChannelAdapter {

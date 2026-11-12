@@ -8,7 +8,7 @@ import {
 	TASK_RISKS,
 	type TaskRisk,
 } from "../tasks/docs";
-import { parseChecks, SignalSyntaxError } from "../tasks/signals";
+import { assertCheckPlacement, parseChecks, SignalSyntaxError } from "../tasks/signals";
 import { defaultGit, type GitRunner } from "./verify";
 
 /**
@@ -43,7 +43,9 @@ export function parseLaneAcceptance(raw: unknown): LaneCheck<AcceptanceItem[]> {
 	for (const [index, text] of texts.entries()) {
 		try {
 			// The stored text is the one-line form; that is the one the claim will run.
-			parseChecks(oneLine(text));
+			const stored = oneLine(text);
+			assertCheckPlacement(stored);
+			parseChecks(stored);
 		} catch (error) {
 			if (!(error instanceof SignalSyntaxError)) throw error;
 			return { ok: false, problem: `acceptance[${index}]의 check 형식 오류: ${error.message}` };
@@ -76,6 +78,14 @@ export async function resolveLaneRepo(cwd: string, git: GitRunner = defaultGit):
 		repo = realpathSync(top.stdout.trim());
 	} catch {
 		return { ok: false, problem: `저장소 경로를 확인하지 못했습니다: ${top.stdout.trim()}` };
+	}
+	// A submodule's sibling worktree path would land inside the superproject's work tree.
+	const superproject = await git(["-C", repo, "rev-parse", "--show-superproject-working-tree"]);
+	if (superproject.code === 0 && superproject.stdout.trim() !== "") {
+		return {
+			ok: false,
+			problem: `서브모듈 안에서는 레인을 시작할 수 없습니다: ${repo} (상위 저장소 ${superproject.stdout.trim()}) — 상위 저장소나 따로 clone한 경로에서 시작하세요.`,
+		};
 	}
 	if (!TASK_PATH_PATTERN.test(repo) || repo.includes("..")) {
 		return {

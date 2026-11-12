@@ -39,7 +39,7 @@ let clock: FakeClock;
 
 /** A bot database with one row of everything the page shows, written through raw SQL after the schema exists. */
 function seedDatabase(): void {
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	const hour = 3_600_000;
 	db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES ('slack/dm/U1', 1, '/s', ?)", [NOW]);
@@ -225,6 +225,7 @@ function fakeRunner(options: { remoteFails?: boolean } = {}): FakeRunner {
 
 const STATUS: StatusReport = {
 	ompVersion: "omp 9.9.9",
+	timezone: "Asia/Seoul",
 	daemonRunning: true,
 	origins: [
 		{ originKey: "slack/dm/U1", epoch: 1, ompPid: 42, busy: true },
@@ -241,6 +242,7 @@ function deps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps & { ipcCalls:
 		ipcCalls: 0,
 		homeDir: home.dir,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: {
 			ompExecutable: home.config.ompExecutable,
 			herdr: {},

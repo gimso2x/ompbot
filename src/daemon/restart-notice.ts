@@ -31,13 +31,27 @@ export function writeRestartMarker(homeDir: string, marker: RestartNoticeMarker)
 	writeFileSync(join(homeDir, RESTART_NOTICE_FILE), `${JSON.stringify(marker)}\n`, { mode: 0o600 });
 }
 
-/** The marker, or undefined when there is none or it is unreadable (an unreadable marker is removed too). */
-export function takeRestartMarker(homeDir: string): RestartNoticeMarker | undefined {
+/**
+ * The marker, or undefined when there is none or it is unusable. An unreadable (permissions, a directory) or torn
+ * marker is removed too, and `onDropped` hears why (the errno code or `unparsable`) — never a missing file.
+ */
+export function takeRestartMarker(
+	homeDir: string,
+	onDropped: (reason: string) => void = () => undefined,
+): RestartNoticeMarker | undefined {
 	const path = join(homeDir, RESTART_NOTICE_FILE);
 	let raw: string;
 	try {
 		raw = readFileSync(path, "utf8");
-	} catch {
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return undefined;
+		try {
+			rmSync(path, { force: true });
+		} catch {
+			// a directory or an unwritable home: the drop is still reported below
+		}
+		onDropped(code ?? "unreadable");
 		return undefined;
 	}
 	rmSync(path, { force: true });
@@ -57,6 +71,7 @@ export function takeRestartMarker(homeDir: string): RestartNoticeMarker | undefi
 	} catch {
 		// fall through: a torn marker is dropped
 	}
+	onDropped("unparsable");
 	return undefined;
 }
 

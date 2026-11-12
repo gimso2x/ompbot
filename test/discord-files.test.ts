@@ -10,16 +10,16 @@ import type { CoreSink, DeliverySource, InboundMessage } from "../src/channel/ty
 import { DiscordAdapter } from "../src/discord/adapter";
 import { downloadDiscordAttachment } from "../src/discord/attachments";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import type { DiscordAttachment, DiscordMessageEvent } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { ApprovalBroker } from "../src/safety/approval";
 import { buildHostTools, type HostToolDef } from "../src/safety/host-tools";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { openStore, type Store } from "../src/store/db";
 import { registryOf } from "./helpers/channels";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -54,7 +54,7 @@ beforeEach(() => {
 	workspaceDir = join(homeDir, "workspace");
 	mkdirSync(join(homeDir, "secrets"), { recursive: true });
 	mkdirSync(workspaceDir, { recursive: true });
-	store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => 0 }, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => 0 }, redact });
 	transport = new FakeDiscordTransport({ botUserId: BOT });
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });
@@ -77,7 +77,7 @@ describe("discord_send_file", () => {
 		const tools = buildHostTools({
 			originKey,
 			channels,
-			broker: new ApprovalBroker({ channels, ownerUserId: OWNER, log: log(), store }),
+			broker: new ApprovalBroker({ timezone: "Asia/Seoul", channels, ownerUserId: OWNER, log: log(), store }),
 			log: log(),
 			homeDir,
 			workspaceDir,

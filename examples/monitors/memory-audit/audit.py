@@ -2,7 +2,7 @@
 """기억 교정 도구: 판정 파일 형식 게이트(check), 은행 스냅샷(snapshot), 교체 메모 id 찾기(find),
 반영 결과 검증(verify).
 
-판정 파일 경로는 ~/.ompbot/workspace/memory-audit/<YYYY-MM-DD>.md(KST)이고 형식은 같은 디렉터리의
+판정 파일 경로는 ~/.ompbot/workspace/memory-audit/<YYYY-MM-DD>.md(BOT_TZ)이고 형식은 같은 디렉터리의
 README.md(판정 파일 형식)를 따른다. 은행(Mnemopi mnemopi.db)은 언제나 mode=ro로만 열고 쓰지 않는다.
 무효화는 모델이 memory_edit invalidate로만 한다.
 
@@ -14,7 +14,7 @@ README.md(판정 파일 형식)를 따른다. 은행(Mnemopi mnemopi.db)은 언�
   audit.py check <file>
       형식을 검사한다. 위반마다 stderr에 '줄 <n>: <사유>' 한 줄.
   audit.py snapshot [은행 인자] --out-dir <dir> [--now <ISO8601>]
-      sqlite3 백업 API로 <dir>/<은행 이름>-<YYYYmmdd-HHMMSS>.db(KST, --now 또는 현재 시각)에 복사하고
+      sqlite3 백업 API로 <dir>/<은행 이름>-<YYYYmmdd-HHMMSS>.db(BOT_TZ, --now 또는 현재 시각)에 복사하고
       경로를 stdout에 낸다.
       <dir>이 없으면 만들고, 같은 은행 스냅샷은 최신 4개만 남긴다.
   audit.py find [은행 인자] --since <ISO8601> [--now <ISO8601>]
@@ -26,7 +26,7 @@ README.md(판정 파일 형식)를 따른다. 은행(Mnemopi mnemopi.db)은 언�
       working id를 summary_of에 담은 episodic 연쇄 무효화 — stdout에 '연쇄 <id>'). 어긋난 행마다 stderr
       '<id>: <사유>'. 통과하고 --record면 state에 {id: {audited_at, sha256, verdict}}를 합쳐 쓴다
       (같은 디렉터리 임시 파일 + os.replace).
---now·--since는 시간대가 없으면 KST로 본다.
+--now·--since는 시간대가 없으면 봇 시간대로 본다.
 
 종료 코드: 0 = 통과/출력함, 1 = find가 찾지 못함, 2 = 형식 위반·검증 실패·스냅샷 실패·인자 오류
 (실패하면 state·스냅샷 디렉터리에 반쯤 쓴 파일을 남기지 않는다)
@@ -45,7 +45,19 @@ import urllib.parse
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-KST = ZoneInfo("Asia/Seoul")
+def bot_timezone() -> dt.tzinfo:
+    """봇 시간대: OMPBOT_TZ 환경 변수 → <OMPBOT_HOME 또는 ~/.ompbot>/config.json의 timezone → 시스템 시간대."""
+    name = os.environ.get("OMPBOT_TZ", "").strip()
+    if not name:
+        config = Path(os.environ.get("OMPBOT_HOME") or Path.home() / ".ompbot") / "config.json"
+        try:
+            name = str(json.loads(config.read_text(encoding="utf-8")).get("timezone") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            name = ""
+    return ZoneInfo(name) if name else dt.datetime.now().astimezone().tzinfo
+
+
+BOT_TZ = bot_timezone()
 UTC = dt.timezone.utc
 DEFAULT_BANKS_ROOT = "~/.omp/agent/memories/mnemopi/banks"
 DEFAULT_WORKSPACE = "~/.ompbot/workspace"
@@ -75,7 +87,7 @@ def parse_now(value: str) -> dt.datetime:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"ISO8601 시각이 아님: {value}") from error
-    return parsed.replace(tzinfo=KST) if parsed.tzinfo is None else parsed
+    return parsed.replace(tzinfo=BOT_TZ) if parsed.tzinfo is None else parsed
 
 
 def parse_time(value: object) -> dt.datetime | None:
@@ -271,7 +283,7 @@ def snapshot(args: argparse.Namespace) -> int:
     bank = resolve_bank(args)
     name = bank.parent.name
     out_dir: Path = args.out_dir.expanduser()
-    stamp = (args.now or dt.datetime.now(KST)).astimezone(KST).strftime("%Y%m%d-%H%M%S")
+    stamp = (args.now or dt.datetime.now(BOT_TZ)).astimezone(BOT_TZ).strftime("%Y%m%d-%H%M%S")
     target = out_dir / f"{name}-{stamp}.db"
     temp: str | None = None
     try:
@@ -306,7 +318,7 @@ def snapshot(args: argparse.Namespace) -> int:
 def find(args: argparse.Namespace) -> int:
     bank = resolve_bank(args)
     since: dt.datetime = args.since
-    now: dt.datetime = args.now or dt.datetime.now(KST)
+    now: dt.datetime = args.now or dt.datetime.now(BOT_TZ)
     db = open_ro(bank)
     try:
         rows = db.execute(
@@ -366,7 +378,7 @@ def verify(args: argparse.Namespace) -> int:
     if problems:
         report(problems)
         raise Failed("판정 파일이 형식 검사를 통과하지 못함")
-    now: dt.datetime = args.now or dt.datetime.now(KST)
+    now: dt.datetime = args.now or dt.datetime.now(BOT_TZ)
     bank = resolve_bank(args)
     db = open_ro(bank)
     try:

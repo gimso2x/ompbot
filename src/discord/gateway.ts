@@ -34,6 +34,8 @@ export interface DiscordGatewayOptions {
 	now?: () => number;
 	backoffBaseMs?: number;
 	backoffMaxMs?: number;
+	/** A connection with no HELLO this long after it was made is closed and retried after the backoff. */
+	helloTimeoutMs?: number;
 	/** Every Ready (`resumed: false`, a new session: events in between are lost) and Resumed (`resumed: true`). */
 	onReady?: (info: { resumed: boolean }) => void;
 	/** A non-retryable close (4004, 4010–4014): the gateway has stopped for good. */
@@ -100,6 +102,7 @@ export class DiscordGateway {
 	readonly #intents: number;
 	readonly #backoffBaseMs: number;
 	readonly #backoffMaxMs: number;
+	readonly #helloTimeoutMs: number;
 	#ws: WebSocket | undefined;
 	/** Bumped whenever a socket is replaced; callbacks of older sockets compare against it and bail. */
 	#generation = 0;
@@ -111,6 +114,7 @@ export class DiscordGateway {
 	#seq: number | undefined;
 	#heartbeatTimer: unknown;
 	#reconnectTimer: unknown;
+	#helloTimer: unknown;
 	#awaitingAck = false;
 	#state: "up" | "down" = "down";
 	#since: number;
@@ -129,6 +133,7 @@ export class DiscordGateway {
 		this.#intents = options.intents ?? DISCORD_INTENTS;
 		this.#backoffBaseMs = options.backoffBaseMs ?? 1_000;
 		this.#backoffMaxMs = options.backoffMaxMs ?? 60_000;
+		this.#helloTimeoutMs = options.helloTimeoutMs ?? 30_000;
 		this.#since = this.#now();
 	}
 
@@ -148,8 +153,10 @@ export class DiscordGateway {
 		this.#generation++;
 		this.#timers.clear(this.#heartbeatTimer);
 		this.#timers.clear(this.#reconnectTimer);
+		this.#timers.clear(this.#helloTimer);
 		this.#heartbeatTimer = undefined;
 		this.#reconnectTimer = undefined;
+		this.#helloTimer = undefined;
 		this.#closeSocket(1000);
 		this.#setDown();
 		this.#first?.reject(new Error("discord gateway stopped before ready"));
@@ -226,8 +233,22 @@ export class DiscordGateway {
 		}
 		if (gen !== this.#generation) return;
 
-		const ws = new WebSocket(withQuery(url));
+		let ws: WebSocket;
+		try {
+			ws = new WebSocket(withQuery(url));
+		} catch (err) {
+			// A gateway URL that is no URL: forget it (the lookup runs again), and a bad resume URL drops the session.
+			this.#report(new Error(`discord gateway url unusable: ${err instanceof Error ? err.message : String(err)}`));
+			if (resumeUrl === undefined) this.#baseUrl = undefined;
+			else this.#dropSession();
+			this.#scheduleConnect(this.#nextBackoff());
+			return;
+		}
 		this.#ws = ws;
+		this.#timers.clear(this.#helloTimer);
+		this.#helloTimer = this.#timers.set(() => {
+			if (gen === this.#generation) this.#reconnect("hello timeout", { newSession: false, delay: "backoff" });
+		}, this.#helloTimeoutMs);
 		const resuming = resumeUrl !== undefined;
 		const current = (): boolean => gen === this.#generation && this.#ws === ws;
 		ws.addEventListener("message", (ev) => {
@@ -254,9 +275,15 @@ export class DiscordGateway {
 			this.#report(new Error("unparseable discord gateway frame"));
 			return;
 		}
+		if (typeof frame !== "object" || frame === null || Array.isArray(frame)) {
+			this.#report(new Error("non-object discord gateway frame"));
+			return;
+		}
 		if (typeof frame.s === "number") this.#seq = frame.s;
 		switch (frame.op) {
 			case OP.HELLO: {
+				this.#timers.clear(this.#helloTimer);
+				this.#helloTimer = undefined;
 				const interval = record(frame.d).heartbeat_interval;
 				if (typeof interval !== "number" || !(interval > 0)) {
 					this.#report(new Error("discord hello without heartbeat_interval"));
@@ -332,6 +359,7 @@ export class DiscordGateway {
 					typeof application.id !== "string"
 				) {
 					this.#report(new Error("discord ready without session or ids"));
+					this.#reconnect("bad ready", { newSession: true, delay: "backoff" });
 					return;
 				}
 				this.#sessionId = d.session_id;
@@ -388,18 +416,22 @@ export class DiscordGateway {
 		if (this.#stopped) return;
 		this.#generation++; // detaches the old socket's callbacks and heartbeat
 		this.#timers.clear(this.#heartbeatTimer);
+		this.#timers.clear(this.#helloTimer);
 		this.#heartbeatTimer = undefined;
+		this.#helloTimer = undefined;
 		this.#closeSocket(plan.newSession ? 1000 : RESUMABLE_CLOSE);
 		this.#setDown();
-		if (plan.newSession) {
-			this.#sessionId = undefined;
-			this.#resumeUrl = undefined;
-			this.#seq = undefined;
-		}
+		if (plan.newSession) this.#dropSession();
 		this.#opts.onReconnect?.(reason);
 		const delay = plan.delay === "backoff" ? this.#nextBackoff() : plan.delay;
 		if (delay === 0) void this.#connect();
 		else this.#scheduleConnect(delay);
+	}
+
+	#dropSession(): void {
+		this.#sessionId = undefined;
+		this.#resumeUrl = undefined;
+		this.#seq = undefined;
 	}
 
 	#nextBackoff(): number {

@@ -11,11 +11,11 @@ import { redact } from "../src/redact";
 import { SlackAdapter } from "../src/slack/adapter";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackReactionEvent } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
 import { readTurnVerdicts } from "../src/store/feedback";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const clock = { now: () => Date.now() };
 
@@ -174,7 +174,7 @@ describe("owner reactions → turn_feedback rows (adapter + store)", () => {
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-feedback-adapter-"));
-		store = openStore({ path: join(dir, "bot.db"), clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "bot.db"), clock, redact });
 		transport = new FakeSlackTransport("UBOT");
 		logs = [];
 	});

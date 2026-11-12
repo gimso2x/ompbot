@@ -41,19 +41,28 @@ function formatKey(key: string): string {
 	return RESERVED_KEYS[clean] ? `f_${clean}` : clean;
 }
 
-/** One grep-stable line: `ts=<iso> level=<l> event=<e> key=value ...`. The whole line is redacted after formatting. */
+/**
+ * One grep-stable line: `ts=<iso> level=<l> event=<e> key=value ...`. Every string value (an object as its JSON) is
+ * redacted BEFORE escaping — escaping turns a newline into `\n`, which would split an indexed secret's fragment
+ * windows — and the whole line once more after formatting (masking is idempotent).
+ */
 export function createLogger(options: LoggerOptions): Logger {
 	const maxBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
+	const masked = (value: Exclude<LogValue, undefined>): Exclude<LogValue, undefined> => {
+		if (typeof value === "string") return options.redact(value);
+		if (typeof value === "object" && value !== null) return options.redact(JSON.stringify(value));
+		return value;
+	};
 
 	const emit = (level: LogLevel, event: string, fields: LogFields = {}): void => {
 		const ts = new Date(options.clock.now()).toISOString();
-		const parts = [`ts=${ts}`, `level=${level}`, `event=${formatValue(event)}`];
-		for (const [key, value] of Object.entries(fields)) {
-			if (value === undefined) continue;
-			parts.push(`${formatKey(key)}=${formatValue(value)}`);
-		}
 		let line: string;
 		try {
+			const parts = [`ts=${ts}`, `level=${level}`, `event=${formatValue(masked(event))}`];
+			for (const [key, value] of Object.entries(fields)) {
+				if (value === undefined) continue;
+				parts.push(`${formatKey(key)}=${formatValue(masked(value))}`);
+			}
 			line = options.redact(parts.join(" "));
 		} catch {
 			line = `ts=${ts} level=error event=log_redact_failed`;

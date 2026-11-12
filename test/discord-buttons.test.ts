@@ -3,9 +3,9 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { ActionButton } from "../src/channel/port";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import { approvalActionId, choiceActionId } from "../src/safety/approval";
 import { taskMergeActionId, taskRecommendActionId } from "../src/tasks/notify";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const DM = "123456789012345678";

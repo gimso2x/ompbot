@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { SlackAdapter } from "../src/slack/adapter";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackMessageEvent } from "../src/slack/transport";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "UOWNER";
 const BOT = "UBOT";

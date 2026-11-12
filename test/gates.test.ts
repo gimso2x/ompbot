@@ -7,6 +7,7 @@ import { type GatesCommandDeps, gatesCommand } from "../src/cli/index";
 import { readSweepHeartbeat, SweepHeartbeatWriter } from "../src/daemon/heartbeat";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { STAMP_FILE } from "../src/ops/backup";
+import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import {
 	collectGates,
 	INBOUND_STARVATION_MS,
@@ -16,8 +17,9 @@ import {
 	SWEEP_STALLED_MS,
 } from "../src/ops/gates";
 import { HERDR_HEALTH_FILE, HERDR_HEALTH_STALE_MS, HerdrHealthProbe, readHerdrHealth } from "../src/ops/herdr-health";
-import { kstDay } from "../src/tasks/docs";
+import { IDLE_HOST_LOAD, testHostLoad } from "../src/ops/host-resources";
 import { TASK_SWEEP_MS } from "../src/tasks/sweeper";
+import { localDay } from "../src/time";
 
 let home: string;
 let now: number;
@@ -326,6 +328,14 @@ describe("collectGates", () => {
 		expect(gateState("slack_disconnected")).toEqual({ state: "closed", detail: "socket=unknown" });
 	});
 
+	test("slack_disconnected: a down socket whose socket_since is in the future opens as ts_in_future (J-3)", () => {
+		writeFields(`socket=down socket_since=${new Date(now + 2 * 60 * 60_000).toISOString()} draining=0`);
+		expect(gateState("slack_disconnected")).toEqual({ state: "open", detail: "socket=down ts_in_future" });
+		// Within the clock tolerance it is still the ordinary "just went down" closed state.
+		writeFields(`socket=down socket_since=${new Date(now + 1_000).toISOString()} draining=0`);
+		expect(gateState("slack_disconnected").state).toBe("closed");
+	});
+
 	describe("monitors_stalled", () => {
 		const CRON = '{"kind":"cron","schedule":"*/5 * * * *","timezone":"UTC"}';
 		const INTERVAL = '{"kind":"interval","intervalMs":300000}';
@@ -352,6 +362,24 @@ describe("collectGates", () => {
 			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "draining" });
 			writeHeartbeat(0);
 			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "heartbeat=old" });
+		});
+
+		test("frozen: a script monitor held back is closed with detail frozen, and stays closed right after unfreeze (#140)", () => {
+			const SCRIPT = '{"kind":"script","command":["/bin/true"],"intervalMs":300000}';
+			writeStamp(0);
+			writeFields("draining=0");
+			writeFreeze(home, { reason: "조사", by: "cli", now: now - 3 * 3_600_000 });
+			// The scheduler does not move a script's cursor while frozen: its next fire is 2h past.
+			seedMonitor(2 * 3_600_000, SCRIPT);
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "frozen" });
+			expect(gateState("frozen").state).toBe("open");
+			clearFreeze(home, now);
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
+			// Still not fired a full overdue window after the unfreeze: now it is a stall.
+			now += MONITOR_OVERDUE_MS - 1;
+			expect(gateState("monitors_stalled")).toEqual({ state: "closed", detail: "overdue=0" });
+			now += 1;
+			expect(gateState("monitors_stalled")).toEqual({ state: "open", detail: "overdue=1" });
 		});
 
 		test("boundary: next fire exactly 15 minutes past opens, 1 ms less is closed", () => {
@@ -624,7 +652,7 @@ describe("collectGates", () => {
 	});
 
 	test("cost_cap exists only with a daily ceiling: open at the day's total, closed under it", () => {
-		const day = kstDay(now);
+		const day = localDay(now, "Asia/Seoul");
 		seedDb((db) => {
 			db.run(
 				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
@@ -633,9 +661,11 @@ describe("collectGates", () => {
 			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES ('20200101', 'slack/dm/D', 99, 1)");
 		});
 		const capGate = (dailyCapUsd: number | undefined) =>
-			collectGates({ homeDir: home, now, ...(dailyCapUsd === undefined ? {} : { dailyCapUsd }) }).find(
-				(g) => g.name === "cost_cap",
-			);
+			collectGates({
+				homeDir: home,
+				now,
+				...(dailyCapUsd === undefined ? {} : { dailyCap: { usd: dailyCapUsd, timezone: "Asia/Seoul" } }),
+			}).find((g) => g.name === "cost_cap");
 		expect(capGate(undefined)).toBeUndefined();
 		expect(capGate(10)).toEqual({ name: "cost_cap", state: "open", detail: "today=12.50 cap=10.00" });
 		expect(capGate(12.5)?.state).toBe("open");
@@ -643,7 +673,7 @@ describe("collectGates", () => {
 	});
 
 	test("cost_cap closes for a day the owner switched off with !budget off", () => {
-		const day = kstDay(now);
+		const day = localDay(now, "Asia/Seoul");
 		seedDb((db) => {
 			db.run(
 				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
@@ -654,13 +684,17 @@ describe("collectGates", () => {
 			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'slack/dm/D', 12.5, 3)", [day]);
 			db.run("INSERT INTO slack_cursors (cursor_key, last_ts, updated_at) VALUES (?, '0', 0)", [`cost-cap-off:${day}`]);
 		});
-		const gate = collectGates({ homeDir: home, now, dailyCapUsd: 10 }).find((g) => g.name === "cost_cap");
+		const gate = collectGates({ homeDir: home, now, dailyCap: { usd: 10, timezone: "Asia/Seoul" } }).find(
+			(g) => g.name === "cost_cap",
+		);
 		expect(gate).toEqual({ name: "cost_cap", state: "closed", detail: "today=12.50 cap=10.00 off=today" });
 	});
 
 	test("cost_cap reads zero spend on a ledger without usage_daily (an older bot) instead of judging unknown", () => {
 		seedDb(() => undefined);
-		const gate = collectGates({ homeDir: home, now, dailyCapUsd: 10 }).find((g) => g.name === "cost_cap");
+		const gate = collectGates({ homeDir: home, now, dailyCap: { usd: 10, timezone: "Asia/Seoul" } }).find(
+			(g) => g.name === "cost_cap",
+		);
 		expect(gate).toEqual({ name: "cost_cap", state: "closed", detail: "today=0.00 cap=10.00" });
 	});
 
@@ -693,7 +727,7 @@ describe("ompbot gates: open, closed and unknown (판정불가)", () => {
 	const calm: GatesCommandDeps = {
 		now: () => now,
 		statfs: () => ({ bavail: 50 * 262_144, blocks: 100 * 262_144, bsize: 4096 }), // 50 of 100 GiB free
-		hostLoad: { loadavg: () => [0, 0, 0], cpuCount: () => 4, meminfo: () => undefined },
+		hostLoad: IDLE_HOST_LOAD,
 	};
 
 	function runGates(args: string[]): { code: number; out: string } {
@@ -744,6 +778,23 @@ describe("ompbot gates: open, closed and unknown (판정불가)", () => {
 		expect(corrupt.out).toContain("gate=ledger_unreadable state=open");
 		expect(lastLine(corrupt.out)).toStartWith("gates_done open=1 unknown=0 total=7 opened=ledger_unreadable(");
 		expect(runGates(["--strict"]).code).toBe(1);
+	});
+});
+
+describe("OMPBOT_TEST_HOST_LOAD test hook", () => {
+	test("inert without OMPBOT_TEST_HOOKS=1, so production always reads this machine", () => {
+		expect(testHostLoad({})).toBeUndefined();
+		expect(testHostLoad({ OMPBOT_TEST_HOST_LOAD: "idle" })).toBeUndefined();
+		expect(testHostLoad({ OMPBOT_TEST_HOOKS: "0", OMPBOT_TEST_HOST_LOAD: "idle" })).toBeUndefined();
+		expect(testHostLoad({ OMPBOT_TEST_HOOKS: "1" })).toBeUndefined();
+	});
+
+	test("with OMPBOT_TEST_HOOKS=1, idle closes host_pressure and any other value is refused", () => {
+		const idle = testHostLoad({ OMPBOT_TEST_HOOKS: "1", OMPBOT_TEST_HOST_LOAD: "idle" });
+		expect(idle).toBe(IDLE_HOST_LOAD);
+		const gate = collectGates({ homeDir: home, now, hostLoad: idle }).find((g) => g.name === "host_pressure");
+		expect(gate?.state).toBe("closed");
+		expect(() => testHostLoad({ OMPBOT_TEST_HOOKS: "1", OMPBOT_TEST_HOST_LOAD: "busy" })).toThrow("unknown value busy");
 	});
 });
 

@@ -2,8 +2,6 @@
 // absolute UTC minutes and compares them with the zone's wall-clock fields (Intl), so a nonexistent spring-forward
 // minute never fires and a repeated fall-back minute fires once per distinct UTC instant.
 
-export const DEFAULT_TIMEZONE = "Asia/Seoul";
-
 const MINUTE_MS = 60_000;
 /** A schedule that never matches (e.g. `0 0 31 2 *`) stops searching after this long. */
 const SEARCH_LIMIT_MS = 5 * 366 * 24 * 60 * MINUTE_MS;
@@ -212,13 +210,6 @@ export function firesBetween(
 		at = next;
 	}
 	return out;
-}
-
-/** `YYYY-MM-DD HH:MM:SS` wall clock of an instant in a zone (for list output). */
-export function formatLocal(ms: number, timezone: string): string {
-	const w = wallClock(ms, timezone);
-	const p = (n: number, width = 2) => String(n).padStart(width, "0");
-	return `${p(w.year, 4)}-${p(w.month)}-${p(w.day)} ${p(w.hour)}:${p(w.minute)}:00`;
 }
 
 /**

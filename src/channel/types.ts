@@ -31,8 +31,31 @@ export interface PeerInboundOutcome {
 	notice?: boolean;
 }
 
+/**
+ * A Teams question answered read-only (a guest, or the owner under `ownerMode: qa`). Its own type, without
+ * `ownerVerified`: it can never be passed where an owner message is expected.
+ */
+export interface GuestInboundMessage {
+	platformMessageId: string;
+	/** The conversation's ledger alias. */
+	conversationId: string;
+	kind: "dm" | "ch";
+	/** `<alias>:<Activity id>`: the answer replies to the question. */
+	threadRef: string;
+	/** The question as typed, mention tags removed. */
+	text: string;
+	asker: { aadObjectId: string; name?: string | undefined };
+	/** The owner writing under `ownerMode: qa` (only then may `!home` act). */
+	owner: boolean;
+}
+
 /** The adapter's whole view of the core. Owner input arrives through `onInbound`, peer bot input through `onPeerInbound`. */
 export interface CoreSink {
+	/**
+	 * A guest/qa question: answered by a one-shot read-only run, never the owner's session or mailbox. `duplicate`: a
+	 * redelivery of a question already taken (no typing indicator).
+	 */
+	onGuestInbound?(message: GuestInboundMessage): { duplicate?: boolean } | undefined;
 	/**
 	 * A peer bot's request. The core decides what the adapter cannot see: a duplicate, a work lane's thread
 	 * (`peer_in_lane_thread`) and the thread's hop cap (`peer_hop_cap`; `notice` is true exactly once per cap episode,
@@ -62,13 +85,20 @@ export interface CoreSink {
 	/**
 	 * An owner reply in a thread: if that thread is an approval card's, the core settles the card with the reply
 	 * (`settled`), recognises a replay (`duplicate`) or names the asking conversation the reply must reach (`route`).
-	 * `undefined`: not an approval card thread — the reply takes the normal inbound path.
+	 * `undefined`: not an approval card thread — the reply takes the normal inbound path. An `injected` message in a
+	 * card's thread is `injected_rejected`: the card is neither answered nor routed.
 	 */
 	onCardReply?(reply: {
 		threadRef: string;
 		platformMessageId: string;
 		text: string;
-	}): { kind: "settled" } | { kind: "duplicate" } | { kind: "route"; originKey: string } | undefined;
+		injected?: boolean | undefined;
+	}):
+		| { kind: "settled" }
+		| { kind: "duplicate" }
+		| { kind: "route"; originKey: string }
+		| { kind: "injected_rejected" }
+		| undefined;
 	/** Whether the bot already takes part in this thread, so an unaddressed owner reply in a channel thread counts. */
 	knowsThread?(threadRef: string): boolean;
 	/** Whether the owner muted this thread with `!shutup`: the bot stays quiet there until a mention or `!unshutup`. */
@@ -151,4 +181,9 @@ export interface AdapterClock {
 }
 
 /** What a single inbound event ended up as (`ingestRecovered`/`ingestOwner` report this). */
-export type IngestOutcome = "recorded" | "duplicate" | "dropped";
+export type IngestOutcome =
+	| "recorded"
+	| "duplicate"
+	| "dropped"
+	/** An injected owner message in an approval/choice card's thread: refused, the card untouched. */
+	| "card_rejected";

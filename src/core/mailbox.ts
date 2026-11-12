@@ -41,6 +41,7 @@ import {
 	type RepoPlan,
 	recordTurn,
 	type TurnSnapshotRow,
+	undoPlanNotes,
 } from "../ops/turn-snapshot";
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
@@ -57,6 +58,7 @@ import {
 	EVENT_PERSIST_MS,
 	IDLE_STOP_MS,
 	type InboundRecord,
+	isHomeCommand,
 	type MailboxClock,
 	MONITOR_IDLE_STOP_MS,
 	MONITOR_STALL_ABORT_MS,
@@ -67,6 +69,7 @@ import {
 	STALL_NOTIFY_MS,
 	STALL_RELEASE_MS,
 	type StatusProvider,
+	TEAMS_GROUP_HOME_REFUSED_TEXT,
 } from "./types";
 
 /** Injected so tests use `FakeOmpDriver`; production builds an `RpcOmpDriver` for (origin, sessionDir). */
@@ -172,6 +175,8 @@ export interface MailboxDeps {
 	store: Store;
 	driverFactory: DriverFactory;
 	clock: MailboxClock;
+	/** The bot's zone (`config.timezone`): the daily cost ledger day and recalled rows' dates. */
+	timezone: string;
 	statusProvider: StatusProvider;
 	/** `/usage-ompbot` answer for an origin (token and cost totals); without it the command says it is not wired. */
 	usageProvider?: (originKey: string) => Promise<string>;
@@ -278,8 +283,15 @@ export interface MailboxDeps {
 export interface TurnUndoDeps {
 	/** Read on every turn and every `!undo`: a config reload changes it without a restart. */
 	repos: () => readonly string[];
-	/** The owner's answer to the undo card; only `approved` writes anything. */
-	approve: (info: { summary: string; threadRef: string }) => Promise<"approved" | "denied" | "timeout">;
+	/**
+	 * The owner's answer to the undo card; only `approved` writes anything. `originKey` is the asking conversation,
+	 * stored on the card's ledger row like every other approval of that conversation.
+	 */
+	approve: (info: {
+		summary: string;
+		threadRef: string;
+		originKey: string;
+	}) => Promise<"approved" | "denied" | "timeout">;
 	/** Git runner (tests inject one that counts or fails); absent = the real git. */
 	run?: GitRunner;
 }
@@ -380,8 +392,15 @@ interface ActiveTurn {
 	 * (`cost_cap: …`) and no failure count. No second abort, no steer.
 	 */
 	costStopReason: string | undefined;
+	/** The turn's spend is already in `usage_daily` (`#recordDailyCost`): a turn is charged once, by its final or its exit. */
+	costRecorded: boolean;
 	/** Leaf read right before the prompt; the turn's answers are the entries after it. */
 	entryCursor: string | null;
+	/**
+	 * The child sent this turn's final; set at once, while its `#onFinal` still waits on the actor's chain. A steer then
+	 * would land after the run, so the dispatch leaves the row for the drain that follows the final.
+	 */
+	finalArrived: boolean;
 	/** Stalls of this turn (one per silence); the first logs `stall_alert`, the rest `stall_repeat`. */
 	stallCount: number;
 	/** Silence of the turn's stalls that have ended (an event arrived); the running one is added on the fly. */
@@ -406,8 +425,18 @@ interface ActiveTurn {
 	 * The work trees captured right before the prompt (`!undo`): absent when the feature is off or this turn is not a
 	 * conversation turn. The after-state is taken in `#onFinal`.
 	 */
-	undoBefore?: { startedAt: number; before: ReadonlyMap<string, { head: string; tree: string }> };
+	undoBefore?: {
+		startedAt: number;
+		before: ReadonlyMap<string, { head: string; tree: string }>;
+		/** Repositories whose snapshot failed on either side; `!undo` must not read their older turns as "the last turn". */
+		failed: ReadonlyMap<string, string>;
+	};
 	pendingAnswer: string | undefined;
+	/**
+	 * When this turn's last interim answer (not a wait note) was recorded for delivery: an owner row written before it
+	 * is steered with {@link STEER_BEFORE_ANSWER_SEEN_NOTE}; undefined until the turn sent one.
+	 */
+	lastInterimDeliveredAt: number | undefined;
 }
 
 /**
@@ -516,6 +545,14 @@ const NO_MODEL_SIGN = /No default model selected/;
 /** The owner's notice for that error: the generic "send it again" would fail the same way until omp has a model. */
 export const NO_MODEL_NOTICE =
 	"[turn failed] omp_no_model — 봇을 돌리는 계정에서 omp가 쓸 모델을 찾지 못했습니다. 그 계정으로 `omp login`(또는 공급자 API 키 설정)을 한 뒤 다시 보내 주세요";
+
+/**
+ * First line of an owner steer written before the turn's last answer reached the owner (2026-11-11: "어디갔어"
+ * written in the same second as the answer made the model write the answer again). Model input only: the inbound
+ * row keeps the owner's text as is.
+ */
+export const STEER_BEFORE_ANSWER_SEEN_NOTE =
+	'[참고: 이 메시지는 네 직전 답이 오너에게 전달되기 전에 쓰인 것이다. 직전 답은 이미 전달됐으니 같은 내용을 다시 쓰지 않는다. 이 메시지에 새 질문·지시·명령(취소·변경 포함)이 있으면 그대로 처리하고, 직전 답을 찾는 말뿐이면 "위에 올렸습니다" 한 줄로 답한다.]';
 
 /** The peer bot whose message opened a turn, and whether that message was itself a peer failure notice. */
 interface TurnPeer {
@@ -675,6 +712,11 @@ export class OriginMailbox {
 	#turn: ActiveTurn | undefined;
 	/** Incremented when a turn starts: `!undo` compares it to refuse a restore after a new turn began. */
 	#turnGeneration = 0;
+	/**
+	 * The repositories the origin's most recent settled turn could not snapshot (`turn.opRef` + reasons), kept in memory
+	 * only: a later turn overwrites it. `!undo` uses it to refuse reverting an older turn of such a repository.
+	 */
+	#lastUndoFailures: { opRef: string; failed: ReadonlyMap<string, string> } | undefined;
 	#lastActivityAt: number;
 	readonly #stallMs: number;
 	#lastEventAt = 0;
@@ -892,7 +934,8 @@ export class OriginMailbox {
 
 	/**
 	 * Turn caught in a tool repeat loop: abort the child and settle the turn as failed (`stuck-loop: …`) through the
-	 * normal failure path. The child is kept — it is not wedged, and its session holds the conversation. A final that
+	 * normal failure path. The child is kept — it is not wedged, and its session holds the conversation — unless the
+	 * abort itself failed: then it is stopped before the drain. A final that
 	 * settled the turn first wins; this then does nothing (no notice either).
 	 */
 	async #abortStuck(turn: ActiveTurn, toolName: string, count: number): Promise<void> {
@@ -901,18 +944,25 @@ export class OriginMailbox {
 		const { originKey, log } = this.#deps;
 		log.warn("stuck_loop_cancel", { origin: originKey, opRef: turn.opRef, tool: toolName, count });
 		this.#deps.onStuckLoop?.({ originKey, threadRef: turn.threadRef, opRef: turn.opRef, toolName, count });
+		let abortFailed = false;
 		try {
 			await driver.abort();
 		} catch (error) {
+			abortFailed = true;
 			log.warn("stuck_abort_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
 		}
 		if (this.#turn !== turn || this.#driver !== driver) return;
-		await this.#onFinal(driver, {
-			opRef: turn.opRef,
-			status: "aborted",
-			text: "",
-			error: stuckCancelReason(toolName, count),
-		});
+		// An abort that failed may leave the child running: stop it, so no answer arrives after the failure notice.
+		await this.#onFinal(
+			driver,
+			{
+				opRef: turn.opRef,
+				status: "aborted",
+				text: "",
+				error: stuckCancelReason(toolName, count),
+			},
+			abortFailed,
+		);
 	}
 
 	/**
@@ -954,13 +1004,20 @@ export class OriginMailbox {
 	 * an error: there is no transcript to read and nothing was spent.
 	 */
 	async #recordDailyCost(driver: OmpSessionDriver, turn: ActiveTurn): Promise<void> {
+		if (turn.costRecorded) return;
+		turn.costRecorded = true;
 		const { store, originKey, log, clock } = this.#deps;
 		let file: string | undefined;
 		try {
 			file = (await driver.state()).sessionFile;
 		} catch (error) {
 			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
-			store.addDailyUsage({ day: ledgerDay(clock.now()), originKey, cost: turn.costUsd, calls: 1 });
+			store.addDailyUsage({
+				day: ledgerDay(clock.now(), this.#deps.timezone),
+				originKey,
+				cost: turn.costUsd,
+				calls: 1,
+			});
 			return;
 		}
 		if (file === undefined || file === "") return;
@@ -980,7 +1037,7 @@ export class OriginMailbox {
 			cost = turn.costUsd;
 			calls = 1;
 		}
-		store.addDailyUsage({ day: ledgerDay(clock.now()), originKey, cost, calls });
+		store.addDailyUsage({ day: ledgerDay(clock.now(), this.#deps.timezone), originKey, cost, calls });
 	}
 
 	/**
@@ -1222,27 +1279,33 @@ export class OriginMailbox {
 		if (event.type !== "message_start" && event.type !== "message_end" && event.type !== "tool_execution_start") return;
 		const pending = turn.pendingAnswer;
 		turn.pendingAnswer = undefined;
-		if (pending !== undefined) this.#recordInterim(turn, pending);
+		if (pending !== undefined && this.#recordInterim(turn, pending)) {
+			turn.lastInterimDeliveredAt = this.#deps.clock.now();
+		}
 		if (event.type !== "message_end") return;
 		const interim = interimOf(event.message);
 		if (interim?.kind === "answer") turn.pendingAnswer = interim.text;
 		else if (interim?.kind === "waitNote") this.#recordInterim(turn, interim.text);
 	}
 
-	/** One interim delivery, unless the turn already sent this text (equal up to whitespace or nearly the same). */
-	#recordInterim(turn: ActiveTurn, text: string): void {
+	/**
+	 * One interim delivery, unless the turn already sent this text (equal up to whitespace or nearly the same).
+	 * Returns whether a delivery row was recorded now.
+	 */
+	#recordInterim(turn: ActiveTurn, text: string): boolean {
 		const { store, originKey, log } = this.#deps;
-		if (alreadySent(text, turn.interim)) return;
+		if (alreadySent(text, turn.interim)) return false;
 		const index = turn.interim.length;
 		try {
 			store.recordInterim({ originKey, opRef: turn.opRef, threadRef: turn.threadRef, index, body: text });
 		} catch (error) {
 			// The text is still part of the turn-end answer, which leaves out only what was recorded here.
 			log.warn("interim_record_failed", { origin: originKey, opRef: turn.opRef, index, error: String(error) });
-			return;
+			return false;
 		}
 		turn.interim.push(text);
 		log.info("interim_recorded", { origin: originKey, opRef: turn.opRef, index, chars: text.length });
+		return true;
 	}
 
 	#reportProgress(turn: ActiveTurn): void {
@@ -1376,6 +1439,10 @@ export class OriginMailbox {
 				if (!(await this.#dispatch(row))) break;
 				continue;
 			}
+			if (isHomeCommand(row.textRef)) {
+				this.#setHome(row);
+				continue;
+			}
 			const command = parseCommand(row.textRef);
 			if (command?.kind === "followup" && command.arg !== "") {
 				if (this.#turn) continue;
@@ -1410,11 +1477,34 @@ export class OriginMailbox {
 			const context = row.peerUserId === null ? await this.#slackContextBlock(row) : null;
 			// The fetch awaited: the turn may have ended meanwhile, and steering an idle child would start a run.
 			if (this.#turn !== turn || !this.#driver) return this.#dispatch(row, text);
-			// Busy: steer ONLY while a turn runs (real omp starts a run when steered while idle).
+			// Written before the turn's last answer reached the owner (still pending, or its interim delivery came after
+			// the row): the model is told the answer already went out. No time window — a row written after the delivery
+			// (a quick "취소해" right after reading it) is steered as is.
+			const beforeAnswerSeen =
+				row.peerUserId === null &&
+				(turn.pendingAnswer !== undefined ||
+					(turn.lastInterimDeliveredAt !== undefined && row.createdAt < turn.lastInterimDeliveredAt));
+			const blocks = [
+				...(beforeAnswerSeen ? [STEER_BEFORE_ANSWER_SEEN_NOTE] : []),
+				...(context === null ? [] : [context]),
+			];
+			// Busy: steer ONLY while a turn runs (real omp starts a run when steered while idle). Each await below may see
+			// the turn end: a turn already settled is re-dispatched like above; a final that arrived but still waits on
+			// the actor's chain leaves the row pending for the drain that `#onFinal` runs.
+			const driver = this.#driver;
+			const ended = (): "settled" | "final" | undefined =>
+				this.#turn !== turn || this.#driver !== driver ? "settled" : turn.finalArrived ? "final" : undefined;
+			let late: "settled" | "final" | undefined;
 			try {
-				const entryCursor = await this.#driver.leafId();
-				await this.#driver.steer(context === null ? text : composeTurnPrompt([context], text));
-				store.markDispatched(row.platformMessageId, { opRef: turn.opRef, entryCursor });
+				const entryCursor = await driver.leafId();
+				late = ended();
+				if (late === undefined) {
+					await driver.steer(composeTurnPrompt(blocks, text));
+					// Sent while the run ended: the old run may or may not have read it. Running it again risks a
+					// duplicate answer, which beats a message recorded as answered that nothing answered.
+					late = ended();
+					if (late === undefined) store.markDispatched(row.platformMessageId, { opRef: turn.opRef, entryCursor });
+				}
 			} catch (error) {
 				log.warn("steer_failed", {
 					origin: originKey,
@@ -1424,7 +1514,16 @@ export class OriginMailbox {
 				});
 				return false;
 			}
-			log.info("steer_delivered", { origin: originKey, id: row.platformMessageId, opRef: turn.opRef });
+			if (late !== undefined) {
+				log.info("steer_turn_ended", { origin: originKey, id: row.platformMessageId, opRef: turn.opRef, late });
+				return late === "settled" ? this.#dispatch(row, text) : false;
+			}
+			log.info("steer_delivered", {
+				origin: originKey,
+				id: row.platformMessageId,
+				opRef: turn.opRef,
+				...(beforeAnswerSeen ? { beforeAnswerSeen: true } : {}),
+			});
 			turn.progress.steers += 1;
 			this.#reportProgress(turn);
 			return true;
@@ -1469,21 +1568,23 @@ export class OriginMailbox {
 	/**
 	 * The work trees as they are before this turn's prompt. Only conversation origins of a chat platform and only the
 	 * configured repositories: a monitor turn or a lane turn (its own worktree and branch) has nothing to undo here, and
-	 * without `turnUndo` no git is ever started.
+	 * without `turnUndo` (or with no repository configured) no git is ever started.
 	 */
 	async #captureUndoBefore(originKey: string): Promise<ActiveTurn["undoBefore"]> {
 		const turnUndo = this.#deps.turnUndo;
 		if (turnUndo === undefined || parseChatOrigin(originKey) === undefined) return undefined;
 		const repos = turnUndo.repos();
 		if (repos.length === 0) return undefined;
-		const before = await captureTrees(repos, { run: turnUndo.run, log: this.#deps.log });
-		if (before.size === 0) return undefined;
-		return { startedAt: this.#deps.clock.now(), before };
+		const captured = await captureTrees(repos, { run: turnUndo.run, log: this.#deps.log });
+		// Every repository failing still matters: `!undo` must say so instead of walking back to an older turn.
+		if (captured.trees.size === 0 && captured.failed.size === 0) return undefined;
+		return { startedAt: this.#deps.clock.now(), before: captured.trees, failed: captured.failed };
 	}
 
 	/**
 	 * The after-state of a settled turn, recorded as one ledger row per changed repository so `!undo` can put exactly
-	 * those files back. Runs after the answer is stored: a slow or failing git never costs the owner the answer.
+	 * those files back. Runs after the answer is stored: a slow or failing git never costs the owner the answer. A
+	 * repository that could not be captured is remembered for `!undo`, which must not mistake an older turn for it.
 	 */
 	async #recordUndoAfter(turn: ActiveTurn): Promise<void> {
 		const captured = turn.undoBefore;
@@ -1493,13 +1594,19 @@ export class OriginMailbox {
 		try {
 			// Only the repositories captured before are compared: a reload in between must not invent a before-state.
 			const live = turnUndo.repos().filter((repo) => captured.before.has(repo));
-			if (live.length === 0) return;
+			const failed = new Map(captured.failed);
+			if (live.length === 0) {
+				this.#lastUndoFailures = { opRef: turn.opRef, failed };
+				return;
+			}
 			const after = await captureTrees(live, { run: turnUndo.run, log });
+			for (const [repo, reason] of after.failed) failed.set(repo, reason);
+			this.#lastUndoFailures = { opRef: turn.opRef, failed };
 			const capture = {
 				startedAt: captured.startedAt,
 				endedAt: this.#deps.clock.now(),
 				before: captured.before,
-				after,
+				after: after.trees,
 			};
 			const written = await recordTurn({ store, originKey, opRef: turn.opRef, capture, run: turnUndo.run, log });
 			if (written > 0) log.info("turn_snapshot", { origin: originKey, opRef: turn.opRef, repos: written });
@@ -1534,7 +1641,9 @@ export class OriginMailbox {
 			costUsd: 0,
 			costSoftSent: false,
 			costStopReason: undefined,
+			costRecorded: false,
 			entryCursor,
+			finalArrived: false,
 			stallCount: 0,
 			stallSilentMs: 0,
 			stallShown: false,
@@ -1547,6 +1656,7 @@ export class OriginMailbox {
 			interim: [],
 			...(undoBefore === undefined ? {} : { undoBefore }),
 			pendingAnswer: undefined,
+			lastInterimDeliveredAt: undefined,
 		};
 		this.#lastEventAt = this.#deps.clock.now();
 		this.#eventPersistedAt = this.#lastEventAt;
@@ -1580,6 +1690,7 @@ export class OriginMailbox {
 				candidates: store.listRecallCandidates(channel, row.threadRef, RECALL_CANDIDATE_LIMIT),
 				freshSession: fresh,
 				channel,
+				timezone: this.#deps.timezone,
 			});
 			if (recall.block !== null) {
 				log.info("recall_injected", {
@@ -1727,7 +1838,10 @@ export class OriginMailbox {
 		await this.#seedCache(driver);
 		this.#cache.markChildRestart();
 		this.#unsubscribe = [
-			driver.onFinal((final) => this.#background("final_failed", () => this.#onFinal(driver, final))),
+			driver.onFinal((final) => {
+				if (driver === this.#driver && this.#turn?.opRef === final.opRef) this.#turn.finalArrived = true;
+				this.#background("final_failed", () => this.#onFinal(driver, final));
+			}),
 			driver.onExit((info) => this.#background("exit_failed", () => this.#onExit(driver, info))),
 			driver.onEvent((event) => this.#onDriverEvent(event)),
 		];
@@ -1947,6 +2061,8 @@ export class OriginMailbox {
 		this.#turn = undefined;
 		// The dispatched rows of the dead turn are answered with one notice; the prompt is never resent.
 		if (turn) {
+			// The dead child spent money too: charge the day as `#onFinal` does (its live total when the state is gone).
+			await this.#recordDailyCost(driver, turn);
 			store.recordTurnFailure({
 				originKey,
 				opRef: turn.opRef,
@@ -1956,6 +2072,26 @@ export class OriginMailbox {
 			await this.#noteTurnFailure(turn.threadRef, `omp_exited code=${info.code ?? "null"}`);
 		}
 		await this.#drain();
+	}
+
+	/** `!home`: this conversation becomes the owner's notice home; answered at once, never sent to omp. */
+	#setHome(row: InboundRow): void {
+		const { store, originKey, log } = this.#deps;
+		const opRef = `home:${row.platformMessageId}`;
+		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		const ref = parseChatOrigin(originKey);
+		let text: string;
+		if (ref === undefined) {
+			text = "⚠️ `!home`은 채팅 대화에서만 쓸 수 있습니다.";
+		} else if (ref.platform === "teams" && ref.kind !== "dm") {
+			// Other people read a Teams group chat: daemon notices must not land there.
+			text = TEAMS_GROUP_HOME_REFUSED_TEXT;
+		} else {
+			store.setOwnerHome({ platform: ref.platform, conversationId: ref.conversationId });
+			log.info("owner_home_set", { origin: originKey, platform: ref.platform, conversation: ref.conversationId });
+			text = "🏠 이 대화를 알림 받을 곳으로 정했습니다. 데몬 알림과 채널 없는 모니터 결과가 여기로 옵니다.";
+		}
+		store.recordAnswer({ originKey, opRef, threadRef: row.threadRef, parts: [text] });
 	}
 
 	async #runCommand(row: InboundRow, command: ParsedCommand): Promise<void> {
@@ -2071,7 +2207,9 @@ export class OriginMailbox {
 			store.recordAnswer({ originKey, opRef, threadRef, parts: [text] });
 		};
 		const turnUndo = this.#deps.turnUndo;
-		if (turnUndo === undefined) {
+		// "Not configured" is about the repository list, not about the dependency: the daemon always passes one and a
+		// config reload fills it without a restart.
+		if (turnUndo === undefined || turnUndo.repos().length === 0) {
 			reply("턴 되돌리기가 설정되지 않았습니다(turnSnapshot).");
 			return;
 		}
@@ -2079,24 +2217,33 @@ export class OriginMailbox {
 			reply("턴이 끝난 뒤 다시 시도하세요. 되돌리기는 턴이 끝난 뒤에만 됩니다.");
 			return;
 		}
-		const rows = store.latestUndoableTurn(originKey);
+		const notes = [...(this.#lastUndoFailures?.failed ?? [])].map(
+			([repo, reason]) =>
+				`스냅샷 없음: ${repo}(${redact(reason.split("\n")[0] ?? reason)}) — 직전 턴을 기록하지 못해 이 저장소는 되돌리지 않음`,
+		);
+		// A repository the last turn could not snapshot has no row for that turn: its newest row belongs to an older
+		// turn, which the owner is not asking to undo. Leave it out instead of silently going further back.
+		const failed = this.#lastUndoFailures;
+		const rows = store
+			.latestUndoableTurn(originKey)
+			.filter((row) => failed === undefined || !failed.failed.has(row.repo) || row.opRef === failed.opRef);
 		if (rows.length === 0) {
-			reply("되돌릴 턴 변경이 없습니다.");
+			reply(notes.length > 0 ? notes.join("\n") : "되돌릴 턴 변경이 없습니다.");
 			return;
 		}
 		const generation = this.#turnGeneration;
-		this.#planUndoCard(rows, { run: turnUndo.run })
+		this.#planUndoCard(rows, notes, { run: turnUndo.run })
 			.then(async (planned) => {
 				if (planned.plans.every((plan) => plan.files.length === 0 && plan.commit === undefined)) {
 					reply(planned.nothing);
 					return;
 				}
-				const outcome = await turnUndo.approve({ summary: planned.summary, threadRef });
+				const outcome = await turnUndo.approve({ summary: planned.summary, threadRef, originKey });
 				if (outcome !== "approved") {
 					reply(outcome === "timeout" ? "승인 시간이 지나 되돌리지 않았습니다." : "승인하지 않아 되돌리지 않았습니다.");
 					return;
 				}
-				const answer = await this.#serial(() => this.#applyUndoPlan(rows, planned.plans, generation));
+				const answer = await this.#serial(() => this.#applyUndoPlan(rows, planned.plans, generation, notes));
 				reply(answer);
 			})
 			.catch((error: unknown) => {
@@ -2111,10 +2258,20 @@ export class OriginMailbox {
 	 */
 	async #planUndoCard(
 		rows: readonly TurnSnapshotRow[],
+		notes: readonly string[],
 		options: { run?: GitRunner },
 	): Promise<{ plans: RepoPlan[]; summary: string; nothing: string }> {
-		const others = this.#deps.store.listTurnSnapshots({ originKey: this.#deps.originKey });
-		const plans = await Promise.all(rows.map((row) => planUndo({ row, others, run: options.run })));
+		// Overlap is checked against every row of the repository, whatever its origin: a turn of another conversation is
+		// exactly the case that must be seen (turns of one origin never run at the same time).
+		const plans = await Promise.all(
+			rows.map((row) =>
+				planUndo({
+					row,
+					others: this.#deps.store.listTurnSnapshots({ repo: row.repo }),
+					run: options.run,
+				}),
+			),
+		);
 		const lines: string[] = ["이 대화의 최근 변경 턴을 되돌릴까요?"];
 		let totalRevert = 0;
 		for (const plan of plans) {
@@ -2127,6 +2284,7 @@ export class OriginMailbox {
 			lines.push(
 				`· ${plan.repo}: 되돌림 ${count("revert")}개, 충돌 ${count("conflict")}개, 겹침 ${count("overlap")}개`,
 			);
+			for (const note of undoPlanNotes(plan)) lines.push(`  ${note}`);
 			for (const kind of ["revert", "conflict", "overlap"] as const) {
 				const paths = plan.files.filter((file) => file.kind === kind).map((file) => file.path);
 				if (paths.length === 0) continue;
@@ -2134,6 +2292,7 @@ export class OriginMailbox {
 				lines.push(`  ${kind}: ${shown}${paths.length > 10 ? ` … 외 ${paths.length - 10}개` : ""}`);
 			}
 		}
+		for (const note of notes) lines.push(`· ${note}`);
 		const summary = lines.join("\n");
 		const nothing = totalRevert === 0 ? `${summary}\n되돌릴 파일이 없습니다(모두 충돌·겹침이거나 커밋된 턴).` : summary;
 		return { plans, summary, nothing };
@@ -2148,6 +2307,7 @@ export class OriginMailbox {
 		rows: readonly TurnSnapshotRow[],
 		planned: readonly RepoPlan[],
 		generation: number,
+		notes: readonly string[],
 	): Promise<string> {
 		const { store, originKey, log } = this.#deps;
 		const turnUndo = this.#deps.turnUndo;
@@ -2155,10 +2315,12 @@ export class OriginMailbox {
 		if (this.#turn !== undefined || this.#turnGeneration !== generation) {
 			return "승인 사이에 새 턴이 시작돼 되돌리지 않았습니다.";
 		}
-		const others = store.listTurnSnapshots({ originKey });
-		const fresh = await Promise.all(rows.map((row) => planUndo({ row, others, run: turnUndo.run })));
+		const fresh = await Promise.all(
+			rows.map((row) => planUndo({ row, others: store.listTurnSnapshots({ repo: row.repo }), run: turnUndo.run })),
+		);
 		const lines: string[] = [];
 		const changed: string[] = [];
+		let failed = false;
 		for (const [index, plan] of fresh.entries()) {
 			const before = planned[index];
 			if (plan.commit !== undefined) {
@@ -2174,19 +2336,35 @@ export class OriginMailbox {
 				if (file.kind === "revert" && !allowed.has(file.path)) changed.push(file.path);
 			}
 			if (writable.files.length === 0) continue;
-			await applyUndo(writable, { run: turnUndo.run });
+			const applied = await applyUndo(writable, { run: turnUndo.run });
 			const counts = new Map<string, number>();
 			for (const file of plan.files) counts.set(file.kind, (counts.get(file.kind) ?? 0) + 1);
+			const conflicts = (counts.get("conflict") ?? 0) + applied.conflicts.length;
 			lines.push(
-				`되돌림: ${plan.repo} 파일 ${writable.files.length}개, 충돌 ${counts.get("conflict") ?? 0}개, 겹침 ${counts.get("overlap") ?? 0}개`,
+				`되돌림: ${plan.repo} 파일 ${applied.reverted}개, 충돌 ${conflicts}개, 겹침 ${counts.get("overlap") ?? 0}개`,
 			);
+			if (applied.conflicts.length > 0) {
+				lines.push(
+					`디렉터리가 있어 남겨 둔 충돌 ${applied.conflicts.length}개: ${applied.conflicts.slice(0, 10).join(", ")}`,
+				);
+			}
+			if (applied.failed !== undefined) {
+				failed = true;
+				lines.push(
+					`되돌리다 멈춤: ${plan.repo} ${applied.failed.path} — ${redact(applied.failed.reason.split("\n")[0] ?? "")}. 이 파일부터는 그대로 두었습니다`,
+				);
+			}
+			for (const note of undoPlanNotes(plan)) lines.push(note);
 		}
 		if (changed.length > 0) {
 			lines.push(`승인 사이에 내용이 바뀌어 남겨 둔 파일 ${changed.length}개: ${changed.slice(0, 10).join(", ")}`);
 		}
+		for (const note of notes) lines.push(note);
 		const opRefs = [...new Set(rows.map((row) => row.opRef))];
 		if (lines.length > 0) {
-			for (const opRef of opRefs) store.markTurnReverted(originKey, opRef, this.#deps.clock.now());
+			// A run that stopped on a failing file stays undoable: the next `!undo` plans the same turn again, where the
+			// files already put back read as conflicts and only the rest is offered.
+			if (!failed) for (const opRef of opRefs) store.markTurnReverted(originKey, opRef, this.#deps.clock.now());
 			const refs = rows.map((row) => `${row.repo}@refs/ompbot/turns/${row.id}/after`);
 			lines.push(`되돌리기 전 상태는 git ref에 남아 있습니다: ${refs.join(", ")}`);
 			log.info("undo_applied", { origin: originKey, opRef: opRefs.join(","), files: changed.length });
@@ -2300,6 +2478,10 @@ export class OriginMailbox {
 			if (error instanceof Error && /nothing to compact/i.test(error.message)) {
 				return "🗜 아직 압축할 만큼 대화가 길지 않습니다.";
 			}
+			// A driver without compaction (agy) refuses by name: tell the owner, a resend would not help.
+			if (error instanceof OmpDriverError && /compact를 지원하지 않습니다/.test(error.message)) {
+				return `🗜 ${error.message}.`;
+			}
 			throw error;
 		}
 		this.#cache.markCompacted();
@@ -2312,6 +2494,11 @@ export class OriginMailbox {
 		const { store, originKey, log } = this.#deps;
 		const sessions = listSavedSessions(dirname(this.#deps.sessionDirFor(originKey, 1)));
 		const current = this.#driver ? (await this.#driver.state()).sessionFile : undefined;
+		// agy keeps its conversation in agy itself (a pointer file here), never an omp `.jsonl`: there is no list to show.
+		const sessionDir = store.getOrigin(originKey)?.sessionDir;
+		if (sessions.length === 0 && sessionDir !== undefined && existsSync(join(sessionDir, "agy-conversation.json"))) {
+			return `agy 세션은 저장된 세션 목록·이어가기를 지원하지 않습니다. 새로 시작하려면 \`${COMMAND_TEXT.new}\`를 쓰세요.`;
+		}
 		if (arg === "") {
 			if (sessions.length === 0) return "저장된 세션이 없습니다.";
 			const lines = sessions.slice(0, 10).map((session, i) => {

@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { ConfigError, defaultHomeDir, loadConfig, type OmpbotConfig } from "../config";
+import { ConfigError, defaultHomeDir, loadConfig, type OmpbotConfig, timezoneOfHome } from "../config";
 import { runDoctor } from "../daemon/doctor";
 import { callDaemon } from "../daemon/ipc";
 import type { ReloadResult } from "../daemon/reload";
@@ -14,6 +14,7 @@ import { BackupError, type BackupResult, DEFAULT_KEEP, runBackup } from "../ops/
 import { clearFreeze, readFreeze, writeFreeze } from "../ops/freeze";
 import { collectGates, type GatesOptions } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
+import { type HostLoadReader, testHostLoad } from "../ops/host-resources";
 import { OffsiteError, type OffsiteResult, runOffsite } from "../ops/offsite";
 import { APPLY_USAGE, applyCommand } from "./apply";
 import { BRIEFING_USAGE, briefingCommand } from "./briefing";
@@ -22,9 +23,11 @@ import { DRAIN_USAGE, drainCommand } from "./drain";
 import { FEEDBACK_USAGE, feedbackCommand } from "./feedback";
 import { INIT_USAGE, initCommand } from "./init";
 import { MONITORS_USAGE, monitorsCommand } from "./monitors";
+import { OMP_USAGE, ompCommand } from "./omp";
 import { RESTORE_USAGE, restoreCommand } from "./restore";
 import { SKILLS_USAGE, skillsCommand } from "./skills";
 import { TASKS_USAGE, tasksCommand } from "./tasks";
+import { TEAMS_USAGE, teamsCommand } from "./teams";
 import { UNITS_USAGE, unitsCommand } from "./units";
 
 /** ssh's own ConnectTimeout is 5 s; the whole check gets a little more. */
@@ -59,7 +62,7 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}${TEAMS_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -84,7 +87,7 @@ function gcCommand(args: string[], homeDir: string): number {
 		process.stdout.write(`gc monitor_${verb} origin=${key}\n`);
 	}
 	process.stdout.write(
-		`gc_done ${verb}=${result.removed.length} retained=${result.retained.length} threads=${result.threadOriginsRemoved.length} monitors=${result.monitorOriginsRemoved.length}\n`,
+		`gc_done ${verb}=${result.removed.length} retained=${result.retained.length} threads=${result.threadOriginsRemoved.length} monitors=${result.monitorOriginsRemoved.length} teams_qa=${result.teamsQaRemoved}\n`,
 	);
 	return 0;
 }
@@ -94,8 +97,8 @@ function gcCommand(args: string[], homeDir: string): number {
  * `ompbot backup` must work on a db-only home (it is the recovery tool) — while a config that exists but is invalid
  * fails loudly, so a broken `maxBundleBytes` or `offsite` never silently reverts to "off".
  */
-function loadConfigIfPresent(homeDir: string): OmpbotConfig | undefined {
-	return existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir) : undefined;
+function loadConfigIfPresent(homeDir: string, options: { checkTokens?: boolean } = {}): OmpbotConfig | undefined {
+	return existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir, options) : undefined;
 }
 
 const firstLine = (text: string | undefined): string => text?.trim().split("\n")[0]?.trim() ?? "";
@@ -106,7 +109,12 @@ const firstLine = (text: string | undefined): string => text?.trim().split("\n")
  */
 async function checkDispatchHosts(config: OmpbotConfig, run: ProcessRunner): Promise<string[]> {
 	const perHost = await Promise.all(
-		Object.entries(config.dispatchHosts ?? {}).map(async ([name, host]) => {
+		Object.entries(config.dispatchHosts ?? {}).map(async ([key, host]) => {
+			// config only warns about a control character in a host name; on a doctor line it must not start a new line.
+			const name = key.replace(
+				/[\p{Cc}\p{Cf}]/gu,
+				(c) => `\\u${(c.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`,
+			);
 			const [result, integration] = await Promise.all([
 				run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host.ssh, "true"], {
 					timeoutMs: DISPATCH_HOST_CHECK_MS,
@@ -284,17 +292,28 @@ async function backupCommand(args: string[], homeDir: string): Promise<number> {
 /** Test seam of `ompbot gates`: the clock and the host readers `collectGates` would otherwise take from this machine. */
 export type GatesCommandDeps = Pick<GatesOptions, "statfs" | "hostLoad"> & { now?: () => number };
 
+/** The `OMPBOT_TEST_HOOKS=1` host readers as gates deps; none in production. */
+function hostLoadDeps(env: Record<string, string | undefined>): GatesCommandDeps {
+	const hostLoad = testHostLoad(env);
+	return hostLoad === undefined ? {} : { hostLoad };
+}
+
 /** `ompbot gates`: exit 1 when a gate is open, or with `--strict` also when one cannot be judged (`unknown`). */
 export function gatesCommand(args: string[], homeDir: string, deps: GatesCommandDeps = {}): number {
 	const { values } = parseArgs({ args, options: { json: { type: "boolean" }, strict: { type: "boolean" } } });
 	// A db-only home (no config.json) has no omp to check; the omp_runtime gate is then omitted.
 	const config = loadConfigIfPresent(homeDir);
-	const omp = config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
+	const omp = {
+		...(config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {}),
+		...(config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+	};
 	const gates = collectGates({
 		homeDir,
 		now: (deps.now ?? Date.now)(),
 		offsiteConfigured: config?.offsite !== undefined,
-		...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
+		...(config?.costCap?.dailyUsd === undefined
+			? {}
+			: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
 		...omp,
 		...(deps.statfs === undefined ? {} : { statfs: deps.statfs }),
 		...(deps.hostLoad === undefined ? {} : { hostLoad: deps.hostLoad }),
@@ -317,7 +336,7 @@ export function gatesCommand(args: string[], homeDir: string, deps: GatesCommand
 	return open.length > 0 || (values.strict === true && unknown.length > 0) ? 1 : 0;
 }
 
-async function statusCommand(args: string[], homeDir: string): Promise<number> {
+async function statusCommand(args: string[], homeDir: string, hostLoad?: Partial<HostLoadReader>): Promise<number> {
 	const { values } = parseArgs({ args, options: { json: { type: "boolean" } } });
 	const socketPath = join(homeDir, "ompbot.sock");
 	let report: StatusReport | undefined;
@@ -333,12 +352,15 @@ async function statusCommand(args: string[], homeDir: string): Promise<number> {
 			process.stderr.write(`status: no daemon at ${socketPath} and no database at ${dbPath}\n`);
 			return 1;
 		}
-		const config = loadConfig(homeDir);
+		// The database is the report; a db-only (recovery) home or broken token files must not hide it.
+		const config = loadConfigIfPresent(homeDir, { checkTokens: false });
 		report = readStatusFromDb(
 			dbPath,
-			await readVersion([config.ompExecutable, "--version"]),
-			config.offsite !== undefined,
-			config.costCap?.dailyUsd,
+			config === undefined ? "unknown" : await readVersion([config.ompExecutable, "--version"]),
+			config?.timezone ?? timezoneOfHome(homeDir),
+			config?.offsite !== undefined,
+			config?.costCap?.dailyUsd,
+			hostLoad,
 		);
 	}
 	process.stdout.write(`${values.json ? JSON.stringify(report) : renderStatusText(report)}\n`);
@@ -384,6 +406,11 @@ async function injectCommand(args: string[], homeDir: string): Promise<number> {
 		process.stderr.write(`inject needs --origin, --as-owner and --text\n${USAGE}`);
 		return 2;
 	}
+	// The daemon posts its marker before it judges the text: a blank text would leave an empty marker behind.
+	if (values.text.trim() === "") {
+		process.stderr.write("inject: --text is empty; give the message text\n");
+		return 2;
+	}
 	let response: unknown;
 	try {
 		response = await callDaemon(join(homeDir, "ompbot.sock"), {
@@ -417,7 +444,13 @@ async function injectCommand(args: string[], homeDir: string): Promise<number> {
 
 /** `ompbot reload`: the running daemon re-reads config.json (same as SIGHUP); exit 1 when it kept the old config. */
 async function reloadCommand(homeDir: string): Promise<number> {
-	const response = (await callDaemon(join(homeDir, "ompbot.sock"), { op: "reload" }, 10_000)) as ReloadResult;
+	let response: ReloadResult;
+	try {
+		response = (await callDaemon(join(homeDir, "ompbot.sock"), { op: "reload" }, 10_000)) as ReloadResult;
+	} catch (error) {
+		process.stderr.write(`reload: daemon not reachable (${error instanceof Error ? error.message : String(error)})\n`);
+		return 1;
+	}
 	if (response.ok !== true) {
 		process.stderr.write(`reload failed, config unchanged: ${response.error}\n`);
 		return 1;
@@ -445,7 +478,7 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return await runDaemon(loadConfig(homeDir), env, bootConfigText);
 			}
 			case "status":
-				return await statusCommand(rest, homeDir);
+				return await statusCommand(rest, homeDir, testHostLoad(env));
 			case "doctor":
 				return await doctorCommand(homeDir, (line) => process.stdout.write(`${line}\n`));
 			case "gc":
@@ -459,13 +492,15 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 			case "unfreeze":
 				return unfreezeCommand(homeDir);
 			case "gates":
-				return gatesCommand(rest, homeDir);
+				return gatesCommand(rest, homeDir, hostLoadDeps(env));
 			case "inject":
 				return await injectCommand(rest, homeDir);
 			case "drain":
 				return await drainCommand(rest, homeDir);
 			case "apply":
 				return await applyCommand(rest, homeDir, env);
+			case "omp":
+				return await ompCommand(rest, homeDir, env);
 			case "restore":
 				return await restoreCommand(rest, homeDir);
 			case "reload":
@@ -480,6 +515,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return await dashboardCommand(rest, homeDir);
 			case "briefing":
 				return await briefingCommand(rest, homeDir);
+			case "teams":
+				return teamsCommand(rest, homeDir);
 			case "feedback":
 				return feedbackCommand(rest, homeDir);
 			default:
@@ -487,7 +524,16 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return command === undefined || command === "--help" || command === "help" ? 0 : 2;
 		}
 	} catch (error) {
+		// node:util parseArgs (unknown option, missing value, `--days -1`): an argument mistake, so a usage error.
+		if (isParseArgsError(error)) {
+			process.stderr.write(`${command}: ${error.message.replace(/\s*\n\s*/g, " ")} (ompbot --help)\n`);
+			return 2;
+		}
 		process.stderr.write(`${command}: ${error instanceof ConfigError ? error.message : String(error)}\n`);
 		return 1;
 	}
+}
+
+function isParseArgsError(error: unknown): error is Error {
+	return error instanceof Error && "code" in error && String(error.code).startsWith("ERR_PARSE_ARGS_");
 }

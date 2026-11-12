@@ -1,13 +1,13 @@
 # 기억 교정 모니터 (memory audit)
 
-매주 일요일 05:00 KST에 ompbot 세션이 쓰는 Mnemopi 은행에서 모니터 턴 기록(잡음)을 모두 무효화하고, 나머지 기억 중 아직 검사하지 않은 것을 회상 횟수 순으로 최대 30개 골라 현재 코드·설정·기록과 대조해 `유지`·`무효`·`교체`로 판정한다. 은행을 스냅샷한 뒤 모델이 `memory_edit invalidate`로 반영하고, `audit.py verify`가 반영 결과를 은행과 대조한다. 스크립트는 은행 DB를 읽기 전용(`mode=ro`)으로만 연다.
+매주 일요일 05:00(봇 시간대)에 ompbot 세션이 쓰는 Mnemopi 은행에서 모니터 턴 기록(잡음)을 모두 무효화하고, 나머지 기억 중 아직 검사하지 않은 것을 회상 횟수 순으로 최대 30개 골라 현재 코드·설정·기록과 대조해 `유지`·`무효`·`교체`로 판정한다. 은행을 스냅샷한 뒤 모델이 `memory_edit invalidate`로 반영하고, `audit.py verify`가 반영 결과를 은행과 대조한다. 스크립트는 은행 DB를 읽기 전용(`mode=ro`)으로만 연다.
 
 | 파일 | 설치 경로 | 하는 일 |
 |---|---|---|
 | `collect.py` | `<홈>/scripts/memory-audit-collect.py` | 은행 지표·잡음·후보 미리보기 출력 (읽기 전용) |
 | `audit.py` | `<홈>/scripts/memory-audit.py` | `check`(판정 파일 형식)·`snapshot`·`find`(교체 메모 id)·`verify`(반영 검증, state 기록) |
 | `procedure.md` | `<홈>/scripts/memory-audit-procedure.md` | 모니터 턴이 따르는 절차 |
-| `monitor.json` | `monitors add --json` 입력 | 일요일 05:00 KST cron, `anthropic/claude-sonnet-5-5`, thinking high, 오너 DM |
+| `monitor.json` | `monitors add --json` 입력 | 일요일 05:00(봇 시간대) cron, 봇 기본 모델, thinking high, 오너 DM |
 
 `<홈>`은 `OMPBOT_HOME`(기본 `~/.ompbot`)이다. 두 스크립트의 사용법·종료 코드는 파일 맨 위 docstring에 있다.
 
@@ -22,7 +22,7 @@ install -m 0755 examples/monitors/memory-audit/audit.py "$HOME_DIR/scripts/memor
 sed -e "s|@OMPBOT_HOME@|$HOME_DIR|g" -e "s|@REPO_DIR@|$REPO_DIR|g" examples/monitors/memory-audit/procedure.md > "$HOME_DIR/scripts/memory-audit-procedure.md"
 mkdir -p "$HOME_DIR/workspace/memory-audit" "$HOME_DIR/backups/memory-audit"
 bun src/main.ts monitors add --json "$(sed "s|@OMPBOT_HOME@|$HOME_DIR|g" examples/monitors/memory-audit/monitor.json)"
-bun src/main.ts monitors list   # 기억 교정: next = 다음 일요일 05:00 KST
+bun src/main.ts monitors list   # 기억 교정: next = 다음 일요일 05:00(봇 시간대)
 ```
 
 - 스냅샷은 `<홈>/backups/memory-audit/`에 둔다. 백업 번들(`sessions`·`config.json`·`workspace`·`scripts`)과 오프사이트(`backups/`의 최신 `ompbot-*.db`와 번들)에 들어가지 않으므로 은행 크기만큼 번들이 커지지 않는다. 같은 은행 스냅샷은 최신 4개만 남는다.

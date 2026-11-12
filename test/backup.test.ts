@@ -207,6 +207,108 @@ describe("backup bundle (sessions + config.json)", () => {
 		expect(entries2.some((e) => e.startsWith("scripts"))).toBe(false);
 	});
 
+	describe("sessions as a symlink (B-1)", () => {
+		const now = new Date(2026, 10, 11, 4, 30, 0);
+
+		test("the link target's contents are bundled under sessions/, inner links stay links", () => {
+			seedDb(home);
+			writeFileSync(join(home, "config.json"), "{}\n");
+			mkdirSync(join(home, "secrets"));
+			writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n");
+			const real = join(home, "elsewhere", "real-sessions");
+			mkdirSync(join(real, "slack-dm-D1"), { recursive: true });
+			writeFileSync(join(real, "slack-dm-D1", "s.jsonl"), '{"memory":true}\n');
+			nodeFs.symlinkSync(join(home, "secrets", "slack-bot-token"), join(real, "inner-link"));
+			nodeFs.symlinkSync(real, join(home, "sessions"));
+
+			const result = runBackup({ homeDir: home, now });
+			const entries = Bun.spawnSync(["tar", "-tzf", result.bundle as string])
+				.stdout.toString()
+				.split("\n");
+			expect(entries).toContain("sessions/slack-dm-D1/s.jsonl");
+			expect(entries).toContain("config.json");
+			expect(entries.some((e) => e.includes("real-sessions") || e.startsWith("elsewhere"))).toBe(false);
+			// Only the top-level link is followed: the inner link is archived as a link, never as the secret's bytes.
+			const verbose = Bun.spawnSync(["tar", "-tvzf", result.bundle as string]).stdout.toString();
+			const inner = verbose.split("\n").find((line) => line.includes("sessions/inner-link"));
+			expect(inner?.startsWith("l")).toBe(true);
+			expect(readStamp(join(home, "backups"))?.bundle).toBe("ompbot-bundle-20261111-043000.tar.gz");
+		});
+
+		test("the size cap measures the link target", () => {
+			seedDb(home);
+			const real = join(home, "elsewhere");
+			mkdirSync(real);
+			writeFileSync(join(real, "big.bin"), Buffer.alloc(64 * 1024));
+			nodeFs.symlinkSync(real, join(home, "sessions"));
+			expect(() => runBackup({ homeDir: home, now, maxBundleBytes: 1024 })).toThrow(/bundle_too_large/);
+			expect(readStamp(join(home, "backups"))).toBeUndefined();
+		});
+
+		test("a link into secrets/, to a file, dangling or cyclic fails as bundle_failed without a stamp", () => {
+			const cases: Array<[string, (link: string) => void]> = [
+				[
+					"secrets",
+					(link) => {
+						mkdirSync(join(home, "secrets", "sub"), { recursive: true });
+						writeFileSync(join(home, "secrets", "sub", "t"), "xoxb-TEST-0\n");
+						nodeFs.symlinkSync(join(home, "secrets", "sub"), link);
+					},
+				],
+				[
+					"file",
+					(link) => {
+						writeFileSync(join(home, "a-file"), "x\n");
+						nodeFs.symlinkSync(join(home, "a-file"), link);
+					},
+				],
+				[
+					"around-secrets",
+					(link) => {
+						mkdirSync(join(home, "secrets"));
+						nodeFs.symlinkSync(home, link);
+					},
+				],
+				["dangling", (link) => nodeFs.symlinkSync(join(home, "nowhere"), link)],
+				[
+					"cyclic",
+					(link) => {
+						nodeFs.symlinkSync(join(home, "loop-b"), join(home, "loop-a"));
+						nodeFs.symlinkSync(join(home, "loop-a"), join(home, "loop-b"));
+						nodeFs.symlinkSync(join(home, "loop-a"), link);
+					},
+				],
+			];
+			for (const [name, setup] of cases) {
+				rmSync(home, { recursive: true, force: true });
+				mkdirSync(home);
+				seedDb(home);
+				setup(join(home, "sessions"));
+				let error: unknown;
+				try {
+					runBackup({ homeDir: home, now });
+				} catch (caught) {
+					error = caught;
+				}
+				expect(`${name}: ${String(error)}`).toContain("bundle_failed");
+				expect(readStamp(join(home, "backups"))).toBeUndefined();
+				expect(readdirSync(join(home, "backups")).some((n) => BUNDLE_FILE_PATTERN.test(n))).toBe(false);
+			}
+		});
+
+		test("a link to an empty directory (fresh install) still backs up", () => {
+			seedDb(home);
+			mkdirSync(join(home, "empty-sessions"));
+			nodeFs.symlinkSync(join(home, "empty-sessions"), join(home, "sessions"));
+			const result = runBackup({ homeDir: home, now });
+			expect(
+				Bun.spawnSync(["tar", "-tzf", result.bundle as string])
+					.stdout.toString()
+					.split("\n"),
+			).toContain("sessions/");
+		});
+	});
+
 	test("a ledger-only home (no sessions, no config.json) writes no bundle and no bundle fields", () => {
 		seedDb(home);
 		const result = runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0) });
@@ -271,5 +373,29 @@ describe("backup bundle (sessions + config.json)", () => {
 		expect(existsSync(join(backupsDir, "ompbot-bundle-pre-upgrade.tar.gz"))).toBe(true);
 		// The daily db file of the same run is kept too.
 		expect(readdirSync(backupsDir).some((name) => name === "ompbot-20261025-043000.db")).toBe(true);
+	});
+
+	test("a hard link to a secrets/ file inside a bundle source fails the backup (J-1/J-5)", () => {
+		seedDb(home);
+		seedSources();
+		mkdirSync(join(home, "workspace"), { recursive: true });
+		nodeFs.linkSync(join(home, "secrets", "slack-bot-token"), join(home, "workspace", "notes.md"));
+		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 26, 4, 30, 0) })).toThrow(
+			/bundle_failed: workspace\/notes\.md is a hard link to a secrets\/ file/,
+		);
+		expect(readStamp(join(home, "backups"))).toBeUndefined();
+		expect(readdirSync(join(home, "backups")).some((n) => BUNDLE_FILE_PATTERN.test(n))).toBe(false);
+
+		// config.json itself hard-linked to a secret is refused too; an unrelated hard link is fine.
+		rmSync(join(home, "workspace", "notes.md"));
+		rmSync(join(home, "config.json"));
+		nodeFs.linkSync(join(home, "secrets", "slack-bot-token"), join(home, "config.json"));
+		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 26, 4, 31, 0) })).toThrow(
+			/config\.json is a hard link to a secrets\/ file/,
+		);
+		rmSync(join(home, "config.json"));
+		writeFileSync(join(home, "workspace", "a.md"), "plain\n");
+		nodeFs.linkSync(join(home, "workspace", "a.md"), join(home, "workspace", "b.md"));
+		expect(runBackup({ homeDir: home, now: new Date(2026, 9, 26, 4, 32, 0) }).bundle).toBeDefined();
 	});
 });

@@ -1,7 +1,7 @@
 // The one place that reads chat origin keys. Keys are built with `chatOriginKey` and otherwise treated as opaque
 // strings; anything that needs the platform, conversation or thread of a key asks `parseChatOrigin`.
 
-export type ChatPlatform = "slack" | "telegram" | "discord";
+export type ChatPlatform = "slack" | "telegram" | "discord" | "teams";
 
 export interface ChatOriginRef {
 	platform: ChatPlatform;
@@ -15,12 +15,15 @@ export interface ChatOriginRef {
 /**
  * Exact id grammar per platform, the only definition of it. Slack ids start with an upper-case letter (`C…`, `D…`,
  * `G…`, `U…`) and run on alphanumeric, with `<sec>.<usec>` thread ts; Telegram group chat ids are negative
- * (`-100…`); Discord ids are snowflakes (digits only), so a Slack id and a Discord id never look alike.
+ * (`-100…`); Discord ids are snowflakes (digits only), so a Slack id and a Discord id never look alike. A Teams
+ * conversation id (`19:…@thread.v2`, `a:…`) cannot sit in a key or thread ref, so the ledger stands in an alias for it:
+ * `t` + 16 lower-case hex (`teams_conversations`); its thread is the original Activity id, kept as it is.
  */
 export const GRAMMAR: Readonly<Record<ChatPlatform, { readonly conversation: RegExp; readonly thread: RegExp }>> = {
 	slack: { conversation: /^[A-Z][A-Z0-9]+$/, thread: /^[0-9.]+$/ },
 	telegram: { conversation: /^-?[0-9]+$/, thread: /^[0-9]+$/ },
 	discord: { conversation: /^[0-9]+$/, thread: /^[0-9]+$/ },
+	teams: { conversation: /^t[0-9a-f]{16}$/, thread: /^[^\s/]+$/ },
 };
 
 const isChatPlatform = (value: string | undefined): value is ChatPlatform =>
@@ -30,8 +33,8 @@ const isChatPlatform = (value: string | undefined): value is ChatPlatform =>
  * Platforms a bare conversation id tells apart. Telegram is left out: its private chat ids are digits like Discord's,
  * so it will need an explicit platform on the ledger rows instead.
  */
-export type IdPlatform = "slack" | "discord";
-const ID_PLATFORMS: readonly IdPlatform[] = ["slack", "discord"];
+export type IdPlatform = "slack" | "discord" | "teams";
+const ID_PLATFORMS: readonly IdPlatform[] = ["slack", "discord", "teams"];
 
 /**
  * Platform of a conversation id met without an origin key (a delivery's thread ref, an approval card's channel), read

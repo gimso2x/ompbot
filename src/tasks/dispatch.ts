@@ -12,6 +12,8 @@ import {
 	type ProcessRunner,
 } from "../dispatch/omp";
 import { type DiskView, diskHeadroom, diskLow } from "../ops/host-resources";
+import { redact } from "../redact";
+import type { HerdrPromptInput } from "../store/db";
 import { summarizeJudgement } from "./checker";
 import {
 	acceptanceItems,
@@ -43,6 +45,8 @@ export interface TaskDispatchDeps {
 	rootText(threadRef: string): string | undefined;
 	channels: ChannelRegistry;
 	now(): number;
+	/** The bot's zone (`config.timezone`): document times and the worker prompt's offset. */
+	timezone: string;
 	workspaceDir: string;
 	dispatchHosts?: Record<string, HostEntry>;
 	/** Config `workerOmpArgs`: extra omp arguments of a local task agent (a remote one takes its host's `ompArgs`). */
@@ -54,12 +58,29 @@ export interface TaskDispatchDeps {
 	diskHeadroom?: (path: string) => DiskView;
 	/** herdr board card link of a started agent (`config.herdrBoard`); absent → the card carries no link. */
 	boardLink?: BoardLinkResolver;
+	/** Keeps a prompt herdr took for the dashboard's 마지막 지시 (`Store.recordHerdrPrompt`); absent → nothing kept. */
+	recordPrompt?: (input: HerdrPromptInput) => void;
 	log: TaskSlackLog & { info(event: string, fields?: Record<string, unknown>): void };
+}
+
+/** Keeps a prompt herdr took; a failed write is only logged, the dispatch result stays as it is. */
+export function notePrompt(
+	deps: { recordPrompt?: (input: HerdrPromptInput) => void; log: TaskSlackLog },
+	input: HerdrPromptInput,
+): void {
+	if (deps.recordPrompt === undefined) return;
+	try {
+		deps.recordPrompt(input);
+	} catch (error) {
+		deps.log.warn("herdr_prompt_record_failed", { host: input.host, agent: input.agent, error: String(error) });
+	}
 }
 
 function hostEntryOf(deps: TaskDispatchDeps, host: string | null): HostEntry | undefined {
 	if (host === null) return undefined;
-	const entry = deps.dispatchHosts?.[host];
+	// Own keys only: `constructor`/`__proto__` are not configured hosts.
+	const hosts = deps.dispatchHosts;
+	const entry = hosts !== undefined && Object.hasOwn(hosts, host) ? hosts[host] : undefined;
 	if (entry === undefined) {
 		const known = Object.keys(deps.dispatchHosts ?? {}).join(", ") || "없음";
 		throw new Error(`알 수 없는 호스트: ${host} (등록된 호스트: ${known})`);
@@ -81,18 +102,31 @@ function herdrOptionsFor(deps: TaskDispatchDeps, entry: HostEntry | undefined): 
 	};
 }
 
-/** Starts the task's herdr agent in its worktree (local herdr, or the host's over ssh) with `prompt`. */
+/**
+ * Starts the task's herdr agent in its worktree (local herdr, or the host's over ssh) with `prompt`.
+ * `closeOnPromptFailure`: a new task's caller removes the worktree on failure, so the agent must not outlive it.
+ */
 async function startAgent(
 	deps: TaskDispatchDeps,
 	row: TaskRow,
 	prompt: string,
+	closeOnPromptFailure = false,
 ): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
 	const entry = hostEntryOf(deps, row.host);
 	const options = herdrOptionsFor(deps, entry);
 	const agentArgs = entry === undefined ? deps.workerOmpArgs : entry.ompArgs;
-	const base = { name: row.agent, task: prompt, cwd: row.worktree, options, ...(agentArgs ? { agentArgs } : {}) };
+	const base = {
+		name: row.agent,
+		task: prompt,
+		cwd: row.worktree,
+		options,
+		closeOnPromptFailure,
+		...(agentArgs ? { agentArgs } : {}),
+	};
 	const started =
 		entry === undefined ? await herdrStartAgent(base) : await herdrRemoteStart({ ...base, sshTarget: entry.ssh });
+	if (started.ok)
+		notePrompt(deps, { host: row.host, agent: row.agent, kind: "start", text: prompt, originKey: deps.originKey });
 	return started.ok ? { ok: true, paneId: started.paneId } : { ok: false, error: started.error };
 }
 
@@ -178,12 +212,13 @@ export async function startTask(
 			agent: row.agent,
 			threadLink: await threadLink(deps.channels, deps.log, threadRef),
 			registeredAt: row.createdAt,
+			timezone: deps.timezone,
 		};
 		const dir = docsDirOf(row.worktree, row.taskId);
 		const docs: Array<[string, string]> = [
-			["context.md", renderContext(meta, spec, deps.rootText(threadRef) ?? input.task)],
+			["context.md", renderContext(meta, spec, redact(deps.rootText(threadRef) ?? input.task))],
 			["spec.md", renderSpec(meta, spec, row.acceptance)],
-			["PROGRESS.md", renderProgress(row.taskId, row.createdAt)],
+			["PROGRESS.md", renderProgress(row.taskId, row.createdAt, deps.timezone)],
 			["outcome.md", renderOutcome(row.taskId)],
 		];
 		for (const [name, content] of docs) {
@@ -199,8 +234,10 @@ export async function startTask(
 			worktree: row.worktree,
 			branch: row.branch,
 			instruction: input.task,
+			timezone: deps.timezone,
+			now: deps.now(),
 		});
-		const started = await startAgent(deps, row, prompt);
+		const started = await startAgent(deps, row, prompt, true);
 		if (!started.ok) return await fail(started.error);
 		paneId = started.paneId;
 	} catch (error) {
@@ -277,6 +314,8 @@ export async function resumeTask(
 		...(input.task === undefined || input.task === "" ? {} : { instruction: input.task }),
 		resumeFindings: check.findings,
 		resumeNotes: check.notes,
+		timezone: deps.timezone,
+		now: deps.now(),
 	});
 	const alive = await herdrAgentExists(row.agent, options);
 	if (!alive.ok) return `재개 실패: ${alive.error}`;
@@ -286,6 +325,7 @@ export async function resumeTask(
 		const sent = await herdrPromptExisting(row.agent, prompt, options);
 		// Unconfirmed: herdr took the text but saw no start; the resume goes on (the sweep watches what follows).
 		if (!sent.ok && sent.unconfirmed !== true) return `재개 실패: ${sent.error ?? "unknown"}`;
+		notePrompt(deps, { host: row.host, agent: row.agent, kind: "followup", text: prompt, originKey: deps.originKey });
 		how = sent.ok
 			? "살아 있는 에이전트에 재개 프롬프트를 보냈습니다"
 			: "살아 있는 에이전트에 재개 프롬프트를 보냈습니다(시작 확인 안 됨)";

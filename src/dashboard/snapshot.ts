@@ -1,8 +1,18 @@
 import { Database } from "bun:sqlite";
-import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import {
+	closeSync,
+	type Dirent,
+	existsSync,
+	fstatSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	statSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import type { OmpbotConfig } from "../config";
-import { TOP_LEVEL_TS } from "../core/normalize";
+import { QUOTED_HEADER, TOP_LEVEL_TS } from "../core/normalize";
 import { parseChatOrigin } from "../core/origin-key";
 import { COMMAND_TEXT, parseCommand } from "../core/types";
 import { readSweepHeartbeat } from "../daemon/heartbeat";
@@ -22,7 +32,6 @@ import {
 	type RunProcessResult,
 } from "../dispatch/omp";
 import { type FlowTransition, type TaskStage, taskFlowStatus, taskStage } from "../flow/task-flow";
-import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import {
 	MONITOR_ORIGIN_PREFIX,
 	type MonitorRow,
@@ -32,18 +41,22 @@ import {
 	toMonitor,
 } from "../monitors/ledger";
 import type { MonitorDeliver, MonitorOverlap, MonitorTrigger } from "../monitors/spec";
+import { isRecord } from "../omp/type-guards";
 import { readLockStartedAt } from "../ops/apply";
 import { readStamp } from "../ops/backup";
 import type { FreezeState } from "../ops/freeze";
 import { collectGates, type Gate, type GateState, type GatesOptions, INBOUND_STARVATION_MS } from "../ops/gates";
 import { OFFSITE_STAMP_FILE } from "../ops/offsite";
 import { redact } from "../redact";
+import { INJECTION_WARNING_HEAD } from "../safety/injection";
 import { type FeedbackVerdict, readTurnVerdicts } from "../store/feedback";
-import { formatKst, type TaskRisk } from "../tasks/docs";
+import type { TaskRisk } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import type { TaskHostOps } from "../tasks/host";
 import { parseTaskJson, type TaskRow, type TaskStatus } from "../tasks/ledger";
-import { type BoardState, type BoardSummary, type BoardTaskRef, summarizeBoard } from "./board";
+import { formatLocal, localIso } from "../time";
+import { type BoardPromptRef, type BoardState, type BoardSummary, type BoardTaskRef, summarizeBoard } from "./board";
+import { createSessionModelReader, type SessionModel, type SessionModelOrigin } from "./session-model";
 
 /** A snapshot is reused this long: IPC, herdr, ssh and git are not asked again inside it. */
 export const SNAPSHOT_TTL_MS = 10_000;
@@ -162,6 +175,8 @@ export interface ThreadInfo {
 	updatedAt: string;
 	/** Newest first, at most {@link THREAD_RECENT}. */
 	recent: ThreadTurn[];
+	/** The model and thinking its omp session runs with ({@link SessionModel}); absent when unknown (no chip). */
+	model?: SessionModel;
 }
 
 /** A thread with no open turn stays on the board this long after its last activity. */
@@ -256,7 +271,39 @@ export interface HerdrAgentInfo {
 	paneId: string;
 	terminalTitle: string;
 	taskId?: string;
+	/** The pane's omp session jsonl (`agent_session` kind `path`): local host only, absolute, `.jsonl`. */
+	sessionPath?: string;
+	question?: string;
+	options?: string[];
+	asks?: AskInfo[];
+	blocked?: string;
+	lastSay?: string;
+	sayError?: string;
 }
+
+export interface AskInfo {
+	question: string;
+	options: string[];
+}
+
+/**
+ * What a local blocked/done omp pane last said, read from its session jsonl (masked): a blocked pane's pending `ask`
+ * (`question`: the first question, ` 외 N개` with more; `options`: its choices; `asks`: every question), else why it
+ * is blocked (`blocked`: 도구 실행 승인 대기 / 프로바이더 오류); a done pane's last answer, first sentence (`lastSay`).
+ * `sayError`: the session file could not be read. Every field is optional: nothing found means nothing shown.
+ */
+export interface PaneSay {
+	status: "blocked" | "done";
+	question?: string;
+	options?: string[];
+	asks?: AskInfo[];
+	blocked?: string;
+	lastSay?: string;
+	sayError?: string;
+}
+
+/** A {@link PaneSay} with its pane: the page merges it into the board card of the same host and pane. */
+export type HerdrSay = PaneSay & { host: string; paneId: string };
 
 export type HerdrHostInfo = { host: string } & Section<{ agents: HerdrAgentInfo[] }>;
 
@@ -346,7 +393,7 @@ export interface MonitorInfo {
 	kind: string;
 	/** When it fires in words (`매일 07:30`, `평일 09:00`, `한 번 · 11-07 09:30`, …); an odd cron stays `cron <expr>`. */
 	schedule: string;
-	/** A cron's expression and time zone (`30 7 * * * (Asia/Seoul)`); null for other triggers. */
+	/** A cron's expression and time zone (`30 7 * * * (Europe/Berlin)`); null for other triggers. */
 	cron: string | null;
 	/** The instruction's first sentence as one masked line of at most {@link PREVIEW_CHARS} chars. */
 	summary: string;
@@ -442,8 +489,8 @@ function monitorStats(db: Database, monitorId: string, now: number): MonitorStat
 	return stats;
 }
 
-/** A cron expression in words, in the monitor's own time zone (named when not Asia/Seoul); else `cron <expr>`. */
-function cronWords(schedule: string, timezone: string): string {
+/** A cron expression in words, in the monitor's own time zone (named when not the bot's zone); else `cron <expr>`. */
+function cronWords(schedule: string, timezone: string, botTimezone: string): string {
 	const fields = schedule.trim().split(/\s+/);
 	const [minute = "", hour = "", dom, month, dow = ""] = fields;
 	const upTo = (field: string, max: number): boolean => /^\d{1,2}$/.test(field) && Number(field) <= max;
@@ -463,15 +510,15 @@ function cronWords(schedule: string, timezone: string): string {
 		}
 	}
 	const label = words ?? `cron ${schedule}`;
-	return timezone === DEFAULT_TIMEZONE ? label : `${label} (${timezone})`;
+	return timezone === botTimezone ? label : `${label} (${timezone})`;
 }
 
-function monitorSchedule(trigger: MonitorTrigger): string {
+function monitorSchedule(trigger: MonitorTrigger, timezone: string): string {
 	switch (trigger.kind) {
 		case "cron":
-			return cronWords(trigger.schedule, trigger.timezone);
+			return cronWords(trigger.schedule, trigger.timezone, timezone);
 		case "at":
-			return `한 번 · ${formatKst(Date.parse(trigger.at)).slice(5, 16).replace("T", " ")}`;
+			return `한 번 · ${formatLocal(Date.parse(trigger.at), timezone).slice(5, 16)}`;
 		case "script": {
 			const every = trigger.intervalMs;
 			return `조건 감시 · ${every % 60_000 === 0 ? `${every / 60_000}분` : `${every / 1000}초`}마다`;
@@ -573,7 +620,7 @@ export interface JobInfo {
 	/** `done/total` in percent, one decimal; absent when `total` is 0 or the counts are absent. */
 	percent?: number;
 	startedAt?: string;
-	/** The file's `updatedAt` (its modification time for an `invalid` file), KST. */
+	/** The file's `updatedAt` (its modification time for an `invalid` file), in the bot's zone. */
 	updatedAt: string;
 	ageMs: number;
 	pid?: number;
@@ -595,7 +642,7 @@ export interface FeedbackTurn {
 	/** The turn's first inbound row (opens its waterfall); null when the row is gone. */
 	inboundId: number | null;
 	originKey: string;
-	/** When the verdict was set (KST). */
+	/** When the verdict was set (in the bot's zone). */
 	at: string;
 	/** The request in one masked line of at most {@link PREVIEW_CHARS} chars; null for monitor turns or no row. */
 	preview: string | null;
@@ -613,7 +660,10 @@ export interface FeedbackInfo {
 }
 
 export interface DashboardSnapshot {
+	/** Build time as an ISO string with the offset of `timezone`, like every other time in the snapshot. */
 	generatedAt: string;
+	/** The bot's zone (`config.timezone`): the page shows and groups times in it. */
+	timezone: string;
 	daemon: Section<DaemonInfo>;
 	turns: Section<{ items: TurnInfo[]; threads: ThreadInfo[] }>;
 	feedback: Section<FeedbackInfo>;
@@ -621,8 +671,11 @@ export interface DashboardSnapshot {
 	/** Always built; optional only so snapshots made before the flow view still type. */
 	flows?: Section<{ items: FlowChainInfo[] }>;
 	lanes: Section<{ items: LaneInfo[] }>;
-	/** `herdr agent list` per host; while the agent board is live, its column counts instead (`hosts` empty). */
-	herdr: Section<{ hosts: HerdrHostInfo[]; board?: BoardSummary }>;
+	/**
+	 * `herdr agent list` per host; while the agent board is live, its column counts instead (`hosts` empty). `says`: what
+	 * the local blocked/done omp panes said (only when there is any), merged into the board cards by the page.
+	 */
+	herdr: Section<{ hosts: HerdrHostInfo[]; board?: BoardSummary; says?: HerdrSay[] }>;
 	/** `items`: the pending ones, oldest first; `recent`: the last settled ones, newest first. */
 	approvals: Section<{ items: ApprovalInfo[]; recent: ApprovalDecision[]; stats: ApprovalStats }>;
 	monitors: Section<{ items: MonitorInfo[] }>;
@@ -637,6 +690,8 @@ export interface DashboardSnapshot {
 	 * it. Always built; optional only so hand-made snapshots still type.
 	 */
 	slackTeam?: string | null;
+	/** Config without `channels.slack`: the Slack card says 꺼짐 instead of waiting for a socket. Optional like `slackTeam`. */
+	slackOff?: boolean;
 	/**
 	 * The one Discord server (config `channels.discord.guildIds` with exactly one id) the turn panels' 디스코드에서
 	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `slackTeam`.
@@ -645,13 +700,24 @@ export interface DashboardSnapshot {
 }
 
 export type DashboardConfig = Partial<
-	Pick<OmpbotConfig, "agent" | "ompExecutable" | "offsite" | "herdr" | "dispatchHosts" | "herdrBoard" | "costCap">
+	Pick<
+		OmpbotConfig,
+		| "agent"
+		| "ompExecutable"
+		| "ompProfile"
+		| "offsite"
+		| "herdr"
+		| "dispatchHosts"
+		| "herdrBoard"
+		| "costCap"
+		| "peerBots"
+	>
 > &
 	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
 		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
 		slack?: { teamId?: string };
-		/** Only the server ids are read, for the Discord links of the turn panels. */
-		channels?: { discord?: { guildIds?: string[] } };
+		/** Only the server ids are read, for the Discord links of the turn panels; `slack` only for whether Slack is on. */
+		channels?: { slack?: { ownerUserId: string }; discord?: { guildIds?: string[] } };
 	};
 
 export interface SnapshotDeps {
@@ -660,6 +726,8 @@ export interface SnapshotDeps {
 	repoDir: string;
 	/** Absent for a home without config.json: no herdr, no board, local tasks only. */
 	config: DashboardConfig | undefined;
+	/** The bot's zone (`config.timezone`; the host zone for a home without config.json): every time is written in it. */
+	timezone: string;
 	now(): number;
 	callDaemon(socketPath: string, request: unknown, timeoutMs: number): Promise<unknown>;
 	/** herdr, ssh and git calls. */
@@ -676,7 +744,11 @@ export interface SnapshotDeps {
 	collectGates?: (options: GatesOptions) => Gate[];
 	/** Whether a job's `pid` still runs; default {@link processAlive}. */
 	isAlive?: (pid: number) => boolean;
+	/** A board thread's session model; default one {@link createSessionModelReader} shared by every snapshot. */
+	sessionModel?: (origin: SessionModelOrigin) => SessionModel | undefined;
 }
+
+const sharedSessionModel = createSessionModelReader();
 
 const message = (error: unknown): string =>
 	redact(error instanceof Error ? error.message : String(error)).slice(0, ERROR_CHARS);
@@ -915,29 +987,261 @@ async function listHerdrAgents(target: HerdrTarget, run: ProcessRunner): Promise
 	}
 	const agents = (parsed as { result?: { agents?: unknown } } | null)?.result?.agents;
 	if (!Array.isArray(agents)) return { ok: false, error: "agent list output has no agents" };
+	// Session files are read on this machine only: a remote host's path never leaves its listing.
+	const local = target.host === "local";
 	return {
 		ok: true,
-		agents: agents.map((entry: Record<string, unknown>) => ({
-			name: str(entry?.name),
-			agent: str(entry?.agent),
-			agentStatus: str(entry?.agent_status),
-			cwd: str(entry?.cwd),
-			paneId: str(entry?.pane_id),
-			terminalTitle: redact(str(entry?.terminal_title)),
-		})),
+		agents: agents.map((entry: Record<string, unknown>) => {
+			const sessionPath = local ? sessionPathOf(entry?.agent_session) : undefined;
+			return {
+				name: str(entry?.name),
+				agent: str(entry?.agent),
+				agentStatus: str(entry?.agent_status),
+				cwd: str(entry?.cwd),
+				paneId: str(entry?.pane_id),
+				terminalTitle: redact(str(entry?.terminal_title)),
+				...(sessionPath === undefined ? {} : { sessionPath }),
+			};
+		}),
 	};
 }
 
-/** A request as one masked line: secrets masked, Slack links and attachment notes folded, whitespace collapsed, cut to the limit. */
-function previewLine(text: string): string {
-	const line = redact(text)
+/** herdr's `agent_session` (outside-controlled JSON): `{kind: "path", value}` with an absolute `.jsonl` path, else none. */
+function sessionPathOf(value: unknown): string | undefined {
+	if (value === null || typeof value !== "object") return undefined;
+	const session = value as { kind?: unknown; value?: unknown };
+	if (session.kind !== "path" || typeof session.value !== "string") return undefined;
+	return isAbsolute(session.value) && session.value.endsWith(".jsonl") ? session.value : undefined;
+}
+
+/** A session file is read back from its end this much at a time, and no further back than {@link SAY_MAX_BYTES}. */
+const SAY_CHUNK_BYTES = 256 * 1024;
+const SAY_MAX_BYTES = 4 * 1024 * 1024;
+/** At most this many panes' files are read per snapshot, all of them within {@link SAY_READ_BUDGET_MS}. */
+const SAY_PANES = 12;
+const SAY_READ_BUDGET_MS = 1_500;
+/** A last answer, an error line: one sentence or line of at most this many characters. */
+const SAY_TEXT_CHARS = 120;
+/** A question or choice is kept whole up to this many characters (a page is no place for a whole essay). */
+const SAY_QUESTION_CHARS = 400;
+const SAY_CACHE_LIMIT = 64;
+
+/** Per session file: what it said at that mtime and size, so an unchanged file is not read again. */
+const sayCache = new Map<string, { mtimeMs: number; size: number; status: PaneSay["status"]; say: PaneSay }>();
+
+type JsonRecord = Record<string, unknown>;
+
+function parseLine(line: Buffer): JsonRecord | undefined {
+	try {
+		const value: unknown = JSON.parse(line.toString("utf8"));
+		return isRecord(value) ? value : undefined;
+	} catch {
+		return undefined; // a broken or half-written line is skipped
+	}
+}
+
+/** The chat message a session line carries (`{type: "message", message: {role, …}}`), if any. */
+function messageOf(line: JsonRecord | undefined): JsonRecord | undefined {
+	return line?.type === "message" && isRecord(line.message) ? line.message : undefined;
+}
+
+function splitLines(data: Buffer): Buffer[] {
+	const parts: Buffer[] = [];
+	let start = 0;
+	for (let at = data.indexOf(0x0a); at >= 0; at = data.indexOf(0x0a, start)) {
+		parts.push(data.subarray(start, at));
+		start = at + 1;
+	}
+	parts.push(data.subarray(start));
+	return parts;
+}
+
+/**
+ * The last assistant message of a session file and the lines after it (file order), read backwards line by line
+ * {@link SAY_CHUNK_BYTES} at a time: a line cut by a chunk start waits for the earlier bytes, so lines are decoded
+ * whole (UTF-8 safe). Undefined when no assistant message is within the last {@link SAY_MAX_BYTES}. Throws when the
+ * file cannot be opened or read.
+ */
+function readLastAssistant(path: string): { message: JsonRecord; after: JsonRecord[] } | undefined {
+	const fd = openSync(path, "r");
+	try {
+		let pos = fstatSync(fd).size;
+		let consumed = 0;
+		let head: Buffer = Buffer.alloc(0); // the front of a line whose start is still unread
+		let after: JsonRecord[] = [];
+		while (pos > 0 && consumed < SAY_MAX_BYTES) {
+			const step = Math.min(SAY_CHUNK_BYTES, SAY_MAX_BYTES - consumed, pos);
+			pos -= step;
+			consumed += step;
+			const chunk = Buffer.alloc(step);
+			readSync(fd, chunk, 0, step, pos);
+			const parts = splitLines(head.length === 0 ? chunk : Buffer.concat([chunk, head]));
+			head = pos > 0 ? (parts.shift() ?? Buffer.alloc(0)) : Buffer.alloc(0);
+			const lines = parts.filter((line) => line.length > 0).map(parseLine);
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const message = messageOf(lines[i]);
+				if (message?.role === "assistant") {
+					return { message, after: [...(lines.slice(i + 1).filter(isRecord) as JsonRecord[]), ...after] };
+				}
+			}
+			after = [...(lines.filter(isRecord) as JsonRecord[]), ...after];
+		}
+		return undefined;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Masked, whitespace folded, cut to `limit` characters (the last one `…` when cut). */
+function sayText(text: string, limit: number): string {
+	const chars = Array.from(redact(text).replace(/\s+/g, " ").trim());
+	return chars.length > limit ? `${chars.slice(0, limit - 1).join("")}…` : chars.join("");
+}
+
+/** The first sentence (up to its `.`/`!`/`?` or the line end) of a text, masked, at most {@link SAY_TEXT_CHARS}. */
+function firstSentence(text: string): string {
+	const line = redact(text).trim().split("\n")[0] ?? "";
+	const end = /[.!?。](?=\s|$)/.exec(line);
+	return sayText(end === null ? line : line.slice(0, end.index + 1), SAY_TEXT_CHARS);
+}
+
+/** The questions of an `ask` call's arguments (`questions[].question`, `options[].label`); unreadable ones are left out. */
+function asksOf(args: unknown): AskInfo[] {
+	const questions = isRecord(args) && Array.isArray(args.questions) ? args.questions : [];
+	return questions.flatMap((entry): AskInfo[] => {
+		if (!isRecord(entry) || typeof entry.question !== "string" || entry.question.trim() === "") return [];
+		const options = (Array.isArray(entry.options) ? entry.options : [])
+			.map((option) => (isRecord(option) && typeof option.label === "string" ? option.label : ""))
+			.filter((label) => label.trim() !== "")
+			.map((label) => sayText(label, SAY_QUESTION_CHARS));
+		return [{ question: sayText(entry.question, SAY_QUESTION_CHARS), options }];
+	});
+}
+
+/**
+ * What the pane's last assistant message says. Blocked: the first tool call without a result after it — an `ask`
+ * gives its questions, any other tool `도구 실행 승인 대기: <name>` — else an error end `프로바이더 오류: <first line>`.
+ * Done: the first sentence of its text.
+ */
+function sayOf(found: { message: JsonRecord; after: JsonRecord[] }, status: PaneSay["status"]): PaneSay {
+	const content = Array.isArray(found.message.content) ? found.message.content.filter(isRecord) : [];
+	if (status === "done") {
+		const text = content.find((block) => block.type === "text" && typeof block.text === "string" && block.text.trim());
+		const lastSay = text === undefined ? "" : firstSentence(text.text as string);
+		return lastSay === "" ? { status } : { status, lastSay };
+	}
+	const answered = new Set(
+		found.after
+			.map(messageOf)
+			.filter((message) => message?.role === "toolResult" && typeof message.toolCallId === "string")
+			.map((message) => message?.toolCallId as string),
+	);
+	const pending = content.find(
+		(block) => block.type === "toolCall" && !(typeof block.id === "string" && answered.has(block.id)),
+	);
+	if (pending !== undefined) {
+		const asks = pending.name === "ask" ? asksOf(pending.arguments) : [];
+		const [first] = asks;
+		if (first !== undefined) {
+			const more = asks.length > 1 ? ` 외 ${asks.length - 1}개` : "";
+			return { status, question: `${first.question}${more}`, options: first.options, asks };
+		}
+		if (pending.name !== "ask") {
+			return { status, blocked: `도구 실행 승인 대기: ${sayText(str(pending.name) || "?", SAY_TEXT_CHARS)}` };
+		}
+		return { status };
+	}
+	const error = typeof found.message.errorMessage === "string" ? found.message.errorMessage : "";
+	if (found.message.stopReason === "error" || error !== "") {
+		const line = sayText(error.trim().split("\n")[0] ?? "", SAY_TEXT_CHARS);
+		return { status, blocked: `프로바이더 오류: ${line || "알 수 없음"}` };
+	}
+	return { status };
+}
+
+/** One pane's say, from the cache while its file keeps its mtime and size; a read failure stays on this pane. */
+function paneSay(path: string, status: PaneSay["status"]): PaneSay {
+	try {
+		const stat = statSync(path);
+		const cached = sayCache.get(path);
+		if (cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.status === status) return cached.say;
+		const found = readLastAssistant(path);
+		const say = found === undefined ? { status } : sayOf(found, status);
+		sayCache.delete(path);
+		sayCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, status, say });
+		if (sayCache.size > SAY_CACHE_LIMIT) {
+			const oldest = sayCache.keys().next().value;
+			if (oldest !== undefined) sayCache.delete(oldest);
+		}
+		return say;
+	} catch (error) {
+		return { status, sayError: sayText(`세션 파일을 읽지 못했습니다: ${message(error)}`, ERROR_CHARS) };
+	}
+}
+
+/**
+ * The says of the local blocked/done omp panes with a session file, blocked ones first (then in the given order): at
+ * most {@link SAY_PANES} files, and no new file once {@link SAY_READ_BUDGET_MS} has passed (the rest wait for the next
+ * snapshot, mostly from the cache then).
+ */
+function localSays(agents: HerdrAgentInfo[], now: () => number): HerdrSay[] {
+	const wanted = agents
+		.filter(
+			(agent) =>
+				agent.agent === "omp" &&
+				agent.sessionPath !== undefined &&
+				(agent.agentStatus === "blocked" || agent.agentStatus === "done"),
+		)
+		.sort((a, b) => Number(b.agentStatus === "blocked") - Number(a.agentStatus === "blocked"))
+		.slice(0, SAY_PANES);
+	const started = now();
+	const says: HerdrSay[] = [];
+	for (const [index, agent] of wanted.entries()) {
+		if (index > 0 && now() - started > SAY_READ_BUDGET_MS) break;
+		const say = paneSay(agent.sessionPath as string, agent.agentStatus as PaneSay["status"]);
+		says.push({ host: "local", paneId: agent.paneId, ...say });
+	}
+	return says;
+}
+
+/** Lines ompbot puts around quoted material (`wrapQuoted`): the header and the injection warning. */
+const QUOTE_HEADS = [QUOTED_HEADER.slice(0, QUOTED_HEADER.indexOf("]") + 1), INJECTION_WARNING_HEAD];
+
+/**
+ * A request as one masked line: ompbot's quote wrapping removed (every header and warning line and every
+ * `<<<quoted-…>>>` block; an open marker with no end drops the rest), secrets masked, Slack links and attachment notes
+ * folded, whitespace collapsed, cut to the limit. With none of the owner's words left (only quotes or attachments) the
+ * line is `[첨부]` and `fallback` (a flow's first TASK title), else the attachment file names. `limit`: longest line.
+ */
+export function previewLine(text: string, fallback?: string, limit = PREVIEW_CHARS): string {
+	let own = text.replace(/<<<quoted-([^>\n]*)>>>[\s\S]*?<<<end-quoted-\1>>>/g, "\n");
+	const open = own.search(/<<<quoted-[^>\n]*>>>/);
+	if (open >= 0) own = own.slice(0, open);
+	own = own
+		.replace(/<<<end-quoted-[^>\n]*>>>/g, "")
+		.split("\n")
+		.filter((line) => !QUOTE_HEADS.some((head) => line.trim().startsWith(head)))
+		.join("\n");
+	const folded = redact(own)
 		.replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2")
-		.replace(/<https?:\/\/([^>]+)>/g, "$1")
+		.replace(/<https?:\/\/([^>]+)>/g, "$1");
+	const files = [...folded.matchAll(/\[첨부: ([^\]]*)\]/g)].map(
+		(match) =>
+			(match[1] ?? "")
+				.replace(/\s+\([^)]*\)$/, "")
+				.split("/")
+				.pop() ?? "",
+	);
+	let line = folded
 		.replace(/\[첨부: [^\]]*\]/g, "[첨부]")
 		.replace(/\s+/g, " ")
 		.trim();
+	if (line.replaceAll("[첨부]", "").trim() === "") {
+		const name = fallback === undefined ? files.filter((file) => file !== "").join(", ") : redact(fallback).trim();
+		line = name === "" ? "[첨부]" : `[첨부] ${name.replace(/\s+/g, " ")}`;
+	}
 	const chars = Array.from(line);
-	return chars.length > PREVIEW_CHARS ? `${chars.slice(0, PREVIEW_CHARS - 1).join("")}…` : line;
+	return chars.length > limit ? `${chars.slice(0, limit - 1).join("")}…` : line;
 }
 
 /**
@@ -945,7 +1249,12 @@ function previewLine(text: string): string {
  * most `limit`) with their masked request line, and the verdict of every inbound row of any judged turn (not cut to
  * `days`: a recent-turn line must badge like the waterfall it opens).
  */
-export function readFeedbackSummary(db: Database, now: number, window: { days: number; limit?: number }): FeedbackInfo {
+export function readFeedbackSummary(
+	db: Database,
+	now: number,
+	window: { days: number; limit?: number },
+	timezone: string,
+): FeedbackInfo {
 	const since = now - window.days * 24 * 3_600_000;
 	const judged = readTurnVerdicts(db, 0);
 	const turns = judged.filter((turn) => turn.at >= since);
@@ -968,7 +1277,7 @@ export function readFeedbackSummary(db: Database, now: number, window: { days: n
 			return {
 				inboundId: turn.inboundId,
 				originKey: turn.originKey,
-				at: formatKst(turn.at),
+				at: localIso(turn.at, timezone),
 				preview: text === null ? null : previewLine(text.text_ref),
 			};
 		}),
@@ -996,7 +1305,7 @@ function jobText(value: unknown, limit: number): string | undefined {
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
 /** One job file; a file that cannot be read as a job comes back `invalid` instead of failing the section. */
-function readJob(dir: string, file: string, now: number, isAlive: (pid: number) => boolean): JobInfo {
+function readJob(dir: string, file: string, now: number, isAlive: (pid: number) => boolean, timezone: string): JobInfo {
 	const name = file.slice(0, -".json".length);
 	const path = join(dir, file);
 	const invalid = (why: string): JobInfo => {
@@ -1010,7 +1319,7 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 			name,
 			title: file,
 			state: null,
-			updatedAt: formatKst(modified),
+			updatedAt: localIso(modified, timezone),
 			ageMs: now - modified,
 			detail: jobText(why, JOB_DETAIL_CHARS) ?? "",
 			health: "invalid",
@@ -1058,8 +1367,8 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 		...(counts ? { done, total } : {}),
 		...(counts && total > 0 ? { percent: Math.round((done / total) * 1000) / 10 } : {}),
 		...(unit === undefined ? {} : { unit }),
-		...(Number.isNaN(startedMs) ? {} : { startedAt: formatKst(startedMs) }),
-		updatedAt: formatKst(updatedMs),
+		...(Number.isNaN(startedMs) ? {} : { startedAt: localIso(startedMs, timezone) }),
+		updatedAt: localIso(updatedMs, timezone),
 		ageMs,
 		...(pid === undefined ? {} : { pid }),
 		...(thread === undefined ? {} : { thread }),
@@ -1073,7 +1382,7 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
  * `<home>/jobs/<name>.json` files whose name passes {@link JOB_NAME}: newest update first, at most {@link JOB_LIMIT},
  * `done` and `stopped` jobs only for {@link JOB_DONE_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
  */
-function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean): JobInfo[] {
+function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean, timezone: string): JobInfo[] {
 	const dir = join(homeDir, "jobs");
 	let entries: Dirent[];
 	try {
@@ -1084,7 +1393,7 @@ function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolea
 	}
 	return entries
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && JOB_NAME.test(entry.name.slice(0, -5)))
-		.map((entry) => readJob(dir, entry.name, now, isAlive))
+		.map((entry) => readJob(dir, entry.name, now, isAlive, timezone))
 		.filter((job) => !((job.state === "done" || job.state === "stopped") && job.ageMs > JOB_DONE_KEEP_MS))
 		.sort((a, b) => a.ageMs - b.ageMs)
 		.slice(0, JOB_LIMIT);
@@ -1113,7 +1422,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 	const now = deps.now();
 	const run = sharedRunner(deps.run);
 	const machinesFetch = sharedFetch(deps.fetch ?? fetch);
-	const { config } = deps;
+	const { config, timezone } = deps;
+	const iso = (ms: number): string => localIso(ms, timezone);
 	const dbPath = join(deps.homeDir, "ompbot.db");
 	const db = existsSync(dbPath) ? new Database(dbPath, { readonly: true, strict: true }) : undefined;
 	try {
@@ -1152,6 +1462,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				report = readStatusFromDb(
 					dbPath,
 					await deps.ompVersion(),
+					timezone,
 					config?.offsite !== undefined,
 					config?.costCap?.dailyUsd,
 				);
@@ -1160,15 +1471,15 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const beat = readSweepHeartbeat(deps.homeDir);
 			if (beat !== undefined) {
 				info.heartbeat = {
-					at: formatKst(beat.ts.getTime()),
+					at: iso(beat.ts.getTime()),
 					ageMs: now - beat.ts.getTime(),
 					...(beat.loopMs === undefined ? {} : { loopMs: beat.loopMs }),
 					...(beat.socket === undefined
 						? {}
-						: { socket: { state: beat.socket.state, since: formatKst(beat.socket.since.getTime()) } }),
+						: { socket: { state: beat.socket.state, since: iso(beat.socket.since.getTime()) } }),
 					...(beat.discord === undefined
 						? {}
-						: { discord: { state: beat.discord.state, since: formatKst(beat.discord.since.getTime()) } }),
+						: { discord: { state: beat.discord.state, since: iso(beat.discord.since.getTime()) } }),
 					...(beat.draining === undefined ? {} : { draining: beat.draining }),
 				};
 			}
@@ -1178,7 +1489,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const commit = head.stdout.trim();
 			if (head.code === 0 && !head.timedOut && /^[0-9a-f]{4,40}$/.test(commit)) info.commit = commit;
 			const startedAt = info.running ? readLockStartedAt(deps.homeDir) : undefined;
-			if (startedAt !== undefined) info.started = { at: formatKst(startedAt), ageMs: now - startedAt };
+			if (startedAt !== undefined) info.started = { at: iso(startedAt), ageMs: now - startedAt };
 			return info;
 		});
 
@@ -1241,7 +1552,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					originKey: r.origin_key,
 					threadRef: r.thread_ref,
 					state: r.state,
-					createdAt: formatKst(r.created_at),
+					createdAt: iso(r.created_at),
 					ageMs: now - r.created_at,
 					silentMs,
 					stalled:
@@ -1267,6 +1578,28 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const since = now - THREAD_WINDOW_MS;
 			const ACTIVE = "COALESCE(last_event_at, dispatched_at, created_at)";
 			const OPEN = "state IN ('pending','dispatched')";
+			const sessionModel = deps.sessionModel ?? sharedSessionModel;
+			/** The chip of a board thread: its origin's session model; nothing when the origin or its session is unknown. */
+			const threadModel = (key: string): SessionModel | undefined => {
+				try {
+					const [origin] = rows<{
+						session_dir: string;
+						session_file: string | null;
+						model: string | null;
+						thinking: string | null;
+					}>(handle, "SELECT session_dir, session_file, model, thinking FROM origins WHERE origin_key = ?", key);
+					return origin === undefined
+						? undefined
+						: sessionModel({
+								sessionDir: origin.session_dir,
+								sessionFile: origin.session_file,
+								model: origin.model,
+								thinking: origin.thinking,
+							});
+				} catch {
+					return undefined;
+				}
+			};
 			const monitorNames = new Map(
 				rows<{ id: string; name: string }>(handle, "SELECT id, name FROM monitors").map((m) => [m.id, m.name]),
 			);
@@ -1318,6 +1651,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				const monitor = key.startsWith(MONITOR_ORIGIN_PREFIX)
 					? (monitorNames.get(key.slice(MONITOR_ORIGIN_PREFIX.length)) ?? key)
 					: undefined;
+				const model = threadModel(key);
 				return [
 					{
 						originKey: key,
@@ -1337,8 +1671,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						runCount: runs?.n ?? 0,
 						pendingCount: openTurns.filter((turn) => turn.state === "pending").length,
 						stalledCount,
-						updatedAt: formatKst(thread.active),
+						updatedAt: iso(thread.active),
 						recent: recent.map(brief),
+						...(model === undefined ? {} : { model }),
 					},
 				];
 			});
@@ -1367,7 +1702,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 		};
 
 		const describeOpen = async ({ row, broken }: ReadTask): Promise<TaskInfo> => {
-			const info = baseTask({ row, broken });
+			const info = baseTask({ row, broken }, timezone);
 			const [evaluation, herdr, link] = await Promise.all([
 				withTimeout(
 					(async () => evaluateTask(row, deps.hostOps(row.host)))(),
@@ -1411,7 +1746,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				now - CLOSED_TASK_DAYS * 86_400_000,
 				CLOSED_TASK_LIMIT,
 			).map(toTaskRow);
-			return { items: [...(await Promise.all(open.map(describeOpen))), ...closed.map(baseTask)] };
+			return {
+				items: [...(await Promise.all(open.map(describeOpen))), ...closed.map((read) => baseTask(read, timezone))],
+			};
 		});
 
 		const flows = section(() => {
@@ -1428,12 +1765,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				FROM task_transitions WHERE task_id IN (SELECT task_id FROM tasks WHERE ${scope}) ORDER BY transition_id`,
 				since,
 			);
-			const statuses = taskFlowStatus(read, transitions);
+			const statuses = taskFlowStatus(read, transitions, (config?.peerBots?.length ?? 0) > 0);
 			const threads = new Map<string, TaskRow[]>();
 			for (const row of read) threads.set(row.threadRef, [...(threads.get(row.threadRef) ?? []), row]);
 			const chains = [...threads].map(([threadRef, list]) => {
 				const steps = list.map((row): FlowStepInfo => {
-					const stage = taskStage(row, statuses);
+					const stage = taskStage(row, statuses, timezone);
 					return {
 						taskId: row.taskId,
 						title: redact(row.title),
@@ -1441,8 +1778,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						risk: row.risk,
 						host: row.host ?? "local",
 						branch: row.branch,
-						createdAt: formatKst(row.createdAt),
-						...(row.closedAt === null ? {} : { closedAt: formatKst(row.closedAt) }),
+						createdAt: iso(row.createdAt),
+						...(row.closedAt === null ? {} : { closedAt: iso(row.closedAt) }),
 						acTotal: row.acceptance.length,
 						stage: { ...stage, msg: redact(stage.msg) },
 					};
@@ -1453,7 +1790,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				let line: string;
 				if (here === undefined) {
 					const closedAt = Math.max(...list.map((row) => row.closedAt ?? row.updatedAt));
-					line = `모두 끝남 · 마지막 close ${formatKst(closedAt).slice(5, 16).replace("T", " ")}`;
+					line = `모두 끝남 · 마지막 close ${iso(closedAt).slice(5, 16).replace("T", " ")}`;
 				} else {
 					const stage = steps.find((step) => step.taskId === here.taskId)?.stage;
 					const msg = Array.from((stage?.msg ?? "").replace(/\s+/g, " ").trim());
@@ -1477,9 +1814,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					threadRef,
 					originKey,
 					place: originLabel(originKey),
-					title: text === undefined ? "(원문 없음)" : previewLine(text),
-					requestedAt: request === undefined ? null : formatKst(request.created_at),
-					updatedAt: formatKst(updatedAt),
+					title: text === undefined ? "(원문 없음)" : previewLine(text, list[0]?.title),
+					requestedAt: request === undefined ? null : iso(request.created_at),
+					updatedAt: iso(updatedAt),
 					done: list.filter((row) => row.status === "done").length,
 					total: list.length,
 					here: here?.taskId ?? null,
@@ -1501,13 +1838,23 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				title: redact(r.title),
 				status: r.status,
 				cwd: r.cwd,
-				updatedAt: formatKst(r.updated_at),
+				updatedAt: iso(r.updated_at),
 			})),
 		}));
 
 		const herdr = section(async () => {
 			const live = deps.board?.();
-			if (live !== undefined) return { hosts: [] as HerdrHostInfo[], board: summarizeBoard(live) };
+			if (live !== undefined) {
+				// The board hides the agent list; the local one is still asked when a local pane is blocked or done, for its session file.
+				const asking = live.cards.some((card) => card.local && (card.status === "blocked" || card.status === "done"));
+				const listing = asking ? await listingOf("local") : undefined;
+				const says = listing?.ok ? localSays(listing.agents, deps.now) : [];
+				return {
+					hosts: [] as HerdrHostInfo[],
+					board: summarizeBoard(live),
+					...(says.length === 0 ? {} : { says }),
+				};
+			}
 			const owners =
 				db === undefined
 					? []
@@ -1515,21 +1862,31 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			if (targets.length === 0) {
 				return { hosts: [{ host: "local", ok: false as const, error: "herdr is not configured" }] };
 			}
+			const says: HerdrSay[] = [];
 			const hosts = await Promise.all(
 				targets.map(async (target): Promise<HerdrHostInfo> => {
 					const listing = (await listingOf(target.host)) as HerdrListing;
 					if (!listing.ok) return { host: target.host, ok: false, error: listing.error };
+					const own = target.host === "local" ? localSays(listing.agents, deps.now) : [];
+					says.push(...own);
 					return {
 						host: target.host,
 						ok: true,
 						agents: listing.agents.map((agent) => {
 							const owner = owners.find((task) => task.agent === agent.name && (task.host ?? "local") === target.host);
-							return owner === undefined ? agent : { ...agent, taskId: owner.task_id };
+							const found = own.find((say) => say.paneId === agent.paneId);
+							const {
+								host: _host,
+								paneId: _pane,
+								status: _status,
+								...said
+							} = found ?? { host: "", paneId: "", status: "" };
+							return { ...agent, ...said, ...(owner === undefined ? {} : { taskId: owner.task_id }) };
 						}),
 					};
 				}),
 			);
-			return { hosts };
+			return { hosts, ...(says.length === 0 ? {} : { says }) };
 		});
 
 		const approvals = section(() => {
@@ -1557,8 +1914,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					return {
 						approvalId: r.approval_id,
 						summary,
-						createdAt: formatKst(r.created_at),
-						expiresAt: formatKst(r.expires_at),
+						createdAt: iso(r.created_at),
+						expiresAt: iso(r.expires_at),
 						originKey: r.origin_key,
 						title: approvalTitle(summary),
 						detail: approvalDetail(r.detail_json),
@@ -1590,8 +1947,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						summary,
 						title: approvalTitle(summary),
 						status: r.status,
-						createdAt: formatKst(r.created_at),
-						decidedAt: r.decided_at === null ? null : formatKst(r.decided_at),
+						createdAt: iso(r.created_at),
+						decidedAt: r.decided_at === null ? null : iso(r.decided_at),
 						tookMs: r.decided_at === null ? null : Math.max(0, r.decided_at - r.created_at),
 						originKey: r.origin_key,
 						originLabel: originLabel(r.origin_key),
@@ -1630,7 +1987,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					id: monitor.id,
 					name: redact(monitor.name),
 					kind: trigger.kind,
-					schedule: monitorSchedule(trigger),
+					schedule: monitorSchedule(trigger, timezone),
 					cron: trigger.kind === "cron" ? `${trigger.schedule} (${trigger.timezone})` : null,
 					summary: monitorSummary(monitor.instruction),
 					destination: channelName(monitor.channel, config),
@@ -1640,20 +1997,20 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					deliver: monitor.deliver,
 					overlap: monitor.overlap,
 					files: monitorFiles(monitor),
-					nextFireAt: next === null ? null : formatKst(next),
+					nextFireAt: next === null ? null : iso(next),
 					lastStage: last?.stage ?? null,
-					lastAt: last === undefined ? null : formatKst(last.updated_at),
+					lastAt: last === undefined ? null : iso(last.updated_at),
 					openIncidents: incidents?.n ?? 0,
 					recent: events
-						.map((event) => ({ stage: event.stage, manual: event.manual === 1, at: formatKst(event.updated_at) }))
+						.map((event) => ({ stage: event.stage, manual: event.manual === 1, at: iso(event.updated_at) }))
 						.reverse(),
 					lastRun:
 						last === undefined
 							? null
 							: {
 									stage: last.stage,
-									at: formatKst(last.updated_at),
-									slotAt: formatKst(last.slot_at),
+									at: iso(last.updated_at),
+									slotAt: iso(last.slot_at),
 									durationMs: monitorDurationMs(last.stage, last.slot_at, last.updated_at),
 									attempts: last.attempts,
 									manual: last.manual === 1,
@@ -1687,8 +2044,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				...((config?.agent ?? "omp") === "omp" && config?.ompExecutable !== undefined
 					? { ompExecutable: config.ompExecutable }
 					: {}),
+				...(config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
 				offsiteConfigured: config?.offsite !== undefined,
-				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
+				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCap: { usd: config.costCap.dailyUsd, timezone } }),
 			}).map((gate) => ({ ...gate, detail: redact(gate.detail) })),
 		}));
 
@@ -1696,7 +2054,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const dir = join(deps.homeDir, "backups");
 			const age = (name?: string): StampAge | undefined => {
 				const ts = readStamp(dir, name)?.ts.getTime();
-				return ts === undefined ? undefined : { at: formatKst(ts), ageMs: now - ts };
+				return ts === undefined ? undefined : { at: iso(ts), ageMs: now - ts };
 			};
 			const local = age();
 			const offsite = config?.offsite === undefined ? null : age(OFFSITE_STAMP_FILE);
@@ -1720,9 +2078,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					scope: r.scope,
 					signature: redact(r.signature),
 					count: r.count,
-					lastAt: formatKst(r.last_at),
+					lastAt: iso(r.last_at),
 					incidentId: r.incident_id,
-					firstAt: formatKst(r.first_at),
+					firstAt: iso(r.first_at),
 					status: r.status,
 				};
 				if (r.scope.startsWith("gate:")) {
@@ -1733,13 +2091,16 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
-		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? processAlive) }));
+		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? processAlive, timezone) }));
 
-		const feedback = section(() => readFeedbackSummary(needDb(), now, { days: FEEDBACK_DAYS, limit: FEEDBACK_RECENT }));
+		const feedback = section(() =>
+			readFeedbackSummary(needDb(), now, { days: FEEDBACK_DAYS, limit: FEEDBACK_RECENT }, timezone),
+		);
 		const guildIds = deps.config?.channels?.discord?.guildIds;
 
 		return {
-			generatedAt: formatKst(now),
+			generatedAt: iso(now),
+			timezone,
 			daemon: await daemon,
 			turns: await turns,
 			feedback: await feedback,
@@ -1754,6 +2115,10 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			backup: await backup,
 			jobs: await jobs,
 			slackTeam: deps.config?.slack?.teamId ?? null,
+			slackOff:
+				deps.config?.channels !== undefined &&
+				deps.config.channels.slack === undefined &&
+				deps.config.slack === undefined,
 			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
 		};
 	} finally {
@@ -1779,7 +2144,31 @@ export function readBoardTasks(homeDir: string): BoardTaskRef[] {
 	}
 }
 
-function baseTask({ row, broken }: ReadTask): TaskInfo {
+/**
+ * The newest recorded herdr prompt of every (host, agent) through a read-only handle, for the board cards'
+ * 마지막 지시; none without a database or before the daemon created the table.
+ */
+export function readBoardPrompts(homeDir: string): BoardPromptRef[] {
+	const dbPath = join(homeDir, "ompbot.db");
+	if (!existsSync(dbPath)) return [];
+	const db = new Database(dbPath, { readonly: true, strict: true });
+	try {
+		const table = rows<{ n: number }>(
+			db,
+			"SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'herdr_prompts'",
+		);
+		if ((table[0]?.n ?? 0) === 0) return [];
+		return rows<BoardPromptRef>(
+			db,
+			`SELECT id, host, agent, kind, preview, at FROM herdr_prompts
+				WHERE id IN (SELECT MAX(id) FROM herdr_prompts GROUP BY host, agent)`,
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function baseTask({ row, broken }: ReadTask, timezone: string): TaskInfo {
 	const open = row.status !== "done" && row.status !== "cancelled";
 	return {
 		taskId: row.taskId,
@@ -1790,8 +2179,8 @@ function baseTask({ row, broken }: ReadTask): TaskInfo {
 		agent: row.agent,
 		branch: row.branch,
 		open,
-		updatedAt: formatKst(row.updatedAt),
-		...(row.closedAt === null ? {} : { closedAt: formatKst(row.closedAt) }),
+		updatedAt: localIso(row.updatedAt, timezone),
+		...(row.closedAt === null ? {} : { closedAt: localIso(row.closedAt, timezone) }),
 		acTotal: row.acceptance.length,
 		...(broken.length === 0 ? {} : { error: `${broken.join("·")} 손상` }),
 	};

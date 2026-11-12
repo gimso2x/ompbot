@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
-import { REDELIVERED_PREFIX } from "../src/channel/text";
-import { mrkdwnToDiscord, renderDiscordParts } from "../src/discord/format";
+import { describe, expect, spyOn, test } from "bun:test";
+import { FENCE_RESERVE, REDELIVERED_PREFIX } from "../src/channel/text";
+import * as discordCard from "../src/discord/card";
+import { mrkdwnToDiscord, renderDiscordMessages, renderDiscordParts } from "../src/discord/format";
+import { MESSAGE_CONTENT_LIMIT } from "../src/discord/transport";
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
@@ -86,5 +88,83 @@ describe("renderDiscordParts", () => {
 		});
 		const single = renderDiscordParts("짧은 답", false, "✅ 00:01");
 		expect(single).toEqual(["짧은 답\n_✅ 00:01_"]);
+	});
+
+	/** No part carries a cut fence mark or a language tag torn from its fence. */
+	const expectFencesWhole = (parts: string[], label: string) => {
+		for (const [i, part] of parts.entries()) {
+			const inner = part.replace(/^```\n/, "").replace(/\n```$/, "");
+			expect(part.length, label).toBeLessThanOrEqual(MESSAGE_CONTENT_LIMIT);
+			expect((part.match(/```/g) ?? []).length % 2, `${label} #${i} fences`).toBe(0);
+			expect(inner.endsWith("`"), `${label} #${i} ends in a cut fence: ${JSON.stringify(inner.slice(-8))}`).toBe(false);
+			expect(/^(`{1,2}js|js\b)/.test(inner), `${label} #${i} starts with a cut fence or its tag`).toBe(false);
+		}
+		expect(
+			parts.some((part) => part.includes("```js\n")),
+			`${label}: js tag on the opening fence's line`,
+		).toBe(true);
+	};
+
+	test("a code fence sliding across the 2000-character boundary is never cut and keeps its js tag", () => {
+		const budget = MESSAGE_CONTENT_LIMIT - FENCE_RESERVE;
+		for (let at = budget - 6; at <= budget + 2; at++) {
+			const parts = renderDiscordParts(`${"a".repeat(at)}\`\`\`js\nconst x = 1;\n\`\`\`\nend`, false);
+			expect(parts.length, `at ${at}`).toBeGreaterThan(1);
+			expectFencesWhole(parts, `at ${at}`);
+		}
+	});
+
+	test("a fenced table right before a code fence: the table stays whole, the fence uncut", () => {
+		const table = "| 도구 | 횟수 |\n|---|---|\n| bash | 10 |";
+		const budget = MESSAGE_CONTENT_LIMIT - FENCE_RESERVE;
+		for (let at = budget - 90; at <= budget + 2; at++) {
+			const parts = renderDiscordParts(
+				`${"a".repeat(at)}\n\n${table}\n\`\`\`js\nconst x = 1;\n\`\`\`\n${"끝".repeat(100)}`,
+				false,
+			);
+			expect(parts.length, `at ${at}`).toBeGreaterThan(1);
+			expectFencesWhole(parts, `at ${at}`);
+			expect(
+				parts.some((part) => part.includes(`\`\`\`\n${table}\n\`\`\``)),
+				`at ${at}: table whole`,
+			).toBe(true);
+		}
+	});
+});
+
+describe("renderDiscordMessages", () => {
+	const card = (title: string): string =>
+		`\`\`\`card\n{"root":"c","elements":{"c":{"type":"Card","props":{"title":"${title}"},"children":[]}}}\n\`\`\``;
+
+	test("a card whose embed rendering throws stays its fence text with an issue; the other card is still an embed", () => {
+		const real = discordCard.cardToEmbed;
+		const spy = spyOn(discordCard, "cardToEmbed").mockImplementation((element) => {
+			if (element.title === "터짐") throw new Error("render boom");
+			return real(element);
+		});
+		try {
+			const body = `앞\n${card("터짐")}\n중간\n${card("정상")}\n뒤`;
+			const parts = renderDiscordMessages(body, false);
+			expect(parts.cardIssues).toEqual(["card 1: render boom"]);
+			expect(parts.map((p) => p.embeds?.length ?? 0)).toEqual([0, 1, 0]);
+			expect(parts[0]?.content).toBe(`앞\n${card("터짐")}\n중간`);
+			expect(parts[1]?.embeds?.[0]?.title).toBe("정상");
+			expect(parts[2]?.content).toBe("뒤");
+			for (const part of parts) expect(part.content.length).toBeLessThanOrEqual(MESSAGE_CONTENT_LIMIT);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+});
+
+describe("qa50b K-9: tables without outer pipes", () => {
+	test("a GFM table without leading/trailing pipes is fenced too", () => {
+		const body = "name | value\n--- | ---\na | 1\nb | 2";
+		expect(renderDiscordParts(body, false)).toEqual([`\`\`\`\n${body}\n\`\`\``]);
+	});
+
+	test("a line with a pipe over a plain --- rule (no pipe, one cell) stays text", () => {
+		const body = "a | b\n---\n끝";
+		expect(renderDiscordParts(body, false)).toEqual([body]);
 	});
 });

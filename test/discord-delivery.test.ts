@@ -7,7 +7,6 @@ import { join } from "node:path";
 import type { CoreSink, DeliverySource } from "../src/channel/types";
 import { DiscordAdapter } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import {
 	type CreateMessageArgs,
 	DiscordCallError,
@@ -17,6 +16,7 @@ import {
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const BOT = "500000000000000000";
@@ -89,7 +89,7 @@ const longBody = (n: number): string =>
 beforeEach(async () => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-discord-delivery-"));
 	now = 1_800_000_000_000;
-	store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => now }, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => now }, redact });
 	transport = new ScriptedTransport({ botUserId: BOT });
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	failed = [];

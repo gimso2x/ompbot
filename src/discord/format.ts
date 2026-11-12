@@ -10,7 +10,7 @@ import { MESSAGE_CONTENT_LIMIT } from "./transport";
 const CODE = /```[\s\S]*?```|`[^`\n]*`/g;
 
 /** Applies `convert` to the text between code spans only. */
-function outsideCode(text: string, convert: (plain: string) => string): string {
+export function outsideCode(text: string, convert: (plain: string) => string): string {
 	let out = "";
 	let last = 0;
 	for (const match of text.matchAll(CODE)) {
@@ -55,8 +55,28 @@ export function escapeDiscordMarkdown(text: string): string {
 	return escapeMrkdwn(text.replace(/[\\*_`~|>]/g, "\\$&"));
 }
 
-const TABLE_ROW = /^\s*\|.*\|\s*$/;
 const TABLE_RULE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+
+/** A row's cells: outer pipes optional, `\|` is a literal pipe inside a cell (GFM). */
+function rowCells(line: string): string[] {
+	return line
+		.trim()
+		.replace(/^\|/, "")
+		.replace(/(?<!\\)\|$/, "")
+		.split(/(?<!\\)\|/);
+}
+
+/** A table body row: any line holding an unescaped pipe. */
+function isTableRow(line: string): boolean {
+	return /(?<!\\)\|/.test(line);
+}
+
+/** A table starts at a header row followed by a `---` rule of the same cell count (2+), outer pipes optional. */
+function isTableStart(line: string, next: string): boolean {
+	if (!isTableRow(line) || !TABLE_RULE.test(next)) return false;
+	const cells = rowCells(line).length;
+	return cells >= 2 && cells === rowCells(next).length;
+}
 
 /**
  * GFM tables (a header row, a `|---|` rule, more rows) outside code fences, each wrapped in a code fence: Discord does
@@ -75,12 +95,12 @@ function fenceTables(text: string): { text: string; spans: Array<[number, number
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
 		if (line.trimStart().startsWith("```")) inFence = !inFence;
-		if (inFence || !TABLE_ROW.test(line) || !TABLE_RULE.test(lines[i + 1] ?? "")) {
+		if (inFence || !isTableStart(line, lines[i + 1] ?? "")) {
 			push(line);
 			continue;
 		}
 		let end = i + 2;
-		while (end < lines.length && TABLE_ROW.test(lines[end] ?? "")) end++;
+		while (end < lines.length && isTableRow(lines[end] ?? "")) end++;
 		const start = offset;
 		push("```");
 		for (const row of lines.slice(i, end)) push(row);
@@ -126,8 +146,9 @@ export type DiscordParts = DiscordPart[] & { cardIssues?: readonly string[] };
 /**
  * `renderDiscordParts` with cards: each valid ` ```card ` fence (see `splitCards`, at most `MAX_CARDS`) becomes a
  * message of its own in place, its embed from `cardToEmbed`; the text around it is split as usual. A fence that fails
- * validation stays text (a code block), its issues in `cardIssues`. The redelivered line opens the first message and
- * the footer closes the last, card or not. Without a valid card the result equals `renderDiscordParts`.
+ * validation or whose embed rendering throws stays text (a code block), its issues in `cardIssues`. The redelivered
+ * line opens the first message and the footer closes the last, card or not. Without a valid card the result equals
+ * `renderDiscordParts`.
  */
 export function renderDiscordMessages(body: string, redelivered: boolean, footer?: string): DiscordParts {
 	const issues: string[] = [];
@@ -157,9 +178,17 @@ export function renderDiscordMessages(body: string, redelivered: boolean, footer
 			text.push(segment.raw);
 			continue;
 		}
-		const embed = cardToEmbed(validated.card);
+		let embed: DiscordEmbed;
+		try {
+			embed = cardToEmbed(validated.card, validated.tone);
+		} catch (err) {
+			// A validated card the embed renderer still chokes on stays text, like an invalid one: the answer goes out.
+			issues.push(`card ${n}: ${err instanceof Error ? err.message : String(err)}`);
+			text.push(segment.raw);
+			continue;
+		}
 		// A card with nothing to show (no title, text, fields or image) would be an empty message Discord refuses.
-		if (Object.keys(embed).length === 0) {
+		if (Object.keys(embed).every((key) => key === "color")) {
 			issues.push(`card ${n}: the card has nothing to show`);
 			text.push(segment.raw);
 			continue;

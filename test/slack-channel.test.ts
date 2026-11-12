@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 describe("SlackChannel over FakeSlackTransport", () => {
 	test("post lands one message in the target thread; edit, react and permalink address that same message", async () => {

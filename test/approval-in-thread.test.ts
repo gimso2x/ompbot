@@ -20,11 +20,11 @@ import {
 } from "../src/safety/approval";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
 import { SlackCallError } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
+import { type FakeCall, FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const ESC = "C0ESCALATE1";
 const REQ = "C0REQUEST01";
@@ -156,7 +156,7 @@ describe("broker: mirror card in the asking thread", () => {
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-approval-thread-"));
-		store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
+		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
 		transport = new WatchTransport();
 		timers = new ManualTimers();
 		lines = [];
@@ -171,6 +171,7 @@ describe("broker: mirror card in the asking thread", () => {
 	/** `null`: no escalation channel configured. */
 	function broker(escalationChannel: string | null = ESC): ApprovalBroker {
 		return new ApprovalBroker({
+			timezone: "Asia/Seoul",
 			channels: registryOf(new SlackChannel(transport)),
 			ownerUserId: OWNER,
 			escalationChannel: escalationChannel ?? undefined,

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { lstatSync, statSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -84,7 +84,9 @@ async function capture(
 			"높이를 재는 중",
 		);
 		const height = heightOf(measured.stdout);
-		await stage(
+		// A file left at --out from before would read as this render's picture: it goes first, so only a new one counts.
+		if (lstatSync(outPath, { throwIfNoEntry: false })?.isDirectory() === false) await rm(outPath, { force: true });
+		const drawn = await stage(
 			run,
 			[
 				opts.chromium,
@@ -99,7 +101,10 @@ async function capture(
 			opts,
 			"그림을 그리는 중",
 		);
-		if (!existsSync(outPath)) throw new Error(`${basename(outPath)} 파일을 만들지 못했습니다`);
+		if (statSync(outPath, { throwIfNoEntry: false })?.isFile() !== true) {
+			const said = drawn.stderr.trim() === "" ? "" : `: ${reasonOf(drawn)}`;
+			throw new Error(`${basename(outPath)} 파일을 만들지 못했습니다${said}`);
+		}
 		return { width: opts.width, height };
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -109,7 +114,7 @@ async function capture(
 /** Runs one chromium stage: a timeout or a non-zero exit becomes a thrown message carrying the browser's own words. */
 async function stage(run: ProcessRunner, cmd: string[], opts: RenderPngOptions, doing: string): Promise<StageResult> {
 	const result = await run(cmd, { timeoutMs: opts.timeoutMs });
-	if (result.timedOut) throw new Error(`브리핑 ${doing} 중 시간 초과(${opts.timeoutMs}ms): 프로세스를 중단했습니다`);
+	if (result.timedOut) throw new Error(`브리핑 ${doing} 시간 초과(${opts.timeoutMs}ms): 프로세스를 중단했습니다`);
 	if (result.code !== 0) throw new Error(`브리핑 ${doing} 실패: ${reasonOf(result)}`);
 	return {
 		stdout: result.stdout,

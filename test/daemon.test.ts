@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { openBotStore } from "../src/core/origin";
@@ -13,9 +13,11 @@ import { runDaemon } from "../src/daemon/run";
 import { createLogger } from "../src/log";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
+import { acceptanceItems } from "../src/tasks/docs";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const ORIGIN = "slack/dm/D1";
@@ -44,6 +46,7 @@ function newDaemon(transport: WaitingTransport): Daemon {
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: BOOT_ID,
+		hostLoad: IDLE_HOST_LOAD, // the gates these tests assert never depend on this machine's load
 		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 	});
 	daemons.push(daemon);
@@ -51,6 +54,10 @@ function newDaemon(transport: WaitingTransport): Daemon {
 }
 
 const echoes = (text: string) => (posted: string) => posted.includes(`ECHO ${text}`);
+
+/** Open gates of the home only: `host_pressure`·`disk_low` read the test machine's real load and disk. */
+const homeGates = <T extends { name: string }>(gates: T[]): T[] =>
+	gates.filter((gate) => gate.name !== "host_pressure" && gate.name !== "disk_low");
 
 describe("opRef namespacing across daemon restarts (answer-loss regression)", () => {
 	test("two daemon incarnations on one DB (same boot id, drivers restarting at req 1) both get delivery rows", async () => {
@@ -76,7 +83,7 @@ describe("opRef namespacing across daemon restarts (answer-loss regression)", ()
 
 describe("startup recovery wiring", () => {
 	test("rule (1): a pending inbound row is dispatched again and answered in its own thread", async () => {
-		const seed = openBotStore(join(home.dir, "ompbot.db"), clock);
+		const seed = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
 		seed.ensureOrigin(ORIGIN, "sess/e1");
 		seed.recordInbound({
 			originKey: ORIGIN,
@@ -102,7 +109,7 @@ describe("startup recovery wiring", () => {
 		const opRef = await previous.prompt("was-in-flight");
 		await final.promise;
 		await previous.stop();
-		const seed = openBotStore(join(home.dir, "ompbot.db"), clock);
+		const seed = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
 		seed.ensureOrigin(ORIGIN, "sess/e1");
 		seed.recordInbound({
 			originKey: ORIGIN,
@@ -122,7 +129,7 @@ describe("startup recovery wiring", () => {
 	});
 
 	test("rule (2): a dispatched row with no cursor gets one interrupted notice", async () => {
-		const seed = openBotStore(join(home.dir, "ompbot.db"), clock);
+		const seed = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
 		seed.ensureOrigin(ORIGIN, "sess/e1");
 		seed.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:7.7", textRef: "no-cursor", threadRef: "D1:7.7" });
 		seed.markDispatched("D1:7.7", { opRef: "old:req_1", entryCursor: null });
@@ -137,7 +144,7 @@ describe("startup recovery wiring", () => {
 	});
 
 	test("rule (3): inflight and failed_ambiguous deliveries are sent again with the redelivery header", async () => {
-		const seed = openBotStore(join(home.dir, "ompbot.db"), clock);
+		const seed = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
 		seed.ensureOrigin(ORIGIN, "sess/e1");
 		for (const [n, op] of [
 			[1, "inflight-op"],
@@ -191,6 +198,25 @@ describe("inject", () => {
 		await transport.waitForPosts((posted) => posted.includes("ECHO summarize"));
 	});
 
+	test("the marker masks the first line before cutting it: a ghp_ token across the 120-char edge leaves no piece", async () => {
+		const transport = new WaitingTransport();
+		const daemon = newDaemon(transport);
+		await daemon.start();
+		const body = "B".repeat(36);
+		// The token starts at column 112: a cut at 120 first would leave `ghp_BBBB`, too short for the token pattern.
+		const text = `${"a".repeat(111)} ghp_${body} tail`;
+		const { nonce } = await daemon.inject({ origin: ORIGIN, asOwner: true, text });
+		await transport.waitForPosts((posted) => posted.includes("ECHO aaa"));
+		const marker = transport.posts((posted) => posted.startsWith(`🧪 inject ${nonce}`));
+		expect(marker).toHaveLength(1);
+		// Masked first: the cut lands inside the mask, not inside the token.
+		expect(marker[0]?.text).toContain(" [REDACTE…");
+		for (const post of transport.posts()) {
+			expect(post.text).not.toContain("ghp_");
+			expect(post.text).not.toContain("BBBB");
+		}
+	});
+
 	test("rejects non-owner requests and origins that are not DMs; a thread ref is returned for the root message", async () => {
 		const transport = new WaitingTransport();
 		const daemon = newDaemon(transport);
@@ -240,7 +266,8 @@ describe("sweep heartbeat", () => {
 		expect(beat).toBeDefined();
 		expect(beat?.ts.getTime()).toBeGreaterThan(0);
 		expect(beat?.loopMs).toBeGreaterThanOrEqual(0);
-		expect(daemon.status().openGates.map((gate) => gate.name)).toEqual(["backup_age"]); // sweep_stalled closed
+		// sweep_stalled closed; backup_age too, the boot backup wrote the first stamp
+		expect(homeGates(daemon.status().openGates)).toEqual([]);
 	});
 
 	test("a sweep step that throws does not reject the sweep: sweep_failed is logged and the heartbeat is not rewritten", async () => {
@@ -372,11 +399,15 @@ describe("unix socket", () => {
 		expect(injected).toMatchObject({ ok: true, nonce: expect.any(String), threadRef: expect.stringMatching(/^D1:/) });
 		await transport.waitForPosts(echoes("ipc"));
 
-		const response = await callDaemon(daemon.socketPath, { op: "status" });
+		const response = (await callDaemon(daemon.socketPath, { op: "status" })) as Record<string, unknown> & {
+			status: Record<string, unknown> & { openGates: { name: string }[] };
+		};
+		response.status.openGates = homeGates(response.status.openGates);
 		expect(response).toEqual({
 			ok: true,
 			status: {
 				ompVersion: "omp-test 0",
+				timezone: "Asia/Seoul",
 				daemonRunning: true,
 				origins: [{ originKey: ORIGIN, epoch: 1, ompPid: null, busy: false }],
 				ledger: {
@@ -388,7 +419,7 @@ describe("unix socket", () => {
 				},
 				inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0 },
 				monitors: { count: 0, next: null },
-				openGates: [{ name: "backup_age", detail: "stamp=missing" }], // makeHome writes no backup stamp
+				openGates: [], // makeHome writes no backup stamp; the boot backup writes the first one
 			},
 		});
 
@@ -427,6 +458,16 @@ describe("single-instance lock", () => {
 		const lock = acquireLock(path);
 		expect(lock.info.bootId).toBe(currentBootId());
 		lock.release();
+	});
+
+	test("qa50b I-21: a fresh unreadable lock (a starter between create and write) is not taken; an old one is", () => {
+		const path = join(home.dir, "ompbot.lock");
+		writeFileSync(path, "");
+		expect(() => acquireLock(path)).toThrow(LockHeldError);
+		expect(readFileSync(path, "utf8")).toBe("");
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(path, old, old);
+		acquireLock(path).release();
 	});
 
 	test("runDaemon refuses with exit 1 and starts nothing while the lock is held", async () => {
@@ -554,7 +595,7 @@ describe("stop() drains running turns before stopping the children", () => {
 		expect(Date.now() - startedAt).toBeGreaterThanOrEqual(50); // the bound was waited out
 		expect(Date.now() - startedAt).toBeLessThan(4_000); // not the 20 s default
 		expect(lines.some((line) => line.includes("event=stop_drain_timeout"))).toBe(true);
-		const after = openBotStore(join(home.dir, "ompbot.db"), clock); // daemon.store is closed by stop()
+		const after = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul"); // daemon.store is closed by stop()
 		expect(after.listInbound({ originKey: ORIGIN, state: "answered" })).toHaveLength(0);
 		expect(after.listInbound({ originKey: ORIGIN, state: "dispatched" })).toHaveLength(1);
 		after.close();
@@ -579,7 +620,7 @@ describe("stop() drains running turns before stopping the children", () => {
 		expect(lines.some((line) => line.includes("event=stop_drained"))).toBe(true);
 
 		// The queued followup was never dispatched into the shutdown window: it stays pending for rule (1).
-		const after = openBotStore(join(home.dir, "ompbot.db"), clock); // daemon.store is closed by stop()
+		const after = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul"); // daemon.store is closed by stop()
 		expect(after.listInbound({ originKey: ORIGIN, state: "pending" }).map((row) => row.textRef)).toEqual([
 			"/followup-ompbot queued job",
 		]);
@@ -788,7 +829,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 		await new Promise<void>((resolve) => setTimeout(resolve, 50));
 		drivers[0]?.release();
 		await stopped;
-		const after = openBotStore(join(home.dir, "ompbot.db"), clock); // daemon.store is closed by stop()
+		const after = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul"); // daemon.store is closed by stop()
 		expect(after.listInbound({ originKey: ORIGIN, state: "pending" }).map((row) => row.textRef)).toEqual([
 			"/followup-ompbot queued job",
 		]);
@@ -837,5 +878,78 @@ describe("provider limit notice", () => {
 		expect(notices[0]?.channel).toBe("D1"); // the owner DM
 		expect(notices[0]?.text).toContain(ORIGIN);
 		expect(notices[0]?.text).toContain("Limit Exhausted");
+	});
+});
+
+// AC-3 of T-20261111-03: refusing injects at cards changed nothing outside card threads — a channel inject (root or an
+// ordinary thread) and the daemon's own button paths (TASK merge, approval retry) still take the owner message.
+describe("inject and owner-message buttons outside card threads (card guard regression)", () => {
+	const inbound = (daemon: Daemon, text: string) =>
+		daemon.store.listInbound().filter((row) => row.textRef.trim().startsWith(text));
+
+	test("a slack/ch inject without a thread and into an ordinary thread is recorded", async () => {
+		const transport = new WaitingTransport();
+		const daemon = newDaemon(transport);
+		await daemon.start();
+		await daemon.inject({ origin: "slack/ch/C1", asOwner: true, text: "채널 루트" });
+		expect(inbound(daemon, "채널 루트")).toHaveLength(1);
+
+		const thread = (await transport.postMessage({ channel: "C1", text: "일반 스레드" })).ts;
+		const injected = await daemon.inject({ origin: "slack/ch/C1", asOwner: true, text: "스레드 후속", thread });
+		expect(injected.threadRef).toBe(`C1:${thread}`);
+		expect(inbound(daemon, "스레드 후속").map((row) => row.threadRef)).toEqual([`C1:${thread}`]);
+	});
+
+	test("a TASK card merge click puts the owner's '머지해' in the task thread", async () => {
+		const transport = new WaitingTransport();
+		const daemon = newDaemon(transport);
+		await daemon.start();
+		const thread = "1700.000100";
+		const task = daemon.store.tasks.register({
+			title: "로그 회전",
+			risk: "L2",
+			originKey: `slack/ch/C1/t/${thread}`,
+			threadRef: `C1:${thread}`,
+			host: null,
+			repo: "/r/repo",
+			acceptance: acceptanceItems(["하나"]),
+		});
+		daemon.store.tasks.transition(task.taskId, "review", "bot");
+		const card = await transport.postMessage({ channel: "C1", threadTs: thread, text: "🔍 머지 대기 카드" });
+		await transport.emitBlockAction({
+			user: { id: OWNER },
+			channel: { id: "C1" },
+			message: { ts: card.ts },
+			actions: [{ action_id: `ompbot:task:merge:${task.taskId}`, value: task.taskId }],
+		});
+		expect(inbound(daemon, "머지해").map((row) => row.threadRef)).toEqual([`C1:${thread}`]);
+	});
+
+	test("a retry click on an expired approval card puts '다시 요청: …' in the asking thread", async () => {
+		const transport = new WaitingTransport();
+		const daemon = newDaemon(transport);
+		await daemon.start();
+		const asking = (await transport.postMessage({ channel: "D1", text: "묻던 스레드" })).ts;
+		const card = (await transport.postMessage({ channel: "D1", text: "🔐 승인 요청\nforce push main" })).ts;
+		const approvalId = `D1:${card}`;
+		const now = Date.now();
+		daemon.store.createApproval({
+			approvalId,
+			channel: "D1",
+			messageTs: card,
+			summary: "force push main",
+			createdAt: now,
+			expiresAt: now + 60_000,
+			originKey: ORIGIN,
+			originThreadRef: `D1:${asking}`,
+		});
+		daemon.store.decideApproval(approvalId, "expired", now);
+		await transport.emitBlockAction({
+			user: { id: OWNER },
+			channel: { id: "D1" },
+			message: { ts: card },
+			actions: [{ action_id: `ompbot:approval:retry:D1:${card}`, value: "retry" }],
+		});
+		expect(inbound(daemon, "다시 요청: force push main").map((row) => row.threadRef)).toEqual([`D1:${asking}`]);
 	});
 });

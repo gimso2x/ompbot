@@ -1,5 +1,6 @@
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import type { Logger } from "../log";
 import type { HostToolDef } from "../safety/host-tools";
 import {
 	type OmpAskQuestion,
@@ -186,6 +187,8 @@ export interface RpcOmpDriverOptions {
 	answerDialog?: OmpDialogAnswerer;
 	/** Side question deadline (tests); default `BTW_TIMEOUT_MS`. */
 	btwTimeoutMs?: number;
+	/** Where `omp_stream_unreadable` warnings go. */
+	log?: Logger;
 }
 
 /**
@@ -195,12 +198,15 @@ export interface RpcOmpDriverOptions {
  * Owner dialogs (`DIALOG_METHODS`) go to `answer` when one is given; without it, or when it returns `undefined`,
  * throws, or the frame does not parse, the dialog is answered `cancelled` (fail-closed). omp's `method:"cancel"`
  * (its own timeout or an aborted turn) aborts the waiting answer, and nothing is written for that dialog afterwards.
+ *
+ * `unreadable` gets every non-blank line that is not one JSON object (see `isJsonObjectLine`).
  */
 export async function tapExtensionUi(
 	stream: ReadableStream<Uint8Array>,
 	emit: (event: OmpEvent) => void,
 	reply: (frame: Record<string, unknown>) => void,
 	answer?: OmpDialogAnswerer,
+	unreadable?: (line: string) => void,
 ): Promise<void> {
 	const decoder = new TextDecoder();
 	const waiting = new Map<string, AbortController>();
@@ -213,6 +219,7 @@ export async function tapExtensionUi(
 				const line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
 				newline = buffer.indexOf("\n");
+				if (unreadable !== undefined && line.trim() !== "" && !isJsonObjectLine(line)) unreadable(line);
 				if (!line.includes('"extension_ui_request"')) continue;
 				let frame: unknown;
 				try {
@@ -247,6 +254,19 @@ export async function tapExtensionUi(
 	}
 	// The child is gone: nobody reads an answer anymore, so close the cards still waiting.
 	for (const controller of waiting.values()) controller.abort();
+}
+
+/**
+ * Whether a stdout line is one JSON object: anything else (broken JSON, `null`, an array) stops omp's own RpcClient
+ * reader, after which no `prompt_result` arrives. An object of an unknown type is fine.
+ */
+function isJsonObjectLine(line: string): boolean {
+	try {
+		const frame: unknown = JSON.parse(line);
+		return isRecord(frame) && !Array.isArray(frame);
+	} catch {
+		return false;
+	}
 }
 
 /** The answerer's response, or `cancelled` when it has none or throws (fail-closed). */
@@ -459,6 +479,9 @@ export class RpcOmpDriver implements OmpSessionDriver {
 					(event) => this.#emit(event),
 					(frame) => this.#writeRaw(frame),
 					options.answerDialog,
+					(line) => {
+						if (this.#child === child) this.#onUnreadable(line);
+					},
 				);
 				this.#child = child;
 				void child.exited.then(
@@ -514,6 +537,30 @@ export class RpcOmpDriver implements OmpSessionDriver {
 		if (this.#child !== child) return;
 		const info: OmpExitInfo = { code, expected: this.#stopping, stderr: child.peekStderr() };
 		for (const listener of this.#exitListeners) listener(info);
+	}
+
+	/**
+	 * A stdout line omp's RpcClient cannot read stops its reader: the running prompts would never get a result. They end
+	 * now with an error final and the child is stopped, so the next message starts a fresh one. With no prompt running
+	 * the line is only logged.
+	 */
+	#onUnreadable(line: string): void {
+		const opRefs = [...this.#admitted];
+		this.#options.log?.warn("omp_stream_unreadable", { line: line.slice(0, 120), prompts: opRefs.length });
+		if (opRefs.length === 0) return;
+		this.#admitted.clear();
+		for (const opRef of opRefs) {
+			const final: OmpFinal = {
+				opRef,
+				status: "error",
+				text: "",
+				error: "omp stream unreadable (non-JSON stdout line)",
+			};
+			for (const listener of this.#finalListeners) listener(final);
+		}
+		void this.stop().catch((error: unknown) => {
+			this.#options.log?.warn("omp_stop_failed", { error: String(error) });
+		});
 	}
 
 	#onPromptResult(frame: PromptResultFrame): void {

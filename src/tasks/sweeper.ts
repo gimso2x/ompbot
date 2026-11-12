@@ -40,6 +40,16 @@ export const REVIEW_REALERT_MS = 24 * 60 * 60_000;
 export const READ_FAILURE_NOTICE_AFTER = 3;
 const NUDGE_HEAD =
 	"Outcome 판정이 아직 미도달입니다. 아래를 채우거나, 진행할 수 없으면 PROGRESS.md status를 blocked로 바꾸고 사유를 적으세요.";
+/** The prompt a block gets once before it reaches the owner (the worker's `blocked_reason` follows as one line). */
+export const BLOCK_RETRY_HEAD =
+	"막힘으로 보고하기 전에 한 번 더: 지금까지와 다른 접근을 하나 이상 시도하라. 풀리면 `status: working`으로 돌려 이어 가라. 그래도 막히면 시도한 것 2가지와 결과를 `blocked_reason`에 적고 `updated`를 고친 뒤 멈춰라. 승인·자격증명·실계정·오너만 정할 범위 선택이 원인이면 시도하지 말고 `needs_owner: yes`를 쓰고 `updated`를 고쳐라.";
+/** Sent once per block and HEAD when every `[check: …]` passes while PROGRESS still says blocked. */
+export const BLOCKED_CHECKS_PASS_HEAD =
+	"ompbot이 이 HEAD에서 수락기준 `[check: …]`를 다시 돌렸고 모두 통과했다. 막힌 원인이 검사 환경(명령을 못 찾음 등)이었다면 해소됐으니 PROGRESS.md를 `status: working`(끝났으면 완료 상태)으로 돌리고 `updated`를 고쳐 docs만 커밋하라. 다른 이유로 막혔다면 그대로 두라.";
+/** Retry prompts per resume window (since the latest resume, else the registration); a block past it goes to the owner. */
+export const BLOCK_RETRY_MAX = 3;
+/** After a retry prompt a block still standing this long goes to the owner, whatever herdr says. */
+export const BLOCK_RETRY_WAIT_MS = 30 * 60_000;
 
 /** A task's own docs never count as a file overlap: every task writes its own `docs/tasks/<ID>/`. */
 const TASK_DOCS_PREFIX = "docs/tasks/";
@@ -70,7 +80,7 @@ export async function taskChangedPaths(
 	if (base === undefined) return { ok: false, reason: "no_base_branch" };
 	const mergeBase = (await git("merge-base", base, "HEAD"))?.trim();
 	if (mergeBase === undefined) return { ok: false, reason: "merge_base_failed" };
-	const diff = await git("diff", "--name-only", "-z", mergeBase);
+	const diff = await git("diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", mergeBase);
 	if (diff === undefined) return { ok: false, reason: "diff_failed" };
 	const status = await git("status", "--porcelain", "-z", "--untracked-files=all");
 	if (status === undefined) return { ok: false, reason: "status_failed" };
@@ -118,6 +128,35 @@ function lastResumeAt(row: TaskRow, history: readonly TaskTransitionRow[]): numb
 function nudgesSince(row: TaskRow): number {
 	const since = nudgeBase(row);
 	return Object.entries(row.notices).filter(([key, at]) => key.startsWith("unmet:") && at >= since).length;
+}
+
+/** The `<ms>` of every `blockretry:<ms>` mark (one per retry prompt, sent or not). */
+function blockRetryMarks(row: TaskRow): number[] {
+	return Object.keys(row.notices)
+		.filter((key) => key.startsWith("blockretry:"))
+		.map((key) => Number(key.slice("blockretry:".length)))
+		.filter((at) => Number.isFinite(at));
+}
+
+/** Retry prompts since `nudgeBase` (the latest resume, else the registration). */
+function blockRetriesSince(row: TaskRow): number {
+	const since = nudgeBase(row);
+	return blockRetryMarks(row).filter((at) => at >= since).length;
+}
+
+/**
+ * The retry prompt the current block is waiting on: the latest `blockretry:<ms>` without its `blockcleared:<ms>` and
+ * with no working → blocked move since (the card went up); `undefined` when there is none.
+ */
+function pendingBlockRetry(row: TaskRow, history: readonly TaskTransitionRow[]): number | undefined {
+	const marks = blockRetryMarks(row);
+	if (marks.length === 0) return undefined;
+	const latest = Math.max(...marks);
+	if (`blockcleared:${latest}` in row.notices) return undefined;
+	const carded = history.some(
+		(entry) => entry.fromStatus === "working" && entry.toStatus === "blocked" && entry.at >= latest,
+	);
+	return carded ? undefined : latest;
 }
 
 export interface TaskSweepDeps {
@@ -309,7 +348,15 @@ export class TaskSweeper {
 		}
 
 		let status = row.status;
+		const retry = pendingBlockRetry(ledger.require(row.taskId), ledger.history(row.taskId));
+		if (!judgement.blocked && retry !== undefined) {
+			// The agent got past the block on its own after the retry prompt: that block ends here, without a card.
+			ledger.recordNotice(row.taskId, `blockcleared:${retry}`);
+			actions.push("block cleared after retry");
+		}
 		if (judgement.blocked) {
+			const step = await this.#blockRetryStep(row, judgement, status, retry, now, actions);
+			if (step === "hold") return this.#result(row, status, judgement, actions);
 			if (status === "working") {
 				ledger.transition(row.taskId, "blocked", "bot", judgement.blockedReason || "PROGRESS status: blocked");
 				status = "blocked";
@@ -320,8 +367,17 @@ export class TaskSweeper {
 			// even for the same reason; repeated sweeps over one block stay silent.
 			const since = ledger.history(row.taskId).findLast((entry) => entry.toStatus === "blocked")?.transitionId ?? 0;
 			if (ledger.recordNotice(row.taskId, `blocked:${since}:${judgement.blockedReason}`)) {
-				await this.#post(row, buildBlockedCard(row, judgement, this.#deps.ownerUserId, await this.#boardLink(row)));
+				await this.#post(
+					row,
+					buildBlockedCard(row, judgement, this.#deps.ownerUserId, await this.#boardLink(row), step === "retried"),
+				);
 				actions.push("blocked notice");
+			}
+			const passHead = judgement.blockedChecksPassHead;
+			// Marked before it goes out, like the retry prompt: a failed send is not repeated for this block and HEAD.
+			if (passHead !== undefined && ledger.recordNotice(row.taskId, `blockedcheckspass:${since}:${passHead}`)) {
+				const sent = await this.#remind(row, BLOCKED_CHECKS_PASS_HEAD);
+				actions.push(sent ? "checks pass while blocked, told agent" : "checks-pass prompt failed");
 			}
 			return this.#result(row, status, judgement, actions);
 		}
@@ -426,6 +482,53 @@ export class TaskSweeper {
 		}
 		await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "failed" }));
 		actions.push("Outcome notice (auto-merge failed)");
+	}
+
+	/**
+	 * What a PROGRESS block does this sweep before it may reach the owner. Without a retry pending: a block the owner
+	 * must decide (`needs_owner`), a frozen or paused task, an already reported block or a used-up resume window goes to
+	 * the card at once (`card`); otherwise the agent is sent the retry prompt once (marked before it goes out, so a
+	 * failed send is not repeated) and the block is held (`hold`) — a failed send goes to the card at once. With a retry
+	 * pending the block is held until the agent wrote PROGRESS since and herdr says it is not working, herdr says it
+	 * stopped, `BLOCK_RETRY_WAIT_MS` passed, or `needs_owner` was set; then `retried`.
+	 */
+	async #blockRetryStep(
+		row: TaskRow,
+		judgement: TaskJudgement,
+		status: TaskRow["status"],
+		retry: number | undefined,
+		now: number,
+		actions: string[],
+	): Promise<"hold" | "card" | "retried"> {
+		const { ledger } = this.#deps;
+		if (retry === undefined) {
+			const fresh = ledger.require(row.taskId);
+			const direct =
+				judgement.needsOwner ||
+				status !== "working" ||
+				this.#deps.frozen?.() !== undefined ||
+				ledger.isPaused(fresh) ||
+				blockRetriesSince(fresh) >= BLOCK_RETRY_MAX;
+			if (direct) return "card";
+			ledger.recordNotice(row.taskId, `blockretry:${now}`);
+			const reason = judgement.blockedReason === "" ? [] : unmetLines([`blocked_reason: ${judgement.blockedReason}`]);
+			if (await this.#remind(row, [BLOCK_RETRY_HEAD, ...reason].join("\n"))) {
+				actions.push("block retry to agent");
+				return "hold";
+			}
+			actions.push("block retry failed");
+			return "card";
+		}
+		if (judgement.needsOwner) return "retried";
+		const agent = this.#sweepAgents.get(row.taskId) ?? (await this.#agentStatus(row));
+		this.#sweepAgents.set(row.taskId, agent);
+		const herdr = agent.ok ? agent.status : undefined;
+		const wrote = agent.ok && herdr !== "working" && (judgement.updatedAtMs ?? 0) > retry;
+		const stopped = herdr === "idle" || herdr === "done" || herdr === "blocked" || herdr === "gone";
+		const waited = now - retry >= BLOCK_RETRY_WAIT_MS;
+		if (wrote || stopped || waited) return "retried";
+		actions.push("block retry pending");
+		return "hold";
 	}
 
 	/** A failed or throwing comparison is a mismatch: the owner is asked as before. */

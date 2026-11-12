@@ -7,18 +7,18 @@ import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { ApprovalBroker, type ApprovalStore, type ApprovalTimers } from "../src/safety/approval";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import type { SlackTransport } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
 import { hasButtons } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 let dir: string;
 let store: Store;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-approval-durable-"));
-	store = openStore({ path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
 });
 
 afterEach(() => {
@@ -63,6 +63,7 @@ class ManualTimers implements ApprovalTimers {
 
 function makeBroker(transport: SlackTransport, timers: ApprovalTimers, now: () => number): ApprovalBroker {
 	return new ApprovalBroker({
+		timezone: "Asia/Seoul",
 		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: OWNER,
 		log: quietLog(),
@@ -128,13 +129,13 @@ describe("durable approvals", () => {
 		old.run("INSERT INTO approvals VALUES ('D1:1.1','D1','1.1','old card','approved',1000,2000,1500)");
 		old.run("INSERT INTO approvals VALUES ('D1:2.2','D1','2.2','pending card','pending',1000,90000,NULL)");
 		old.close();
-		const migrated = openStore({ path, clock: { now: () => 1_000 }, redact });
+		const migrated = openStore({ timezone: "Asia/Seoul", path, clock: { now: () => 1_000 }, redact });
 		expect(migrated.getApproval("D1:1.1")).toMatchObject({ status: "approved", originKey: null, replyTs: null });
 		expect(migrated.replyApproval("D1:2.2", "3.3", "ok", 2_000)).toBe(true);
 		expect(migrated.getApproval("D1:2.2")?.status).toBe("replied");
 		migrated.close();
 		// Opening again is a no-op (the CHECK already allows `replied`).
-		const again = openStore({ path, clock: { now: () => 1_000 }, redact });
+		const again = openStore({ timezone: "Asia/Seoul", path, clock: { now: () => 1_000 }, redact });
 		expect(again.getApproval("D1:2.2")?.status).toBe("replied");
 		again.close();
 	});
@@ -222,7 +223,7 @@ describe("durable approvals", () => {
 		);
 		old.close();
 		for (let open = 0; open < 2; open++) {
-			const migrated = openStore({ path, clock: { now: () => 1_000 }, redact });
+			const migrated = openStore({ timezone: "Asia/Seoul", path, clock: { now: () => 1_000 }, redact });
 			expect(migrated.getApproval("C1:1.1")).toMatchObject({ status: "pending", originKey: "slack/dm/D1" });
 			migrated.close();
 		}

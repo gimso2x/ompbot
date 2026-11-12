@@ -438,9 +438,13 @@ export function savePendingProposals(homeDir: string, proposals: SkillProposal[]
 	return paths;
 }
 
-/** The agent skills directory ompbot installs into (`~/.omp/agent/skills`); `userHome` is a test seam. */
+/**
+ * The agent skills directory ompbot installs into (`~/.omp/agent/managed-skills`, the same store omp's
+ * `learn`/`manage_skill` write, so one revision snapshot, weekly report and unused-archive covers both);
+ * `userHome` is a test seam.
+ */
 export function agentSkillsRoot(userHome: string = homedir()): string {
-	return join(userHome, ".omp", "agent", "skills");
+	return join(userHome, ".omp", "agent", "managed-skills");
 }
 
 /** Directory of one installed skill (`<skills>/<name>/SKILL.md` and `revisions/` live here). */

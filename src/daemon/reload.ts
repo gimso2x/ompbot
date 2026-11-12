@@ -34,7 +34,10 @@ export const RESTART_FIELDS = [
 	"channels",
 	"slack",
 	"ompExecutable",
+	"ompProfile",
 	"workspaceDir",
+	// Day keys, prompts and monitor tool descriptions take it when the daemon starts.
+	"timezone",
 	"agent",
 	"claudeExecutable",
 	"agyExecutable",
@@ -59,7 +62,7 @@ export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "dashboard"
 
 /**
  * Compile-time guard: a new config field must land in one of the three lists, or `reload` never reports it.
- * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, and `deprecated` from which key
+ * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, and `deprecated` / `warnings` from which key
  * names it uses, not from a setting in it.
  */
 type UnclassifiedField = Exclude<
@@ -71,6 +74,7 @@ type UnclassifiedField = Exclude<
 	| "homeDir"
 	| "configPath"
 	| "deprecated"
+	| "warnings"
 >;
 const _everyFieldClassified: [UnclassifiedField] extends [never] ? true : never = true;
 

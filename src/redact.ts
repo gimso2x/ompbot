@@ -9,14 +9,18 @@ export const REDACTED = "[REDACTED]";
  */
 const DISCORD_TOKEN_SHAPE = "(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{23,28}\\.[A-Za-z0-9_-]{6,7}\\.[A-Za-z0-9_-]{27,}";
 
+/** Entra (Azure AD) client secret, the Teams bot's credential: 3 chars, a digit, `Q~`, then 31–34 chars. */
+const ENTRA_SECRET_SHAPE = "(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}";
+
 /**
- * xox[abposre]-, xapp-, sk-ant-, sk-, GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_), Discord bot tokens as one regex
+ * xox[a-z]- (Slack bot/user/app/refresh/client/cookie tokens), xapp-, sk-ant-, sk-, GitHub tokens
+ * (ghp_/gho_/ghu_/ghs_/ghr_, fine-grained github_pat_), Discord bot tokens, Entra client secrets as one regex
  * source. `sk-` needs a non-alphanumeric left edge so words like "task-1" or "risk-free" survive; `skRun` is the
  * quantifier of the key body after `sk-` / `sk-ant-`, the only part the upload check (`safety/host-tools.ts`) sets
  * differently.
  */
 export const secretShapes = (skRun: string): string =>
-	`xox[abposre]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}|${DISCORD_TOKEN_SHAPE}`;
+	`xox[a-z]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|${DISCORD_TOKEN_SHAPE}|${ENTRA_SECRET_SHAPE}`;
 const SECRET_PATTERN = new RegExp(secretShapes("+"), "g");
 
 export type Redactor = (text: string) => string;
@@ -140,7 +144,41 @@ export function maskKnownFragments(text: string): string {
 	return replaced;
 }
 
-export const redact: Redactor = (text) => maskKnownFragments(text.replace(SECRET_PATTERN, REDACTED));
+const WHOLE_SECRET = new RegExp(`^(?:${secretShapes("+")})$`);
+
+/**
+ * A secret-shaped token wrapped onto the next line (a terminal paste): the shapes are matched again on the text
+ * with line breaks taken out, and a hit that spans a break is masked as its whole original run — but only when the
+ * part before the first break is not a complete shape by itself (then the next line is prose, as in `exit 1 with
+ * <token>` + newline + `more`). Only line breaks are joined: joining spaces would swallow the words after a token.
+ */
+function maskWrappedShapes(text: string): string {
+	if (!/[\r\n]/.test(text)) return text;
+	const projected: string[] = [];
+	const originalIndex: number[] = [];
+	for (let i = 0; i < text.length; i++) {
+		const ch = text.charAt(i);
+		if (ch === "\r" || ch === "\n") continue;
+		projected.push(ch);
+		originalIndex.push(i);
+	}
+	let replaced = "";
+	let copiedTo = 0;
+	for (const match of projected.join("").matchAll(SECRET_PATTERN)) {
+		const start = match.index ?? 0;
+		if (match[0].length === 0) continue;
+		const from = originalIndex[start] ?? 0;
+		const to = (originalIndex[start + match[0].length - 1] ?? text.length - 1) + 1;
+		const run = text.slice(from, to);
+		const head = run.split(/[\r\n]/, 1)[0] ?? "";
+		if (head === run || WHOLE_SECRET.test(head)) continue;
+		replaced += text.slice(copiedTo, from) + REDACTED;
+		copiedTo = to;
+	}
+	return replaced + text.slice(copiedTo);
+}
+
+export const redact: Redactor = (text) => maskKnownFragments(maskWrappedShapes(text).replace(SECRET_PATTERN, REDACTED));
 
 const encoder = new TextEncoder();
 

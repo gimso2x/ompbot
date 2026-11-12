@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { timezoneOfHome } from "../config";
 import { FEEDBACK_DAYS, type FeedbackTurn, readFeedbackSummary } from "../dashboard/snapshot";
 
 export const FEEDBACK_USAGE = `  feedback [--days N] [--json]   the owner's 👎 turns of the last N days (default ${FEEDBACK_DAYS}), newest first, one per
@@ -21,7 +22,7 @@ export function feedbackCommand(args: string[], homeDir: string): number {
 	if (existsSync(dbPath)) {
 		const db = new Database(dbPath, { readonly: true, strict: true });
 		try {
-			turns = readFeedbackSummary(db, Date.now(), { days }).recentDown;
+			turns = readFeedbackSummary(db, Date.now(), { days }, timezoneOfHome(homeDir)).recentDown;
 		} finally {
 			db.close();
 		}

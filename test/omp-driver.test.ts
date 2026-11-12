@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createLogger } from "../src/log";
 import {
 	type OmpDialogAnswerer,
 	type OmpDialogResponse,
@@ -19,6 +20,7 @@ import {
 	RpcOmpDriver,
 	tapExtensionUi,
 } from "../src/omp/rpc-driver";
+import { redact } from "../src/redact";
 
 const tempDirs: string[] = [];
 function tempDir(prefix: string): string {
@@ -436,8 +438,11 @@ export class RpcClient {
 		this.options = options;
 	}
 
+	stopCalls = 0;
 	async start(): Promise<void> {}
-	async stop(): Promise<void> {}
+	async stop(): Promise<void> {
+		this.stopCalls += 1;
+	}
 
 	onEvent(listener: Listener): () => void {
 		this.eventListener = listener;
@@ -527,6 +532,7 @@ export class RpcClient {
 
 interface FakeRpcClient {
 	autoResolvePrompts: boolean;
+	stopCalls: number;
 	emitSessionEvent(event: unknown): void;
 	emitPromptResult(frame: unknown): void;
 	resolvePrompt(opRef: string): void;
@@ -573,11 +579,14 @@ function fakeOmpPackage(
 		utilsModule,
 		options.spawnChild === true
 			? [
-					"// A child that never exits; what the driver writes to its stdin is kept in `written`.",
+					"// A child that never exits; what the driver writes to its stdin is kept in `written`, and `stdout.push`",
+					"// writes a raw text to its stdout.",
 					"export const written = [];",
+					"export const stdout = { push: undefined };",
 					"export const ptree = { spawn() { return {",
 					"  pid: 4242, stdin: { write(data) { written.push(String(data)); } },",
-					"  stdout: new ReadableStream({ start() {} }), peekStderr: () => '', kill() {}, exited: new Promise(() => {}),",
+					"  stdout: new ReadableStream({ start(c) { stdout.push = (text) => c.enqueue(new TextEncoder().encode(text)); } }),",
+					"  peekStderr: () => '', kill() {}, exited: new Promise(() => {}),",
 					"}; } };",
 					"",
 				].join("\n")
@@ -705,4 +714,96 @@ test("missingRpcMethods names onSessionEvent when the RpcClient class lacks it",
 		if (name !== "onSessionEvent") Object.defineProperty(Old.prototype, name, { value: () => undefined });
 	}
 	expect(missingRpcMethods(Old)).toEqual(["onSessionEvent"]);
+});
+
+/** A driver over the spawning fake package, its fake RpcClient, a raw stdout writer and the warn logs. */
+async function startStreamDriver(): Promise<{
+	driver: RpcOmpDriver;
+	client: FakeRpcClient;
+	push: (text: string) => void;
+	finals: OmpFinal[];
+	warns: string[];
+	/** Resolves once every line written so far was read: a dialog frame pushed last comes back as an event. */
+	readAll: () => Promise<void>;
+}> {
+	const dir = tempDir("ompbot-fakeomp-");
+	const tree = fakeOmpPackage(dir, { spawnChild: true });
+	const warns: string[] = [];
+	const driver = new RpcOmpDriver({
+		ompExecutable: tree.ompExecutable,
+		cwd: dir,
+		sessionDir: join(dir, "s"),
+		bunExecutable: process.execPath,
+		log: createLogger({ sink: (line) => warns.push(line), clock: { now: () => 0 }, redact }),
+	});
+	await driver.start();
+	const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
+	const client = fixture.RpcClient.instances.at(-1);
+	const utils = (await import(tree.utilsModule)) as { stdout: { push: (text: string) => void } };
+	if (!client) throw new Error("fake RpcClient was not constructed");
+	const finals: OmpFinal[] = [];
+	driver.onFinal((final) => finals.push(final));
+	let barrier = 0;
+	const readAll = (): Promise<void> => {
+		const id = `barrier-${++barrier}`;
+		const seen = Promise.withResolvers<void>();
+		const off = driver.onEvent((event) => {
+			if (event.type === "extension_ui_request" && (event as { id?: unknown }).id === id) {
+				off();
+				seen.resolve();
+			}
+		});
+		utils.stdout.push(`${JSON.stringify({ type: "extension_ui_request", method: "notify", id })}\n`);
+		return seen.promise;
+	};
+	return { driver, client, push: (text) => utils.stdout.push(text), finals, warns, readAll };
+}
+
+test("an unreadable stdout line during a prompt ends it with an error final and stops the child (#88)", async () => {
+	for (const broken of ["{ this is not json", "null", "[1,2,3]"]) {
+		const { driver, client, push, finals } = await startStreamDriver();
+		try {
+			const opRef = await driver.prompt("hi");
+			push(`${broken}\n`);
+			await until(() => finals.length > 0, 1000);
+			expect(finals, broken).toEqual([
+				{ opRef, status: "error", text: "", error: expect.stringContaining("omp stream unreadable") },
+			]);
+			expect(client.stopCalls, broken).toBe(1);
+		} finally {
+			await driver.stop();
+		}
+	}
+});
+
+test("blank lines and unknown event types do not end a turn; its own result still does (#88)", async () => {
+	const { driver, client, push, finals, warns, readAll } = await startStreamDriver();
+	try {
+		const opRef = await driver.prompt("hi");
+		push(
+			`\n   \n${JSON.stringify({ type: "totally_unknown_event_type", payload: 1 })}\n${JSON.stringify({ type: 12345 })}\n`,
+		);
+		await readAll();
+		expect(finals).toEqual([]);
+		expect(warns.filter((line) => line.includes("omp_stream_unreadable"))).toEqual([]);
+		client.emitPromptResult({ id: opRef, status: "completed" });
+		await until(() => finals.length > 0, 1000);
+		expect(finals).toEqual([{ opRef, status: "completed", text: "fake assistant text" }]);
+		expect(client.stopCalls).toBe(0);
+	} finally {
+		await driver.stop();
+	}
+});
+
+test("an unreadable line with no prompt running is only logged (#88)", async () => {
+	const { driver, client, push, finals, warns, readAll } = await startStreamDriver();
+	try {
+		push("garbage line\n");
+		await readAll();
+		expect(finals).toEqual([]);
+		expect(client.stopCalls).toBe(0);
+		expect(warns.filter((line) => line.includes("omp_stream_unreadable"))).toHaveLength(1);
+	} finally {
+		await driver.stop();
+	}
 });

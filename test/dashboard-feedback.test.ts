@@ -19,7 +19,12 @@ let store: Store;
 beforeEach(() => {
 	home = mkdtempSync(join(tmpdir(), "ompbot-feedback-dash-"));
 	at = NOW;
-	store = openStore({ path: join(home, "ompbot.db"), clock: { now: () => at }, redact: (text) => text });
+	store = openStore({
+		timezone: "Asia/Seoul",
+		path: join(home, "ompbot.db"),
+		clock: { now: () => at },
+		redact: (text) => text,
+	});
 });
 afterEach(() => {
 	store.close();
@@ -30,6 +35,7 @@ function deps(): SnapshotDeps {
 	return {
 		homeDir: home,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: undefined,
 		now: () => NOW,
 		callDaemon: async () => {

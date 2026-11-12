@@ -247,6 +247,26 @@ describe("runOffsite", () => {
 		expect(fake.calls).toEqual([]);
 	});
 
+	test("remoteDir is judged like config: `a..b` is a plain name, a `..` segment is refused, `//` collapses (J-이관1)", async () => {
+		seedLocal();
+		const fake = fakeRemote();
+		await runOffsite({
+			homeDir: home,
+			target: { ssh: "box", remoteDir: `${remote}//a..b/` },
+			run: fake.run,
+			env: {},
+		});
+		expect(existsSync(join(remote, "a..b", DB))).toBe(true);
+		expect(fake.calls.flat().some((arg) => arg.includes("//"))).toBe(false);
+		const error = await runOffsite({
+			homeDir: home,
+			target: { ssh: "box", remoteDir: `${remote}/../x` },
+			run: fake.run,
+			env: {},
+		}).catch((e: unknown) => e);
+		expect((error as OffsiteError).code).toBe("not_configured");
+	});
+
 	test("an ssh that cannot connect fails before anything is copied", async () => {
 		seedLocal();
 		const run: ProcessRunner = async () => ({ code: 255, stdout: "Permission denied (publickey)", timedOut: false });

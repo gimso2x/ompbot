@@ -1,7 +1,7 @@
 // Cards on Discord are embeds: a validated ```card fence (here) and an OutboundMessage card (`DiscordChannel`) both
 // become one embed, cut to Discord's embed limits instead of being refused (doc/plans/discord-channel.md §10).
 import type { CardChild } from "chat";
-import { type CardElement, chartToAscii, tableToAscii } from "../channel/card";
+import { type CardElement, type CardTone, chartToAscii, tableToAscii, toneColorInt } from "../channel/card";
 import { cutCodePointSafe } from "../channel/text";
 
 /** Embed limits (Embed Limits table): title, description, field count, field name and value, all text together. */
@@ -25,6 +25,8 @@ export interface DiscordEmbed {
 	description?: string;
 	fields?: DiscordEmbedField[];
 	image?: { url: string };
+	/** The colour bar on the embed's left edge (a card's `tone`). */
+	color?: number;
 }
 
 /** A field name or value Discord requires non-empty: a zero-width space stands in. */
@@ -40,7 +42,10 @@ function cutFenced(text: string, limit: number): string {
 	return balanced(shorter) ? shorter : `${shorter}\n\`\`\``;
 }
 
-/** The embed within every limit: each value cut, fields capped at 25, then the whole kept under 6000 characters. */
+/**
+ * The embed within every limit: each value cut, fields capped at 25, then the whole kept under 6000 characters.
+ * `image` and `color` pass unchanged.
+ */
 export function fitEmbed(embed: DiscordEmbed): DiscordEmbed {
 	const title =
 		embed.title === undefined || embed.title === "" ? undefined : cutCodePointSafe(embed.title, EMBED_LIMITS.title);
@@ -62,6 +67,7 @@ export function fitEmbed(embed: DiscordEmbed): DiscordEmbed {
 		...(description === undefined ? {} : { description }),
 		...(fields.length === 0 ? {} : { fields }),
 		...(embed.image === undefined ? {} : { image: embed.image }),
+		...(embed.color === undefined ? {} : { color: embed.color }),
 	};
 }
 
@@ -111,8 +117,11 @@ function childLines(child: CardChild, embed: { fields: DiscordEmbedField[]; imag
 	}
 }
 
-/** A validated card as one embed: Text → description, Fields → fields, Table/Chart → ASCII code blocks, Image → image. */
-export function cardToEmbed(card: CardElement): DiscordEmbed {
+/**
+ * A validated card as one embed: Text → description, Fields → fields, Table/Chart → ASCII code blocks, Image → image,
+ * `tone` → the embed's colour.
+ */
+export function cardToEmbed(card: CardElement, tone?: CardTone): DiscordEmbed {
 	const parts: { fields: DiscordEmbedField[]; image?: { url: string } } = {
 		fields: [],
 		...(card.imageUrl ? { image: { url: card.imageUrl } } : {}),
@@ -126,5 +135,6 @@ export function cardToEmbed(card: CardElement): DiscordEmbed {
 		description: lines.join("\n"),
 		fields: parts.fields,
 		...(parts.image === undefined ? {} : { image: parts.image }),
+		...(tone === undefined ? {} : { color: toneColorInt(tone) }),
 	});
 }

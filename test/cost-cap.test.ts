@@ -8,9 +8,10 @@ import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
 import type { OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { sessionWindowCost } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
-import { kstDay } from "../src/tasks/docs";
+import { localDay } from "../src/time";
 
 const ORIGIN = "slack/dm/DBUDGET";
 
@@ -44,7 +45,7 @@ let sessionStore: FakeSessionStore;
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-cost-cap-"));
 	clock = new FakeClock();
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact });
 	drivers = [];
 	logLines = [];
 	escalations = [];
@@ -57,6 +58,7 @@ beforeEach(() => {
 /** A router over the current store/clock; `beforeEach` builds one, and a test may build another before routing. */
 function buildRouter(options: { sessionFile?: string } = {}): OriginRouter {
 	return new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
@@ -172,7 +174,7 @@ describe("AC-2: daily ledger", () => {
 	test("addDailyUsage accumulates one row per day and origin, and KST midnight starts a new row", () => {
 		// 2026-11-10T14:59:00Z is 23:59 KST; one minute later is the next KST day (same UTC date).
 		clock.t = Date.parse("2026-11-10T14:59:00Z");
-		const late = kstDay(clock.now());
+		const late = localDay(clock.now(), "Asia/Seoul");
 		store.addDailyUsage({ day: late, originKey: ORIGIN, cost: 1.5, calls: 2 });
 		store.addDailyUsage({ day: late, originKey: ORIGIN, cost: 0.5, calls: 1 });
 		store.addDailyUsage({ day: late, originKey: "monitor/daily", cost: 2, calls: 1 });
@@ -184,7 +186,7 @@ describe("AC-2: daily ledger", () => {
 		]);
 
 		clock.advance(60_000);
-		const next = kstDay(clock.now());
+		const next = localDay(clock.now(), "Asia/Seoul");
 		expect(next).not.toBe(late);
 		expect(store.dailyCost(next)).toBe(0);
 		store.addDailyUsage({ day: next, originKey: ORIGIN, cost: 3, calls: 1 });
@@ -243,9 +245,66 @@ describe("AC-2: daily ledger", () => {
 		clock.advance(10_000);
 		await finishTurn(driver);
 
-		const day = kstDay(turnStart);
+		const day = localDay(turnStart, "Asia/Seoul");
 		expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(3, 6);
 		expect(logLines.some((line) => line.includes("event=usage_daily_failed"))).toBe(false);
+	});
+
+	test("depth 2 sub-agents count once each: own $1 + child $1 + grandchild $2 = $4, past the depth cap skipped", async () => {
+		const t0 = Date.parse("2026-11-10T12:00:00Z");
+		const at = (ms: number): string => new Date(t0 + ms).toISOString();
+		const usageLine = (ms: number, total: number): string =>
+			`${JSON.stringify({ type: "model_usage", timestamp: at(ms), usage: { cost: { total } } })}\n`;
+		const sessionFile = join(dir, "sessions", "session.jsonl");
+		const stem = join(dir, "sessions", "session");
+		mkdirSync(join(stem, "sub-a", "nested-b"), { recursive: true });
+		writeFileSync(
+			sessionFile,
+			`${[
+				{ id: "u0", type: "message", timestamp: at(-1_000), message: { role: "user" } },
+				{
+					id: "a1",
+					type: "message",
+					timestamp: at(1_000),
+					message: { role: "assistant", usage: { cost: { total: 1 } } },
+				},
+			]
+				.map((record) => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		writeFileSync(join(stem, "sub-a.jsonl"), usageLine(2_000, 1));
+		writeFileSync(join(stem, "sub-a", "nested-b.jsonl"), usageLine(3_000, 2));
+		writeFileSync(join(stem, "sub-a", "nested-b", "too-deep.jsonl"), usageLine(4_000, 8));
+
+		const got = await sessionWindowCost({ sessionFile, afterEntryId: "u0", from: t0, to: t0 + 10_000 });
+		expect(got).toEqual({ cost: 4, calls: 3 });
+	});
+
+	test("a child dying mid-turn still adds the turn's live total to the day, once (#49)", async () => {
+		clock.t = Date.parse("2026-11-10T12:00:00Z");
+		const driver = await startTurn("도중에 죽는 턴");
+		driver.emitTestEvent(usageEvent(1.25));
+		driver.crash(137);
+		await router.mailbox(ORIGIN).sweepIdle();
+		// A second exit of the same child finds no turn left to charge.
+		driver.crash(137);
+		await router.mailbox(ORIGIN).sweepIdle();
+
+		const day = localDay(clock.now(), "Asia/Seoul");
+		expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.25, 6);
+		expect(bodies()).toEqual(["[turn failed] omp_exited code=137 — 다시 보내 주세요"]);
+	});
+
+	test("a turn settled by its final and then exiting is charged once (#49)", async () => {
+		clock.t = Date.parse("2026-11-10T12:00:00Z");
+		router = buildRouter({ sessionFile: join(dir, "gone", "session.jsonl") });
+		const driver = await startTurn("끝난 뒤 죽는 턴");
+		driver.emitTestEvent(usageEvent(0.75));
+		await finishTurn(driver);
+		driver.crash(137);
+		await router.mailbox(ORIGIN).sweepIdle();
+
+		expect(store.dailyCost(localDay(clock.now(), "Asia/Seoul"), ORIGIN)).toBeCloseTo(0.75, 6);
 	});
 
 	test("an unreadable session file falls back to the turn's live total and logs usage_daily_failed", async () => {
@@ -256,7 +315,7 @@ describe("AC-2: daily ledger", () => {
 		driver.emitTestEvent(usageEvent(1.25));
 		await finishTurn(driver);
 
-		const day = kstDay(clock.now());
+		const day = localDay(clock.now(), "Asia/Seoul");
 		expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.25, 6);
 		expect(logLines.some((line) => line.includes("event=usage_daily_failed"))).toBe(true);
 	});

@@ -1,6 +1,7 @@
 import {
 	chmodSync,
 	copyFileSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -136,7 +137,14 @@ export function exportMonitors(
 	ctx: PortableContext,
 	options: { withFiles?: boolean } = {},
 ): ExportResult {
-	mkdirSync(dir, { recursive: true });
+	try {
+		mkdirSync(dir, { recursive: true });
+		if (!statSync(dir).isDirectory()) throw new Error("not a directory");
+	} catch (error) {
+		throw new PortableUsageError(
+			`--dir is not a directory: ${dir} (${error instanceof Error ? error.message : String(error)})`,
+		);
+	}
 	const warnings: string[] = [];
 	const written = new Set<string>();
 	const copies = new Map<string, string>();
@@ -186,11 +194,20 @@ export function exportMonitors(
 	}
 	let removed = 0;
 	for (const file of readdirSync(dir)) {
-		if (!file.endsWith(".json") || written.has(file)) continue;
+		// A directory named `*.json` is not a stale monitor file.
+		if (!file.endsWith(".json") || written.has(file) || lstatSync(join(dir, file)).isDirectory()) continue;
 		rmSync(join(dir, file), { force: true });
 		removed++;
 	}
 	return { written: written.size, removed, warnings };
+}
+
+/** `export --dir` cannot be a directory (a file stands there or below its parent); nothing was written. */
+export class PortableUsageError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "PortableUsageError";
+	}
 }
 
 /** Some files of an `apply` directory did not validate; nothing was changed. */

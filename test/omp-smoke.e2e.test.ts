@@ -80,8 +80,9 @@ async function command(text: string): Promise<string> {
 beforeAll(() => {
 	if (!enabled) return;
 	dir = mkdtempSync(join(tmpdir(), "ompbot-smoke-"));
-	store = openBotStore(join(dir, "ompbot.db"), { now: () => now });
+	store = openBotStore(join(dir, "ompbot.db"), { now: () => now }, "Asia/Seoul");
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock: { now: () => now },
 		sessionsRoot: join(dir, "sessions"),

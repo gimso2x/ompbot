@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""기억 교정 수집기: '기억 교정' 모니터가 매주 일요일 05:00 KST에 한 번 실행한다.
+"""기억 교정 수집기: '기억 교정' 모니터가 매주 일요일 05:00(봇 시간대)에 한 번 실행한다.
 
 ompbot 세션이 쓰는 Mnemopi 은행(mnemopi.db)을 읽기 전용으로 열어 교정할 기억을 마크다운으로
 출력한다. 섹션 순서는 고정이다.
@@ -15,7 +15,7 @@ ompbot 세션이 쓰는 Mnemopi 은행(mnemopi.db)을 읽기 전용으로 열어
 입력: --bank <mnemopi.db> 또는 --banks-root <dir>(기본 ~/.omp/agent/memories/mnemopi/banks)와
       --workspace <dir>(기본 ~/.ompbot/workspace; metadata_json cwd가 이 경로인 working 행이 가장 많은 은행),
       --state <json>(기본 ~/.ompbot/workspace/memory-audit/state.json), --limit N(기본 30, 1..40),
-      --recheck-days N(기본 30), --now <ISO8601>(기본 현재 시각; 시간대 없으면 KST)
+      --recheck-days N(기본 30), --now <ISO8601>(기본 현재 시각; 시간대 없으면 BOT_TZ)
 종료 코드: 0 = 출력함(은행을 못 찾거나 못 열어도 0), 2 = 인자 오류
 """
 
@@ -31,7 +31,19 @@ import urllib.parse
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-KST = ZoneInfo("Asia/Seoul")
+def bot_timezone() -> dt.tzinfo:
+    """봇 시간대: OMPBOT_TZ 환경 변수 → <OMPBOT_HOME 또는 ~/.ompbot>/config.json의 timezone → 시스템 시간대."""
+    name = os.environ.get("OMPBOT_TZ", "").strip()
+    if not name:
+        config = Path(os.environ.get("OMPBOT_HOME") or Path.home() / ".ompbot") / "config.json"
+        try:
+            name = str(json.loads(config.read_text(encoding="utf-8")).get("timezone") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            name = ""
+    return ZoneInfo(name) if name else dt.datetime.now().astimezone().tzinfo
+
+
+BOT_TZ = bot_timezone()
 UTC = dt.timezone.utc
 DEFAULT_BANKS_ROOT = "~/.omp/agent/memories/mnemopi/banks"
 DEFAULT_WORKSPACE = "~/.ompbot/workspace"
@@ -59,7 +71,7 @@ def parse_now(value: str) -> dt.datetime:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"ISO8601 시각이 아님: {value}") from error
-    return parsed.replace(tzinfo=KST) if parsed.tzinfo is None else parsed
+    return parsed.replace(tzinfo=BOT_TZ) if parsed.tzinfo is None else parsed
 
 
 def bounded_int(low: int, high: int | None):
@@ -97,7 +109,7 @@ def is_valid(valid_until: object, superseded_by: object, now: dt.datetime) -> bo
 
 def kst_minute(value: object) -> str:
     parsed = parse_time(value)
-    return parsed.astimezone(KST).strftime("%Y-%m-%d %H:%M") if parsed else str(value)
+    return parsed.astimezone(BOT_TZ).strftime("%Y-%m-%d %H:%M") if parsed else str(value)
 
 
 def open_ro(path: Path) -> sqlite3.Connection:
@@ -257,7 +269,7 @@ def main() -> int:
     parser.add_argument("--recheck-days", type=bounded_int(1, None), default=30)
     parser.add_argument("--now", type=parse_now, default=None)
     args = parser.parse_args()
-    now = args.now or dt.datetime.now(KST)
+    now = args.now or dt.datetime.now(BOT_TZ)
 
     bank = find_bank(args.bank, args.banks_root, args.workspace)
     if bank is None:
@@ -278,7 +290,7 @@ def main() -> int:
             "## 소스 상태",
             f"- 은행: {bank} ({bank.parent.name})",
             f"- state: {state_status}",
-            f"- 기준 시각: {now.astimezone(KST):%Y-%m-%d %H:%M} KST",
+            f"- 기준 시각: {now.astimezone(BOT_TZ):%Y-%m-%d %H:%M %Z}",
         ]
     )
     fixed = "\n\n".join([head, metrics, noise, "## 후보"])

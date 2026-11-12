@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""주간 개선 회의 수집기: '주간 개선 회의' 모니터가 매주 일요일 06:00 KST에 한 번 실행한다.
+"""주간 개선 회의 수집기: '주간 개선 회의' 모니터가 매주 일요일 06:00(봇 시간대)에 한 번 실행한다.
 
-지난 N일(기본 7일, 창 = [now - N일, now), 날짜는 Asia/Seoul 기준) 기록을 읽기 전용으로 모아
+지난 N일(기본 7일, 창 = [now - N일, now), 날짜는 봇 시간대 기준) 기록을 읽기 전용으로 모아
 마크다운으로 출력한다. 섹션 순서는 고정이다.
   1. 소스 상태: reflections, db, log, meetings 각각 ok/missing/error
   2. 자체회고: <home>/workspace/reflections/<날짜>.md의 '## 문제'·'## 다음 행동' 절
@@ -12,12 +12,14 @@
 못 읽은 소스는 본문 섹션 대신 '소스 상태'에 missing/error로 남긴다. DB는 mode=ro로만 열고
 어떤 파일도 쓰지 않는다.
 
-입력: --home <dir>(기본 ~/.ompbot), --now <ISO8601>(기본 현재 시각; 시간대 없으면 KST), --days N(기본 7)
+입력: --home <dir>(기본 ~/.ompbot), --now <ISO8601>(기본 현재 시각; 시간대 없으면 BOT_TZ), --days N(기본 7)
 종료 코드: 0 = 출력함(소스 일부를 못 읽어도 0), 2 = 인자 오류
 """
 
 import argparse
 import datetime as dt
+import json
+import os
 import re
 import sqlite3
 import sys
@@ -26,7 +28,19 @@ from collections import Counter
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-KST = ZoneInfo("Asia/Seoul")
+def bot_timezone() -> dt.tzinfo:
+    """봇 시간대: OMPBOT_TZ 환경 변수 → <OMPBOT_HOME 또는 ~/.ompbot>/config.json의 timezone → 시스템 시간대."""
+    name = os.environ.get("OMPBOT_TZ", "").strip()
+    if not name:
+        config = Path(os.environ.get("OMPBOT_HOME") or Path.home() / ".ompbot") / "config.json"
+        try:
+            name = str(json.loads(config.read_text(encoding="utf-8")).get("timezone") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            name = ""
+    return ZoneInfo(name) if name else dt.datetime.now().astimezone().tzinfo
+
+
+BOT_TZ = bot_timezone()
 MAX_SECTION_CHARS = 1500
 MAX_OUTPUT_CHARS = 20000
 CUT = "…(잘림)"
@@ -56,7 +70,7 @@ def parse_now(value: str) -> dt.datetime:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"ISO8601 시각이 아님: {value}") from error
-    return parsed.replace(tzinfo=KST) if parsed.tzinfo is None else parsed
+    return parsed.replace(tzinfo=BOT_TZ) if parsed.tzinfo is None else parsed
 
 
 def positive_int(value: str) -> int:
@@ -204,7 +218,7 @@ def collect_meetings(home: Path, now: dt.datetime, db: sqlite3.Connection | None
     root = home / "workspace" / "meetings"
     if not root.is_dir():
         return "missing", None
-    year, week, _ = now.astimezone(KST).isocalendar()
+    year, week, _ = now.astimezone(BOT_TZ).isocalendar()
     this_week = (year, week)
     try:
         files = sorted(
@@ -252,9 +266,9 @@ def main() -> int:
     parser.add_argument("--now", type=parse_now, default=None)
     parser.add_argument("--days", type=positive_int, default=7)
     args = parser.parse_args()
-    now = args.now or dt.datetime.now(KST)
+    now = args.now or dt.datetime.now(BOT_TZ)
     start = now - dt.timedelta(days=args.days)
-    start_day = start.astimezone(KST).date()
+    start_day = start.astimezone(BOT_TZ).date()
     dates = [start_day + dt.timedelta(days=offset) for offset in range(args.days)]
     start_ms, end_ms = int(start.timestamp() * 1000), int(now.timestamp() * 1000)
     home: Path = args.home.expanduser()
@@ -280,7 +294,7 @@ def main() -> int:
     if db is not None:
         db.close()
 
-    window = f"{start.astimezone(KST):%Y-%m-%d %H:%M} ~ {now.astimezone(KST):%Y-%m-%d %H:%M} KST"
+    window = f"{start.astimezone(BOT_TZ):%Y-%m-%d %H:%M} ~ {now.astimezone(BOT_TZ):%Y-%m-%d %H:%M %Z}"
     head = "\n".join(["## 소스 상태", f"- 창: {window}", *(f"- {name}: {value}" for name, value in status.items())])
     output = "\n\n".join([head, *sections]) + "\n"
     if len(output) > MAX_OUTPUT_CHARS:

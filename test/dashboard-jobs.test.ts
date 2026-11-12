@@ -22,6 +22,7 @@ function deps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
 	return {
 		homeDir: home,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: undefined,
 		now: () => NOW,
 		callDaemon: async () => {
@@ -185,7 +186,12 @@ describe("dashboard jobs section", () => {
 	describe("turn view", () => {
 		/** A bot database with no open turn: the turns section reads ok and empty. */
 		beforeEach(() => {
-			openStore({ path: join(home, "ompbot.db"), clock: { now: () => NOW }, redact: (text) => text }).close();
+			openStore({
+				timezone: "Asia/Seoul",
+				path: join(home, "ompbot.db"),
+				clock: { now: () => NOW },
+				redact: (text) => text,
+			}).close();
 		});
 
 		test("AC-3: no jobs directory draws today's turn view; a running job alone gets the jobs block, counted in the head only", async () => {

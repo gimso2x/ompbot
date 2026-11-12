@@ -635,9 +635,10 @@ describe("router: taskSpec thread binding and restart recovery of two roots", ()
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-root-iso-router-"));
-		store = openBotStore(join(dir, "ompbot.db"), clock);
+		store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 		sessions = new FakeSessionStore();
 		router = new OriginRouter({
+			timezone: "Asia/Seoul",
 			store,
 			clock,
 			sessionsRoot: join(dir, "sessions"),

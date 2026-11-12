@@ -7,6 +7,8 @@ const WAIT_MS = 5_000;
 interface Harness {
 	received: Array<Record<string, unknown>>;
 	sockets: Array<ServerWebSocket<undefined>>;
+	/** Wall-clock time of each server-side socket open. */
+	openedAt: number[];
 	requestUrls: string[];
 	opens: number;
 	/** Resolves once `cond` holds; re-checked on every server-side event. Bounded by WAIT_MS. */
@@ -15,7 +17,7 @@ interface Harness {
 	stopServer(): void;
 }
 
-function startHarness(openResponse?: () => Response): Harness {
+function startHarness(openResponse?: () => Response, afterHello?: (ws: ServerWebSocket<undefined>) => void): Harness {
 	const waiters: Array<() => void> = [];
 	const notify = (): void => {
 		for (const w of waiters.splice(0)) w();
@@ -23,6 +25,7 @@ function startHarness(openResponse?: () => Response): Harness {
 	const h: Harness = {
 		received: [],
 		sockets: [],
+		openedAt: [],
 		requestUrls: [],
 		opens: 0,
 		until: async (cond) => {
@@ -52,7 +55,9 @@ function startHarness(openResponse?: () => Response): Harness {
 		websocket: {
 			open(ws) {
 				h.sockets.push(ws);
+				h.openedAt.push(Date.now());
 				ws.send(JSON.stringify({ type: "hello", num_connections: 1 }));
+				afterHello?.(ws);
 				notify();
 			},
 			message(_ws, m) {
@@ -174,6 +179,25 @@ describe("SocketClient", () => {
 		expect(h.opens).toBe(1);
 	});
 
+	test("null, array and number frames are reported once each and dropped; the next envelope is still acked", async () => {
+		const h = startHarness();
+		harness = h;
+		const errors: string[] = [];
+		const c = make(h, { onError: (e) => errors.push(e.message) });
+		await c.start();
+		const ws = h.sockets[0];
+		if (!ws) throw new Error("no server socket");
+		for (const frame of ["null", "[]", "1"]) {
+			const before = errors.length;
+			const id = `after-${frame}`;
+			ws.send(frame);
+			ws.send(JSON.stringify({ envelope_id: id, type: "events_api", payload: {} }));
+			await h.until(() => h.received.some((m) => m.envelope_id === id));
+			expect(errors.slice(before)).toEqual(["non-object websocket message"]);
+		}
+		expect(h.opens).toBe(1);
+	});
+
 	test("disconnect envelope reconnects with a fresh url", async () => {
 		const h = startHarness();
 		harness = h;
@@ -186,6 +210,20 @@ describe("SocketClient", () => {
 		expect(reasons).toEqual(["disconnect:refresh_requested"]);
 		expect(h.requestUrls[0]).toContain("n=1");
 		expect(h.requestUrls[1]).toContain("n=2");
+	});
+
+	test("a server that disconnects right after every hello: the first reconnect is immediate, the next ones back off", async () => {
+		const h = startHarness(undefined, (ws) =>
+			ws.send(JSON.stringify({ type: "disconnect", reason: "refresh_requested" })),
+		);
+		harness = h;
+		const c = make(h, { backoffBaseMs: 60, backoffMaxMs: 60 });
+		await c.start();
+		await h.until(() => h.openedAt.length >= 4);
+		c.stop();
+		const gaps = h.openedAt.slice(1).map((at, i) => at - (h.openedAt[i] ?? at));
+		// A lower bound only: each later reconnect waits for its backoff timer, which never fires early.
+		for (const gap of gaps.slice(1)) expect(gap).toBeGreaterThanOrEqual(55);
 	});
 
 	test("reconnects with backoff when the server closes the socket", async () => {
@@ -231,6 +269,26 @@ describe("SocketClient", () => {
 		expect(errors).toHaveLength(2);
 	});
 
+	test("an open url that is not a ws(s) URL is reported and retried, never thrown (#71)", async () => {
+		let calls = 0;
+		const h = startHarness();
+		harness = h;
+		const good = h.fetchImpl;
+		const bad = ["not-a-url", "https://example.invalid/socket"];
+		h.fetchImpl = (async (...args: Parameters<typeof fetch>) => {
+			const url = bad[calls++];
+			return url === undefined ? good(...args) : Response.json({ ok: true, url });
+		}) as unknown as typeof fetch;
+		const errors: string[] = [];
+		await make(h, { onError: (e) => errors.push(e.message) }).start();
+		expect(calls).toBe(3);
+		expect(errors).toEqual([
+			expect.stringContaining("apps.connections.open returned a bad url"),
+			expect.stringContaining("apps.connections.open returned a bad url"),
+		]);
+		expect(h.sockets).toHaveLength(1);
+	});
+
 	test("start rejects when Slack refuses the app token", async () => {
 		const h = startHarness(() => Response.json({ ok: false, error: "invalid_auth" }));
 		harness = h;
@@ -246,5 +304,47 @@ describe("SocketClient", () => {
 		c.stop();
 		await h.until(() => h.sockets[0]?.readyState !== 1);
 		expect(h.opens).toBe(1);
+	});
+});
+
+describe("qa50b lane K: socket client edge cases", () => {
+	test("K-7: an envelope Slack sends again is acked again but its slash command runs once", async () => {
+		const h = startHarness();
+		harness = h;
+		let runs = 0;
+		const c = make(h, {
+			handlers: {
+				...noopHandlers,
+				slashCommand: async () => {
+					runs += 1;
+					return undefined;
+				},
+			},
+		});
+		await c.start();
+		const ws = h.sockets[0];
+		if (!ws) throw new Error("no server socket");
+		const envelope = JSON.stringify({ envelope_id: "s9", type: "slash_commands", payload: { command: "/x" } });
+		ws.send(envelope);
+		await h.until(() => h.received.length === 1);
+		ws.send(envelope);
+		await h.until(() => h.received.length === 2);
+		expect(h.received).toEqual([{ envelope_id: "s9" }, { envelope_id: "s9" }]);
+		expect(runs).toBe(1);
+	});
+
+	test("K-8: an open response that is JSON null is an open error, retried with backoff", async () => {
+		let calls = 0;
+		const h = startHarness();
+		harness = h;
+		const good = h.fetchImpl;
+		h.fetchImpl = (async (...args: Parameters<typeof fetch>) => {
+			if (++calls <= 1) return Response.json(null);
+			return good(...args);
+		}) as unknown as typeof fetch;
+		const errors: string[] = [];
+		await make(h, { onError: (e) => errors.push(e.message) }).start();
+		expect(calls).toBe(2);
+		expect(errors).toEqual([expect.stringContaining("apps.connections.open")]);
 	});
 });

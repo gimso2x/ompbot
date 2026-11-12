@@ -4,15 +4,22 @@ import { basename, dirname, join } from "node:path";
 import type { ChannelAdapter, ChannelBinding } from "../channel/adapter";
 import { ChannelRegistry } from "../channel/registry";
 import { escapeMrkdwn } from "../channel/text";
-import type { CoreSink, DeliverySource, IngestOutcome } from "../channel/types";
-import { DEPRECATED_KEYS, loadConfig, type OmpbotConfig } from "../config";
+import type { CoreSink, DeliverySource, GuestInboundMessage, IngestOutcome } from "../channel/types";
+import { DEPRECATED_KEYS, LANE_REVIEW_TIMEOUT_MS, loadConfig, type OmpbotConfig, primaryOwnerUserId } from "../config";
 import type { DriverFactory, ProviderLimitInfo, ThreadSource, TurnFailureEscalation } from "../core/mailbox";
 import { parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
 import { type ChatPlatform, type IdPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { stuckStopText } from "../core/stuck";
-import { COMMAND_OP_REF, COMMAND_TEXT, type MailboxClock } from "../core/types";
-import { briefingSummaryLine, kstFileName, renderBriefingHtml } from "../dashboard/briefing";
+import {
+	COMMAND_OP_REF,
+	COMMAND_TEXT,
+	isHomeCommand,
+	type MailboxClock,
+	parseCommand,
+	TEAMS_GROUP_HOME_REFUSED_TEXT,
+} from "../core/types";
+import { briefingFileName, briefingSummaryLine, renderBriefingHtml } from "../dashboard/briefing";
 import { snapshotReader } from "../dashboard/snapshot-assembly";
 import { escapeDiscordMarkdown } from "../discord/format";
 import { createDispatchAudit, installProcessAudit } from "../dispatch/audit";
@@ -42,7 +49,6 @@ import {
 } from "../lanes/trigger";
 import type { ClaimEvidence, VerifyResult } from "../lanes/verify";
 import type { Logger } from "../log";
-import { DEFAULT_TIMEZONE } from "../monitors/cron";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { MonitorScheduler } from "../monitors/scheduler";
 import { buildMonitorTools, isPersonaOrigin } from "../monitors/tools";
@@ -50,6 +56,7 @@ import { WebhookServer } from "../monitors/webhook";
 import type { ClaudeApprovalHook } from "../omp/claude-driver";
 import type { OmpDialogAnswerer, OmpSessionDriver } from "../omp/driver";
 import { readConfigText, recordLastGoodConfig } from "../ops/apply";
+import { type BackupOptions, type BackupResult, readStamp, runBackup } from "../ops/backup";
 import { formatCacheMissNotice, formatColdCacheNotice } from "../ops/cache-monitor";
 import {
 	budgetBreach,
@@ -65,6 +72,7 @@ import {
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
+import type { HostLoadReader } from "../ops/host-resources";
 import { pruneMediaFiles } from "../ops/media";
 import { BRIEFING_TIMEOUT_MS, BRIEFING_WIDTH, renderPng } from "../ops/screenshot";
 import { allSessionFiles, conversationSessionFiles, renderUsage, summarizeSessionFiles } from "../ops/usage";
@@ -77,12 +85,19 @@ import {
 	savePendingProposals,
 	skillDirOf,
 } from "../review/skills";
-import { ApprovalBroker, parseApprovalRetryActionId } from "../safety/approval";
+import { ApprovalBroker, type ApprovalOutcome, parseApprovalRetryActionId } from "../safety/approval";
 import { answerDialogOnSlack } from "../safety/choice";
 import { buildHostTools, type HostToolDef } from "../safety/host-tools";
-import type { FloorsSurface } from "../safety/prompt";
-import { type DeliveryRow, INTERIM_INFIX, type InboundRow, LOG_COPY_SUFFIX, Store } from "../store/db";
-import { formatKst } from "../tasks/docs";
+import { buildFloorsPrompt, type FloorsSurface, teamsQaSystemPrompt } from "../safety/prompt";
+import {
+	type DeliveryRow,
+	type HerdrPromptInput,
+	INTERIM_INFIX,
+	type InboundRow,
+	LOG_COPY_SUFFIX,
+	Store,
+} from "../store/db";
+import { notePrompt } from "../tasks/dispatch";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
 import type { TaskRow } from "../tasks/ledger";
@@ -98,7 +113,17 @@ import {
 } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
 import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
+import { localIso, offsetLabel } from "../time";
 import type { CrashPoint } from "./crash";
+import {
+	buildGuestPrompt,
+	GUEST_BUSY_TEXT,
+	GUEST_COMMAND_TEXT,
+	GUEST_CONTEXT_PAIRS,
+	GUEST_FAILED_TEXT,
+	GuestQueue,
+	runGuestQuestion,
+} from "./guest";
 import { DEFAULT_SWEEP_MS, EVENT_LOOP_WARN_MS, SweepHeartbeatWriter } from "./heartbeat";
 import { type IpcServer, startIpcServer } from "./ipc";
 import {
@@ -171,6 +196,8 @@ export const PENDING_RETRY_MS = 60_000;
 export const PENDING_ALERT_AFTER = 3;
 
 /** Ephemeral answer to a slash command typed during a restart drain (recorded; the next process runs it). */
+export const LANE_DRAIN_REFUSED_TEXT =
+	"재시작 준비 중이라 작업 레인을 시작하지 않았습니다. 재시작이 끝난 뒤 같은 메시지를 다시 보내 주세요.";
 export const DRAIN_DEFERRED_COMMAND_TEXT = "재시작 준비 중이라 재시작 뒤에 처리합니다. 다시 보내지 않아도 됩니다.";
 
 /**
@@ -206,6 +233,13 @@ export interface DaemonOptions {
 	 * slim, not wired to any production config or env (the daemon always keeps the default).
 	 */
 	gateSweepMs?: number;
+	/** Test seam for the `host_pressure` gate in sweeps and status (default this machine's readings). */
+	hostLoad?: Partial<HostLoadReader>;
+	/**
+	 * The backup `start()` runs once when the home has no backup stamp yet (a first install), before the first gate
+	 * sweep; default {@link runBackup}. Tests inject a failing one.
+	 */
+	bootBackup?: (options: BackupOptions) => BackupResult;
 	/** [TASK] sweep cadence (default 5 minutes); 0 disables it (tests call `sweepTasks()` directly). */
 	taskSweepMs?: number;
 	/**
@@ -228,10 +262,16 @@ export interface DaemonOptions {
 	verifyClaim?: (evidence: ClaimEvidence, cwd: string) => Promise<VerifyResult>;
 	/** Test seam for landing a closed work lane; default merges, pushes and cleans up with real git. */
 	landLane?: LandLane;
+	/** Test seam for the lanes' independent review (`taskAutoLand.review`); default runs the real `omp -p`. */
+	laneReviewRun?: ProcessRunner;
 	/** Test seam for the [TASK] sweep's herdr calls (remind, agent status, board pane); default runs the real herdr. */
 	herdrRun?: ProcessRunner;
 	/** Test seam for `!brief`'s chromium capture; default runs the real chromium. */
 	briefingRun?: ProcessRunner;
+	/** Test seam for the Teams guest/qa `omp -p` runs; default runs the real omp. */
+	guestRun?: ProcessRunner;
+	/** Test seam: the env the guest/qa runs inherit (and find the real omp agent dir in); default `process.env`. */
+	guestEnv?: Record<string, string | undefined>;
 }
 
 export interface InjectRequest {
@@ -247,14 +287,6 @@ export interface InjectResult {
 	nonce: string;
 	threadRef: string;
 }
-
-/** `HH:MM` in the owner's zone, for a card's result line. */
-const CLOCK_FORMAT = new Intl.DateTimeFormat("en-GB", {
-	timeZone: DEFAULT_TIMEZONE,
-	hour: "2-digit",
-	minute: "2-digit",
-	hourCycle: "h23",
-});
 
 /** Card note when a `머지` click could not reach the task thread: the owner answers by hand instead. */
 const MERGE_REJECTED_NOTE = '⚠️ 머지 요청을 넣지 못함 — 스레드에 "머지해"라고 답해 주세요';
@@ -290,18 +322,22 @@ class DaemonStore extends Store {
 		private readonly crash: (point: CrashPoint) => void,
 		private readonly nudge: () => void,
 		log: Logger,
-		slackOwnerUserId: string,
+		slackOwnerUserId: string | undefined,
 		logChannel: string | undefined,
+		timezone: string,
 	) {
 		super({
 			path,
 			clock,
+			timezone,
 			redact,
-			slackOwnerUserId,
+			...(slackOwnerUserId === undefined ? {} : { slackOwnerUserId }),
 			logChannel,
 			hooks: {
 				afterInboundAnswered: () => crash("after_final_before_answered"),
 				onDeliveryState: ({ deliveryId, from, to }) => log.info("delivery_state", { id: deliveryId, from, to }),
+				onOwnerNoticeUnroutable: ({ originKey, opRef }) =>
+					log.warn("owner_notice_unroutable", { origin: originKey, op: opRef }),
 			},
 		});
 	}
@@ -332,6 +368,12 @@ class DaemonStore extends Store {
 		return row;
 	}
 
+	override recordGuestAnswer(...args: Parameters<Store["recordGuestAnswer"]>): DeliveryRow {
+		const row = super.recordGuestAnswer(...args);
+		this.nudge();
+		return row;
+	}
+
 	override recordTurnFailure(...args: Parameters<Store["recordTurnFailure"]>): DeliveryRow | undefined {
 		const row = super.recordTurnFailure(...args);
 		if (row) this.nudge();
@@ -343,6 +385,8 @@ class DaemonStore extends Store {
 export class Daemon {
 	readonly #options: DaemonOptions;
 	readonly #clock: MailboxClock;
+	/** `HH:MM` in the bot's zone (`config.timezone`), for a card's result line. */
+	readonly #clockFormat: Intl.DateTimeFormat;
 	readonly #log: Logger;
 	readonly #drivers = new Map<string, NamespacedDriver>();
 	/** Unique per Daemon instance; `bootId` is the kernel boot id and repeats across daemon restarts. */
@@ -354,6 +398,9 @@ export class Daemon {
 	#webhook: WebhookServer | undefined;
 	/** One adapter per bound platform, built at start. */
 	readonly #adapters = new Map<ChatPlatform, ChannelAdapter>();
+	/** Teams guest/qa runs: 2 at once, 5 waiting; aborted at shutdown before the ledger closes. */
+	readonly #guestQueue = new GuestQueue();
+	readonly #guestAbort = new AbortController();
 	#ipc: IpcServer | undefined;
 	#timer: NodeJS.Timeout | undefined;
 	#lastMediaSweep = 0;
@@ -401,6 +448,12 @@ export class Daemon {
 		for (const binding of options.channels) channels.register(binding.port);
 		this.#channels = channels;
 		this.#clock = options.clock ?? { now: () => Date.now() };
+		this.#clockFormat = new Intl.DateTimeFormat("en-GB", {
+			timeZone: options.config.timezone,
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+		});
 		this.#log = options.log;
 		this.#frozen = createFreezeProbe(options.config.homeDir);
 	}
@@ -417,13 +470,25 @@ export class Daemon {
 		return platform === undefined ? undefined : this.#adapters.get(platform);
 	}
 
-	/** The adapter that reaches the owner's notice conversation (`ownerChannel()`); logged when none is bound. */
-	#ownerAdapter(): ChannelAdapter | undefined {
-		const channel = this.#store?.ownerChannel();
-		if (channel === undefined) return undefined;
-		const adapter = this.#adapterOfConversation(channel);
-		if (adapter === undefined && this.#adapters.size > 0) this.#log.warn("owner_channel_unbound", { channel });
-		return adapter;
+	/**
+	 * The owner's notice conversation (`ownerHome()`) and the adapter that reaches it. No home yet (the owner has not
+	 * written anywhere) is logged as `owner_notice_unroutable` with the notice that could not go out; a home on a
+	 * platform without a bound adapter as `owner_channel_unbound`.
+	 */
+	#ownerTarget(notice: string): { adapter: ChannelAdapter; channel: string } | undefined {
+		const store = this.#store;
+		if (store === undefined) return undefined;
+		const home = store.ownerHome();
+		if (home === undefined) {
+			this.#log.warn("owner_notice_unroutable", { notice });
+			return undefined;
+		}
+		const adapter = this.#adapters.get(home.platform);
+		if (adapter === undefined) {
+			if (this.#adapters.size > 0) this.#log.warn("owner_channel_unbound", { channel: home.conversationId });
+			return undefined;
+		}
+		return { adapter, channel: home.conversationId };
 	}
 
 	/** Per platform with a thread reader: what the mailbox reads a turn's thread context through. */
@@ -472,6 +537,15 @@ export class Daemon {
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
 		const lanePlatform = lane === undefined ? undefined : platformOfThreadRef(lane.threadRef);
 		if (lanePlatform !== undefined) return { lanePlatform };
+		// A persona session's monitor line quotes the bot's zone and the offset in force when it starts.
+		const timezone = isPersonaOrigin(originKey)
+			? {
+					timezone: {
+						name: this.#options.config.timezone,
+						offset: offsetLabel(this.#clock.now(), this.#options.config.timezone),
+					},
+				}
+			: {};
 		const ref = parseChatOrigin(originKey);
 		const noLaneChannel =
 			ref?.platform === "discord" &&
@@ -479,7 +553,7 @@ export class Daemon {
 			isPersonaOrigin(originKey) &&
 			this.#laneChannelOf(originKey, ref.conversationId) === undefined &&
 			!this.peerTouched(originKey);
-		return noLaneChannel ? { noLaneChannel } : {};
+		return noLaneChannel ? { noLaneChannel, ...timezone } : timezone;
 	}
 
 	/** Host tools for the omp child of `originKey`: file upload, owner approval, and the lane tools of its kind. */
@@ -499,6 +573,7 @@ export class Daemon {
 			homeDir: config.homeDir,
 			workspaceDir: config.workspaceDir,
 			...(chatOrigin !== undefined ? { ompExecutable: config.ompExecutable } : {}),
+			...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
 			...(channel === undefined ? {} : { channel }),
 			...(config.dispatchHosts === undefined ? {} : { dispatchHosts: config.dispatchHosts }),
 			...(config.workerOmpArgs === undefined ? {} : { workerOmpArgs: config.workerOmpArgs }),
@@ -515,7 +590,9 @@ export class Daemon {
 							rootText: (threadRef: string) => this.#store?.getInbound(threadRef)?.textRef,
 							channels: this.#channels,
 							now: () => this.#clock.now(),
+							timezone: config.timezone,
 						},
+						recordPrompt: (input: HerdrPromptInput) => this.#store?.recordHerdrPrompt(input),
 					}),
 			// Resolved when the tool runs: the upload thread follows the origin's current conversation, not driver start.
 			threadTs: () => this.#uploadThreadTs(originKey, lane?.threadRef),
@@ -530,6 +607,9 @@ export class Daemon {
 					watcherRoots: config.watcherRoots,
 					workspaceDir: config.workspaceDir,
 					webhook: config.webhook,
+					timezone: config.timezone,
+					slackOff: config.channels.slack === undefined,
+					now: () => this.#clock.now(),
 					log: this.#log,
 				})
 			: [];
@@ -610,9 +690,13 @@ export class Daemon {
 	cwdFor(originKey: string): string {
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
 		if (lane === undefined) return this.#options.config.workspaceDir;
+		if (existsSync(lane.cwd)) return lane.cwd;
+		// An open lane without its worktree was damaged by hand: running in the live checkout instead would let the
+		// lane change the owner's working copy, so the child is refused.
+		if (lane.status !== "closed") throw new Error(`lane_worktree_missing: ${lane.name} ${lane.cwd}`);
 		// A landed or discarded lane has no worktree any more: its session answers later questions from the
 		// repository it was merged into.
-		return existsSync(lane.cwd) ? lane.cwd : (lane.meta.repo ?? this.#options.config.workspaceDir);
+		return lane.meta.repo ?? this.#options.config.workspaceDir;
 	}
 
 	/**
@@ -667,21 +751,24 @@ export class Daemon {
 			crash,
 			() => this.#nudgePump(),
 			log,
-			config.channels.slack.ownerUserId,
+			config.channels.slack?.ownerUserId,
 			config.logChannel,
+			config.timezone,
 		);
 		this.#store = store;
 		this.#broker = new ApprovalBroker({
 			channels: this.#channels,
-			ownerUserId: config.channels.slack.ownerUserId,
+			ownerUserId: primaryOwnerUserId(config.channels),
 			platformOwners: {
-				slack: config.channels.slack.ownerUserId,
+				...(config.channels.slack === undefined ? {} : { slack: config.channels.slack.ownerUserId }),
 				...(config.channels.discord === undefined ? {} : { discord: config.channels.discord.ownerUserId }),
+				...(config.channels.teams === undefined ? {} : { teams: config.channels.teams.ownerAadObjectId }),
 			},
 			escalationChannel: config.escalationChannel,
 			log,
 			store,
 			clock: this.#clock,
+			timezone: config.timezone,
 			...(this.#options.approvalTimeoutMs === undefined ? {} : { timeoutMs: this.#options.approvalTimeoutMs }),
 		});
 		const requeued = store.requeueAmbiguous();
@@ -693,6 +780,8 @@ export class Daemon {
 			requeued_ambiguous: requeued,
 		});
 		for (const key of config.deprecated ?? []) log.warn("config_deprecated_key", { key, use: DEPRECATED_KEYS[key] });
+		for (const { field, reason } of config.warnings ?? []) log.warn("config_warning", { field, reason });
+		this.#bootBackup();
 
 		// Rule (2): settle dispatched rows of the dead process before any new child is started.
 		const recovered = await recoverDispatched({
@@ -707,6 +796,7 @@ export class Daemon {
 		this.#router = new OriginRouter({
 			store,
 			clock: this.#clock,
+			timezone: config.timezone,
 			log,
 			sessionsRoot,
 			sessionBackupsRoot: join(config.homeDir, "session-backups"),
@@ -727,6 +817,12 @@ export class Daemon {
 			budgetProvider: (arg) => this.#budgetCommand(arg),
 			briefingProvider: (originKey, threadRef) => this.#brief(originKey, threadRef),
 			distillProvider: (originKey) => this.#distill(originKey),
+			// Read on every turn and every `!undo`: a reload changes the repository list without a restart. The real git
+			// runs here: no `run` is passed, so the daemon never gains a test seam in production.
+			turnUndo: {
+				repos: () => this.#options.config.turnSnapshot?.repos ?? [],
+				approve: (info) => this.#undoApproval(info.summary, info.threadRef, info.originKey),
+			},
 			threadSource: this.#threadSources(),
 			idleStopMs: config.idleTimeoutMinutes === undefined ? undefined : config.idleTimeoutMinutes * 60_000,
 			...(config.model === undefined ? {} : { defaultModel: config.model }),
@@ -753,9 +849,8 @@ export class Daemon {
 			isHeld: (originKey) => this.#store?.getLaneByOrigin(originKey)?.status === "paused",
 			onHeldWork: (info) => this.#lanes?.onHeldWork(info.originKey),
 			onStallEscalate: (info) => {
-				const target = this.#store;
-				if (target === undefined) return;
-				void this.#ownerAdapter()?.postNotice(target.ownerChannel(), formatStallNotice(info));
+				const owner = this.#ownerTarget("stall");
+				void owner?.adapter.postNotice(owner.channel, formatStallNotice(info));
 			},
 			dialogs: {
 				open: (originKey) => this.#approval.openDialogs(originKey),
@@ -768,6 +863,7 @@ export class Daemon {
 			store,
 			channels: this.#channels,
 			clock: this.#clock,
+			timezone: config.timezone,
 			log,
 			sessionsRoot,
 			route: (record) => this.#router?.route(record) ?? Promise.resolve(),
@@ -782,8 +878,16 @@ export class Daemon {
 			autoLandPolicy: () => this.#autoLandPolicy(),
 			// Cards mention the owner on the platform of the lane's thread.
 			ownerUserId: (platform) =>
-				platform === "discord" ? config.channels.discord?.ownerUserId : config.channels.slack.ownerUserId,
+				platform === "discord" ? config.channels.discord?.ownerUserId : config.channels.slack?.ownerUserId,
 			laneBusy: (originKey) => this.#router?.mailbox(originKey).state.busy ?? false,
+			// The independent review before a lane's auto-merge: a one-shot `omp -p` under the same safety floors.
+			reviewer: {
+				ompBin: config.ompExecutable,
+				...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+				systemPromptAppendix: buildFloorsPrompt(join(config.homeDir, "secrets")),
+				reviewsDir: join(config.homeDir, "reviews"),
+				...(this.#options.laneReviewRun === undefined ? {} : { run: this.#options.laneReviewRun }),
+			},
 			...(this.#options.maxLanes === undefined ? {} : { maxLanes: this.#options.maxLanes }),
 			...(this.#options.verifyClaim === undefined ? {} : { verify: this.#options.verifyClaim }),
 			...(this.#options.landLane === undefined ? {} : { land: this.#options.landLane }),
@@ -871,6 +975,12 @@ export class Daemon {
 						return {};
 					}
 					const trigger = parseLaneTrigger(message.text);
+					if (trigger && this.#router?.draining === true) {
+						// A drain must not create a worktree and branch mid-restart, and a pending trigger row would reach
+						// the DM's omp session after it instead of starting the lane: refuse it with a retry hint.
+						void this.#settleLaneCommand(row, trigger.title, { kind: "refused", text: LANE_DRAIN_REFUSED_TEXT });
+						return {};
+					}
 					if (trigger) {
 						void this.#startLane(row, trigger);
 						return {};
@@ -885,6 +995,7 @@ export class Daemon {
 				this.#dispatchPending(originKey);
 				return {};
 			},
+			onGuestInbound: (message) => this.#onGuestInbound(message),
 			onPeerInbound: (message, hop) => {
 				// Never the owner paths: no lane routing, no `!reopen`, no lane trigger, no command. A work lane's thread
 				// belongs to the owner and its worker; a peer there is dropped before any row exists.
@@ -940,9 +1051,9 @@ export class Daemon {
 			seenMuteCommand: (platformMessageId) => store.getCursor(`mute:${platformMessageId}`) !== undefined,
 			rememberMuteCommand: (platformMessageId) => store.setCursor(`mute:${platformMessageId}`, "1"),
 			// The thread of an approval card is `<card channel>:<card ts>` — the ledger's approval id.
-			onCardReply: ({ threadRef, platformMessageId, text }) => {
+			onCardReply: ({ threadRef, platformMessageId, text, injected }) => {
 				const ts = parseThreadRef(platformMessageId)?.threadTs ?? platformMessageId;
-				return this.#approval.handleCardReply({ approvalId: threadRef, ts, text });
+				return this.#approval.handleCardReply({ approvalId: threadRef, ts, text, injected });
 			},
 			onAction: ({ actionId, value, userId, channel, messageTs }) => {
 				if (this.#approval.handleAction({ actionId, userId })) return;
@@ -1039,14 +1150,21 @@ export class Daemon {
 				frozen: this.#frozen,
 				evaluate: (row, checks) =>
 					evaluateTask(row, resolveTaskHost(row.host, this.#options.config.dispatchHosts), checks),
-				remind: (row, text) => {
+				remind: async (row, text) => {
 					const entry = row.host === null ? undefined : this.#options.config.dispatchHosts?.[row.host];
-					return herdrPromptExisting(row.agent, text, {
+					const sent = await herdrPromptExisting(row.agent, text, {
 						cwd: config.workspaceDir,
 						...(entry === undefined ? {} : { sshTarget: entry.ssh }),
 						...(entry?.herdrBin === undefined ? {} : { herdrBin: entry.herdrBin }),
 						...(herdrRun === undefined ? {} : { run: herdrRun }),
 					});
+					if (sent.ok || sent.unconfirmed === true) {
+						notePrompt(
+							{ recordPrompt: (input) => store.recordHerdrPrompt(input), log },
+							{ host: row.host, agent: row.agent, kind: "remind", text, originKey: row.originKey },
+						);
+					}
+					return sent;
 				},
 				agentStatus: (row) => {
 					const entry = row.host === null ? undefined : this.#options.config.dispatchHosts?.[row.host];
@@ -1096,7 +1214,7 @@ export class Daemon {
 				},
 				autoLand: (row) => this.autoLand(row),
 				channels: this.#channels,
-				ownerUserId: config.channels.slack.ownerUserId,
+				ownerUserId: primaryOwnerUserId(config.channels),
 				now: () => this.#clock.now(),
 				log,
 			});
@@ -1115,7 +1233,9 @@ export class Daemon {
 			socket: this.socketPath,
 			driver: config.agent ?? "omp",
 			herdr: config.herdr === undefined ? "off" : "on",
+			slack: this.#adapters.has("slack") ? "on" : "off",
 			discord: this.#adapters.has("discord") ? "on" : "off",
+			teams: this.#adapters.has("teams") ? "on" : "off",
 		});
 		if (bootConfigText === undefined) log.warn("last_good_config_skipped", { reason: "config_unreadable" });
 		else if (readConfigText(config.homeDir) === bootConfigText)
@@ -1358,7 +1478,15 @@ export class Daemon {
 	/** `taskAutoLand` as the [TASK] sweep and the lanes apply it (`maxRisk` defaults to L2); `undefined` = off. */
 	#autoLandPolicy(): AutoLandPolicy | undefined {
 		const policy = this.#options.config.taskAutoLand;
-		return policy === undefined ? undefined : { repos: policy.repos, maxRisk: policy.maxRisk ?? "L2" };
+		if (policy === undefined) return undefined;
+		const { review } = policy;
+		return {
+			repos: policy.repos,
+			maxRisk: policy.maxRisk ?? "L2",
+			...(review === undefined
+				? {}
+				: { review: { model: review.model, timeoutMs: review.timeoutMs ?? LANE_REVIEW_TIMEOUT_MS } }),
+		};
 	}
 
 	#dispatchPending(originKey: string): void {
@@ -1433,8 +1561,9 @@ export class Daemon {
 			return;
 		}
 		state.failures += 1;
-		const adapter = this.#ownerAdapter();
-		if (state.failures < PENDING_ALERT_AFTER || adapter === undefined) return;
+		if (state.failures < PENDING_ALERT_AFTER) return;
+		const owner = this.#ownerTarget("pending_dispatch");
+		if (owner === undefined) return;
 		const now = this.#clock.now();
 		const sign = state.sign === "" ? "resume_pending_stuck" : state.sign;
 		let incident = { notify: true, count: 1, firstAt: now };
@@ -1451,8 +1580,8 @@ export class Daemon {
 			count: incident.count,
 		});
 		const oldest = store.getInbound(state.oldestId);
-		void adapter.postNotice(
-			store.ownerChannel(),
+		void owner.adapter.postNotice(
+			owner.channel,
 			formatPendingDispatchNotice(originKey, now - (oldest?.createdAt ?? now), redact(sign), incident.count),
 		);
 	}
@@ -1570,9 +1699,9 @@ export class Daemon {
 	 */
 	#escalateTurnFailures(info: TurnFailureEscalation): void {
 		const store = this.#store;
-		const adapter = this.#ownerAdapter();
-		if (store === undefined || adapter === undefined) return;
-		if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
+		if (store === undefined || info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
+		const owner = this.#ownerTarget("turn_failures");
+		if (owner === undefined) return;
 		const now = this.#clock.now();
 		let incident = { notify: true, count: 1, firstAt: now };
 		try {
@@ -1587,8 +1716,8 @@ export class Daemon {
 			count: incident.count,
 			modelHealed: info.modelHealed,
 		});
-		void adapter.postNotice(
-			store.ownerChannel(),
+		void owner.adapter.postNotice(
+			owner.channel,
 			formatTurnEscalationNotice({ ...info, reason: redact(info.reason) }, incident.count),
 		);
 	}
@@ -1600,8 +1729,9 @@ export class Daemon {
 	 */
 	#notifyProviderLimit(info: ProviderLimitInfo): void {
 		const store = this.#store;
-		const adapter = this.#ownerAdapter();
-		if (store === undefined || adapter === undefined) return;
+		if (store === undefined) return;
+		const owner = this.#ownerTarget("provider_limit");
+		if (owner === undefined) return;
 		const now = this.#clock.now();
 		let incident = { notify: true, count: 1, firstAt: now };
 		try {
@@ -1611,7 +1741,28 @@ export class Daemon {
 		}
 		if (!incident.notify) return;
 		this.#log.warn("provider_limit_notified", { origin: info.originKey, count: incident.count });
-		void adapter.postNotice(store.ownerChannel(), formatProviderLimitNotice(info, incident.count));
+		void owner.adapter.postNotice(owner.channel, formatProviderLimitNotice(info, incident.count));
+	}
+
+	/**
+	 * A first install has no backup stamp until somebody runs `ompbot backup`, so `backup_age` would open (and DM the
+	 * owner) on the very first gate sweep. `start()` runs the same local backup once instead; a failure is logged and
+	 * left to the gate, which then opens and alerts as before.
+	 */
+	#bootBackup(): void {
+		const { homeDir, maxBundleBytes } = this.#options.config;
+		if (readStamp(join(homeDir, "backups")) !== undefined) return;
+		try {
+			// The daemon's clock, so the gates (judged on the same clock) see a fresh stamp.
+			const result = (this.#options.bootBackup ?? runBackup)({
+				homeDir,
+				now: new Date(this.#clock.now()),
+				...(maxBundleBytes === undefined ? {} : { maxBundleBytes }),
+			});
+			this.#log.info("boot_backup_done", { file: result.file, bundle: result.bundle ?? "none" });
+		} catch (error) {
+			this.#log.warn("boot_backup_failed", { error: String(error) });
+		}
 	}
 
 	/**
@@ -1628,19 +1779,26 @@ export class Daemon {
 	async #sweepGates(): Promise<void> {
 		const interval = this.#options.gateSweepMs ?? DEFAULT_GATE_SWEEP_MS;
 		const store = this.#store;
-		const adapter = this.#ownerAdapter();
-		if (interval <= 0 || store === undefined || adapter === undefined) return;
+		if (interval <= 0 || store === undefined) return;
+		const owner = this.#ownerTarget("gate_sweep");
+		if (owner === undefined) return;
 		const now = this.#clock.now();
 		if (now - this.#lastGateSweepAt < interval) return;
 		this.#lastGateSweepAt = now;
 		const { config } = this.#options;
-		const omp = (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
+		const omp = {
+			...((config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {}),
+			...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+		};
 		for (const gate of collectGates({
 			homeDir: config.homeDir,
 			now,
 			offsiteConfigured: config.offsite !== undefined,
-			...(config.costCap?.dailyUsd === undefined ? {} : { dailyCapUsd: config.costCap.dailyUsd }),
+			...(config.costCap?.dailyUsd === undefined
+				? {}
+				: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
 			...omp,
+			...(this.#options.hostLoad === undefined ? {} : { hostLoad: this.#options.hostLoad }),
 		})) {
 			// Nothing to judge (stamp or ledger missing): keep the previous state untouched — no notice, no incident
 			// write or resolve — so a stamp deleted under an open gate never reads as a recovery.
@@ -1653,7 +1811,7 @@ export class Daemon {
 					// repeat inside 24h still counts as "the owner knows".
 					const alerted = incident.notify || incident.standing || (previous?.state === "open" && previous.alerted);
 					if (incident.notify) {
-						await adapter.postNotice(store.ownerChannel(), formatGateOpenNotice(gate, incident.firstAt, now));
+						await owner.adapter.postNotice(owner.channel, formatGateOpenNotice(gate, incident.firstAt, now));
 					}
 					this.#gateStates.set(gate.name, { state: "open", alerted, closedSweeps: 0, pendingResolve: false });
 				} else if (previous?.state === "open") {
@@ -1661,7 +1819,7 @@ export class Daemon {
 					// except the window gates, whose close only means the evidence aged out. Either way an alerted
 					// incident is resolved after the closed sweeps, so a window gate's row does not stay alerted.
 					if (previous.alerted && !WINDOW_GATES.has(gate.name)) {
-						await adapter.postNotice(store.ownerChannel(), formatGateClosedNotice(gate));
+						await owner.adapter.postNotice(owner.channel, formatGateClosedNotice(gate));
 					}
 					this.#gateStates.set(gate.name, {
 						state: "closed",
@@ -1691,13 +1849,17 @@ export class Daemon {
 
 	/**
 	 * The day's cost state: ledger total, the configured ceiling and both of today's flags. Read on every monitor tick
-	 * and `!budget`, so a `!budget off`, a `ompbot reload` of `costCap.dailyUsd` and KST midnight all take effect
+	 * and `!budget`, so a `!budget off`, a `ompbot reload` of `costCap.dailyUsd` and the bot zone's midnight all take effect
 	 * without a restart. `undefined` before the daemon has a store (a construction-time probe).
 	 */
 	#dailyBudget(now = this.#clock.now()): DailyBudgetState | undefined {
 		const store = this.#store;
 		if (store === undefined) return undefined;
-		return dailyBudgetState({ store, day: ledgerDay(now), cap: this.#options.config.costCap?.dailyUsd });
+		return dailyBudgetState({
+			store,
+			day: ledgerDay(now, this.#options.config.timezone),
+			cap: this.#options.config.costCap?.dailyUsd,
+		});
 	}
 
 	/**
@@ -1706,14 +1868,32 @@ export class Daemon {
 	 */
 	#sweepCostCap(): void {
 		const store = this.#store;
-		const adapter = this.#ownerAdapter();
 		const state = this.#dailyBudget();
-		if (store === undefined || adapter === undefined || state === undefined) return;
+		if (store === undefined || state === undefined) return;
 		const breach = budgetBreach(state);
 		if (breach === undefined || state.notified) return;
+		// No owner home: the breach is not marked notified, so the next sweep tries again.
+		const owner = this.#ownerTarget("cost_cap_daily");
+		if (owner === undefined) return;
 		store.setCursor(dailyNoticeKey(state.day), String(this.#clock.now()));
 		this.#log.warn("cost_cap_daily_stop", { day: state.day, cost: breach.cost, cap: breach.cap });
-		void adapter.postNotice(store.ownerChannel(), dailyCapNotice(breach.cap, breach.cost));
+		void owner.adapter.postNotice(
+			owner.channel,
+			dailyCapNotice(breach.cap, breach.cost, this.#options.config.timezone),
+		);
+	}
+
+	/**
+	 * The `!undo` card: an approval request in the conversation's own thread, so the owner answers where they asked. A
+	 * free-text reply on the card is not an approval (the undo writes files): it counts as denied.
+	 */
+	async #undoApproval(summary: string, threadRef: string, originKey: string): Promise<ApprovalOutcome> {
+		const parsed = parseThreadRef(threadRef);
+		if (parsed === undefined) return "denied";
+		const result = await this.#approval.ask(parsed.channel, summary, {
+			origin: { originKey, channel: parsed.channel, threadTs: parsed.threadTs },
+		});
+		return typeof result === "string" ? result : "denied";
 	}
 
 	/**
@@ -1740,8 +1920,8 @@ export class Daemon {
 		const html = renderBriefingHtml(snapshot, now);
 		const dir = join(config.homeDir, "media", "briefing");
 		mkdirSync(dir, { recursive: true });
-		// `<KST YYYYMMDD-HHmmss>-<suffix>`: the suffix is per render, so two briefings in the same second never collide.
-		const out = join(dir, `${kstFileName(now)}-${randomUUID().slice(0, 8)}.png`);
+		// `<YYYYMMDD-HHmmss in the bot's zone>-<suffix>`: the suffix is per render, so two briefings in the same second never collide.
+		const out = join(dir, `${briefingFileName(now, this.#options.config.timezone)}-${randomUUID().slice(0, 8)}.png`);
 		const startedAt = Date.now();
 		const size = await renderPng(html, out, {
 			chromium: config.briefing?.chromium ?? "chromium",
@@ -1751,7 +1931,7 @@ export class Daemon {
 		});
 		await route.port.uploadFile(route.target, {
 			path: out,
-			title: `ompbot 브리핑 ${formatKst(now).slice(11, 16)}`,
+			title: `ompbot 브리핑 ${localIso(now, this.#options.config.timezone).slice(11, 16)}`,
 			comment: briefingSummaryLine(snapshot),
 		});
 		this.#log.info("briefing_rendered", {
@@ -1763,7 +1943,7 @@ export class Daemon {
 
 	/**
 	 * `!budget`: no argument answers today's totals and both ceilings; `off` lifts the day's daily ceiling
-	 * (`cost-cap-off:<day>`, kept in the ledger so a restart keeps it and KST midnight drops it); `on` removes it
+	 * (`cost-cap-off:<day>`, kept in the ledger so a restart keeps it and the bot zone's midnight drops it); `on` removes it
 	 * early. Owner turns are never blocked by the daily ceiling — only monitor fires are.
 	 */
 	async #budgetCommand(arg: string): Promise<string> {
@@ -1775,7 +1955,7 @@ export class Daemon {
 			if (state.cap === undefined) return "하루 상한이 설정되어 있지 않습니다(config.json `costCap.dailyUsd`).";
 			store.setCursor(dailyOffKey(state.day), String(this.#clock.now()));
 			this.#log.info("cost_cap_daily_off", { day: state.day, cost: state.cost, cap: state.cap });
-			return `오늘(${state.day}) 하루 상한을 껐습니다. KST 자정에 다시 켜집니다. 지금 켜려면 \`${COMMAND_TEXT.budget} on\`.`;
+			return `오늘(${state.day}) 하루 상한을 껐습니다. 자정(${this.#options.config.timezone})에 다시 켜집니다. 지금 켜려면 \`${COMMAND_TEXT.budget} on\`.`;
 		}
 		if (arg === "on") {
 			const wasOff = store.getCursor(dailyOffKey(state.day)) !== undefined;
@@ -2051,7 +2231,9 @@ export class Daemon {
 	 */
 	#announceMarker(kind: "back" | "cancelled"): void {
 		const { config } = this.#options;
-		const marker = takeRestartMarker(config.homeDir);
+		const marker = takeRestartMarker(config.homeDir, (reason) =>
+			this.#log.info("restart_notice_dropped", { kind, reason }),
+		);
 		if (marker === undefined) return;
 		const age = this.#clock.now() - marker.at;
 		if (config.restartNotice === false || age > RESTART_NOTICE_STALE_MS) {
@@ -2076,6 +2258,7 @@ export class Daemon {
 		const report = buildStatus(
 			this.store,
 			this.#options.ompVersion,
+			this.#options.config.timezone,
 			(originKey) => {
 				const state = router?.mailbox(originKey).state;
 				return {
@@ -2087,7 +2270,10 @@ export class Daemon {
 				join(this.#options.config.homeDir, "ompbot.db"),
 				this.#clock.now(),
 				this.#options.config.offsite !== undefined,
-				this.#options.config.costCap?.dailyUsd,
+				this.#options.config.costCap?.dailyUsd === undefined
+					? undefined
+					: { usd: this.#options.config.costCap.dailyUsd, timezone: this.#options.config.timezone },
+				this.#options.hostLoad,
 			),
 		);
 		const withFreeze = { ...report, ...frozenField(this.#options.config.homeDir) };
@@ -2110,26 +2296,33 @@ export class Daemon {
 			throw new Error(
 				`inject origin must be slack/dm/<id>, slack/ch/<id>, discord/dm/<id> or discord/ch/<id>: ${request.origin}`,
 			);
+		if (!this.#adapters.has(ref.platform)) throw new Error(`${ref.platform} is not configured`);
 		const channel = ref.conversationId;
-		if (request.thread !== undefined && parseThreadRef(threadRefOf(channel, request.thread)) === undefined)
+		// A Slack thread is a message ts, a Discord one a message id (snowflake).
+		if (request.thread !== undefined && !(ref.platform === "slack" ? /^\d+\.\d+$/ : /^\d{17,20}$/).test(request.thread))
 			throw new Error(`inject thread is not a message id: ${request.thread}`);
 		const nonce = randomBytes(6).toString("hex");
-		// The marker is all the owner sees of the injected message, so it carries the text's first line.
-		const firstLine =
+		// The marker is all the owner sees of the injected message, so it carries the text's first line — masked before it
+		// is cut: a secret cut short no longer matches its pattern and would go out half.
+		const firstLine = redact(
 			request.text
 				.split("\n")
 				.find((line) => line.trim() !== "")
 				?.replace(/\s+/g, " ")
-				.trim() ?? "";
+				.trim() ?? "",
+		);
 		const preview = firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine;
 		const { outcome, markerTs } = await this.#ingestOwnerText(
-			{ channel, threadTs: request.thread, kind: ref.kind },
+			{ channel, threadTs: request.thread, kind: ref.kind, injected: true },
 			request.text,
 			preview === ""
 				? `🧪 inject ${nonce}`
 				: `🧪 inject ${nonce}\n> ${ref.platform === "discord" ? escapeDiscordMarkdown(preview) : escapeMrkdwn(preview)}`,
 			request.quoted === undefined ? undefined : [request.quoted],
 		);
+		// The marker stays up either way, so the owner sees what was tried.
+		if (outcome === "card_rejected")
+			throw new Error("inject_rejected: approval/choice card threads take only the owner's own reply");
 		if (outcome === "dropped") throw new Error("inject_rejected: message was not accepted");
 		return { nonce, threadRef: threadRefOf(channel, request.thread ?? markerTs) };
 	}
@@ -2140,13 +2333,14 @@ export class Daemon {
 	 * soon as the marker is up, so a caller still knows it when the ingest throws.
 	 */
 	async #ingestOwnerText(
-		target: { channel: string; threadTs?: string | undefined; kind: "dm" | "ch" },
+		/** `injected`: put in by `ompbot inject`, not by an owner click (`OwnerIngest.injected`). */
+		target: { channel: string; threadTs?: string | undefined; kind: "dm" | "ch"; injected?: boolean },
 		text: string,
 		marker: string,
 		quoted?: readonly string[],
 		posted: { ts?: string } = {},
 	): Promise<{ outcome: IngestOutcome; markerTs: string }> {
-		const { channel, threadTs, kind } = target;
+		const { channel, threadTs, kind, injected } = target;
 		const adapter = this.#adapterOfConversation(channel);
 		const route = this.#channels.forConversation(channel);
 		if (adapter === undefined || route === undefined) throw new Error("daemon not started");
@@ -2164,6 +2358,7 @@ export class Daemon {
 			messageId,
 			text,
 			quoted,
+			...(injected === true ? { injected } : {}),
 		});
 		return { outcome, markerTs: messageId };
 	}
@@ -2222,8 +2417,8 @@ export class Daemon {
 				undefined,
 				posted,
 			);
-			if (outcome === "dropped") {
-				log.warn("task_autoland_rejected", { task: row.taskId, reason: "dropped", marker: posted.ts });
+			if (outcome === "dropped" || outcome === "card_rejected") {
+				log.warn("task_autoland_rejected", { task: row.taskId, reason: outcome, marker: posted.ts });
 				return false;
 			}
 			log.info("task_autoland_requested", { task: row.taskId, marker: posted.ts, outcome });
@@ -2311,7 +2506,7 @@ export class Daemon {
 			await redraw(rejected);
 			return;
 		}
-		await redraw(button.settledCard(row, button.requestedNote(CLOCK_FORMAT.format(this.#clock.now()))));
+		await redraw(button.settledCard(row, button.requestedNote(this.#clockFormat.format(this.#clock.now()))));
 		const posted: { ts?: string } = {};
 		try {
 			const { outcome } = await this.#ingestOwnerText(
@@ -2321,7 +2516,7 @@ export class Daemon {
 				undefined,
 				posted,
 			);
-			if (outcome !== "dropped") {
+			if (outcome !== "dropped" && outcome !== "card_rejected") {
 				log.info(`task_${kind}_requested`, { task: taskId, marker: posted.ts, outcome });
 				return;
 			}
@@ -2371,7 +2566,7 @@ export class Daemon {
 			await redraw(`⚠️ 다시 요청할 수 없음 (${refused})`);
 			return;
 		}
-		await redraw(`▶ 다시 요청됨 · ${CLOCK_FORMAT.format(this.#clock.now())}`);
+		await redraw(`▶ 다시 요청됨 · ${this.#clockFormat.format(this.#clock.now())}`);
 		const firstLine = row.summary.split("\n")[0] ?? "";
 		const posted: { ts?: string } = {};
 		try {
@@ -2382,7 +2577,7 @@ export class Daemon {
 				undefined,
 				posted,
 			);
-			if (outcome !== "dropped") {
+			if (outcome !== "dropped" && outcome !== "card_rejected") {
 				log.info("approval_retry_requested", { id: approvalId, marker: posted.ts, outcome });
 				return;
 			}
@@ -2445,6 +2640,87 @@ export class Daemon {
 	}
 
 	/**
+	 * A Teams guest/qa question (doc/plans/teams-channel.md TASK C): no origin, no inbound row, no mailbox. A `!` command
+	 * gets one line (`!home` acts for the owner in a 1:1 only); a question goes to the bounded read-only runner, and its
+	 * answer — or the busy line — becomes a plain delivery replying to it.
+	 */
+	#onGuestInbound(message: GuestInboundMessage): { duplicate?: boolean } | undefined {
+		const store = this.#store;
+		if (store === undefined) return undefined;
+		const seenKey = `guest:${message.platformMessageId}`;
+		if (store.getCursor(seenKey) !== undefined) return { duplicate: true };
+		store.setCursor(seenKey, "1");
+		const alias = message.conversationId;
+		const reply = (opRef: string, body: string) =>
+			store.recordGuestAnswer({
+				alias,
+				opRef: `${opRef}:${message.platformMessageId}`,
+				threadRef: message.threadRef,
+				body,
+			});
+		const text = message.text.trim();
+		if (text.startsWith("!") || parseCommand(text) !== undefined) {
+			if (message.owner && isHomeCommand(text)) {
+				if (message.kind !== "dm") {
+					reply("home", TEAMS_GROUP_HOME_REFUSED_TEXT);
+				} else {
+					store.setOwnerHome({ platform: "teams", conversationId: alias });
+					this.#log.info("owner_home_set", { origin: `teams/dm/${alias}`, platform: "teams", conversation: alias });
+					reply("home", "🏠 이 대화를 알림 받을 곳으로 정했습니다. 데몬 알림과 채널 없는 모니터 결과가 여기로 옵니다.");
+				}
+			} else {
+				reply("guest-command", GUEST_COMMAND_TEXT);
+			}
+			return {};
+		}
+		const teams = this.#options.config.channels.teams;
+		const signal = this.#guestAbort.signal;
+		const job = async (): Promise<void> => {
+			if (signal.aborted) return;
+			const id = store.recordTeamsQuestion({
+				alias,
+				askerAad: message.asker.aadObjectId,
+				askerName: message.asker.name,
+				question: text,
+			});
+			const prompt = buildGuestPrompt({
+				context: store.teamsQaContext(alias, GUEST_CONTEXT_PAIRS, id),
+				question: text,
+				askerName: message.asker.name,
+			});
+			const answer = await runGuestQuestion(
+				{
+					ompBin: this.#options.config.ompExecutable,
+					homeDir: this.#options.config.homeDir,
+					systemPromptAppendix: teamsQaSystemPrompt(),
+					model: teams?.guestModel,
+					run: this.#options.guestRun,
+					inheritedEnv: this.#options.guestEnv,
+					log: this.#log,
+					signal,
+				},
+				prompt,
+			);
+			if (signal.aborted) return;
+			if (answer === undefined) {
+				this.#log.warn("guest_run_failed", { alias, id: message.platformMessageId });
+				reply("guest", GUEST_FAILED_TEXT);
+				return;
+			}
+			store.recordTeamsAnswer(id, answer);
+			reply("guest", answer);
+		};
+		const admitted = this.#guestQueue.submit(() =>
+			job().catch((error: unknown) =>
+				this.#log.error("guest_run_error", { alias, id: message.platformMessageId, error: String(error) }),
+			),
+		);
+		this.#log.info("guest_question", { alias, id: message.platformMessageId, owner: message.owner, admitted });
+		if (admitted === "full") reply("guest-busy", GUEST_BUSY_TEXT);
+		return {};
+	}
+
+	/**
 	 * SIGTERM path: stop dispatching pending rows (they stay pending for the next boot's rule (1)), stop intake,
 	 * wait bounded for running turns to settle (their answers land in the ledger for the next boot's recovery),
 	 * stop the omp children, close the ledger. A turn that outlives the drain bound is stopped mid-flight exactly
@@ -2462,12 +2738,16 @@ export class Daemon {
 
 	async #shutdown(): Promise<void> {
 		clearInterval(this.#timer);
+		// Running lane checks are killed now; the verdicts are not awaited (the claims stay pending for the next boot).
+		this.#lanes?.stop();
 		this.#heartbeat?.stop();
 		this.#heartbeat = undefined;
 		installProcessAudit(undefined);
 		this.#ipc?.stop();
 		this.#webhook?.stop();
 		for (const adapter of this.#adapters.values()) await adapter.stop();
+		this.#guestAbort.abort();
+		await this.#guestQueue.idle();
 		await this.#pumping;
 		this.#monitors?.stop();
 		await this.#monitors?.idle();

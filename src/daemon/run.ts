@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelBinding } from "../channel/adapter";
-import { type OmpbotConfig, readDiscordToken, readSlackTokens } from "../config";
+import { type OmpbotConfig, readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
 import { DiscordBinding } from "../discord/binding";
 import { DiscordChannel } from "../discord/channel";
 import { DiscordSocketTransport } from "../discord/socket-transport";
@@ -10,17 +10,22 @@ import type { DiscordTransport } from "../discord/transport";
 import { createLogger, type Logger } from "../log";
 import { AgyOmpDriver } from "../omp/agy-driver";
 import { ClaudeOmpDriver } from "../omp/claude-driver";
+import { withOmpProfile } from "../omp/env";
 import { RpcOmpDriver } from "../omp/rpc-driver";
-import { createAggregatingLogger, startServiceAlive } from "../ops/log-hygiene";
+import { testHostLoad } from "../ops/host-resources";
+import { type AggregatingLogger, createAggregatingLogger, startServiceAlive } from "../ops/log-hygiene";
 import { LogDirError, openLogSink } from "../ops/logfile";
 import { redact } from "../redact";
-import { floorsArgs, floorsSystemPrompt } from "../safety/prompt";
+import { spawnSystemPrompt } from "../safety/prompt";
 import { indexRuntimeSecrets } from "../safety/secret-index";
 import { SlackBinding } from "../slack/binding";
 import { SlackChannel } from "../slack/channel";
 import { SocketModeTransport } from "../slack/socket-transport";
 import { FileFakeTransport } from "../slack/test-transport";
 import type { SlackTransport } from "../slack/transport";
+import { TeamsBinding } from "../teams/binding";
+import { TeamsChannel } from "../teams/channel";
+import { TeamsConnector } from "../teams/transport";
 import { crashHook } from "./crash";
 import { Daemon } from "./daemon";
 import { acquireLock, type Lock, LockHeldError } from "./lock";
@@ -28,10 +33,23 @@ import { readVersion } from "./tools";
 import { startWatchdog, watchdogStallMs } from "./watchdog";
 
 /** `provider/model` in config.json becomes the two RpcClient options. */
-function splitModel(model: string | undefined): { provider?: string; model?: string } {
+export function splitModel(model: string | undefined): { provider?: string; model?: string } {
 	if (model === undefined) return {};
 	const slash = model.indexOf("/");
 	return slash === -1 ? { model } : { provider: model.slice(0, slash), model: model.slice(slash + 1) };
+}
+
+/**
+ * `env` and `baseEnv` of every bot RPC child (chat, lane and monitor turns share the daemon's driver factory). With
+ * `ompProfile` the parent env loses `PI_CODING_AGENT_DIR` and gains `OMP_PROFILE`; without it `baseEnv` stays
+ * unset, so the driver reads `process.env` exactly as before.
+ */
+export function botRpcEnv(
+	ompProfile: string | undefined,
+	base: Record<string, string | undefined> = process.env,
+): { env: Record<string, string>; baseEnv?: Record<string, string | undefined> } {
+	const env = { OMP_WIKI_NOTE_DISABLE: "1" };
+	return ompProfile === undefined ? { env } : { env, baseEnv: withOmpProfile(base, ompProfile) };
 }
 
 function pickTransport(config: OmpbotConfig, env: Record<string, string | undefined>, log: Logger): SlackTransport {
@@ -71,6 +89,35 @@ function discordBindings(config: OmpbotConfig, env: Record<string, string | unde
 	return [new DiscordBinding(new DiscordChannel(transport, { ownerUserId: discord.ownerUserId }))];
 }
 
+/**
+ * The Teams binding when `channels.teams` is set: the Bot Framework endpoint on its loopback listener and the Bot
+ * Connector with the client secret, read again at every token request.
+ */
+function teamsBindings(config: OmpbotConfig): ChannelBinding[] {
+	const teams = config.channels.teams;
+	if (teams === undefined) return [];
+	const connector = new TeamsConnector({
+		appId: teams.appId,
+		clientSecret: () => readTeamsClientSecret(config),
+		tokenTenant: teams.tokenTenant ?? teams.tenantId,
+	});
+	return [new TeamsBinding(new TeamsChannel(connector))];
+}
+
+/**
+ * One binding per configured platform: Slack only when `channels.slack` is set (its tokens are read only then),
+ * Discord only when `channels.discord` is, Teams only when `channels.teams` is.
+ */
+export function channelBindings(
+	config: OmpbotConfig,
+	env: Record<string, string | undefined>,
+	log: Logger,
+): ChannelBinding[] {
+	const slack =
+		config.channels.slack === undefined ? [] : [new SlackBinding(new SlackChannel(pickTransport(config, env, log)))];
+	return [...slack, ...discordBindings(config, env, log), ...teamsBindings(config)];
+}
+
 /** Logs the omp version on every start and warns when it differs from the one recorded by the previous start. */
 async function checkOmpVersion(config: OmpbotConfig, log: Logger): Promise<string> {
 	const version = await readVersion([config.ompExecutable, "--version"]);
@@ -100,6 +147,30 @@ function testFatal(env: Record<string, string | undefined>): void {
 			throw new Error("test_fatal");
 		}, 0);
 	}
+}
+
+/**
+ * The crash exit: one synchronous `daemon_fatal` line, then the folded counts (`log_summary`) the hourly flush would
+ * have written, then exit 1 — the code Bun itself exits with on an uncaught error or an unhandled rejection.
+ */
+export function fatalHandler(
+	lastWords: Logger,
+	log: AggregatingLogger,
+	exit: (code: number) => void,
+): (kind: string, error: unknown) => void {
+	return (kind, error) => {
+		lastWords.error("daemon_fatal", {
+			kind,
+			error: String(error).slice(0, 500),
+			stack: error instanceof Error ? error.stack?.split("\n").slice(0, 5).join("\n") : undefined,
+		});
+		try {
+			log.stop();
+		} catch {
+			// best effort: the fatal line above is already written
+		}
+		exit(1);
+	};
 }
 
 /**
@@ -173,15 +244,7 @@ export async function runDaemon(
 			}
 		},
 	});
-	const fatal = (kind: string, error: unknown) => {
-		lastWords.error("daemon_fatal", {
-			kind,
-			error: String(error).slice(0, 500),
-			stack: error instanceof Error ? error.stack?.split("\n").slice(0, 5).join("\n") : undefined,
-		});
-		// The code Bun itself exits with on an uncaught error or an unhandled rejection.
-		process.exit(1);
-	};
+	const fatal = fatalHandler(lastWords, log, (code) => process.exit(code));
 	process.on("uncaughtException", (error) => fatal("uncaughtException", error));
 	process.on("unhandledRejection", (reason) => fatal("unhandledRejection", reason));
 	process.on("exit", (code) => lastWords.info("daemon_exit", { code }));
@@ -232,6 +295,7 @@ export async function runDaemon(
 			claimSignals();
 		}
 	}
+	const hostLoad = testHostLoad(env); // test-only idle host, behind OMPBOT_TEST_HOOKS=1
 	const daemon = new Daemon({
 		config,
 		bootConfigText,
@@ -239,14 +303,31 @@ export async function runDaemon(
 		clock,
 		bootId: lock.info.bootId,
 		ompVersion: await checkOmpVersion(config, log),
-		channels: [
-			new SlackBinding(new SlackChannel(pickTransport(config, env, log))),
-			...discordBindings(config, env, log),
-		],
+		channels: channelBindings(config, env, log),
 		crash: crashHook(env),
+		...(hostLoad === undefined ? {} : { hostLoad }),
 		sweepMs: env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SWEEP_MS ? Number(env.OMPBOT_SWEEP_MS) : undefined,
-		driverFactory: (origin, sessionDir) =>
-			config.agent === "agy"
+		driverFactory: (origin, sessionDir) => {
+			// Only the omp driver answers dialogs and narrows host tools for a peer-touched conversation.
+			const omp = config.agent !== "agy" && config.agent !== "claude";
+			const answerDialog = omp ? daemon.answerDialogsFor(origin) : undefined;
+			const systemPrompt = spawnSystemPrompt({
+				secretsDir,
+				originKey: origin,
+				sessionDir,
+				files: personaFiles,
+				onPersonaError,
+				herdr: config.herdr !== undefined,
+				// `ask` is allowed only where the owner can answer it: the same answerer the omp driver gets below.
+				ownerDialogs: answerDialog !== undefined,
+				peerTouched: omp && daemon.peerTouched(origin),
+				surface: daemon.floorsSurfaceFor(origin),
+				// agy and claude children get no ompbot host tools, so their floors name none.
+				hostTools: omp,
+				now: clock.now(),
+				log,
+			});
+			return config.agent === "agy"
 				? new AgyOmpDriver({
 						agyExecutable: config.agyExecutable ?? "agy",
 						cwd: daemon.cwdFor(origin),
@@ -254,16 +335,7 @@ export async function runDaemon(
 						...(agyModel === undefined ? {} : { model: agyModel }),
 						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 						// No --append-system-prompt in agy: the driver prepends this to the first message of each child.
-						systemPrompt: floorsSystemPrompt(
-							secretsDir,
-							origin,
-							personaFiles,
-							onPersonaError,
-							config.herdr !== undefined,
-							false,
-							false,
-							daemon.floorsSurfaceFor(origin),
-						),
+						systemPrompt,
 					})
 				: config.agent === "claude"
 					? new ClaudeOmpDriver({
@@ -273,16 +345,7 @@ export async function runDaemon(
 							...(claudeModel === undefined ? {} : { model: claudeModel }),
 							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 							secretsDir,
-							systemPrompt: floorsSystemPrompt(
-								secretsDir,
-								origin,
-								personaFiles,
-								onPersonaError,
-								config.herdr !== undefined,
-								false,
-								false,
-								daemon.floorsSurfaceFor(origin),
-							),
+							systemPrompt,
 							approval: daemon.requestApprovalFor(origin),
 						})
 					: new DaemonRpcDriver({
@@ -291,21 +354,13 @@ export async function runDaemon(
 							sessionDir,
 							...model,
 							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
-							env: { OMP_WIKI_NOTE_DISABLE: "1" },
-							// `ask` is allowed only where the owner can answer it: the same answerer the driver gets below.
-							extraArgs: floorsArgs(
-								secretsDir,
-								origin,
-								personaFiles,
-								onPersonaError,
-								config.herdr !== undefined,
-								daemon.answerDialogsFor(origin) !== undefined,
-								daemon.peerTouched(origin),
-								daemon.floorsSurfaceFor(origin),
-							),
+							...botRpcEnv(config.ompProfile),
+							extraArgs: ["--append-system-prompt", systemPrompt],
 							hostTools: daemon.hostToolsFor(origin),
-							answerDialog: daemon.answerDialogsFor(origin),
-						}),
+							answerDialog,
+							log,
+						});
+		},
 	});
 	claimSignals();
 	try {

@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { DispatchHostConfig } from "../config";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
@@ -6,8 +6,9 @@ import type { ApprovalDetail, ApprovalResult } from "../safety/approval";
 import { scanHandoffBrief } from "../safety/handoff-risk";
 import type { HostToolDef } from "../safety/host-tools";
 import { buildFloorsPrompt } from "../safety/prompt";
-import { resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
-import { parseTaskSpecInput } from "../tasks/docs";
+import type { HerdrPromptInput } from "../store/db";
+import { notePrompt, resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
+import { parseTaskSpecInput, TASK_ID_PATTERN } from "../tasks/docs";
 import { auditContext } from "./audit";
 import { type BoardLinkResolver, boardCardLink, type HerdrBoardConfig } from "./board";
 import {
@@ -15,6 +16,7 @@ import {
 	herdrPromptExisting,
 	herdrReadAgent,
 	herdrRemoteStart,
+	herdrStartAgent,
 	OWNER_NAME_PATTERN,
 	runOmpPrint,
 } from "./omp";
@@ -22,6 +24,8 @@ import {
 export interface DispatchToolDeps {
 	originKey: string;
 	ompExecutable: string;
+	/** Config `ompProfile` of the simple `omp -p` run (absent: the inherited agent dir). */
+	ompProfile?: string;
 	homeDir: string;
 	workspaceDir: string;
 	/** Remote dispatch targets (hub fleet pattern): herdr runs on that host over ssh. */
@@ -35,12 +39,14 @@ export interface DispatchToolDeps {
 	/** [TASK] state docs (`taskSpec`); absent → `taskSpec` is refused and dispatch is exactly the plain flow. */
 	tasks?: Omit<
 		TaskDispatchDeps,
-		"originKey" | "workspaceDir" | "dispatchHosts" | "workerOmpArgs" | "run" | "log" | "boardLink"
+		"originKey" | "workspaceDir" | "dispatchHosts" | "workerOmpArgs" | "run" | "log" | "boardLink" | "recordPrompt"
 	>;
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state every call is refused before any command runs. */
 	frozen?: () => FreezeState | undefined;
 	/** Config `herdr`: present → herdr/host/taskSpec dispatch; absent → the tool is simple-only (`omp -p`). */
 	herdr?: { bin?: string };
+	/** Keeps every prompt herdr took for the dashboard's 마지막 지시 (`Store.recordHerdrPrompt`); absent → nothing kept. */
+	recordPrompt?: (input: HerdrPromptInput) => void;
 	/** Owner approval card for a high_risk brief (herdr or simple); absent → such a brief is refused (`no_approver`). */
 	approve?: (summary: string, detail: ApprovalDetail, signal?: AbortSignal) => Promise<ApprovalResult>;
 	log: {
@@ -59,6 +65,8 @@ const SIMPLE_ONLY_PARAMETERS = {
 	additionalProperties: false,
 };
 const HERDR_OFF_MESSAGE = "herdr가 꺼져 있어 simple만 쓸 수 있습니다";
+/** A [TASK] agent's name (its TASKID, lowercased); an ad hoc local start never takes one. */
+const TASK_AGENT_NAME = new RegExp(TASK_ID_PATTERN.source, "i");
 /** A brief the handoff risk scan found nothing in (or a call with no brief): the result goes out unchanged. */
 const CLEAR_GATE = { suffix: "", approved: false };
 
@@ -96,7 +104,11 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 					description:
 						"원격 실행 대상(config dispatchHosts 키, 예: wsl). 지정하면 그 호스트의 herdr로 omp 에이전트를 띄운다",
 				},
-				cwd: { type: "string", description: "원격 작업 디렉터리(host 지정 시). 기본은 호스트 설정의 workDir" },
+				cwd: {
+					type: "string",
+					description:
+						"새 에이전트의 작업 디렉터리. host 지정 시 기본은 호스트 설정의 workDir, 로컬 mode=herdr는 절대경로만 받고 기본은 ompbot 메인 작업 디렉터리",
+				},
 				taskSpec: {
 					type: "object",
 					description:
@@ -194,7 +206,11 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 		const host = typeof params.host === "string" && params.host.trim() !== "" ? params.host.trim() : undefined;
 		const mode = params.mode === "herdr" ? "herdr" : "simple";
 		const name = typeof params.name === "string" && params.name.trim() !== "" ? params.name.trim() : undefined;
-		const hostEntry = host === undefined ? undefined : deps.dispatchHosts?.[host];
+		// Own keys only: `constructor` or `__proto__` must not find an Object.prototype member.
+		const hostEntry =
+			host === undefined || deps.dispatchHosts === undefined || !Object.hasOwn(deps.dispatchHosts, host)
+				? undefined
+				: deps.dispatchHosts[host];
 		const taskDeps: TaskDispatchDeps | undefined =
 			deps.tasks === undefined
 				? undefined
@@ -206,6 +222,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 						...(deps.workerOmpArgs === undefined ? {} : { workerOmpArgs: deps.workerOmpArgs }),
 						...(deps.run === undefined ? {} : { run: deps.run }),
 						...(boardLink === undefined ? {} : { boardLink }),
+						...(deps.recordPrompt === undefined ? {} : { recordPrompt: deps.recordPrompt }),
 						log: deps.log,
 					};
 		if (params.taskSpec !== undefined) {
@@ -261,6 +278,9 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			if (existing.exists) {
 				const follow = await herdrPromptExisting(name, task, sshOptions);
 				const check = `진행 확인: ompbot_dispatch {host:"${host}", name:"${name}"}`;
+				if (follow.ok || follow.unconfirmed === true) {
+					notePrompt(deps, { host, agent: name, kind: "followup", text: task, originKey: deps.originKey });
+				}
 				if (follow.unconfirmed === true) {
 					deps.log.warn("dispatch_remote_prompt_unconfirmed", { host, agent: name, error: follow.error });
 					return `전달은 했지만 작업 시작이 확인되지 않았습니다(${follow.error?.replace("agent prompt unconfirmed: ", "")}). ${check}${gate.suffix}`;
@@ -278,6 +298,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				options: sshOptions,
 			});
 			if (!start.ok) return `시작 실패: ${start.error}`;
+			notePrompt(deps, { host, agent: name, kind: "start", text: task, originKey: deps.originKey });
 			deps.log.info("dispatch_remote_started", { host, agent: name, cwd });
 			const link = boardLink === undefined ? undefined : await boardLink(host, start.paneId);
 			return (
@@ -299,15 +320,56 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				return `▸ ${name} 최근 출력:\n${redact(read.output ?? "")}${summary === undefined ? "" : `\n${summary}`}`;
 			}
 			const gate = await gateWork(task, signal);
-			const follow = await herdrPromptExisting(name, task, herdrOptions);
-			const check = `진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}`;
-			if (follow.unconfirmed === true) {
-				deps.log.warn("dispatch_prompt_unconfirmed", { agent: name, error: follow.error });
-				return `전달은 했지만 작업 시작이 확인되지 않았습니다(${follow.error?.replace("agent prompt unconfirmed: ", "")}). ${check}${gate.suffix}`;
+			// A name local herdr already runs gets the task as a follow-up; a new one starts an agent, like the remote branch.
+			const existing = await herdrAgentExists(name, herdrOptions);
+			if (!existing.ok) return `시작 실패: ${existing.error}`;
+			if (existing.exists) {
+				const follow = await herdrPromptExisting(name, task, herdrOptions);
+				const check = `진행 확인: ompbot_dispatch {mode:"herdr", name:"${name}"}`;
+				if (follow.ok || follow.unconfirmed === true) {
+					notePrompt(deps, { host: null, agent: name, kind: "followup", text: task, originKey: deps.originKey });
+				}
+				if (follow.unconfirmed === true) {
+					deps.log.warn("dispatch_prompt_unconfirmed", { agent: name, error: follow.error });
+					return `전달은 했지만 작업 시작이 확인되지 않았습니다(${follow.error?.replace("agent prompt unconfirmed: ", "")}). ${check}${gate.suffix}`;
+				}
+				if (!follow.ok) return `전달 실패: ${follow.error ?? "unknown"}`;
+				deps.log.info("dispatch_prompted", { agent: name });
+				return `후속 지시를 ${name}에 전달했습니다. ${check}${gate.suffix}`;
 			}
-			if (!follow.ok) return `전달 실패: ${follow.error ?? "unknown"}`;
-			deps.log.info("dispatch_prompted", { agent: name });
-			return `후속 지시를 ${name}에 전달했습니다. ${check}${gate.suffix}`;
+			// An ad hoc start has no [TASK] ledger: a TASKID-shaped name would pass for a task agent it is not.
+			if (TASK_AGENT_NAME.test(name)) {
+				throw new Error(
+					`TASKID 꼴 이름(${name})으로는 새 에이전트를 시작하지 않습니다. [TASK] 작업은 taskSpec으로 등록하거나 재개하세요`,
+				);
+			}
+			if (!OWNER_NAME_PATTERN.test(name)) throw new Error(`name은 소문자·숫자·-·_ 32자 이내여야 합니다: ${name}`);
+			const givenCwd = typeof params.cwd === "string" && params.cwd.trim() !== "" ? params.cwd.trim() : undefined;
+			if (givenCwd !== undefined && !isAbsolute(givenCwd))
+				throw new Error(`로컬 cwd는 절대경로여야 합니다: ${givenCwd}`);
+			const cwd = givenCwd ?? deps.workspaceDir;
+			const start = await herdrStartAgent({
+				name,
+				task,
+				cwd,
+				...(deps.workerOmpArgs === undefined ? {} : { agentArgs: deps.workerOmpArgs }),
+				options: herdrOptions,
+			});
+			if (!start.ok) return `시작 실패: ${start.error}`;
+			notePrompt(deps, { host: null, agent: name, kind: "start", text: task, originKey: deps.originKey });
+			deps.log.info("dispatch_started", { agent: name, cwd });
+			const link = boardLink === undefined ? undefined : await boardLink(null, start.paneId);
+			return (
+				[
+					`${name} 에이전트를 시작했습니다 (cwd ${cwd}, pane ${start.paneId}).`,
+					...(givenCwd === undefined
+						? ["메인 작업 디렉터리에서 작업합니다 — 저장소 작업은 taskSpec이나 cwd를 주세요."]
+						: []),
+					...(link === undefined ? [] : [`진행 보기: ${link}`]),
+					`오너에게는 이 모양으로 접수를 알린다: 첫 줄 '\`${name}\`(<제목>)가 맡았습니다. 결정이 필요하거나 끝나면 이 스레드로 알려 드립니다.'${link === undefined ? "" : ", 다음 줄 '진행 보기: <위 링크>'"}, 빈 줄 뒤 '[목표] <한 문장>'과 '[가정] <오너 대신 정한 해석, 없으면 없음>'. 그 밖의 과정은 쓰지 않는다.`,
+					`후속 지시·진행 확인은 ompbot_dispatch {mode:"herdr", name:"${name}"} 로.`,
+				].join("\n") + gate.suffix
+			);
 		}
 
 		if (task === undefined || task === "") throw new Error("task is required");
@@ -319,6 +381,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			...(deps.run === undefined ? {} : { run: deps.run }),
 			systemPromptAppendix: buildFloorsPrompt(join(deps.homeDir, "secrets"), deps.originKey, herdrOn),
 			ompBin: deps.ompExecutable,
+			...(deps.ompProfile === undefined ? {} : { ompProfile: deps.ompProfile }),
 			inheritedEnv: process.env,
 		});
 		deps.log.info("dispatch_simple_done", { ok: result.ok });

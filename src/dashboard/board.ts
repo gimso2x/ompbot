@@ -3,6 +3,7 @@
  * and the machines stream reader follow the owner's herdr-board (shared/board.ts, server/machines-source.ts,
  * server/board-service.ts), ported to this codebase.
  */
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { redact } from "../redact";
 
 /** herdr-web-ui's own machine: its cards are keyed by the bare pane id. */
@@ -69,13 +70,25 @@ export interface BoardCard {
 	column: ColumnId;
 	/** herdr reported a status the board does not know: shown as attention, never as done. */
 	unknown: boolean;
-	/** Epoch ms at which this process first saw the pane in this status (restarts count again). */
+	/**
+	 * Epoch ms at which the pane was first seen in this status, kept across dashboard restarts by the since file; 0 when
+	 * unknown (the pane was already in this status when its machine was first seen and no saved record matched).
+	 */
 	since: number;
 	cwd: string | null;
 	/** TASK whose agent or worktree is this pane's. */
 	taskId?: string;
 	/** "herdr에서 답하기" link; only with `dashboard.herdrWebUrl`. */
 	replyUrl?: string;
+	/** What the pane said (the snapshot's `herdr.says`, merged by the page; see `PaneSay` in snapshot.ts). */
+	question?: string;
+	options?: string[];
+	asks?: Array<{ question: string; options: string[] }>;
+	blocked?: string;
+	lastSay?: string;
+	sayError?: string;
+	/** The newest prompt ompbot gave this agent name (local cards: local herdr only), as a masked one-line preview. */
+	lastPrompt?: { preview: string; at: number; kind: BoardPromptKind };
 }
 
 export interface BoardMachine {
@@ -94,6 +107,18 @@ export interface BoardView {
 
 /** What the page draws in the board block: the live board, or why there is none. */
 export type BoardPanel = BoardView | { ok: false; error: string };
+
+export type BoardPromptKind = "start" | "followup" | "remind";
+
+/** The newest recorded prompt of one (host, agent): `herdr_prompts`, `host` '' for local herdr. */
+export interface BoardPromptRef {
+	id: number;
+	host: string;
+	agent: string;
+	kind: BoardPromptKind;
+	preview: string;
+	at: number;
+}
 
 /** An open TASK a card can belong to. */
 export interface BoardTaskRef {
@@ -144,14 +169,18 @@ export function deepLink(
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
-/** One card per pane that runs an agent; `since` keeps a status's first sighting across recomputations. */
+/**
+ * One card per pane that runs an agent; `since` keeps a status's first sighting across recomputations. A card with no
+ * record of the same status gets `firstSight`: `now` for a change seen live, 0 when its time is unknown.
+ */
 export function buildCards(
 	machine: MachineRecord,
 	now: number,
 	since: ReadonlyMap<string, { status: string; since: number }>,
+	firstSight = now,
 ): BoardCard[] {
 	const machineId = text(machine.id);
-	const machineName = text(machine.name) || machineId;
+	const machineName = redact(text(machine.name) || machineId);
 	const local = machine.kind === "local" || machine.id === LOCAL_MACHINE;
 	const labels = (records: unknown, idField: "workspace_id" | "tab_id") =>
 		new Map(
@@ -172,7 +201,7 @@ export function buildCards(
 		const workspaceId = text(pane.workspace_id);
 		const tabId = text(pane.tab_id);
 		const tabLabel = redact(tabs.get(tabId) || tabId);
-		const cwd = text(pane.foreground_cwd) || text(pane.cwd);
+		const cwd = redact(text(pane.foreground_cwd) || text(pane.cwd));
 		cards.push({
 			key,
 			local,
@@ -185,12 +214,12 @@ export function buildCards(
 			paneLabel: redact(
 				displayLabel(text(pane.label) || text(pane.title) || text(pane.terminal_title_stripped) || paneId),
 			),
-			name: text(pane.name) || (/^ompbot · (\S+)$/.exec(workspaces.get(workspaceId) ?? "")?.[1] ?? ""),
+			name: redact(text(pane.name) || (/^ompbot · (\S+)$/.exec(workspaces.get(workspaceId) ?? "")?.[1] ?? "")),
 			agent,
 			status,
 			column,
 			unknown,
-			since: previous !== undefined && previous.status === status ? previous.since : now,
+			since: previous !== undefined && previous.status === status ? previous.since : firstSight,
 			cwd: cwd === "" ? null : cwd,
 		});
 	}
@@ -219,6 +248,44 @@ export interface BoardSourceOptions {
 	 */
 	idleMs?: number;
 	now?: () => number;
+	/**
+	 * Where each card's status and since are kept across restarts (`<home>/dashboard-board-since.json`, 0600). With it,
+	 * a card already in its status when its machine is first seen keeps the saved since, or gets 0 (unknown) when the
+	 * file has no matching record. Without it the since lives in memory only and a first sighting counts as now.
+	 */
+	sinceFile?: string;
+}
+
+/** A card's status and since as the since file keeps them; `gone` is when the card left the board. */
+interface SinceRecord {
+	status: string;
+	since: number;
+	gone?: number;
+}
+
+/** A card that left the board this long ago is dropped from the since file. */
+const SINCE_GONE_KEEP_MS = 7 * 24 * 3_600_000;
+
+/** The since file's records; an absent or unreadable file is no records (bad entries are skipped). */
+function readSinceFile(file: string): Map<string, SinceRecord> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(file, "utf8"));
+	} catch {
+		return new Map(); // absent or broken: every card first seen counts as unknown
+	}
+	const records = new Map<string, SinceRecord>();
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return records;
+	for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+		const record = value as Partial<SinceRecord> | null;
+		if (typeof record?.status !== "string" || typeof record.since !== "number" || !(record.since >= 0)) continue;
+		records.set(key, {
+			status: record.status,
+			since: record.since,
+			...(typeof record.gone === "number" ? { gone: record.gone } : {}),
+		});
+	}
+	return records;
 }
 
 /**
@@ -232,7 +299,12 @@ export class BoardSource {
 	private readonly idleMs: number;
 	private readonly now: () => number;
 	private machines = new Map<string, MachineRecord>();
-	private since = new Map<string, { status: string; since: number }>();
+	private since = new Map<string, SinceRecord>();
+	private readonly sinceFile: string | undefined;
+	/** The since file's content as last read or written, so an unchanged board writes nothing. */
+	private savedSince = "";
+	/** Machines this process has seen connected: cards they show from then on are live sightings. */
+	private readonly seenMachines = new Set<string>();
 	private state: BoardState | undefined;
 	private cardsByKey = new Map<string, BoardCard>();
 	private readonly listeners = new Set<() => void>();
@@ -246,6 +318,11 @@ export class BoardSource {
 		this.retryMs = options.retryMs ?? 2_000;
 		this.idleMs = options.idleMs ?? 45_000;
 		this.now = options.now ?? Date.now;
+		this.sinceFile = options.sinceFile;
+		if (this.sinceFile !== undefined) {
+			this.since = readSinceFile(this.sinceFile);
+			this.savedSince = JSON.stringify(Object.fromEntries(this.since));
+		}
 	}
 
 	current(): BoardState | undefined {
@@ -386,23 +463,62 @@ export class BoardSource {
 		const now = this.now();
 		const shown = [...this.machines.values()].filter((machine) => machine.enabled !== false);
 		const cards = sortCards(
-			shown.flatMap((machine) =>
-				machine.state === "connected" && machine.snapshot != null ? buildCards(machine, now, this.since) : [],
-			),
+			shown.flatMap((machine) => {
+				if (machine.state !== "connected" || machine.snapshot == null) return [];
+				const id = text(machine.id);
+				// A machine's first list shows panes already in their status for an unknown time (with a since file).
+				const firstSight = this.sinceFile === undefined || this.seenMachines.has(id) ? now : 0;
+				this.seenMachines.add(id);
+				return buildCards(machine, now, this.since, firstSight);
+			}),
 		);
 		const next: BoardState = {
 			machines: shown.map((machine) => ({
 				id: text(machine.id),
-				name: text(machine.name) || text(machine.id),
+				name: redact(text(machine.name) || text(machine.id)),
 				connected: machine.state === "connected",
 			})),
 			cards,
 		};
-		this.since = new Map(cards.map((card) => [card.key, { status: card.status, since: card.since }]));
+		this.keepSince(cards, now);
 		const same = this.state !== undefined && JSON.stringify(this.state) === JSON.stringify(next);
 		this.state = next;
 		this.cardsByKey = new Map(cards.map((card) => [card.key, card]));
 		if (!same) this.emit();
+	}
+
+	/**
+	 * The since records after a recomputation: the board's cards, and with a since file also the cards that left the
+	 * board (stamped `gone`, dropped {@link SINCE_GONE_KEEP_MS} later) so a machine that comes back keeps its times.
+	 * The file is rewritten (temporary file, then rename) only when the records change.
+	 */
+	private keepSince(cards: BoardCard[], now: number): void {
+		const next = new Map<string, SinceRecord>(
+			cards.map((card) => [card.key, { status: card.status, since: card.since }]),
+		);
+		if (this.sinceFile === undefined) {
+			this.since = next;
+			return;
+		}
+		for (const [key, record] of this.since) {
+			if (next.has(key)) continue;
+			const gone = record.gone ?? now;
+			if (now - gone < SINCE_GONE_KEEP_MS) next.set(key, { status: record.status, since: record.since, gone });
+		}
+		this.since = next;
+		const body = JSON.stringify(Object.fromEntries(next));
+		if (body === this.savedSince) return;
+		try {
+			const tmp = `${this.sinceFile}.${process.pid}.tmp`;
+			writeFileSync(tmp, body, { mode: 0o600 });
+			renameSync(tmp, this.sinceFile);
+			this.savedSince = body;
+		} catch (error) {
+			// The board goes on with the times in memory; the next change tries the file again.
+			process.stderr.write(
+				`dashboard board_since_save_failed: ${redact(error instanceof Error ? error.message : String(error))}\n`,
+			);
+		}
 	}
 
 	private emit(): void {
@@ -410,10 +526,13 @@ export class BoardSource {
 	}
 }
 
-/** The board as served: each card gets its TASK (agent name or worktree = cwd) and, with a herdr web URL, its link. */
+/**
+ * The board as served: each card gets its TASK (agent name or worktree = cwd), its last prompt and, with a herdr web
+ * URL, its link.
+ */
 export function boardView(
 	state: BoardState,
-	options: { tasks: BoardTaskRef[]; herdrWebUrl?: string; now: number },
+	options: { tasks: BoardTaskRef[]; prompts?: BoardPromptRef[]; herdrWebUrl?: string; now: number },
 ): BoardView {
 	return {
 		ok: true,
@@ -425,9 +544,22 @@ export function boardView(
 					(candidate.agent !== "" && candidate.agent === card.name) ||
 					(candidate.worktree !== "" && candidate.worktree === card.cwd),
 			);
+			// By name only: a local card takes local prompts, a remote one any host's (machine ids are not mapped to hosts).
+			const prompt = (options.prompts ?? [])
+				.filter(
+					(candidate) =>
+						card.name !== "" &&
+						candidate.agent === card.name &&
+						(card.local ? candidate.host === "" : candidate.host !== ""),
+				)
+				.reduce<BoardPromptRef | undefined>(
+					(newest, candidate) => (newest === undefined || candidate.id > newest.id ? candidate : newest),
+					undefined,
+				);
 			return {
 				...card,
 				...(task === undefined ? {} : { taskId: task.taskId }),
+				...(prompt === undefined ? {} : { lastPrompt: { preview: prompt.preview, at: prompt.at, kind: prompt.kind } }),
 				...(options.herdrWebUrl === undefined ? {} : { replyUrl: deepLink(options.herdrWebUrl, card) }),
 			};
 		}),

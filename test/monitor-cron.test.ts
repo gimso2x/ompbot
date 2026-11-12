@@ -1,23 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import {
-	assertTimezone,
-	CronError,
-	DEFAULT_TIMEZONE,
-	firesBetween,
-	formatLocal,
-	nextFire,
-	parseCron,
-	zonedToUtc,
-} from "../src/monitors/cron";
+import { assertTimezone, CronError, firesBetween, nextFire, parseCron, zonedToUtc } from "../src/monitors/cron";
+import { formatLocal } from "../src/time";
 
 const utc = (iso: string): number => Date.parse(iso);
 const iso = (ms: number | undefined): string | undefined => (ms === undefined ? undefined : new Date(ms).toISOString());
 
 describe("cron: Asia/Seoul (no DST)", () => {
-	test("default zone is Asia/Seoul", () => {
-		expect(DEFAULT_TIMEZONE).toBe("Asia/Seoul");
-	});
-
 	test("daily 09:30 KST is 00:30Z, then exactly 24h later", () => {
 		const cron = parseCron("30 9 * * *");
 		const first = nextFire(cron, "Asia/Seoul", utc("2026-03-10T00:00:00Z"));

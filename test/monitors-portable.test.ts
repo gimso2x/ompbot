@@ -37,7 +37,12 @@ function ledgerOf(h: TestHome) {
 }
 
 function addMonitor(h: TestHome, spec: Record<string, unknown>) {
-	const ctx = { scriptsRoot: join(h.dir, "scripts"), workspaceDir: h.config.workspaceDir, webhook: { port: 1 } };
+	const ctx = {
+		scriptsRoot: join(h.dir, "scripts"),
+		workspaceDir: h.config.workspaceDir,
+		webhook: { port: 1 },
+		defaultTimezone: "Asia/Seoul",
+	};
 	return ledgerOf(h).addMonitor(parseMonitorSpec(spec, ctx));
 }
 

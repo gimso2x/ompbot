@@ -44,7 +44,13 @@ afterEach(() => {
 });
 
 function tools(originKey = ORIGIN) {
-	const built = buildMonitorTools({ originKey, ledger, scriptsRoot: join(home.dir, "scripts"), log });
+	const built = buildMonitorTools({
+		timezone: "Asia/Seoul",
+		originKey,
+		ledger,
+		scriptsRoot: join(home.dir, "scripts"),
+		log,
+	});
 	const get = (name: string) => {
 		const tool = built.find((candidate) => candidate.name === name);
 		if (!tool) throw new Error(`tool missing: ${name}`);
@@ -60,6 +66,7 @@ function tools(originKey = ORIGIN) {
 
 function tools2(webhook: { port: number } | undefined) {
 	const built = buildMonitorTools({
+		timezone: "Asia/Seoul",
 		originKey: ORIGIN,
 		ledger,
 		scriptsRoot: join(home.dir, "scripts"),
@@ -201,7 +208,9 @@ describe("who gets the tools", () => {
 			"ompbot_monitor_remove",
 		]);
 		for (const origin of [monitorOrigin("mabc12345"), laneOriginKey("work"), "slack/channel/C1"]) {
-			expect(buildMonitorTools({ originKey: origin, ledger, scriptsRoot: home.dir, log })).toEqual([]);
+			expect(
+				buildMonitorTools({ timezone: "Asia/Seoul", originKey: origin, ledger, scriptsRoot: home.dir, log }),
+			).toEqual([]);
 		}
 	});
 
@@ -270,7 +279,7 @@ describe("who gets the tools", () => {
 describe("status groups thread sessions", () => {
 	test("thread origins collapse into one `<channel> × N스레드` line; DM and channel origins stay listed", () => {
 		const dbPath = join(home.dir, "threads.db");
-		const store = openBotStore(dbPath, { now: () => NOW });
+		const store = openBotStore(dbPath, { now: () => NOW }, "Asia/Seoul");
 		try {
 			store.ensureOrigin("slack/dm/D1", "/s/dm");
 			store.ensureOrigin("slack/ch/C1", "/s/ch");
@@ -279,7 +288,7 @@ describe("status groups thread sessions", () => {
 		} finally {
 			store.close();
 		}
-		const text = renderStatusText(readStatusFromDb(dbPath, "omp-test 0"));
+		const text = renderStatusText(readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul"));
 		expect(text).toContain("origin 4개");
 		expect(text).toContain("• slack/dm/D1 epoch=1");
 		expect(text).toContain("• slack/ch/C1 epoch=1");
@@ -309,9 +318,15 @@ describe("status shows monitors", () => {
 
 	test("the text and the read-only database report show count, name and Seoul time", async () => {
 		const dbPath = join(home.dir, "full.db");
-		const store = openBotStore(dbPath, { now: () => NOW });
+		const store = openBotStore(dbPath, { now: () => NOW }, "Asia/Seoul");
 		try {
-			const built = buildMonitorTools({ originKey: ORIGIN, ledger: store.monitors, scriptsRoot: home.dir, log });
+			const built = buildMonitorTools({
+				timezone: "Asia/Seoul",
+				originKey: ORIGIN,
+				ledger: store.monitors,
+				scriptsRoot: home.dir,
+				log,
+			});
 			await built[0]?.execute(
 				{ name: "soon", trigger: AT, instruction: "x" },
 				{ signal: new AbortController().signal },
@@ -319,7 +334,7 @@ describe("status shows monitors", () => {
 		} finally {
 			store.close();
 		}
-		const report = readStatusFromDb(dbPath, "omp-test 0");
+		const report = readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul");
 		expect(report.monitors).toEqual({ count: 1, next: { name: "soon", at: "2026-10-19T06:05:00.000Z" } });
 		expect(renderStatusText(report)).toContain("모니터 1개 · 다음 발사 soon 2026-10-19 15:05:00 (Asia/Seoul)");
 		expect(renderStatusText({ ...report, monitors: { count: 0, next: null } })).toContain("모니터 0개");

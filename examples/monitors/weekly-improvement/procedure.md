@@ -1,6 +1,6 @@
 # 주간 개선 회의 절차
 
-너는 이 회의의 **제안자**(anthropic/claude-opus-5-5)다. 지난 7일 기록에서 근거 있는 개선 안건을 최대 5개 만들고, 다른 모델 패밀리 검토자(google-antigravity/gemini-4-argon)의 반박을 받아 회의록을 쓰고 오너에게 올린다. **결정은 오너가 한다** — 이 턴은 안건을 올리기만 한다. 아래 순서를 그대로 따른다.
+너는 이 회의의 **제안자**다. 지난 7일 기록에서 근거 있는 개선 안건을 최대 5개 만들고, 검토자(설치할 때 고른 다른 공급자 모델, 없으면 봇 기본 모델)의 반박을 받아 회의록을 쓰고 오너에게 올린다. **결정은 오너가 한다** — 이 턴은 안건을 올리기만 한다. 아래 순서를 그대로 따른다.
 
 ## 1. 수집 (한 번)
 
@@ -10,10 +10,10 @@ python3 @OMPBOT_HOME@/scripts/weekly-improvement-collect.py
 
 - 정확히 한 번 실행하고, 출력 전문을 이후 단계의 유일한 사실 근거로 쓴다. **출력에 없는 사실은 쓰지 않는다**(다른 파일·DB·로그를 따로 열어 보충하지 않는다).
 - `## 소스 상태`에 `missing`/`error`가 있으면 그 소스는 근거로 쓰지 않고, 답의 회의록 경로 줄 뒤에 한 줄로 알린다.
-- 회의 주차와 기간은 다음으로 정한다(KST, ISO 주차; 출력 `<YYYY>-W<ww> <월요일> <일요일>`):
+- 회의 주차와 기간은 다음으로 정한다(봇 시간대: `OMPBOT_TZ` → `@OMPBOT_HOME@/config.json`의 `timezone` → 시스템 시간대, ISO 주차; 출력 `<YYYY>-W<ww> <월요일> <일요일>`):
 
 ```
-python3 -c 'import datetime as d,zoneinfo as z;t=d.datetime.now(z.ZoneInfo("Asia/Seoul")).date();m=t-d.timedelta(t.weekday());y,w,_=t.isocalendar();print(f"{y}-W{w:02d} {m} {m+d.timedelta(6)}")'
+python3 -c 'import datetime as d,json,os,zoneinfo as z;n=os.environ.get("OMPBOT_TZ") or json.load(open("@OMPBOT_HOME@/config.json")).get("timezone");t=d.datetime.now(z.ZoneInfo(n) if n else None).date();m=t-d.timedelta(t.weekday());y,w,_=t.isocalendar();print(f"{y}-W{w:02d} {m} {m+d.timedelta(6)}")'
 ```
 
 ## 2. 안건 초안
@@ -31,7 +31,8 @@ python3 -c 'import datetime as d,zoneinfo as z;t=d.datetime.now(z.ZoneInfo("Asia
 ## 3. 교차 모델 검토 (task 도구 정확히 한 번)
 
 `task` 도구를 **정확히 한 번**, `tasks` 1개로 부른다.
-- tasks[0]: `model: "google-antigravity/gemini-4-argon"`, `agent`는 생략한다.
+- tasks[0]: `model: "@REVIEWER_MODEL@"` — 설치할 때 고른 검토 모델이다.
+- tasks[0]의 `agent`는 생략한다.
 - 브리프(`task`)에 넣을 것: 수집기 출력 전문, 안건 초안 표(ID·제목·근거·제안), 그리고 이 지시 — "파일 수정·명령 실행 없이, 수집기 출력만 근거로 안건 ID마다 한 줄씩 `<ID> 동의: <이유 한 줄>` / `<ID> 수정: <이유 한 줄>` / `<ID> 반대: <이유 한 줄>` 형식으로만 답하라."
 - 하위가 실패·중단되거나 답에 형식에 맞는 줄이 없으면 그 안건의 검토 셀은 `검토 실패: <사유 한 줄>`로 쓴다. **재시도하지 않는다.** 검토 답의 `|` 문자는 `/`로 바꿔 옮긴다.
 
@@ -41,8 +42,8 @@ python3 -c 'import datetime as d,zoneinfo as z;t=d.datetime.now(z.ZoneInfo("Asia
 
 ```
 # 주간 개선 회의 <YYYY>-W<ww>
-기간: <월요일> ~ <일요일> (KST)
-제안자: anthropic/claude-opus-5-5 · 검토자: google-antigravity/gemini-4-argon
+기간: <월요일> ~ <일요일> (봇 시간대)
+제안자: <이 턴의 모델> · 검토자: <3단계 tasks[0]의 model, 그 줄이 없으면 "기본 모델">
 
 ## 안건
 | ID | 제목 | 근거 | 제안 | 검토 | 결정 | TASK |

@@ -18,7 +18,7 @@ python3 @OMPBOT_HOME@/scripts/memory-audit-collect.py
 ```
 
 - 정확히 한 번 실행한다. `## 소스 상태`의 은행 이름(괄호 안)을 판정 파일 `은행:` 줄에 쓴다.
-- 판정 파일 날짜(KST)는 `TZ=Asia/Seoul date +%F`로 정한다. 경로는 `@OMPBOT_HOME@/workspace/memory-audit/<YYYY-MM-DD>.md`(디렉터리가 없으면 만들고, 파일이 있으면 덮어쓴다).
+- 판정 파일 날짜(봇 시간대: `OMPBOT_TZ` → `@OMPBOT_HOME@/config.json`의 `timezone` → 시스템 시간대)는 `python3 -c 'import datetime as d,json,os,zoneinfo as z;n=os.environ.get("OMPBOT_TZ") or json.load(open("@OMPBOT_HOME@/config.json")).get("timezone");t=d.datetime.now(z.ZoneInfo(n) if n else None).date();print(t)'`로 정한다. 경로는 `@OMPBOT_HOME@/workspace/memory-audit/<YYYY-MM-DD>.md`(디렉터리가 없으면 만들고, 파일이 있으면 덮어쓴다).
 - `## 잡음`이 `잡음 없음`이고 `## 후보`가 `후보 없음`이면 판정 파일의 `## 판정` 아래에 `후보 없음` 한 줄만 쓰고, 6단계의 `check`만 돌린 뒤 답을 `[SILENT]`로 끝낸다.
 
 ## 3. 잡음 (판단 없이 전부 무효)

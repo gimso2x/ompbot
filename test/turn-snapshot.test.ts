@@ -2,17 +2,30 @@
 // into git trees without touching the real index, a turn's plan puts exactly its own files back, and the ledger keeps
 // the newest rows per origin.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gcSessions } from "../src/ops/gc";
 import {
 	applyUndo,
 	captureTree,
+	type GitRunner,
 	planUndo,
 	recordTurn,
 	removeTurnRefs,
+	runGit,
 	type TurnSnapshotRow,
+	undoPlanNotes,
 } from "../src/ops/turn-snapshot";
 import { openStore, type Store } from "../src/store/db";
 import { git, makeRepo } from "./helpers/git-fixtures";
@@ -29,7 +42,7 @@ const clock = { now: () => 1_000_000 };
 
 function newStore(): Store {
 	const dir = mkdtempSync(join(tmpdir(), "ompbot-turn-store-"));
-	const store = openStore({ path: join(dir, "ompbot.db"), clock, redact: (text) => text });
+	const store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact: (text) => text });
 	stores.push(store);
 	return store;
 }
@@ -101,6 +114,41 @@ describe("captureTree (AC-1)", () => {
 		expect(listing).toContain("100755 ");
 		expect(listing).toContain("run.sh");
 		expect(listing).not.toContain("README.md");
+	});
+
+	test("TMPDIR equal to the repository root keeps the temporary index outside it (J-14)", async () => {
+		const repo = makeRepo(repos);
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = repo;
+		try {
+			const first = await captureTree(repo);
+			const second = await captureTree(repo);
+			expect(second.tree).toBe(first.tree);
+			expect(git(repo, "ls-tree", "-r", "--name-only", first.tree)).not.toContain("ompbot-turn-index-");
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+		}
+	});
+});
+
+describe("symlink undo (J-15)", () => {
+	test("a turn that only retargets a symlink reverts it instead of calling it a conflict", async () => {
+		const repo = makeRepo(repos);
+		writeFileSync(join(repo, "a.txt"), "a\n");
+		writeFileSync(join(repo, "b.txt"), "b\n");
+		symlinkSync("a.txt", join(repo, "link"));
+		git(repo, "add", "--", "a.txt", "b.txt", "link");
+		git(repo, "commit", "-q", "-m", "link");
+		const before = await captureTree(repo);
+		rmSync(join(repo, "link"));
+		symlinkSync("b.txt", join(repo, "link"));
+		const after = await captureTree(repo);
+
+		const plan = await planUndo({ row: rowOf({ before, after }) });
+		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([["link", "revert"]]);
+		await applyUndo(plan);
+		expect(readlinkSync(join(repo, "link"))).toBe("a.txt");
 	});
 });
 
@@ -195,6 +243,41 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		expect(aPlan.files.map((file) => [file.path, file.kind])).toEqual([["foo.txt", "overlap"]]);
 	});
 
+	test("an overlapping turn whose paths cannot be read makes every file of the repository an overlap (#94)", async () => {
+		const repo = makeRepo(repos);
+		const base = await captureTree(repo);
+		writeFileSync(join(repo, "foo.txt"), "foo\n");
+		const aAfter = await captureTree(repo);
+		writeFileSync(join(repo, "bar.txt"), "bar\n");
+		const bAfter = await captureTree(repo);
+		const a = rowOf(
+			{ before: base, after: aAfter },
+			{ id: 1, originKey: "slack/dm/DA", startedAt: 1000, endedAt: 2000 },
+		);
+		const b = rowOf(
+			{ before: base, after: bAfter },
+			{ id: 2, originKey: "slack/dm/DB", startedAt: 1500, endedAt: 3000 },
+		);
+		// Only the other row's diff fails; the row's own diff and tree listings still work.
+		const failing: GitRunner = async (dir, args, options) => {
+			if (args[0] === "diff" && args.includes(aAfter.tree))
+				return { code: 128, stdout: "", stderr: "fatal: bad object" };
+			return runGit(dir, args, options);
+		};
+
+		const plan = await planUndo({ row: b, others: [a], run: failing });
+		expect(plan.files.map((file) => [file.path, file.kind]).sort()).toEqual([
+			["bar.txt", "overlap"],
+			["foo.txt", "overlap"],
+		]);
+		expect(plan.files.filter((file) => file.kind === "revert")).toHaveLength(0);
+		await applyUndo(plan);
+		expect(readFileSync(join(repo, "bar.txt"), "utf8")).toBe("bar\n");
+
+		expect(plan.overlapFailed).toContain("bad object");
+		expect(undoPlanNotes(plan).join("\n")).toContain(`겹침 확인 실패: ${repo}`);
+	});
+
 	test("sequential turns (A then B) do not mix: B's plan holds only B's file", async () => {
 		const repo = makeRepo(repos);
 		const base = await captureTree(repo);
@@ -216,6 +299,51 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([["bar.txt", "revert"]]);
 	});
 
+	test("a nested repository (gitlink) the turn moved is a conflict; the undo finishes and keeps it (#46)", async () => {
+		const repo = makeRepo(repos);
+		const inner = join(repo, "vendor", "dep");
+		mkdirSync(inner, { recursive: true });
+		git(inner, "init", "-q");
+		writeFileSync(join(inner, "f.txt"), "one\n");
+		git(inner, "add", "f.txt");
+		git(inner, "commit", "-q", "-m", "one");
+		writeFileSync(join(repo, "mod.txt"), "one\n");
+		const before = await captureTree(repo);
+
+		writeFileSync(join(inner, "f.txt"), "two\n");
+		git(inner, "commit", "-qam", "two");
+		writeFileSync(join(repo, "mod.txt"), "two\n");
+		const after = await captureTree(repo);
+
+		const plan = await planUndo({ row: rowOf({ before, after }) });
+		expect(plan.files.map((file) => [file.path, file.kind]).sort()).toEqual([
+			["mod.txt", "revert"],
+			["vendor/dep", "conflict"],
+		]);
+		expect(await applyUndo(plan)).toEqual({ reverted: 1, conflicts: [] });
+		expect(readFileSync(join(repo, "mod.txt"), "utf8")).toBe("one\n");
+		expect(readFileSync(join(inner, "f.txt"), "utf8")).toBe("two\n");
+	});
+
+	test("a revert that would delete a directory leaves it and reports it as a conflict instead of throwing", async () => {
+		const repo = makeRepo(repos);
+		const before = await captureTree(repo);
+		mkdirSync(join(repo, "dir"));
+		writeFileSync(join(repo, "dir", "keep.txt"), "keep\n");
+		writeFileSync(join(repo, "made.txt"), "made\n");
+		const result = await applyUndo({
+			repo,
+			source: before.tree,
+			files: [
+				{ path: "dir", kind: "revert" },
+				{ path: "made.txt", kind: "revert" },
+			],
+		});
+		expect(result).toEqual({ reverted: 1, conflicts: ["dir"] });
+		expect(readFileSync(join(repo, "dir", "keep.txt"), "utf8")).toBe("keep\n");
+		expect(existsSync(join(repo, "made.txt"))).toBe(false);
+	});
+
 	test("a turn that committed touches no file and answers with the revert advice", async () => {
 		const repo = makeRepo(repos);
 		const before = await captureTree(repo);
@@ -231,6 +359,25 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		expect(plan.files).toEqual([]);
 		await applyUndo(plan);
 		expect(readFileSync(join(repo, "committed.txt"), "utf8")).toBe("x\n");
+	});
+
+	test("a file named like pathspec magic is restored alone; other uncommitted changes stay (qa-d M-1)", async () => {
+		const repo = makeRepo(repos);
+		const magic = ":(glob)**";
+		writeFileSync(join(repo, "a.txt"), "base-a\n");
+		writeFileSync(join(repo, magic), "base-magic\n");
+		git(repo, "--literal-pathspecs", "add", "--", "a.txt", magic);
+		git(repo, "commit", "-q", "-m", "magic name");
+		const before = await captureTree(repo);
+		writeFileSync(join(repo, magic), "turn\n");
+		const after = await captureTree(repo);
+		writeFileSync(join(repo, "a.txt"), "USER\n");
+
+		const plan = await planUndo({ row: rowOf({ before, after }) });
+		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([[magic, "revert"]]);
+		await applyUndo(plan);
+		expect(readFileSync(join(repo, magic), "utf8")).toBe("base-magic\n");
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("USER\n");
 	});
 });
 
@@ -302,7 +449,12 @@ describe("ledger retention and refs (AC-4)", () => {
 		const dbPath = join(home, "ompbot.db");
 		const now = 1_700_000_000_000;
 		const day = 24 * 60 * 60 * 1000;
-		const store = openStore({ path: dbPath, clock: { now: () => now }, redact: (text) => text });
+		const store = openStore({
+			timezone: "Asia/Seoul",
+			path: dbPath,
+			clock: { now: () => now },
+			redact: (text) => text,
+		});
 		const base = await captureTree(repo);
 		writeFileSync(join(repo, "x.txt"), "x\n");
 		const after = await captureTree(repo);
@@ -327,9 +479,19 @@ describe("ledger retention and refs (AC-4)", () => {
 		const freshId = await record(1);
 		store.close();
 
+		// A dry run counts what a real run would release and changes nothing (J-12).
+		const dry = gcSessions({ homeDir: home, retentionDays: 30, now, dryRun: true });
+		expect(dry.turnSnapshotsRemoved).toBe(1);
+		expect(git(repo, "for-each-ref", "--format=%(refname)", "refs/ompbot/turns").split("\n")).toHaveLength(4);
+
 		const result = gcSessions({ homeDir: home, retentionDays: 30, now });
 		expect(result.turnSnapshotsRemoved).toBe(1);
-		const reopened = openStore({ path: dbPath, clock: { now: () => now }, redact: (text) => text });
+		const reopened = openStore({
+			timezone: "Asia/Seoul",
+			path: dbPath,
+			clock: { now: () => now },
+			redact: (text) => text,
+		});
 		stores.push(reopened);
 		const kept = reopened.listTurnSnapshots({ originKey: "slack/dm/D1" });
 		expect(kept.map((row) => row.id)).toEqual([freshId]);

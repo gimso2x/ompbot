@@ -10,26 +10,36 @@ export interface HealedSessionModel {
 	to: string;
 }
 
+/** A session file as omp's listing sorts it. */
+export interface ListedSession {
+	mtimeMs: number;
+	createdMs: number;
+	name: string;
+}
+
 /**
- * The session file omp resumes for a session dir: the newest `*.jsonl` by omp's own listing order — mtime
- * descending, then creation time descending, then path ascending (pi-coding-agent dist session listing sort;
- * its `open_session` resumes the first non-empty session of that order). ompbot keeps one active session per
- * epoch dir, so the newest file is the resumed one.
+ * Whether `a` lists before `b` in omp's own session listing order — mtime descending, then creation time descending,
+ * then path descending (pi-coding-agent dist session listing sort `t.path.localeCompare(e.path)`; its `open_session`
+ * resumes the first non-empty session of that order).
+ */
+export function listsBefore(a: ListedSession, b: ListedSession): boolean {
+	if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs > b.mtimeMs;
+	if (a.createdMs !== b.createdMs) return a.createdMs > b.createdMs;
+	return a.name.localeCompare(b.name) > 0;
+}
+
+/**
+ * The session file omp resumes for a session dir: the first `*.jsonl` of {@link listsBefore}. ompbot keeps one active
+ * session per epoch dir, so the newest file is the resumed one.
  */
 export function newestSessionFile(sessionDir: string): string | undefined {
-	let newest: { file: string; mtimeMs: number; createdMs: number; name: string } | undefined;
+	let newest: (ListedSession & { file: string }) | undefined;
 	for (const name of readdirSync(sessionDir)) {
 		if (!name.endsWith(".jsonl")) continue;
 		const file = join(sessionDir, name);
 		const { mtimeMs, birthtimeMs } = statSync(file);
-		if (
-			newest === undefined ||
-			mtimeMs > newest.mtimeMs ||
-			(mtimeMs === newest.mtimeMs &&
-				(birthtimeMs > newest.createdMs || (birthtimeMs === newest.createdMs && name.localeCompare(newest.name) < 0)))
-		) {
-			newest = { file, mtimeMs, createdMs: birthtimeMs, name };
-		}
+		const listed = { file, mtimeMs, createdMs: birthtimeMs, name };
+		if (newest === undefined || listsBefore(listed, newest)) newest = listed;
 	}
 	return newest?.file;
 }

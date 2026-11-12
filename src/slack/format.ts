@@ -1,5 +1,12 @@
-import { type CardElement, splitCards } from "../channel/card";
-import { CHUNK_LIMIT, chunkText, cutCodePointSafe, FENCE_RESERVE, REDELIVERED_PREFIX } from "../channel/text";
+import { CARD_TONE_COLORS, type CardElement, type CardTone, splitCards } from "../channel/card";
+import {
+	CHUNK_LIMIT,
+	chunkText,
+	cutCodePointSafe,
+	displayWidth,
+	FENCE_RESERVE,
+	REDELIVERED_PREFIX,
+} from "../channel/text";
 import { CARD_MAX_BLOCKS, cardFallbackText, cardToBlocks, parseCard, type SlackBlock } from "./card";
 
 /** Markdown -> Slack mrkdwn. Fenced blocks pass through untouched; GFM tables become fixed-width fenced blocks. */
@@ -7,8 +14,32 @@ export function toMrkdwn(markdown: string): string {
 	// Only fences are split here: a table row carrying code spans stays one prose segment, so the
 	// table detector below sees whole lines (code spans themselves are masked inside convertProse). A last fence that
 	// never closes is code to the end too: `chunkText` closes it, so converting its body would show altered code.
-	const parts = markdown.split(/(```[\s\S]*?(?:```|$))/g);
+	const parts = splitFences(markdown);
 	return parts.map((part, i) => (i % 2 === 1 ? part : convertProse(part))).join("");
+}
+
+/** A line opening a fence: up to 3 spaces, a run of 3+ backticks, an info string without backticks. */
+const FENCE_OPEN = /^ {0,3}(`{3,})[^`\n]*$/gm;
+
+/**
+ * `text` cut into prose and code, code at odd indexes. A fence opens on a line starting with a run of 3+ backticks and
+ * closes only on a line holding a run at least as long (else at the end), so a ```` fence may quote a ``` one.
+ * Inside prose, a mid-line ``` still opens code up to the next ``` (or the end of that prose).
+ */
+function splitFences(text: string): string[] {
+	const parts: string[] = [];
+	let prose = 0;
+	FENCE_OPEN.lastIndex = 0;
+	for (let open = FENCE_OPEN.exec(text); open !== null; open = FENCE_OPEN.exec(text)) {
+		const run = open[1]?.length ?? 3;
+		const close = new RegExp(`^ {0,3}\`{${run},}[ \\t]*$`, "m").exec(text.slice(open.index + open[0].length + 1));
+		const end = close === null ? text.length : open.index + open[0].length + 1 + close.index + close[0].length;
+		parts.push(...text.slice(prose, open.index).split(/(```[\s\S]*?(?:```|$))/g), text.slice(open.index, end));
+		prose = end;
+		FENCE_OPEN.lastIndex = end;
+	}
+	parts.push(...text.slice(prose).split(/(```[\s\S]*?(?:```|$))/g));
+	return parts;
 }
 
 const CODE_SPAN = /`[^`\n]+`/g;
@@ -22,10 +53,14 @@ const LINK_PLACEHOLDER = /\uE000(\d+)\uE000/g;
 function convertProse(text: string): string {
 	const spans: string[] = [];
 	const links: string[] = [];
+	// The input's own sentinel characters would be read back as placeholders (dropping or swapping text): drop them.
 	const masked = text
+		.replace(/[\uE000\uE001]/g, "")
 		.replace(CODE_SPAN, (span) => `\uE001${spans.push(span) - 1}\uE001`)
 		.replace(LINK, (_m, label: string, url: string) => {
-			links.push(`<${url}|${label.replace(/[<>|]/g, "")}>`);
+			links.push(
+				`<${url.replace(/\|/g, "%7C").replace(/</g, "%3C").replace(/>/g, "%3E")}|${label.replace(/[<>|]/g, "")}>`,
+			);
 			return `\uE000${links.length - 1}\uE000`;
 		})
 		// Only well-formed user mentions stay live Slack tokens; every other `<...>` is still escaped below.
@@ -159,30 +194,6 @@ function tableSpans(text: string): Array<readonly [number, number]> {
 	return spans;
 }
 
-/** Terminal-style width: East Asian wide/fullwidth and emoji count as 2 columns, everything else as 1. */
-function displayWidth(text: string): number {
-	let width = 0;
-	for (const ch of text) {
-		const cp = ch.codePointAt(0) ?? 0;
-		const wide =
-			(cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
-			(cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals and symbols
-			(cp >= 0x3041 && cp <= 0x33ff) || // Kana, CJK compatibility
-			(cp >= 0x3400 && cp <= 0x4dbf) || // CJK extension A
-			(cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
-			(cp >= 0xa960 && cp <= 0xa97f) || // Hangul Jamo extended-A
-			(cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
-			(cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
-			(cp >= 0xfe30 && cp <= 0xfe6f) || // CJK compatibility forms
-			(cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
-			(cp >= 0xffe0 && cp <= 0xffe6) ||
-			(cp >= 0x1f300 && cp <= 0x1f9ff) || // emoji
-			(cp >= 0x20000 && cp <= 0x3fffd); // CJK extension B and beyond
-		width += wide ? 2 : 1;
-	}
-	return width;
-}
-
 function padCell(text: string, width: number, align: ColumnAlign): string {
 	const gap = width - displayWidth(text);
 	if (gap <= 0) return text;
@@ -253,14 +264,28 @@ export type AnswerBlock =
 export interface MarkdownPart {
 	/** mrkdwn fallback for notifications. */
 	text: string;
+	/** A card with a `tone`: the same blocks without the colour bar, sent only when Slack refuses the attachment. */
 	blocks: ReadonlyArray<AnswerBlock | SlackBlock>;
+	/** A card with a `tone`: one attachment of its colour holding the part's blocks, sent instead of top-level blocks. */
+	attachments?: ReadonlyArray<SlackAttachment>;
 	/** Set on a card part: what its sender falls back to when Slack refuses the card's blocks. */
 	card?: CardFallback;
 }
 
+/** A legacy attachment carrying Block Kit blocks: `color` draws the bar on the message's left edge. */
+export interface SlackAttachment {
+	color: string;
+	blocks: ReadonlyArray<AnswerBlock | SlackBlock>;
+	/** Notification text; set when sent, since the message's own `text` stays empty (Slack would show it above). */
+	fallback?: string;
+}
+
 /** A card part's fallbacks, decorated like the part (redelivered, 🔔, footer). */
 export interface CardFallback {
-	/** The same card with every chart as an ASCII code block; only when the card has a chart drawn natively. */
+	/**
+	 * The same card with every chart as an ASCII code block; only when the card has a chart drawn natively. A card with
+	 * a `tone` sends them inside an attachment of the part's colour.
+	 */
 	asciiBlocks?: ReadonlyArray<AnswerBlock | SlackBlock>;
 	/** The card fence's source as a code block, without blocks. */
 	text: string;
@@ -269,7 +294,9 @@ export interface CardFallback {
 /** `renderMarkdownParts`' result; `cardIssues` lists why card fences stayed text (`card <n>: <issue>`). */
 export type MarkdownParts = MarkdownPart[] & { cardIssues?: readonly string[] };
 
-type Piece = { kind: "text"; text: string } | { kind: "card"; card: CardElement; blocks: SlackBlock[]; raw: string };
+type Piece =
+	| { kind: "text"; text: string }
+	| { kind: "card"; card: CardElement; blocks: SlackBlock[]; raw: string; tone?: CardTone };
 
 /**
  * `content` as text and validated card pieces; a card that fails validation stays in the text around it, its issues
@@ -308,7 +335,13 @@ function cardPieces(content: string, charts: boolean, headed: boolean, issues: s
 			continue;
 		}
 		flush();
-		pieces.push({ kind: "card", card: parsed.card, blocks: parsed.blocks, raw: segment.raw });
+		pieces.push({
+			kind: "card",
+			card: parsed.card,
+			blocks: parsed.blocks,
+			raw: segment.raw,
+			...(parsed.tone === undefined ? {} : { tone: parsed.tone }),
+		});
 	}
 	flush();
 	return pieces.some((piece) => piece.kind === "card") ? pieces : undefined;
@@ -349,8 +382,7 @@ function readableToken(token: string, names: MentionNames): string {
 
 /** Every live token outside code (fences, inline code spans) replaced by `swap(token)`; code stays byte for byte. */
 function swapTokensOutsideCode(markdown: string, swap: (token: string) => string): string {
-	return markdown
-		.split(/(```[\s\S]*?(?:```|$))/g)
+	return splitFences(markdown)
 		.map((part, i) =>
 			i % 2 === 1
 				? part
@@ -414,7 +446,8 @@ const NO_NAMES: MentionNames = { ownerUserId: "", peerBots: [] };
  * the first message's header block instead of a markdown line.
  * With `cards`, each validated ` ```card ` fence (see `splitCards`) becomes a message of its own in place: the card's
  * Block Kit blocks with `cardFallbackText` as `text`; the redelivered block, `🔔` line and footer still go to the first
- * and last messages, after the card's blocks. A fence that fails validation stays text, its issues in `cardIssues`.
+ * and last messages, after the card's blocks. A card with a `tone` also gets `attachments`: one of its colour holding
+ * those same blocks. A fence that fails validation stays text, its issues in `cardIssues`.
  * `charts: false` draws card charts as ASCII code blocks. Without a valid card the result equals `cards: false`.
  * `undefined` when the plain path (`renderParts`) must carry it: an empty body, or a table longer than one message.
  */
@@ -476,12 +509,14 @@ export function renderMarkdownParts(
 		const title = i === 0 && titled !== undefined ? `${titled.line}\n` : "";
 		if (piece.kind === "card") {
 			const titleText = title === "" ? "" : toMrkdwn(title);
+			const blocks = [...head(i), ...piece.blocks, ...tail(i)];
 			return {
 				text: cutCodePointSafe(
 					`${i === 0 ? prefix : ""}${titleText}${cardFallbackText(piece.card)}`,
 					MARKDOWN_TEXT_LIMIT,
 				),
-				blocks: [...head(i), ...piece.blocks, ...tail(i)],
+				blocks,
+				...(piece.tone === undefined ? {} : { attachments: [{ color: CARD_TONE_COLORS[piece.tone], blocks }] }),
 				card: {
 					...(charts && piece.blocks.some((block) => block.type === "data_visualization")
 						? { asciiBlocks: [...head(i), ...cardToBlocks(piece.card, { charts: false }), ...tail(i)] }

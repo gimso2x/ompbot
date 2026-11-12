@@ -22,7 +22,10 @@ const base = {
 };
 
 function ledgerAt(now: { ms: number }): TaskLedger {
-	return new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => now.ms } });
+	return new TaskLedger(new Database(":memory:", { strict: true }), {
+		timezone: "Asia/Seoul",
+		clock: { now: () => now.ms },
+	});
 }
 
 describe("TaskLedger", () => {
@@ -111,7 +114,7 @@ describe("TaskLedger", () => {
 
 	test("a failed history insert rolls the status change back", () => {
 		const db = new Database(":memory:", { strict: true });
-		const ledger = new TaskLedger(db, { clock: { now: () => 1 } });
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 1 } });
 		const row = ledger.register(base);
 		db.run("CREATE TRIGGER fail_history BEFORE INSERT ON task_transitions BEGIN SELECT RAISE(ABORT, 'injected'); END");
 		expect(() => ledger.transition(row.taskId, "review", "bot")).toThrow("injected");
@@ -122,7 +125,7 @@ describe("TaskLedger", () => {
 	test("discard drops the history lines too, with foreign keys on", () => {
 		const db = new Database(":memory:", { strict: true });
 		db.run("PRAGMA foreign_keys = ON");
-		const ledger = new TaskLedger(db, { clock: { now: () => 1 } });
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 1 } });
 		const row = ledger.register(base);
 		ledger.discard(row.taskId);
 		expect(ledger.get(row.taskId)).toBeUndefined();
@@ -139,7 +142,7 @@ describe("TaskLedger", () => {
 		const before = db.query("SELECT * FROM tasks").all();
 		migrateTaskSchema(db);
 		expect(db.query("SELECT * FROM tasks").all()).toEqual(before);
-		const ledger = new TaskLedger(db, { clock: { now: () => 7 } });
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 7 } });
 		expect(ledger.history("T-20261001-01")).toEqual([]);
 		ledger.transition("T-20261001-01", "working", "bot", "resume dispatch");
 		expect(ledger.history("T-20261001-01").map((h) => [h.fromStatus, h.toStatus])).toEqual([["review", "working"]]);
@@ -422,7 +425,10 @@ describe("host ops (fake runner)", () => {
 
 describe("evaluateTask", () => {
 	test("reads the three docs through the host; an unreadable host is a failed evaluation", async () => {
-		const row = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => 1 } }).register(base);
+		const row = new TaskLedger(new Database(":memory:", { strict: true }), {
+			timezone: "Asia/Seoul",
+			clock: { now: () => 1 },
+		}).register(base);
 		const dir = docsDirOf(row.worktree, row.taskId);
 		const meta = {
 			taskId: row.taskId,
@@ -433,6 +439,7 @@ describe("evaluateTask", () => {
 			agent: row.agent,
 			threadLink: "x",
 			registeredAt: 1,
+			timezone: "Asia/Seoul",
 		};
 		const files: Record<string, string> = {
 			[`${dir}/spec.md`]: renderSpec(
@@ -440,7 +447,7 @@ describe("evaluateTask", () => {
 				{ title: "t", risk: "L2", goal: "g", scope: [], exclusions: [], acceptance: [], repo: row.repo },
 				row.acceptance,
 			),
-			[`${dir}/PROGRESS.md`]: renderProgress(row.taskId, 1),
+			[`${dir}/PROGRESS.md`]: renderProgress(row.taskId, 1, "Asia/Seoul"),
 			[`${dir}/outcome.md`]: renderOutcome(row.taskId),
 		};
 		const ops = createTaskHostOps({
@@ -468,7 +475,7 @@ describe("ompbot tasks (CLI)", () => {
 	});
 
 	test("list / show / close round trip; close is the only way to done", async () => {
-		const ledger = openTaskLedger(join(home.dir, "ompbot.db"));
+		const ledger = openTaskLedger(join(home.dir, "ompbot.db"), "Asia/Seoul");
 		const row = ledger.register({ ...base, repo: join(home.dir, "repo") });
 		ledger.close();
 

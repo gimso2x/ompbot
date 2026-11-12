@@ -162,7 +162,7 @@ export function readSessionConversation(file: string, before?: string): Extract<
 	);
 
 	const toolPart = (call: Json): ConversationPart => {
-		const name = typeof call.name === "string" ? call.name : "tool";
+		const name = typeof call.name === "string" ? redact(call.name) : "tool";
 		const args = isRecord(call.arguments) ? call.arguments : {};
 		// omp records the intent beside the args (`intent`); older records only have it as the `i` argument.
 		const intent =

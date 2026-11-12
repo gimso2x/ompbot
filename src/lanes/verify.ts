@@ -41,26 +41,53 @@ function gitEnv(): Record<string, string> {
 export const gitRunner =
 	(timeoutMs: number): GitRunner =>
 	async (args) => {
+		let timer: Timer | undefined;
 		try {
 			const proc = Bun.spawn(["git", "-c", "core.fsmonitor=false", ...args], {
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
-				timeout: timeoutMs,
+				// Its own process group: a timeout ends git and what it started (an external diff, a textconv, a hook) too,
+				// which would otherwise hold the pipes open past the deadline (qa-d M-3).
+				detached: true,
 				// `git status` must not rewrite the index of a repository somebody is working in.
 				env: gitEnv(),
 			});
-			const [stdout, stderr, code] = await Promise.all([
-				new Response(proc.stdout).text(),
-				new Response(proc.stderr).text(),
-				proc.exited,
+			const out = proc.stdout.getReader();
+			const err = proc.stderr.getReader();
+			const timedOut = Promise.withResolvers<never>();
+			timer = setTimeout(() => {
+				try {
+					process.kill(-proc.pid, "SIGKILL");
+				} catch {
+					proc.kill("SIGKILL");
+				}
+				for (const reader of [out, err]) reader.cancel().catch(() => undefined);
+				timedOut.reject(new Error(`git timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
+			const [stdout, stderr, code] = await Promise.race([
+				Promise.all([readText(out), readText(err), proc.exited]),
+				timedOut.promise,
 			]);
 			if (proc.signalCode !== null) throw new Error(`git killed by ${proc.signalCode}`);
 			return { code, stdout, stderr };
 		} catch (error) {
 			throw new VerifyUnavailableError(error instanceof Error ? error.message : String(error));
+		} finally {
+			clearTimeout(timer);
 		}
 	};
+
+/** All of a pipe as text; a cancelled reader ends it early with what was read. */
+async function readText(reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> }): Promise<string> {
+	const decoder = new TextDecoder();
+	let text = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return text + decoder.decode();
+		text += decoder.decode(value, { stream: true });
+	}
+}
 
 export const defaultGit: GitRunner = gitRunner(GIT_TIMEOUT_MS);
 

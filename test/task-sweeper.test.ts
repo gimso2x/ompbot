@@ -4,19 +4,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
+import { previewLine } from "../src/dashboard/snapshot";
 import { type HerdrAgentStatusResult, realProcessRunner, setLocalHerdrBin } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
-import type { TaskJudgement } from "../src/tasks/checker";
+import { HERDR_PROMPT_PREVIEW_CHARS } from "../src/store/db";
+import { checkTask, type TaskJudgement } from "../src/tasks/checker";
 import { resumeTask, type TaskDispatchDeps } from "../src/tasks/dispatch";
 import {
 	acceptanceItems,
 	docsDirOf,
-	formatKst,
 	renderContext,
 	renderOutcome,
 	renderProgress,
@@ -27,6 +27,9 @@ import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { formatAgentWaitingNotice, NUDGE_MAX } from "../src/tasks/notify";
 import { restatedHash } from "../src/tasks/resume-check";
 import {
+	BLOCK_RETRY_HEAD,
+	BLOCK_RETRY_MAX,
+	BLOCK_RETRY_WAIT_MS,
 	READ_FAILURE_NOTICE_AFTER,
 	REVIEW_REALERT_MS,
 	STALE_NOTICE_MS,
@@ -36,10 +39,12 @@ import {
 	TaskSweeper,
 	taskChangedPaths,
 } from "../src/tasks/sweeper";
+import { localIso } from "../src/time";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
 import { killSpawned, runMain } from "./helpers/daemon-process";
 import { git as gitFixture } from "./helpers/git-fixtures";
+import { type FakeCall, FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const T0 = Date.parse("2026-10-26T06:00:00Z");
 const MIN = 60_000;
@@ -53,11 +58,12 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		stepsDone: 0,
 		stepsTotal: 1,
 		status: "working",
-		updatedAt: formatKst(T0),
+		updatedAt: localIso(T0, "Asia/Seoul"),
 		updatedAtMs: T0,
 		specChanged: false,
 		specKey: "spec1",
 		blocked: false,
+		needsOwner: false,
 		blockedReason: "",
 		decision: { question: "", recommend: "", impact: "" },
 		current: "S1",
@@ -97,6 +103,7 @@ async function reachedCard(over: Partial<TaskJudgement> = {}): Promise<string> {
 interface Rig {
 	sweeper: TaskSweeper;
 	ledger: TaskLedger;
+	db: Database;
 	transport: FakeSlackTransport;
 	clock: { ms: number };
 	row: TaskRow;
@@ -119,7 +126,8 @@ function rig(
 	task: Partial<Pick<TaskRow, "host" | "risk">> = {},
 ): Rig {
 	const clock = { ms: T0 };
-	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => clock.ms } });
+	const db = new Database(":memory:", { strict: true });
+	const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => clock.ms } });
 	const row = ledger.register({
 		title: "로그 회전",
 		risk: task.risk ?? "L2",
@@ -166,6 +174,7 @@ function rig(
 	return {
 		sweeper: new TaskSweeper(deps),
 		ledger,
+		db,
 		transport,
 		clock,
 		row,
@@ -331,7 +340,13 @@ describe("TaskSweeper", () => {
 		const r = rig();
 		r.next.value = {
 			ok: true,
-			judgement: judgement({ blocked: true, status: "blocked", blockedReason: "토큰 없음", current: "S2" }),
+			judgement: judgement({
+				blocked: true,
+				needsOwner: true,
+				status: "blocked",
+				blockedReason: "토큰 없음",
+				current: "S2",
+			}),
 		};
 		await r.sweeper.sweep();
 		await r.sweeper.sweep();
@@ -353,7 +368,7 @@ describe("TaskSweeper", () => {
 		expect(r.ledger.require(r.row.taskId).status).toBe("working");
 		expect(added(r)).toEqual(["construction", "hourglass_flowing_sand"]);
 		// A different reason reports again.
-		r.next.value = { ok: true, judgement: judgement({ blocked: true, blockedReason: "다른 사유" }) };
+		r.next.value = { ok: true, judgement: judgement({ blocked: true, needsOwner: true, blockedReason: "다른 사유" }) };
 		await r.sweeper.sweep();
 		expect(posts(r)).toHaveLength(2);
 		// Each sweep move is one history line carrying the PROGRESS reason.
@@ -369,7 +384,10 @@ describe("TaskSweeper", () => {
 		const r = rig();
 		for (const blockedReason of ["토큰 없음", ""]) {
 			const before = posts(r).length;
-			r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked", blockedReason }) };
+			r.next.value = {
+				ok: true,
+				judgement: judgement({ blocked: true, needsOwner: true, status: "blocked", blockedReason }),
+			};
 			await r.sweeper.sweep();
 			await r.sweeper.sweep();
 			expect(posts(r)).toHaveLength(before + 1);
@@ -377,7 +395,10 @@ describe("TaskSweeper", () => {
 			r.next.value = { ok: true, judgement: judgement() };
 			await r.sweeper.sweep();
 			expect(r.ledger.require(r.row.taskId).status).toBe("working");
-			r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked", blockedReason }) };
+			r.next.value = {
+				ok: true,
+				judgement: judgement({ blocked: true, needsOwner: true, status: "blocked", blockedReason }),
+			};
 			await r.sweeper.sweep();
 			await r.sweeper.sweep();
 			expect(posts(r)).toHaveLength(before + 2);
@@ -388,7 +409,7 @@ describe("TaskSweeper", () => {
 
 	test("blocked without a written reason is recorded as the PROGRESS status", async () => {
 		const r = rig();
-		r.next.value = { ok: true, judgement: judgement({ blocked: true, status: "blocked" }) };
+		r.next.value = { ok: true, judgement: judgement({ blocked: true, needsOwner: true, status: "blocked" }) };
 		await r.sweeper.sweep();
 		expect(r.ledger.history(r.row.taskId).at(-1)).toMatchObject({
 			toStatus: "blocked",
@@ -402,6 +423,7 @@ describe("TaskSweeper", () => {
 			ok: true,
 			judgement: judgement({
 				blocked: true,
+				needsOwner: true,
 				status: "blocked",
 				blockedReason: "push 승인 필요",
 				decision: { question: "origin에 push할까요?", recommend: "push 후 CI 확인", impact: "CI가 처음 돈다" },
@@ -509,7 +531,10 @@ describe("TaskSweeper", () => {
 		await r.sweeper.sweep();
 		expect(r.reminders).toHaveLength(1);
 
-		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: r.clock.ms, updatedAt: formatKst(r.clock.ms) }) };
+		r.next.value = {
+			ok: true,
+			judgement: judgement({ updatedAtMs: r.clock.ms, updatedAt: localIso(r.clock.ms, "Asia/Seoul") }),
+		};
 		r.clock.ms += 29 * MIN;
 		await r.sweeper.sweep();
 		expect(r.reminders).toHaveLength(1);
@@ -520,7 +545,10 @@ describe("TaskSweeper", () => {
 		const r = rig();
 		r.clock.ms = T0 + 10 * MIN;
 		const written = r.clock.ms + 3 * MIN;
-		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: written, updatedAt: formatKst(written) }) };
+		r.next.value = {
+			ok: true,
+			judgement: judgement({ updatedAtMs: written, updatedAt: localIso(written, "Asia/Seoul") }),
+		};
 		await r.sweeper.sweep();
 		expect(r.ledger.require(r.row.taskId).progressAt).toBe(T0 + 10 * MIN);
 
@@ -1000,6 +1028,7 @@ describe("TaskSweeper", () => {
 		const herdr: string[][] = [];
 		const dispatch: TaskDispatchDeps = {
 			ledger: r.ledger,
+			timezone: "Asia/Seoul",
 			originKey: "slack/ch/C1/t/100.1",
 			threadRef: () => "C1:100.1",
 			rootText: () => undefined,
@@ -1127,6 +1156,76 @@ describe("TaskSweeper", () => {
 		expect(await r.sweeper.syncReaction(r.row.taskId)).toBe(true);
 		expect(added(r)).toEqual(["white_check_mark"]);
 		expect(await r.sweeper.syncReaction("T-19990101-01")).toBe(false);
+	});
+});
+
+describe("TaskSweeper: worker prose with a secret never reaches the ledger or the cards", () => {
+	// Fake token shapes only, built at run time.
+	const SLACK = ["xoxb", "TEST", "0", "sweep"].join("-");
+	const GH = `ghp_${"T".repeat(36)}`;
+	const progress = (status: string) =>
+		[
+			"---",
+			"task: T-20261026-01",
+			`status: ${status}`,
+			`updated: ${localIso(T0, "Asia/Seoul")}`,
+			`current: S2 ${SLACK}`,
+			"next: 기다린다",
+			"needs_owner: yes",
+			`blocked_reason: 토큰 ${GH} 만료`,
+			`question: ${SLACK}를 바꿀까요?`,
+			`recommend: ${GH} 회전`,
+			`impact: ${SLACK} 무효`,
+			"---",
+			"# 단계",
+			"- [x] S1: 구현 | 완료 조건: 테스트 | 증거: commit abc1234",
+		].join("\n");
+	const spec = "---\ntask: T-20261026-01\n---\n# 수락기준\n- [x] AC-1: 하나\n- [x] AC-2: 둘\n";
+	const outcome = `## 요약\n- 토큰 ${GH} 회전을 마쳤습니다.\n- ${SLACK} 없이 5 pass.\n## AC-1\n- commit: abc1234 feat\n## AC-2\n- test: bun test → 5 pass\n`;
+	/** The judgement the evaluator builds from these documents (the real parsers, no fake judgement). */
+	const judged = (r: Rig, status: string) =>
+		checkTask({
+			snapshot: r.row.acceptance,
+			spec,
+			progress: progress(status),
+			outcome,
+			commitCheck: async () => "ok",
+		});
+	const leaked = (r: Rig): string[] => {
+		const { notices_json } = r.db.query("SELECT notices_json FROM tasks").get() as { notices_json: string };
+		const surfaces = [notices_json, JSON.stringify(r.ledger.history(r.row.taskId)), JSON.stringify(posts(r))];
+		return surfaces.filter((text) => text.includes(SLACK) || text.includes(GH));
+	};
+
+	test("AC-2b: a blocked reason and decision request with a token: notices_json, history and the blocked card are masked", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: await judged(r, "blocked") };
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(posts(r)).toHaveLength(1);
+		expect(leaked(r)).toEqual([]);
+		const lines = (posts(r)[0] as { text: string }).text.split("\n");
+		expect(lines).toContain("*사유*: 토큰 [REDACTED] 만료");
+		expect(lines).toContain("*질문*: [REDACTED]를 바꿀까요?");
+		expect(lines).toContain("*추천*: [REDACTED] 회전");
+		expect(lines).toContain("*영향*: [REDACTED] 무효");
+		expect(
+			Object.keys(r.ledger.require(r.row.taskId).notices).some((key) => key.endsWith(":토큰 [REDACTED] 만료")),
+		).toBe(true);
+	});
+
+	test("AC-2b: an outcome summary with a token: the reached card and notices_json are masked", async () => {
+		const r = rig();
+		const judgement = await judged(r, "working");
+		expect(judgement.reached).toBe(true);
+		r.next.value = { ok: true, judgement };
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("review");
+		expect(posts(r)).toHaveLength(1);
+		expect(leaked(r)).toEqual([]);
+		const text = (posts(r)[0] as { text: string }).text;
+		expect(text).toContain("• 토큰 [REDACTED] 회전을 마쳤습니다.");
+		expect(text).toContain("• [REDACTED] 없이 5 pass.");
 	});
 });
 
@@ -1343,9 +1442,12 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 	/** Every argv the daemon handed to herdr, and the agents its fake `agent list` reports (idle). */
 	let herdrCalls: string[][];
 	let herdrAgents: string[];
-	const clock = { now: () => Date.now() };
+	/** Added to the real time the daemon sees: moves a test past the staleness thresholds. */
+	let skew = 0;
+	const clock = { now: () => Date.now() + skew };
 
 	beforeEach(async () => {
+		skew = 0;
 		home = makeHome("ompbot-task-daemon-");
 		transport = new WaitingTransport();
 		worktreeRoot = mkdtempSync(join(tmpdir(), "ompbot-task-wt-"));
@@ -1414,6 +1516,7 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 			agent: row.agent,
 			threadLink: "x",
 			registeredAt: row.createdAt,
+			timezone: "Asia/Seoul",
 		};
 		const spec = {
 			title: "t",
@@ -1426,7 +1529,7 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 		};
 		const specText = renderSpec(meta, spec, acceptance);
 		writeFileSync(join(dir, "spec.md"), done ? specText.replace("- [ ]", "- [x]") : specText);
-		writeFileSync(join(dir, "PROGRESS.md"), renderProgress(row.taskId, Date.now()));
+		writeFileSync(join(dir, "PROGRESS.md"), renderProgress(row.taskId, Date.now(), "Asia/Seoul"));
 		writeFileSync(
 			join(dir, "outcome.md"),
 			done ? `${renderOutcome(row.taskId)}## AC-1\n- test: bun test → 5 pass\n` : renderOutcome(row.taskId),
@@ -1458,6 +1561,29 @@ describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
 		const count = transport.calls.length;
 		await daemon.sweepTasks();
 		expect(transport.calls).toHaveLength(count);
+	});
+
+	test("AC-5: a stale task's reminder that herdr took is kept as a remind prompt of its agent", async () => {
+		const row = registerWithDocs(false);
+		skew = STALE_REMIND_MS + 60_000;
+		await daemon.sweepTasks();
+		const sent = herdrCalls.find((cmd) => cmd[1] === "agent" && cmd[2] === "prompt" && cmd[3] === row.agent)?.[4];
+		expect(sent).toBeString();
+		const db = new Database(join(home.dir, "ompbot.db"), { readonly: true });
+		try {
+			const rows = db.query("SELECT host, agent, kind, preview, origin_key AS originKey FROM herdr_prompts").all();
+			expect(rows).toEqual([
+				{
+					host: "",
+					agent: row.agent,
+					kind: "remind",
+					preview: previewLine(sent ?? "", undefined, HERDR_PROMPT_PREVIEW_CHARS),
+					originKey: "slack/ch/C1",
+				},
+			]);
+		} finally {
+			db.close();
+		}
 	});
 
 	test("ompbot tasks check goes through the daemon; close is human-only and flips the reaction to ✅", async () => {
@@ -1621,7 +1747,10 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 
 	function overlapRig(): OverlapRig {
 		const clock = { ms: T0 };
-		const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => clock.ms } });
+		const ledger = new TaskLedger(new Database(":memory:", { strict: true }), {
+			timezone: "Asia/Seoul",
+			clock: { now: () => clock.ms },
+		});
 		const register = (threadTs: string, host: string | null = null) =>
 			ledger.register({
 				title: `작업 ${threadTs}`,
@@ -1971,5 +2100,272 @@ describe("TaskSweeper: the resumed agent's restated line", () => {
 		await r.sweeper.sweep();
 		expect(texts(r)).toEqual([MISSING]);
 		expect(r.ledger.require(r.row.taskId).notices).toHaveProperty(`restated-missing:${T0 + 10 * MIN}`);
+	});
+});
+
+describe("TaskSweeper: one retry prompt before a blocked card", () => {
+	const RETRIED = "*사유*: 토큰 없음 (재도전 1회 뒤)";
+	const blocked = (over: Partial<TaskJudgement> = {}): TaskEvaluation => ({
+		ok: true,
+		judgement: judgement({ blocked: true, status: "blocked", blockedReason: "토큰 없음", current: "S2", ...over }),
+	});
+	const retries = (r: Rig) => r.reminders.filter((text) => text.startsWith(BLOCK_RETRY_HEAD));
+	const marks = (r: Rig, prefix: string) =>
+		Object.keys(r.ledger.require(r.row.taskId).notices).filter((key) => key.startsWith(prefix));
+	const texts = (r: Rig) => posts(r).map((post) => ("text" in post ? post.text : ""));
+	/** A block seen at T0 + 5 min gets its retry prompt; herdr then says the agent is working on it. */
+	const retriedRig = async (): Promise<Rig> => {
+		const r = rig();
+		r.clock.ms = T0 + 5 * MIN;
+		r.next.value = blocked();
+		await r.sweeper.sweep();
+		expect(retries(r)).toHaveLength(1);
+		r.agent.value = { ok: true, status: "working" };
+		return r;
+	};
+	/** The block went to the owner in this sweep: blocked, 🚧, one card saying the retry came first. */
+	const expectRetriedCard = async (r: Rig) => {
+		const [result] = await r.sweeper.sweep();
+		expect(result?.actions).toContain("working → blocked, 🚧");
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(added(r)).toEqual(["construction"]);
+		expect(texts(r)).toHaveLength(1);
+		expect(texts(r)[0]?.split("\n")).toContain(RETRIED);
+		await r.sweeper.sweep();
+		expect(texts(r)).toHaveLength(1);
+		expect(added(r)).toEqual(["construction"]);
+		expect(retries(r)).toHaveLength(1);
+	};
+
+	test("AC-1: a first block sends exactly one retry prompt and nothing else; the same state again sends nothing", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "working" };
+		r.clock.ms = T0 + 5 * MIN;
+		r.next.value = blocked();
+		const [first] = await r.sweeper.sweep();
+		expect(first?.actions).toEqual(["block retry to agent"]);
+		expect(r.reminders).toEqual([`${BLOCK_RETRY_HEAD}\n- blocked_reason: 토큰 없음`]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+		expect(reactions(r)).toEqual([]);
+		expect(posts(r)).toEqual([]);
+		expect(marks(r, "blockretry:")).toEqual([`blockretry:${T0 + 5 * MIN}`]);
+		r.clock.ms += 5 * MIN;
+		const [second] = await r.sweeper.sweep();
+		expect(second?.actions).toEqual(["block retry pending"]);
+		expect(r.reminders).toHaveLength(1);
+		expect(posts(r)).toEqual([]);
+		expect(reactions(r)).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+	});
+
+	test("AC-2 (a): PROGRESS written after the retry with herdr idle → blocked, 🚧 and one card marked as retried", async () => {
+		const r = await retriedRig();
+		r.clock.ms += 5 * MIN;
+		r.next.value = blocked({ updatedAtMs: T0 + 8 * MIN });
+		r.agent.value = { ok: true, status: "idle" };
+		await expectRetriedCard(r);
+		// Written after the retry with herdr neither working nor stopped (unknown) is enough on its own; unwritten is not.
+		for (const [updatedAtMs, carded] of [
+			[T0, false],
+			[T0 + 8 * MIN, true],
+		] as const) {
+			const other = await retriedRig();
+			other.clock.ms += 5 * MIN;
+			other.next.value = blocked({ updatedAtMs });
+			other.agent.value = { ok: true, status: "unknown" };
+			await other.sweeper.sweep();
+			expect(posts(other)).toHaveLength(carded ? 1 : 0);
+		}
+	});
+
+	test("AC-2 (b): herdr gone or blocked → blocked, 🚧 and one card marked as retried", async () => {
+		for (const status of ["gone", "blocked"] as const) {
+			const r = await retriedRig();
+			r.clock.ms += 5 * MIN;
+			r.agent.value = { ok: true, status };
+			const [result] = await r.sweeper.sweep();
+			expect(result?.actions).toContain("working → blocked, 🚧");
+			expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+			expect(added(r)).toEqual(["construction"]);
+			expect(texts(r)).toHaveLength(1);
+			expect(texts(r)[0]?.split("\n")).toContain(RETRIED);
+			await r.sweeper.sweep();
+			expect(texts(r)).toHaveLength(1);
+		}
+	});
+
+	test("AC-2 (c): 30 minutes after the retry the card goes up whatever herdr says, even when herdr cannot be asked", async () => {
+		const r = await retriedRig();
+		r.next.value = blocked({ updatedAtMs: T0 + 8 * MIN });
+		r.clock.ms = T0 + 5 * MIN + BLOCK_RETRY_WAIT_MS - 1;
+		await r.sweeper.sweep();
+		expect(posts(r)).toEqual([]);
+		r.clock.ms = T0 + 5 * MIN + BLOCK_RETRY_WAIT_MS;
+		await expectRetriedCard(r);
+
+		// A failed lookup: only the 30 minutes count, a PROGRESS write does not.
+		const lost = await retriedRig();
+		lost.agent.value = { ok: false, error: "herdr down" };
+		lost.next.value = blocked({ updatedAtMs: T0 + 8 * MIN });
+		lost.clock.ms = T0 + 10 * MIN;
+		await lost.sweeper.sweep();
+		expect(posts(lost)).toEqual([]);
+		lost.clock.ms = T0 + 5 * MIN + BLOCK_RETRY_WAIT_MS;
+		await lost.sweeper.sweep();
+		expect(texts(lost)).toHaveLength(1);
+		expect(texts(lost)[0]?.split("\n")).toContain(RETRIED);
+	});
+
+	test("AC-3: PROGRESS written after the retry while herdr is working, before 30 minutes → no card", async () => {
+		const r = await retriedRig();
+		const calls = r.statusCalls.count;
+		for (const minutes of [10, 20, 34]) {
+			r.clock.ms = T0 + minutes * MIN;
+			r.next.value = blocked({ updatedAtMs: T0 + (minutes - 1) * MIN, blockedReason: `시도 ${minutes}` });
+			await r.sweeper.sweep();
+		}
+		expect(posts(r)).toEqual([]);
+		expect(reactions(r)).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+		expect(retries(r)).toHaveLength(1);
+		// One herdr question per sweep.
+		expect(r.statusCalls.count).toBe(calls + 3);
+	});
+
+	test("AC-4: needs_owner from the start goes to the card at once, without a retry", async () => {
+		const r = rig();
+		r.clock.ms = T0 + 5 * MIN;
+		r.next.value = blocked({ needsOwner: true });
+		await r.sweeper.sweep();
+		expect(r.reminders).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(added(r)).toEqual(["construction"]);
+		expect(texts(r)).toHaveLength(1);
+		expect(texts(r)[0]?.split("\n")).toContain("*사유*: 토큰 없음");
+		expect(marks(r, "blockretry:")).toEqual([]);
+	});
+
+	test("AC-4: needs_owner written after the retry goes to the card in that sweep, herdr working or not", async () => {
+		const r = await retriedRig();
+		r.clock.ms += 5 * MIN;
+		r.next.value = blocked({ needsOwner: true, updatedAtMs: T0 + 9 * MIN });
+		await expectRetriedCard(r);
+		expect(r.reminders).toHaveLength(1);
+	});
+
+	test("AC-5: back to working after the retry → no card, a blockcleared mark; a new block is retried once more", async () => {
+		const r = await retriedRig();
+		r.clock.ms += 5 * MIN;
+		r.next.value = { ok: true, judgement: judgement({ updatedAtMs: T0 + 9 * MIN }) };
+		const [cleared] = await r.sweeper.sweep();
+		expect(cleared?.actions).toContain("block cleared after retry");
+		expect(marks(r, "blockcleared:")).toEqual([`blockcleared:${T0 + 5 * MIN}`]);
+		expect(posts(r)).toEqual([]);
+		expect(reactions(r)).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+
+		r.clock.ms += 5 * MIN;
+		r.next.value = blocked({ updatedAtMs: T0 + 14 * MIN, blockedReason: "다른 벽" });
+		await r.sweeper.sweep();
+		expect(retries(r)).toHaveLength(2);
+		expect(retries(r)[1]).toBe(`${BLOCK_RETRY_HEAD}\n- blocked_reason: 다른 벽`);
+		expect(posts(r)).toEqual([]);
+		expect(marks(r, "blockretry:")).toHaveLength(2);
+	});
+
+	test("AC-6: the fourth block of one resume window goes to the card at once; after resumeTask it is retried again", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "working" };
+		for (let n = 1; n <= BLOCK_RETRY_MAX; n++) {
+			r.clock.ms += 5 * MIN;
+			r.next.value = blocked();
+			await r.sweeper.sweep();
+			expect(retries(r)).toHaveLength(n);
+			r.clock.ms += 5 * MIN;
+			r.next.value = { ok: true, judgement: judgement() };
+			await r.sweeper.sweep();
+		}
+		expect(marks(r, "blockcleared:")).toHaveLength(BLOCK_RETRY_MAX);
+		r.clock.ms += 5 * MIN;
+		r.next.value = blocked();
+		const [capped] = await r.sweeper.sweep();
+		expect(capped?.actions).toEqual(["working → blocked, 🚧", "blocked notice"]);
+		expect(retries(r)).toHaveLength(BLOCK_RETRY_MAX);
+		expect(texts(r)).toHaveLength(1);
+		expect(texts(r)[0]?.split("\n")).toContain("*사유*: 토큰 없음");
+
+		const dispatch: TaskDispatchDeps = {
+			ledger: r.ledger,
+			timezone: "Asia/Seoul",
+			originKey: "slack/ch/C1/t/100.1",
+			threadRef: () => "C1:100.1",
+			rootText: () => undefined,
+			channels: registryOf(new SlackChannel(r.transport)),
+			now: () => r.clock.ms,
+			workspaceDir: "/ws",
+			run: async (cmd) => ({
+				code: 0,
+				stdout: cmd.includes("list")
+					? JSON.stringify({ result: { agents: [{ name: r.row.agent, agent_status: "idle" }] } })
+					: "{}",
+				timedOut: false,
+			}),
+			log: noop,
+		};
+		r.clock.ms += 5 * MIN;
+		await resumeTask(dispatch, { id: r.row.taskId, task: "다시 해", host: undefined });
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+		const before = texts(r).length;
+		r.clock.ms += 5 * MIN;
+		r.next.value = blocked();
+		await r.sweeper.sweep();
+		expect(retries(r)).toHaveLength(BLOCK_RETRY_MAX + 1);
+		expect(
+			texts(r)
+				.slice(before)
+				.filter((text) => text.startsWith("🚧")),
+		).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("working");
+	});
+
+	test("AC-7: a failed retry send goes to the card in that sweep, unmarked, and is not sent again next sweep", async () => {
+		const sent: string[] = [];
+		const r = rig({
+			remind: async (_row, text) => {
+				sent.push(text);
+				return { ok: false, error: "agent_gone" };
+			},
+		});
+		r.clock.ms = T0 + 5 * MIN;
+		r.next.value = blocked();
+		const [result] = await r.sweeper.sweep();
+		expect(result?.actions).toEqual(["block retry failed", "working → blocked, 🚧", "blocked notice"]);
+		expect(sent.filter((text) => text.startsWith(BLOCK_RETRY_HEAD))).toHaveLength(1);
+		expect(marks(r, "blockretry:")).toEqual([`blockretry:${T0 + 5 * MIN}`]);
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(added(r)).toEqual(["construction"]);
+		expect(texts(r)).toHaveLength(1);
+		expect(texts(r)[0]?.split("\n")).toContain("*사유*: 토큰 없음");
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(sent.filter((text) => text.startsWith(BLOCK_RETRY_HEAD))).toHaveLength(1);
+		expect(texts(r)).toHaveLength(1);
+	});
+
+	test("AC-7: a frozen or owner-paused task goes to the card at once, without a retry", async () => {
+		const frozen = rig({ frozen: () => ({ since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" }) });
+		const paused = rig();
+		paused.ledger.pauseTask(paused.row.taskId);
+		for (const r of [frozen, paused]) {
+			r.clock.ms = T0 + 5 * MIN;
+			r.next.value = blocked();
+			await r.sweeper.sweep();
+			expect(r.reminders).toEqual([]);
+			expect(marks(r, "blockretry:")).toEqual([]);
+			expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+			expect(added(r)).toEqual(["construction"]);
+			expect(texts(r)).toHaveLength(1);
+			expect(texts(r)[0]?.split("\n")).toContain("*사유*: 토큰 없음");
+		}
 	});
 });

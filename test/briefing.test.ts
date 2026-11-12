@@ -1,7 +1,7 @@
 // AC-1 of T-20261111-01: the one-page briefing HTML — section titles and summary numbers, 6 lines + `외 N개`,
 // `ok: false` sections marked unreadable while the rest still render, HTML escaped, secrets masked.
 import { describe, expect, test } from "bun:test";
-import { renderBriefingHtml } from "../src/dashboard/briefing";
+import { briefingSummaryLine, renderBriefingHtml } from "../src/dashboard/briefing";
 import type { DashboardSnapshot, MonitorInfo, TurnInfo } from "../src/dashboard/snapshot";
 
 /** 2026-11-11 07:30 KST. */
@@ -57,6 +57,7 @@ const monitor = (name: string, extra: Partial<MonitorInfo> = {}): MonitorInfo =>
 /** A daemon section that answered: everything else starts out readable-but-empty, so a test only fills what it reads. */
 const snapshot = (extra: Partial<DashboardSnapshot> = {}): DashboardSnapshot => ({
 	generatedAt: "2026-11-11T07:30:00+09:00",
+	timezone: "Asia/Seoul",
 	daemon: {
 		ok: true,
 		running: true,
@@ -99,6 +100,25 @@ const text = (html: string): string =>
 		.map((line) => line.trim())
 		.filter((line) => line !== "")
 		.join("\n");
+
+describe("briefingSummaryLine (qa50b N-12, 레인 M 이관)", () => {
+	test("counts the same six numbers as the page summary: an open lane and a failing monitor alone are not 이상 없음", () => {
+		const shot = snapshot({
+			lanes: { ok: true, items: [{ name: "l1", status: "working" }] } as never,
+			monitors: { ok: true, items: [monitor("broken", { failStreak: 2 })] },
+		});
+		const line = briefingSummaryLine(shot);
+		expect(line).toContain("레인 1");
+		expect(line).toContain("모니터 실패 1");
+		// Every non-zero number of the page summary is in the line, in the page's order.
+		const page = /주의 \d+ · 진행 TASK \d+ · 레인 \d+ · 승인 대기 \d+ · 게이트 열림 \d+ · 모니터 실패 \d+/.exec(
+			text(renderBriefingHtml(shot, NOW)),
+		)?.[0];
+		const nonZero = (page ?? "").split(" · ").filter((part) => !part.endsWith(" 0"));
+		expect(line).toBe(nonZero.join(" · "));
+		expect(briefingSummaryLine(snapshot())).toBe("이상 없음");
+	});
+});
 
 describe("AC-1: briefing render", () => {
 	test("head, summary numbers and every section title with an empty state", () => {

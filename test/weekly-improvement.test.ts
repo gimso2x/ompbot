@@ -55,7 +55,7 @@ function meetingDoc(week: string, rows: string[]): string {
 	return [
 		`# 주간 개선 회의 ${week}`,
 		"기간: 2026-11-02 ~ 2026-11-08 (KST)",
-		"제안자: anthropic/claude-opus-5-5 · 검토자: google-antigravity/gemini-4-argon",
+		"제안자: 메인 모델 · 검토자: 검토 모델",
 		"",
 		"## 안건",
 		HEADER,
@@ -361,7 +361,7 @@ describe("weekly-improvement meeting.py decide", () => {
 });
 
 describe("weekly-improvement monitor.json", () => {
-	test("AC-5: with @OMPBOT_HOME@ replaced by a temp home it parses; Sunday 06:00 KST cron, opus, one procedure file", () => {
+	test("AC-5: with @OMPBOT_HOME@ replaced by a temp home it parses; Sunday 06:00 KST cron, bot model, one procedure file", () => {
 		const home = tempDir("weekly-improvement-install-");
 		const scriptsRoot = join(home, "scripts");
 		mkdirSync(scriptsRoot);
@@ -371,9 +371,9 @@ describe("weekly-improvement monitor.json", () => {
 		expect(JSON.parse(template).procedureFiles).toEqual(["@OMPBOT_HOME@/scripts/weekly-improvement-procedure.md"]);
 		const raw = JSON.parse(template.replaceAll("@OMPBOT_HOME@", home));
 		expect(raw.procedureFiles).toEqual([installed]);
-		const spec = parseMonitorSpec(raw, { scriptsRoot });
+		const spec = parseMonitorSpec(raw, { scriptsRoot, defaultTimezone: "Asia/Seoul" });
 		expect(spec.trigger).toEqual({ kind: "cron", schedule: "0 6 * * 0", timezone: "Asia/Seoul" });
-		expect(spec.model).toBe("anthropic/claude-opus-5-5");
+		expect(spec.model).toBeUndefined(); // doc/plans/first-install-defaults.md: the bot's default model
 		expect(spec.procedureFiles).toHaveLength(1);
 		expect("channel" in spec).toBe(false);
 	});
@@ -383,5 +383,17 @@ describe("weekly-improvement monitor.json", () => {
 		expect(procedure).toContain("python3 @OMPBOT_HOME@/scripts/weekly-improvement-collect.py");
 		expect(procedure).toContain("python3 @OMPBOT_HOME@/scripts/weekly-improvement-meeting.py check");
 		expect(procedure).not.toMatch(/\/home\//);
+	});
+
+	// doc/plans/first-install-defaults.md AC-4: the installer picks the reviewer; no provider is assumed.
+	test("the reviewer model is an install-time placeholder on its own line, explained in the README", () => {
+		const procedure = readFileSync(join(PKG, "procedure.md"), "utf8");
+		const lines = procedure.split("\n").filter((line) => line.includes("@REVIEWER_MODEL@"));
+		expect(lines).toEqual(['- tasks[0]: `model: "@REVIEWER_MODEL@"` — 설치할 때 고른 검토 모델이다.']);
+		const readme = readFileSync(join(PKG, "README.md"), "utf8");
+		expect(readme).toContain("@REVIEWER_MODEL@");
+		for (const file of ["procedure.md", "README.md", "monitor.json"]) {
+			expect(readFileSync(join(PKG, file), "utf8")).not.toMatch(/"model":|gemini-4-argon|claude-opus|claude-sonnet/);
+		}
 	});
 });

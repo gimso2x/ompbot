@@ -25,3 +25,21 @@ export function buildChildEnv(
 	}
 	return env;
 }
+
+/**
+ * The env of a bot omp child under config `ompProfile`: `OMP_PROFILE=<profile>` and no inherited `PI_CODING_AGENT_DIR`
+ * (omp would take that agent dir over the profile's). Without a profile `env` itself is returned, unchanged.
+ */
+export function withOmpProfile(env: Record<string, string>, profile: string | undefined): Record<string, string>;
+export function withOmpProfile(
+	env: Record<string, string | undefined>,
+	profile: string | undefined,
+): Record<string, string | undefined>;
+export function withOmpProfile(
+	env: Record<string, string | undefined>,
+	profile: string | undefined,
+): Record<string, string | undefined> {
+	if (profile === undefined) return env;
+	const { PI_CODING_AGENT_DIR: _dropped, ...rest } = env;
+	return { ...rest, OMP_PROFILE: profile };
+}

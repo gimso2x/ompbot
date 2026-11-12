@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CARDS, splitCards } from "../src/channel/card";
+import { CARD_TONE_COLORS, MAX_CARDS, splitCards, tableToAscii, validateCard } from "../src/channel/card";
 import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { CARD_SKELETONS } from "../src/safety/prompt";
 import { CARD_MAX_BLOCKS, parseCard } from "../src/slack/card";
-import { renderMarkdownParts } from "../src/slack/format";
+import { renderMarkdownParts, toMrkdwn } from "../src/slack/format";
 
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
 const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });
@@ -31,14 +31,52 @@ const FIELDS = spec({
 });
 
 describe("parseCard", () => {
-	test("the three prompt skeletons (Fields, Table, bar chart) validate with their native blocks", () => {
-		const expected = ["section", "data_table", "data_visualization"];
-		expect(CARD_SKELETONS).toHaveLength(3);
+	test("the four prompt skeletons (Fields, Table, bar chart, decision) validate with their native blocks", () => {
+		const expected = ["section", "data_table", "data_visualization", "section"];
+		expect(CARD_SKELETONS).toHaveLength(4);
 		CARD_SKELETONS.forEach((json, i) => {
 			const parsed = parseCard(json);
 			expect(parsed.ok).toBe(true);
 			if (parsed.ok) expect(parsed.blocks.map(typeOf)).toContain(expected[i]);
 		});
+	});
+
+	test("the decision skeleton passes validateCard and parseCard with its tone: a header and one fields section", () => {
+		const json = CARD_SKELETONS[3];
+		const validated = validateCard(json);
+		expect(validated.ok && validated.tone).toBe("warn");
+		const parsed = parseCard(json);
+		expect(parsed.ok && parsed.tone).toBe("warn");
+		if (!parsed.ok) throw new Error(parsed.issues.join("; "));
+		expect(parsed.blocks.map(typeOf)).toEqual(["header", "section"]);
+		expect(parsed.blocks[1]?.fields).toEqual([
+			{ text: "*✅ 추천*\n1번: 스테이징에서 먼저 확인", type: "mrkdwn" },
+			{ text: "*선택지*\n1. 스테이징 먼저\n2. 바로 배포", type: "mrkdwn" },
+		]);
+	});
+
+	test("root Card tone: validateCard and parseCard keep a palette value; an unknown one is ignored without an issue", () => {
+		const toned = (tone: unknown) =>
+			spec({
+				c: el("Card", { title: "요약", tone }, ["f"]),
+				f: el("Fields", {}, ["a"]),
+				a: el("Field", { label: "x", value: "1" }),
+			});
+		for (const tone of ["ok", "warn", "danger", "info"] as const) {
+			const validated = validateCard(toned(tone));
+			expect(validated.ok && validated.tone).toBe(tone);
+			const parsed = parseCard(toned(tone));
+			expect(parsed.ok && parsed.tone).toBe(tone);
+		}
+		expect(CARD_TONE_COLORS).toEqual({ ok: "#2EB67D", warn: "#ECB22E", danger: "#E01E5A", info: "#36C5F0" });
+		for (const tone of ["purple", 3, null]) {
+			const validated = validateCard(toned(tone));
+			expect(validated.ok).toBe(true);
+			expect(validated.ok && "tone" in validated).toBe(false);
+		}
+		// Without tone the result is what it was: no tone key.
+		expect(validateCard(FIELDS)).toEqual({ ok: true, card: expect.anything() });
+		expect("tone" in validateCard(FIELDS)).toBe(false);
 	});
 
 	test("elements without children or props, and a spec without root but one Card, are repaired and validate", () => {
@@ -60,6 +98,15 @@ describe("parseCard", () => {
 		expect(parseCard(twoCards).ok).toBe(false);
 	});
 
+	test("one closing bracket too many after a whole spec is dropped; other trailing text still fails", () => {
+		expect(parseCard(`${FIELDS}}`)).toMatchObject({ ok: true, card: { title: "요약" } });
+		expect(parseCard(`${FIELDS} }\n]`)).toMatchObject({ ok: true });
+		const braceInString = spec({ c: el("Card", { title: "a}b" }, ["t"]), t: el("Text", { content: "{" }) });
+		expect(parseCard(`${braceInString}}`)).toMatchObject({ ok: true, card: { title: "a}b" } });
+		expect(parseCard(`${FIELDS} 끝`).ok).toBe(false);
+		expect(parseCard(`${FIELDS}{}`).ok).toBe(false);
+	});
+
 	test("root Text, unknown component, bad JSON, Button and two tables each fail with issues and never throw", () => {
 		const table = el("Table", { headers: ["a"], rows: [["1"]] });
 		const cases = {
@@ -74,6 +121,18 @@ describe("parseCard", () => {
 			expect(parsed.ok).toBe(false);
 			if (!parsed.ok) expect(parsed.issues.length).toBeGreaterThan(0);
 		}
+	});
+
+	test("an element id __proto__, constructor or prototype is refused with an issue naming it", () => {
+		// Raw JSON: an object literal's `__proto__` key would set the prototype instead of making an element.
+		for (const id of ["__proto__", "constructor", "prototype"]) {
+			const json = `{"root":"c","elements":{"c":{"type":"Card","props":{"title":"오염"},"children":["${id}"]},"${id}":{"type":"Text","props":{"content":"x"},"children":[]}}}`;
+			const parsed = parseCard(json);
+			expect(parsed.ok).toBe(false);
+			if (!parsed.ok) expect(parsed.issues.join(" ")).toContain(id);
+		}
+		const asRoot = `{"root":"constructor","elements":{"constructor":{"type":"Card","props":{"title":"x"},"children":[]}}}`;
+		expect(parseCard(asRoot).ok).toBe(false);
 	});
 
 	test(`a card of ${CARD_MAX_BLOCKS + 1} blocks is refused; ${CARD_MAX_BLOCKS} blocks pass`, () => {
@@ -167,6 +226,26 @@ describe("renderMarkdownParts with cards", () => {
 		expect(ascii?.card?.asciiBlocks).toBeUndefined();
 	});
 
+	test("a chart with a repeated category is refused by validation and stays text on both chart paths (#83)", () => {
+		const dup = spec({
+			c: el("Card", { title: "추이" }, ["s"]),
+			s: el("Section", {}, ["g"]),
+			g: el("Chart", {
+				title: "일별",
+				chart: { type: "bar", categories: ["A", "A", "B"], series: [{ name: "턴", values: [1, 2, 3] }] },
+			}),
+		});
+		const checked = validateCard(dup);
+		expect(checked.ok).toBe(false);
+		expect(checked.ok ? [] : checked.issues).toEqual([expect.stringContaining('category "A"')]);
+		for (const charts of [true, false]) {
+			const parts = renderMarkdownParts(fence(dup), false, undefined, { cards: true, charts }) ?? [];
+			expect(parts.some((part) => part.card !== undefined)).toBe(false);
+			expect(parts.cardIssues).toEqual([expect.stringContaining('category "A"')]);
+			expect(parts.map((part) => part.text).join("\n")).toContain("```card");
+		}
+	});
+
 	test("redelivered marks the first part and the footer closes the last part even when that part is a card", () => {
 		const parts = renderMarkdownParts(`앞 글\n\n${fence(FIELDS)}`, true, "✅ 00:42", { cards: true }) ?? [];
 		expect(parts).toHaveLength(2);
@@ -210,5 +289,115 @@ describe("renderMarkdownParts with cards", () => {
 		const over = renderMarkdownParts(fence(textCard(CARD_MAX_BLOCKS + 1)), true, "✅", { cards: true });
 		expect(over?.some((part) => part.card !== undefined)).toBe(false);
 		expect(over?.cardIssues?.length).toBeGreaterThan(0);
+	});
+});
+
+describe("code fences by backtick run length", () => {
+	const names = { ownerUserId: "U0OWNER", peerBots: [] };
+	const four = "````md\n```js\n**bold** <@U0OWNER> <!here>\n```\n````";
+
+	test("a 4-backtick fence holding a 3-backtick fence is code to its own closing run: no 🔔 line, bytes kept", () => {
+		const parts = renderMarkdownParts(four, false, undefined, { names }) ?? [];
+		expect(parts).toHaveLength(1);
+		expect(parts[0]?.blocks).toEqual([{ type: "markdown", text: four }]);
+		expect(parts[0]?.text).toBe(four);
+		expect(toMrkdwn(four)).toBe(four);
+		// Prose after the outer fence is still converted.
+		const after = `${four}\n**끝** <@U0OWNER>`;
+		expect(toMrkdwn(after)).toBe(`${four}\n*끝* <@U0OWNER>`);
+		expect(renderMarkdownParts(after, false, undefined, { names })?.[0]?.blocks).toEqual([
+			{ type: "markdown", text: `${four}\n**끝** @오너` },
+			context("🔔 <@U0OWNER>"),
+		]);
+	});
+
+	test("3-backtick fences, mid-line triple backticks and inline code keep their behaviour", () => {
+		const body = "```\n<@U0CODE> **x**\n```\n예: ```<!here>``` 와 `<@U0SPAN>` 표시, <@U0OWNER> **굵게**";
+		expect(renderMarkdownParts(body, false, undefined, { names })?.[0]?.blocks).toEqual([
+			{
+				type: "markdown",
+				text: "```\n<@U0CODE> **x**\n```\n예: ```<!here>``` 와 `<@U0SPAN>` 표시, @오너 **굵게**",
+			},
+			context("🔔 <@U0OWNER>"),
+		]);
+		expect(toMrkdwn(body)).toBe("```\n<@U0CODE> **x**\n```\n예: ```<!here>``` 와 `<@U0SPAN>` 표시, <@U0OWNER> *굵게*");
+		// An unclosed 3-backtick fence is code to the end.
+		expect(toMrkdwn("앞 **a**\n```\n**b** <!here>")).toBe("앞 *a*\n```\n**b** <!here>");
+	});
+});
+
+describe("qa50b lane K: mrkdwn links and sentinels, card fences and limits", () => {
+	test("K-4: a link URL holding | < > is percent-encoded so the Slack token stays whole", () => {
+		expect(toMrkdwn("[위키](https://x.y/a|b)")).toBe("<https://x.y/a%7Cb|위키>");
+		expect(toMrkdwn("[위키](https://x.y/a>b<c)")).toBe("<https://x.y/a%3Eb%3Cc|위키>");
+	});
+
+	test("K-5: private-use sentinel characters in the input never delete or swap text", () => {
+		expect(toMrkdwn("앞 \uE0009\uE000 뒤")).toContain("9");
+		const out = toMrkdwn("[a](https://a.b) \uE0000\uE000 \uE0010\uE001 `c`");
+		expect(out.match(/<https:\/\/a\.b\|a>/g)).toHaveLength(1);
+		expect(out.match(/`c`/g)).toHaveLength(1);
+	});
+
+	test("K-10: a 4-backtick fence closes only on 4+ backticks, so a card fence after it is a card", () => {
+		const kinds = splitCards("````md\nhello\n````\n```card\n{}\n```\n").map((s) => s.kind);
+		expect(kinds).toEqual(["text", "card", "text"]);
+		const inside = splitCards("````md\n```card\n{}\n```\n````").map((s) => s.kind);
+		expect(inside).toEqual(["text"]);
+	});
+
+	test("K-11: tableToAscii pads by display width, so Hangul columns line up", () => {
+		const lines = tableToAscii({
+			headers: ["이름", "n"],
+			rows: [
+				["가나다라", "1"],
+				["ab", "2"],
+			],
+		}).split("\n");
+		const bar = (line: string): number => {
+			let width = 0;
+			for (const ch of line.slice(0, line.indexOf(" | "))) width += /[\uac00-\ud7a3]/.test(ch) ? 2 : 1;
+			return width;
+		};
+		expect(lines.map(bar)).toEqual([8, 8, 8]);
+	});
+
+	test("K-15: a header cut at its limit never splits a surrogate pair", () => {
+		const parsed = parseCard(spec({ c: el("Card", { title: `${"a".repeat(149)}😀` }) }));
+		expect(parsed.ok).toBe(true);
+		const header = parsed.ok ? (parsed.blocks[0] as { text: { text: string } }).text.text : "";
+		expect(header).toBe("a".repeat(149));
+	});
+
+	test("K-16: a too-long chart label is reported in UTF-16 units, not characters", () => {
+		const label = "😀".repeat(11);
+		const result = validateCard(
+			spec({
+				c: el("Card", {}, ["p"]),
+				p: el("Chart", { title: "t", chart: { type: "pie", segments: [{ label, value: 1 }] } }),
+			}),
+		);
+		expect(result.ok).toBe(false);
+		const issues = result.ok ? [] : result.issues;
+		expect(issues.some((issue) => issue.includes("UTF-16"))).toBe(true);
+		expect(issues.some((issue) => /\bcharacters\b/.test(issue))).toBe(false);
+	});
+
+	test("K-17: more than 10 fields go out as several sections, none dropped", () => {
+		const elements: Record<string, unknown> = {
+			c: el("Card", {}, ["f"]),
+			f: el(
+				"Fields",
+				{},
+				Array.from({ length: 13 }, (_, i) => `x${i}`),
+			),
+		};
+		for (let i = 0; i < 13; i++) elements[`x${i}`] = el("Field", { label: `칸${i}`, value: String(i) });
+		const parsed = parseCard(spec(elements));
+		expect(parsed.ok).toBe(true);
+		const fields = parsed.ok ? parsed.blocks.flatMap((b) => (b as { fields?: unknown[] }).fields ?? []) : [];
+		expect(fields).toHaveLength(13);
+		for (const block of parsed.ok ? parsed.blocks : [])
+			expect(((block as { fields?: unknown[] }).fields ?? []).length).toBeLessThanOrEqual(10);
 	});
 });

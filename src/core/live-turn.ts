@@ -45,13 +45,14 @@ const tail = (text: string, chars: number): string => redact(text).slice(-chars)
 
 /**
  * A tool call's one-line summary: omp's `intent` (it strips `i` out of the args it executes and sends it beside them),
- * else an `i` still in the args, else the args as one JSON line.
+ * else an `i` still in the args, else the args as one JSON line, masked whole before it is cut (a cut first could
+ * leave a secret's head too short to match).
  */
 function summaryOf(args: unknown, intent?: unknown): string {
 	if (typeof intent === "string" && intent.trim() !== "") return intent;
 	if (typeof args === "object" && args !== null && "i" in args && typeof args.i === "string") return args.i;
 	if (args === undefined) return "";
-	return (JSON.stringify(args) ?? "").replace(/\s+/g, " ").slice(0, SUMMARY_CHARS);
+	return redact((JSON.stringify(args) ?? "").replace(/\s+/g, " ")).slice(0, SUMMARY_CHARS);
 }
 
 /** `partialResult` as text: its `content[].text` parts joined, or the value itself when it is a string. */
@@ -144,7 +145,10 @@ export class LiveTurn {
 			else if (part.type === "toolCall") {
 				toolCalls.push({
 					name: redact(typeof part.name === "string" ? part.name : ""),
-					summary: redact(summaryOf(part.arguments, "intent" in part ? part.intent : undefined)),
+					summary: redact(summaryOf(part.arguments, "intent" in part ? part.intent : undefined)).slice(
+						0,
+						SUMMARY_CHARS,
+					),
 				});
 			}
 		}
@@ -158,7 +162,7 @@ export class LiveTurn {
 			toolCalls,
 			running: [...this.#running.values()].map((tool) => ({
 				name: redact(tool.name),
-				summary: redact(tool.intent),
+				summary: redact(tool.intent).slice(0, SUMMARY_CHARS),
 				ageMs: Math.max(0, now - tool.startedAt),
 				outputTail: tail(tool.output, OUTPUT_CHARS),
 			})),

@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { OFFSITE_DIR, OFFSITE_SSH } from "../config";
+import { isOffsiteDir, OFFSITE_SSH } from "../config";
 import { dispatchEnv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 import {
 	BACKUP_FILE_PATTERN,
@@ -86,7 +86,8 @@ function newest(names: string[], pattern: RegExp): string | undefined {
 export async function runOffsite(options: OffsiteOptions): Promise<OffsiteResult> {
 	const { homeDir, target } = options;
 	// Validated again here: this runs from the CLI with a config object, and these strings reach a remote shell.
-	if (!OFFSITE_SSH.test(target.ssh) || !OFFSITE_DIR.test(target.remoteDir) || target.remoteDir.includes("..")) {
+	// Same predicate as config load: a `..` segment is refused, `a..b` is a plain name.
+	if (!OFFSITE_SSH.test(target.ssh) || !isOffsiteDir(target.remoteDir)) {
 		throw new OffsiteError("not_configured", "invalid ssh or remoteDir");
 	}
 	const keep = target.keep ?? DEFAULT_KEEP;
@@ -117,7 +118,8 @@ export async function runOffsite(options: OffsiteOptions): Promise<OffsiteResult
 
 	// `~/x` stays unquoted so the remote shell expands it (the charset is safe); scp has no tilde, so its path is
 	// the same place relative to the login directory.
-	const dir = target.remoteDir.replace(/\/+$/, "");
+	// Repeated slashes collapse first (isOffsiteDir judged the collapsed path), so `~//x` stays relative for scp.
+	const dir = target.remoteDir.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
 	const scpBase = dir.replace(/^~\//, "");
 	const remote = (command: string, timeoutMs = STEP_TIMEOUT_MS) =>
 		run(["ssh", ...SSH_OPTIONS, "--", target.ssh, command], { env, timeoutMs });

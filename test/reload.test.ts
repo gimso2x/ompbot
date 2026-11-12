@@ -69,6 +69,7 @@ describe("planReload", () => {
 			{ ...home.config, channels: { slack: { ownerUserId: "UNEW0000" } } },
 		);
 		expect(changed.restartRequired).toEqual(["channels"]);
+		if (changed.next.channels.slack === undefined) throw new Error("expected channels.slack");
 		expect(changed.next.channels.slack.ownerUserId).toBe(OWNER);
 	});
 

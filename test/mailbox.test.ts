@@ -17,6 +17,7 @@ import {
 	NO_MODEL_NOTICE,
 	OriginMailbox,
 	type SessionMismatchInfo,
+	STEER_BEFORE_ANSWER_SEEN_NOTE,
 	type StuckLoopInfo,
 	type TurnFailureEscalation,
 } from "../src/core/mailbox";
@@ -68,7 +69,27 @@ class SteerFailingDriver extends FakeOmpDriver {
 		}
 		return super.entriesSince(since);
 	}
+	/** Holds the next `leafId()` / `steer()` until resolved, like a slow RPC round trip inside the mailbox's dispatch. */
+	leafGate: PromiseWithResolvers<void> | undefined;
+	steerGate: PromiseWithResolvers<void> | undefined;
+	/** Resolves when a held `leafId()` / `steer()` is waiting on its gate. */
+	gateEntered = Promise.withResolvers<void>();
+	override async leafId(): Promise<string | null> {
+		const gate = this.leafGate;
+		if (gate !== undefined) {
+			this.leafGate = undefined;
+			this.gateEntered.resolve();
+			await gate.promise;
+		}
+		return super.leafId();
+	}
 	override async steer(text: string): Promise<void> {
+		const gate = this.steerGate;
+		if (gate !== undefined) {
+			this.steerGate = undefined;
+			this.gateEntered.resolve();
+			await gate.promise;
+		}
 		if (this.failSteers > 0) {
 			this.failSteers--;
 			this.calls.push(`steer-rejected:${text}`);
@@ -228,6 +249,7 @@ let threadBot: { id: string | undefined } | undefined;
 /** Fresh router over the current test knobs; `defaultModel` is only readable here, so stale-model tests rebuild the router. */
 function buildRouter(): OriginRouter {
 	return new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(dir, "sessions"),
@@ -276,7 +298,7 @@ function buildRouter(): OriginRouter {
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-mailbox-"));
 	clock = new FakeClock();
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	drivers = [];
 	driverOptions = {};
 	failSteers = 0;
@@ -382,6 +404,41 @@ describe("mailbox: prompt vs steer", () => {
 		expect(driver.calls).not.toContain("newSession");
 		expect(drivers).toHaveLength(1);
 	});
+
+	for (const held of ["leafId", "steer"] as const) {
+		test(`the turn ending while a steer's ${held} call is in flight: the message runs as a new turn (#61)`, async () => {
+			driverOptions = { holdTurns: true };
+			const mailbox = router.mailbox(ORIGIN);
+			const a = msg("long job");
+			await router.route(a);
+			const driver = drivers[0] as SteerFailingDriver;
+			const gate = Promise.withResolvers<void>();
+			if (held === "leafId") driver.leafGate = gate;
+			else driver.steerGate = gate;
+			const b = msg("추가 지시");
+			const routed = router.route(b);
+			await driver.gateEntered.promise;
+			// The final arrives while the dispatch still awaits the call; its handler queues behind the dispatch.
+			const finalSeen = Promise.withResolvers<void>();
+			const off = driver.onFinal(() => {
+				off();
+				finalSeen.resolve();
+			});
+			driver.release();
+			await finalSeen.promise;
+			gate.resolve();
+			await routed;
+			await mailbox.sweepIdle();
+			expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job", "prompt:추가 지시"]);
+			const rowA = store.getInbound(a.platformMessageId);
+			const rowB = store.getInbound(b.platformMessageId);
+			expect(rowB?.opRef).not.toBe(rowA?.opRef ?? "missing");
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.getInbound(b.platformMessageId)?.state).toBe("answered");
+			const replies = store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.threadRef === b.threadRef);
+			expect(replies.map((d) => d.body)).toEqual(["ECHO 추가 지시"]);
+		});
+	}
 
 	test("a duplicate platform message is prompted once", async () => {
 		const mailbox = router.mailbox(ORIGIN);
@@ -1274,7 +1331,7 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 	test("AC-5: a `✅ 완료` answer that went out early is copied to the log channel exactly once at the turn end", async () => {
 		await router.close();
 		store.close();
-		store = openStore({ path: join(dir, "log.db"), clock, redact, logChannel: "C0LOGCHAN01" });
+		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "log.db"), clock, redact, logChannel: "C0LOGCHAN01" });
 		router = buildRouter();
 		const report = "✅ 완료 — wap 분석\n게이트 중계기 확인, 세션 쿠키 갱신 경로 정리.";
 		const { opRef, finish } = await heldTurn([
@@ -1300,6 +1357,65 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 		await finish();
 		expect(notices().map((d) => [d.opRef, d.threadRef])).toEqual([[`${opRef}:steer:0`, "D1:900.000009"]]);
 		expect(notices()[0]?.body).toContain(FIRST.slice(0, 20));
+	});
+});
+
+describe("mailbox: an owner steer written before the turn's answer reached the owner gets a note", () => {
+	const ANSWER = "네, 다 확인했습니다. safe-care-web은 배포 대기 중이고 남은 일은 없습니다.";
+	const steers = (driver: FakeOmpDriver) => driver.calls.filter((c) => c.startsWith("steer:"));
+
+	test("AC-1: a steer while the stop answer is still pending starts with the note; the inbound row keeps the text", async () => {
+		driverOptions = {
+			script: () => [{ role: "assistant", text: ANSWER, stopReason: "stop" }],
+			messageEvents: true,
+			holdTurns: true,
+		};
+		await router.route(msg("상태 확인해"));
+		const driver = drivers[0] as SteerFailingDriver;
+		await driver.untilScripted();
+		const asked = msg("어디갔어 쑥");
+		await router.route(asked);
+		const [steered] = steers(driver);
+		expect(steered?.startsWith(`steer:${STEER_BEFORE_ANSWER_SEEN_NOTE}\n`)).toBe(true);
+		expect(steered?.endsWith("\n어디갔어 쑥")).toBe(true);
+		expect(store.getInbound(asked.platformMessageId)?.textRef).toBe("어디갔어 쑥");
+		expect(store.getInbound(asked.platformMessageId)?.state).toBe("dispatched");
+	});
+
+	test("AC-2: a row written before the interim answer went out gets the note; one written 1s after it does not", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("상태 확인해"));
+		const driver = drivers[0] as SteerFailingDriver;
+		// Written (recorded) first, dispatched only after the interim answer was delivered.
+		const early = msg("어디갔어 쑥");
+		store.recordInbound({ originKey: ORIGIN, platformMessageId: early.platformMessageId, textRef: early.text });
+		clock.advance(500);
+		const message = { role: "assistant", content: [{ type: "text", text: ANSWER }], stopReason: "stop" };
+		driver.emitTestEvent({ type: "message_end", message });
+		driver.emitTestEvent({ type: "message_start", message: { role: "developer" } });
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([ANSWER]);
+		await mailbox.resumePending();
+		expect(steers(driver)).toEqual([`steer:${STEER_BEFORE_ANSWER_SEEN_NOTE}\n\n[현재 요청]\n어디갔어 쑥`]);
+		clock.advance(1000);
+		await router.route(msg("취소해"));
+		expect(steers(driver).at(-1)).toBe("steer:취소해");
+	});
+
+	test("AC-2: a turn without an answer steers the text as is", async () => {
+		driverOptions = { holdTurns: true };
+		await router.route(msg("상태 확인해"));
+		const driver = drivers[0] as SteerFailingDriver;
+		const message = { role: "assistant", content: [{ type: "toolCall", name: "bash" }], stopReason: "toolUse" };
+		driver.emitTestEvent({ type: "message_end", message });
+		driver.emitTestEvent({ type: "tool_execution_start", toolCallId: "c0", toolName: "bash" });
+		await router.route(msg("어디갔어 쑥"));
+		expect(steers(driver)).toEqual(["steer:어디갔어 쑥"]);
+	});
+
+	test("AC-2: the note tells the model to handle a new question, instruction or command", () => {
+		expect(STEER_BEFORE_ANSWER_SEEN_NOTE).toContain("질문·지시·명령");
+		expect(STEER_BEFORE_ANSWER_SEEN_NOTE).toContain("그대로 처리");
 	});
 });
 
@@ -1431,6 +1547,7 @@ describe("mailbox: session resume check", () => {
 	/** A mailbox built directly (no router) whose children report `reported(sessionDir)` as their session file. */
 	function resumeMailbox(reported: (sessionDir: string) => string | undefined): OriginMailbox {
 		return new OriginMailbox({
+			timezone: "Asia/Seoul",
 			originKey: RESUME_ORIGIN,
 			store,
 			clock,
@@ -1562,6 +1679,7 @@ describe("mailbox: tool repeat loop (stuck-loop)", () => {
 
 	function loopMailbox(options: FakeOmpDriverOptions): OriginMailbox {
 		return new OriginMailbox({
+			timezone: "Asia/Seoul",
 			originKey: LOOP_ORIGIN,
 			store,
 			clock,
@@ -1628,6 +1746,42 @@ describe("mailbox: tool repeat loop (stuck-loop)", () => {
 			await mailbox.close();
 		}
 	});
+
+	test("qa50b K-2: an abort that throws stops the child before the turn is settled as failed", async () => {
+		const stopped = Promise.withResolvers<void>();
+		class AbortFailingDriver extends LoopDriver {
+			override async abort(): Promise<void> {
+				this.calls.push("abort");
+				throw new Error("abort rpc timed out");
+			}
+			override async stop(): Promise<void> {
+				stopped.resolve();
+				await super.stop();
+			}
+		}
+		const mailbox = new OriginMailbox({
+			timezone: "Asia/Seoul",
+			originKey: LOOP_ORIGIN,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) =>
+				new AbortFailingDriver({ holdTurns: true, events: pairs(6), sessionDir, store: sessionStore }),
+			onStuckLoop: (info) => loops.push(info),
+		});
+		try {
+			const row = msg("테스트 고쳐", { originKey: LOOP_ORIGIN });
+			await mailbox.enqueue(row);
+			const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2000));
+			expect(await Promise.race([stopped.promise.then(() => "stopped"), timeout])).toBe("stopped");
+			await mailbox.sweepIdle();
+			expect(store.getInbound(row.platformMessageId)?.state).toBe("failed_notified");
+		} finally {
+			await mailbox.close();
+		}
+	});
 });
 
 describe("mailbox: an owner message answers the origin's one open omp dialog", () => {
@@ -1641,6 +1795,7 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 
 	function dialogMailbox(): OriginMailbox {
 		return new OriginMailbox({
+			timezone: "Asia/Seoul",
 			originKey: DIALOG_ORIGIN,
 			store,
 			clock,

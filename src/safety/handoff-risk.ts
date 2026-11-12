@@ -56,7 +56,8 @@ const HIGH_RISK_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
 		/\bsystemctl(?:\s+-{1,2}[\w=-]+)*\s+(?:restart|stop|start|disable|kill)\b|\b(?:docker|podman)\s+(?:(?:container|compose)\s+)?(?:rm|stop|kill|restart)\b|\bpm2\s+(?:restart|stop|delete)\b/i,
 	],
 	["disk_destructive", new RegExp(`\\bmkfs\\b|\\bdd\\s${SEGMENT}\\bof=/dev/`, "i")],
-	["secret_path", /\.ompbot\/secrets/i],
+	// `/./` and `//` between the two names are the same directory (`~/.ompbot/./secrets`, `$HOME//.ompbot//secrets`).
+	["secret_path", /\.ompbot\/(?:\.?\/)*secrets/i],
 ];
 
 const ADVISORY_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
@@ -69,7 +70,7 @@ const ADVISORY_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
 
 /** Forbidding markers: a high_risk hit whose clause carries one of these is downgraded to advisory. */
 const FORBIDDING =
-	/하지\s*마|하지\s*않|않는다|금지|말\s*것|말고|\bnever\b|\bdo\s+not\b|\bdon['’]t\b|\bmust\s+not\b|\bforbidden\b|^\s*[-*]\s+no\s/i;
+	/하지\s*마|하지\s*않|지\s*말고|지\s*않고|않는다|금지|말\s*것|말고|\bnever\b|\bdo\s+not\b|\bdon['’]t\b|\bmust\s+not\b|\bforbidden\b|^\s*[-*]\s+no\s/i;
 /** Phrases that contain a forbidding marker but order the command: "don't hesitate to", a double negative "…않으면 안". */
 const NOT_FORBIDDING = /\b(?:do\s+not|don['’]t)\s+hesitate\b|(?:하지\s*)?않으면\s*안/gi;
 
@@ -83,11 +84,13 @@ const HIGH_RISK_GLOBAL = HIGH_RISK_PATTERNS.map(
 const KOREAN_CONNECTORS = "하고|하되|하며|한\\s+뒤|한\\s+다음|한\\s*후|해서|하여|그리고|다음에|후에|뒤에";
 /**
  * Where one clause of a line ends and the next begins: `; , ， 、`, `. 。 ! ?` before whitespace, an English connector
- * or a lone `후` between spaces, a Korean connector with whitespace on one side. Parentheses are handled apart
- * (`commandContext`).
+ * or a lone `후` between spaces, a Korean connector with whitespace on one side. A forbidding `<용언>지 말고`/`지 않고`
+ * ends its clause with a zero-width boundary after it, so the forbidding marker stays with the command before it and
+ * the command after it is a clause of its own. Parentheses are handled apart (`commandContext`).
  */
 const CLAUSE_BOUNDARY = new RegExp(
 	[
+		"(?<=지\\s*(?:말고|않고))(?=\\s)",
 		"[;,，、]",
 		"[.。!?](?=\\s)",
 		"(?<=\\s)(?:and|then|but|after|before|후)(?=\\s)",
@@ -159,10 +162,14 @@ function removesAbsoluteTree(line: string): Hit[] {
 interface ParenGroup {
 	open: number;
 	close: number;
+	/** The innermost group around this one. */
+	parent?: ParenGroup;
+	/** The groups directly inside this one, by `open`. */
+	children: ParenGroup[];
 }
 
-/** Balanced `( )` / `（ ）` pairs of a line, by index; an unmatched one is ordinary text. */
-function parenGroups(line: string): ParenGroup[] {
+/** Balanced `( )` / `（ ）` pairs of a line, by `open`, with their nesting; an unmatched one is ordinary text. */
+function parenGroups(line: string): { groups: ParenGroup[]; top: ParenGroup[] } {
 	const groups: ParenGroup[] = [];
 	const stack: number[] = [];
 	for (let i = 0; i < line.length; i++) {
@@ -170,48 +177,110 @@ function parenGroups(line: string): ParenGroup[] {
 		if (char === "(" || char === "（") stack.push(i);
 		else if (char === ")" || char === "）") {
 			const open = stack.pop();
-			if (open !== undefined) groups.push({ open, close: i });
+			if (open !== undefined) groups.push({ open, close: i, children: [] });
 		}
 	}
-	return groups;
+	groups.sort((a, b) => a.open - b.open);
+	const top: ParenGroup[] = [];
+	const around: ParenGroup[] = [];
+	for (const group of groups) {
+		while (around.length > 0 && (around.at(-1) as ParenGroup).close < group.open) around.pop();
+		const parent = around.at(-1);
+		if (parent === undefined) top.push(group);
+		else {
+			group.parent = parent;
+			parent.children.push(group);
+		}
+		around.push(group);
+	}
+	return { groups, top };
+}
+
+/**
+ * The visible `[from, to)` ranges (line indices) of one nesting level `[lo, hi)`: the clause holding `span`, without
+ * `span` and without the groups directly inside the level. The level is matched as a string with each hidden run
+ * standing as one {@link MASK} — no boundary or marker matches a mask, so one stands for any number — which keeps the
+ * work per level to its own text, not the text of every group inside it.
+ */
+function levelRanges(
+	line: string,
+	lo: number,
+	hi: number,
+	children: readonly ParenGroup[],
+	span: { start: number; end: number },
+): Array<[number, number]> {
+	const hidden = [...children.map((group) => [group.open, group.close + 1] as const), [span.start, span.end] as const]
+		.filter(([from, to]) => to > lo && from < hi)
+		.sort((a, b) => a[0] - b[0]);
+	/** Visible runs: where each starts in the level string and in the line. */
+	const runs: Array<{ at: number; from: number; to: number }> = [];
+	let level = "";
+	let spanAt = -1;
+	let pos = lo;
+	for (const [from, to] of hidden) {
+		if (from > pos) {
+			runs.push({ at: level.length, from: pos, to: from });
+			level += line.slice(pos, from);
+		}
+		if (from >= pos) level += MASK;
+		if (from === span.start && to === span.end) spanAt = level.length - 1;
+		pos = Math.max(pos, to);
+	}
+	if (pos < hi) {
+		runs.push({ at: level.length, from: pos, to: hi });
+		level += line.slice(pos, hi);
+	}
+	let from = 0;
+	let to = level.length;
+	for (const boundary of level.matchAll(CLAUSE_BOUNDARY)) {
+		const at = boundary.index;
+		if (at + boundary[0].length <= spanAt) from = at + boundary[0].length;
+		else if (at > spanAt && at < to) to = at;
+	}
+	return runs.flatMap((run): Array<[number, number]> => {
+		const start = Math.max(from, run.at);
+		const end = Math.min(to, run.at + (run.to - run.from));
+		return start < end ? [[run.from + start - run.at, run.from + end - run.at]] : [];
+	});
 }
 
 /**
  * The text a forbidding marker must sit in to downgrade the command at `[start, end)`, as the line with everything
  * else masked: the command's clause, without the command itself and without the parentheses inside that clause. A
  * command inside a parenthesis adds the clause around that parenthesis, outward to the line level. Clause boundaries
- * are looked for with the command and the inner parentheses masked, so neither is ever cut.
+ * are looked for with the command and the inner parentheses masked, so neither is ever cut. A masked run is one
+ * {@link MASK}, however long.
  */
-function commandContext(line: string, groups: readonly ParenGroup[], start: number, end: number): string {
-	const visible = new Array<boolean>(line.length).fill(false);
+function commandContext(
+	line: string,
+	parens: { groups: readonly ParenGroup[]; top: readonly ParenGroup[] },
+	start: number,
+	end: number,
+): string {
+	let enclosing: ParenGroup | undefined;
+	for (const group of parens.groups) {
+		if (group.open < start && group.close >= end && (enclosing === undefined || group.open > enclosing.open))
+			enclosing = group;
+	}
+	const ranges: Array<[number, number]> = [];
 	let span = { start, end };
 	for (;;) {
-		let enclosing: ParenGroup | undefined;
-		for (const group of groups) {
-			const encloses = group.open < span.start && group.close >= span.end;
-			if (encloses && (enclosing === undefined || group.open > enclosing.open)) enclosing = group;
-		}
 		const lo = enclosing === undefined ? 0 : enclosing.open + 1;
 		const hi = enclosing === undefined ? line.length : enclosing.close;
-		const hidden = new Array<boolean>(hi - lo).fill(false);
-		const hide = (from: number, to: number) => {
-			for (let i = Math.max(from, lo); i < Math.min(to, hi); i++) hidden[i - lo] = true;
-		};
-		hide(span.start, span.end);
-		for (const group of groups) if (group.open >= lo && group.close < hi) hide(group.open, group.close + 1);
-		const level = Array.from(hidden, (masked, i) => (masked ? MASK : line[lo + i])).join("");
-		let from = 0;
-		let to = level.length;
-		for (const boundary of level.matchAll(CLAUSE_BOUNDARY)) {
-			const at = boundary.index;
-			if (at + boundary[0].length <= span.start - lo) from = at + boundary[0].length;
-			else if (at >= span.end - lo && at < to) to = at;
-		}
-		for (let i = from; i < to; i++) if (!hidden[i]) visible[lo + i] = true;
+		ranges.push(...levelRanges(line, lo, hi, enclosing === undefined ? parens.top : enclosing.children, span));
 		if (enclosing === undefined) break;
 		span = { start: enclosing.open, end: enclosing.close + 1 };
+		enclosing = enclosing.parent;
 	}
-	return Array.from(visible, (shown, i) => (shown ? line[i] : MASK)).join("");
+	ranges.sort((a, b) => a[0] - b[0]);
+	let context = "";
+	let pos = 0;
+	for (const [from, to] of ranges) {
+		if (from > pos) context += MASK;
+		context += line.slice(from, to);
+		pos = to;
+	}
+	return pos < line.length ? `${context}${MASK}` : context;
 }
 
 /** The first `HANDOFF_SCAN_BYTES` bytes of `text` (UTF-8), cut back to a whole character. */
@@ -224,47 +293,124 @@ function headBytes(text: string): { head: string; truncated: boolean } {
 }
 
 /**
+ * Whether `hit` is the quoted pattern of a line defining its rule (- `git_reset_hard`: `git reset --hard`): such a
+ * line documents this scanner, not an order. Only a hit inside the inline code spans listed right after the
+ * `` `rule`: `` prefix counts; the same command in the plain text, or in a code span after it, is an order like on any
+ * other line.
+ */
+function definesRule(line: string, hit: Hit): boolean {
+	const prefix = new RegExp(`^\\s*[-*]?\\s*\`${escapeRegExp(hit.rule)}\`\\s*:`).exec(line);
+	if (prefix === null) return false;
+	// The definition is the list of code spans right after the prefix (`DROP TABLE`, `DROP DATABASE`); a span after
+	// prose (`… 이제 \`git reset --hard HEAD~9\` 를 실행`) is an order.
+	const list = /^(?:[\s,，、/·|]*`[^`\n]*`)+/.exec(line.slice(prefix[0].length));
+	if (list === null) return false;
+	for (const span of list[0].matchAll(/`[^`\n]*`/g)) {
+		const open = prefix[0].length + span.index;
+		if (hit.start > open && hit.end < open + span[0].length) return true;
+	}
+	return false;
+}
+
+/**
+ * The line as the shell reads its words: a quoted word without blanks loses its quotes (`'--hard'` → `--hard`) and a
+ * backslash before a word character or `-` goes (`\\--hard`, `--h\\ard`). A quote right after a letter stays, so
+ * `don't` keeps its forbidding marker.
+ */
+function shellSpelling(text: string): string {
+	return text.replace(/(?<!\w)(['"])([^'"\s`]*)\1/g, "$2").replace(/\\(?=[\w-])/g, "");
+}
+
+/**
+ * The findings of one line of a brief (`line` is its 1-based number for the report), as written and as the shell
+ * reads its words (`shellSpelling`); a rule keeps the more severe of the two, with the excerpt as written.
+ */
+function scanLine(text: string, line: number, branches: readonly string[]): HandoffFinding[] {
+	const findings = scanSpelling(text, line, branches);
+	const plain = shellSpelling(text);
+	if (plain === text) return findings;
+	for (const finding of scanSpelling(plain, line, branches)) {
+		const index = findings.findIndex((found) => found.rule === finding.rule);
+		const found = findings[index];
+		if (found === undefined) findings.push({ ...finding, excerpt: excerptOf(text) });
+		else if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[found.severity])
+			findings[index] = { ...found, severity: finding.severity };
+	}
+	return findings;
+}
+
+function excerptOf(text: string): string {
+	return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, EXCERPT_CHARS).join("");
+}
+
+function scanSpelling(text: string, line: number, branches: readonly string[]): HandoffFinding[] {
+	const hits: Hit[] = [
+		...HIGH_RISK_GLOBAL.flatMap(([rule, pattern]) =>
+			Array.from(text.matchAll(pattern), (match) => ({
+				rule,
+				start: match.index,
+				end: match.index + match[0].length,
+			})),
+		),
+		...pushesProtected(text, branches),
+		...removesAbsoluteTree(text),
+	];
+	const rules = [
+		...new Set(hits.map((hit) => hit.rule)),
+		...ADVISORY_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(([rule]) => rule),
+	];
+	if (rules.length === 0) return [];
+	const groups = parenGroups(text);
+	const excerpt = excerptOf(text);
+	return rules.map((rule) => {
+		// A marker inside a `NOT_FORBIDDING` phrase ("don't hesitate to", "…않으면 안") does not forbid.
+		const ordered = hits.some(
+			(hit) =>
+				hit.rule === rule &&
+				!definesRule(text, hit) &&
+				!FORBIDDING.test(commandContext(text, groups, hit.start, hit.end).replace(NOT_FORBIDDING, MASK)),
+		);
+		const severity = HIGH_RISK_RULES.has(rule) && ordered ? "high_risk" : "advisory";
+		return { rule, line, excerpt, severity };
+	});
+}
+
+/** A line ending in a backslash (trailing blanks allowed) is continued on the next one, as in a shell script. */
+const CONTINUED = /\\[ \t\r]*$/;
+
+const SEVERITY_RANK = { advisory: 0, high_risk: 1 } as const;
+
+/**
  * Scans the first `HANDOFF_SCAN_BYTES` of a brief line by line for the high-risk patterns above; a hit whose own
- * clause forbids the command (`commandContext`) is downgraded to advisory.
+ * clause forbids the command (`commandContext`) is downgraded to advisory. Lines joined by trailing backslashes are
+ * also scanned as one line, reported at the first of them, so a command split across them is still seen; a rule
+ * the joined line finds no more severely than one of its own lines already did is not reported twice.
  */
 export function scanHandoffBrief(brief: string, options: { protectedBranches?: readonly string[] } = {}): HandoffScan {
 	const branches = options.protectedBranches ?? DEFAULT_PROTECTED_BRANCHES;
 	const { head, truncated } = headBytes(brief);
 	const findings: HandoffFinding[] = [];
-	head.split("\n").forEach((text, index) => {
-		const hits: Hit[] = [
-			...HIGH_RISK_GLOBAL.flatMap(([rule, pattern]) =>
-				Array.from(text.matchAll(pattern), (match) => ({
-					rule,
-					start: match.index,
-					end: match.index + match[0].length,
-				})),
-			),
-			...pushesProtected(text, branches),
-			...removesAbsoluteTree(text),
-		];
-		const rules = [
-			...new Set(hits.map((hit) => hit.rule)),
-			...ADVISORY_PATTERNS.filter(([, pattern]) => pattern.test(text)).map(([rule]) => rule),
-		];
-		if (rules.length === 0) return;
-		const groups = parenGroups(text);
-		const excerpt = Array.from(text.replace(/\s+/g, " ").trim()).slice(0, EXCERPT_CHARS).join("");
-		for (const rule of rules) {
-			// A line defining the rule (- `git_reset_hard`: `git reset --hard`) documents this scanner, not an order.
-			const defined = new RegExp(`^\\s*[-*]?\\s*\`${escapeRegExp(rule)}\`\\s*:`).test(text);
-			// A marker inside a `NOT_FORBIDDING` phrase ("don't hesitate to", "…않으면 안") does not forbid.
-			const ordered =
-				!defined &&
-				hits.some(
-					(hit) =>
-						hit.rule === rule &&
-						!FORBIDDING.test(commandContext(text, groups, hit.start, hit.end).replace(NOT_FORBIDDING, MASK)),
+	const lines = head.split("\n");
+	for (let first = 0; first < lines.length; ) {
+		let last = first;
+		while (last + 1 < lines.length && CONTINUED.test(lines[last] ?? "")) last++;
+		const own: HandoffFinding[] = [];
+		for (let index = first; index <= last; index++) own.push(...scanLine(lines[index] ?? "", index + 1, branches));
+		findings.push(...own);
+		if (last > first) {
+			const joined = lines
+				.slice(first, last + 1)
+				.map((text, offset) => (first + offset < last ? text.replace(CONTINUED, "") : text))
+				.join(" ");
+			for (const finding of scanLine(joined, first + 1, branches)) {
+				const seen = own.some(
+					(found) => found.rule === finding.rule && SEVERITY_RANK[found.severity] >= SEVERITY_RANK[finding.severity],
 				);
-			const severity = HIGH_RISK_RULES.has(rule) && ordered ? "high_risk" : "advisory";
-			findings.push({ rule, line: index + 1, excerpt, severity });
+				if (!seen) findings.push(finding);
+			}
 		}
-	});
+		first = last + 1;
+	}
 	const verdict: HandoffVerdict = findings.some((finding) => finding.severity === "high_risk")
 		? "high_risk"
 		: findings.length > 0 || truncated

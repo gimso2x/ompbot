@@ -38,6 +38,11 @@ export function toDiscordEmoji(name: string): string {
 	return unicode;
 }
 
+/** Unicode emoji for a Slack emoji name the core writes, `undefined` for any other name. */
+export function unicodeOfSlackName(name: string): string | undefined {
+	return SLACK_TO_UNICODE.get(name);
+}
+
 /** Slack name of an inbound reaction emoji (`👍`→`+1`, `👎`→`-1`); `undefined` for emoji the bot does not read. */
 export function fromDiscordEmoji(emoji: string | null): string | undefined {
 	if (emoji === null) return undefined;

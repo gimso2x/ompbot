@@ -31,13 +31,16 @@ export interface LaneClaim {
 /**
  * Where a closed worktree lane stands with its merge: `pending` waits for the owner's `머지`/`폐기` (or for the
  * landing that already began, `requestedBy`), `blocked` needs the owner (dirty checkout, twice not fast-forward),
- * `landed` is merged, pushed and cleaned up, `merged-not-pushed` is merged with the push refused, `discarded` dropped
+ * `landed` is merged and pushed (`cleanup` names what was not cleaned up), `merged-not-pushed` is merged with the push
+ * refused, `discarded` dropped
  * the worktree and branch unmerged. Only `pending` and `blocked` take a merge or a discard.
  */
 export type LaneLandState = "pending" | "landed" | "merged-not-pushed" | "blocked" | "discarded";
 
 /** `autoLandHeld` of a lane closed past an integrity refusal: auto-merge skips it, the owner's `머지` does not. */
 export const INTEGRITY_APPROVED = "무결성 승인";
+/** `autoLandHeld` of a lane the owner closed past checks that timed out twice: auto-merge skips it, `머지` does not. */
+export const INCONCLUSIVE_APPROVED = "확인 불가 승인";
 /** `autoLandHeld` of a closed lane whose auto-merge the owner's pause holds: `머지해`/`머지` still lands it. */
 export const OWNER_PAUSE_HELD = "오너 멈춤";
 
@@ -49,16 +52,64 @@ export interface LaneLand {
 	preSha?: string;
 	/** Why the landing is `blocked` or `merged-not-pushed`. */
 	reason?: string;
-	/** Why auto-merge leaves this lane to the owner: `INTEGRITY_APPROVED` or `OWNER_PAUSE_HELD`. */
+	/** Why auto-merge leaves this lane to the owner: `INTEGRITY_APPROVED`, `INCONCLUSIVE_APPROVED` or `OWNER_PAUSE_HELD`. */
 	autoLandHeld?: string;
 	/** A landing has begun and not finished: the tick resumes it (each step is idempotent). */
 	requestedBy?: "auto" | "owner";
 	/** `origin/<baseBranch>` once the merge was pushed there. */
 	pushed?: string;
+	/** What of the worktree and branch a `landed`/`merged-not-pushed` landing left behind; absent = both are gone. */
+	cleanup?: string;
 	/** The Outcome card in the lane thread (edited in place as the landing moves on). */
 	cardTs?: string;
 	/** Landings that threw (git or host unavailable) in a row; the third is `blocked`. */
 	errors?: number;
+}
+
+/** Judgements at `head` that ended with timed-out checks only, and when the last one ran. */
+export interface LaneChecksInconclusive {
+	head: string;
+	runs: number;
+	lastAt: number;
+}
+
+/**
+ * The independent review of a closed lane's claim commit (`taskAutoLand.review`): a receipt for `sha` only — a lane
+ * whose `meta.sha` moved on has no receipt. Auto-merge needs `CLEAR`; `BLOCK` and `inconclusive` go to the owner.
+ */
+export interface LaneReview {
+	/** The commit reviewed (`meta.sha` at the time). */
+	sha: string;
+	verdict: "CLEAR" | "BLOCK" | "inconclusive";
+	model: string;
+	at: number;
+	/** What the reviewer wrote before its `VERDICT` line (redacted, at most 1500 characters). */
+	notes: string;
+	/** Why the review is `inconclusive` (timed out, exit code, no or several VERDICT lines, no diff). */
+	reason?: string;
+}
+
+/**
+ * What the claim commit changed against the base branch (`computeLaneChanges`), shown on the Outcome card only: never
+ * read by the auto-merge. Bound to `sha`: a lane whose `meta.sha` moved on shows none. Overlaps are a snapshot of the
+ * moment the card went up (branch commits only, not uncommitted work in other worktrees).
+ */
+export interface LaneChanges {
+	/** The claim commit these numbers are for (ignored when `meta.sha` differs). */
+	sha: string;
+	files: number;
+	insertions: number;
+	deletions: number;
+	/** Text files with the most changed lines (added + deleted), at most 5. */
+	top: { path: string; added: number; deleted: number }[];
+	/** Other open lanes of the same repository that changed the same files (at most 3 lanes, 5 files each). */
+	overlaps: { lane: string; files: string[] }[];
+	/** Files the base branch changed after the merge-base that this lane changed too (at most 5). */
+	baseDrift: string[];
+	/** Why this lane's own diff could not be read (then the numbers are 0 and the lists empty). */
+	error?: string;
+	/** Why the base drift or another lane's diff could not be read (that part only is missing). */
+	overlapError?: string;
 }
 
 /** Runtime facts of a lane that are not registry columns (kept as one JSON column). */
@@ -93,8 +144,17 @@ export interface LaneMeta {
 	risk?: TaskRisk;
 	/** Acceptance criteria as given at the start; a trailing `[check: …]` is re-run by the core before closing. */
 	acceptance?: AcceptanceItem[];
-	/** The last `[check: …]` run, at worktree HEAD `head`; the same HEAD is never checked again. */
-	checks?: { head: string; results: TaskCheck[] };
+	/** The start's brief (redacted, at most 16000 characters): the spec the independent review reads. */
+	brief?: string;
+	/** The independent review of the claim commit (`taskAutoLand.review`); `!reopen` drops it. */
+	review?: LaneReview;
+	/** What the claim commit changed, computed once per claim commit when its card goes up; `!reopen` drops it. */
+	changes?: LaneChanges;
+	/**
+	 * The last `[check: …]` run, at worktree HEAD `head`; the same HEAD is never checked again, except its timed-out
+	 * (inconclusive) results — `inconclusive` counts those judgements at one HEAD (absent when the run had none).
+	 */
+	checks?: { head: string; results: TaskCheck[]; inconclusive?: LaneChecksInconclusive };
 	/**
 	 * The merge of a closed worktree lane; absent on lanes without a worktree and before the first close. A lane sent
 	 * back to work by a non-ff landing keeps it (`attempts`) until it closes again; `!reopen` drops it.

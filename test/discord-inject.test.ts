@@ -107,4 +107,38 @@ describe("inject into Discord", () => {
 		expect(discord.posts()).toHaveLength(0);
 		expect(slack.posts()).toHaveLength(0);
 	});
+
+	// AC-2 of T-20261111-03: an inject replying to a pending approval card is refused like on Slack; the owner's own
+	// Discord reply still settles the card.
+	test("an inject replying to a pending approval card is refused; the card stays pending until the owner replies", async () => {
+		const tool = daemon.hostToolsFor(DM_ORIGIN).find((candidate) => candidate.name === "ompbot_request_approval");
+		if (tool === undefined) throw new Error("ompbot_request_approval missing");
+		let finished = false;
+		const result = tool
+			.execute({ summary: "force push main" }, { signal: new AbortController().signal })
+			.finally(() => {
+				finished = true;
+			});
+		// The buttons go up after the ledger row and the waiting request exist.
+		const shown = await discord.waitForCall(
+			(call) => call.method === "editMessage" && Array.isArray(call.components) && call.components.length > 0,
+		);
+		const card = shown.method === "editMessage" ? shown.messageId : "";
+
+		await expect(daemon.inject({ origin: DM_ORIGIN, asOwner: true, thread: card, text: "진행" })).rejects.toThrow(
+			"approval/choice card",
+		);
+		expect(daemon.store.getApproval(`${DISCORD_DM}:${card}`)?.status).toBe("pending");
+		expect(finished).toBe(false);
+
+		await discord.emitMessage({
+			id: "700000000000000009", // gitleaks:allow (fake snowflake)
+			channel_id: DISCORD_DM,
+			author: { id: DISCORD_OWNER },
+			content: "진행",
+			type: 19,
+			message_reference: { message_id: card, channel_id: DISCORD_DM },
+		});
+		expect(await result).toBe("replied: 진행");
+	});
 });

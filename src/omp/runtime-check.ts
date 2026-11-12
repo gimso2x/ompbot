@@ -11,7 +11,7 @@ import { isRecord } from "./type-guards";
  * every new session failed as `omp_rpc_client_missing`, which named neither cause.
  */
 export interface OmpRuntimeProblem {
-	code: "omp_launcher_standalone" | "bun_too_old";
+	code: "omp_launcher_standalone" | "omp_launcher_unreadable" | "bun_too_old";
 	/** Short `key=value` detail for gates and logs. */
 	detail: string;
 	/** Human-readable cause with the fix. */
@@ -36,7 +36,19 @@ function isScript(path: string): boolean {
 export function checkOmpRuntime(cliPath: string, bun: string): OmpRuntimeProblem | undefined {
 	const packageRoot = dirname(dirname(cliPath));
 	const manifestPath = join(packageRoot, "package.json");
-	if (!existsSync(manifestPath) && !isScript(cliPath)) {
+	let script: boolean;
+	try {
+		script = existsSync(manifestPath) || isScript(cliPath);
+	} catch (error) {
+		// A directory or an unreadable file in ompExecutable: a problem to report, not an exception that ends the caller.
+		const reason = error instanceof Error && "code" in error ? String(error.code) : String(error);
+		return {
+			code: "omp_launcher_unreadable",
+			detail: `error=${reason} path=${cliPath}`,
+			message: `${cliPath} cannot be read as the omp launcher (${reason}); point ompExecutable at <global node_modules>/@oh-my-pi/pi-coding-agent/dist/cli.js.`,
+		};
+	}
+	if (!script) {
 		return {
 			code: "omp_launcher_standalone",
 			detail: `launcher=standalone path=${cliPath}`,

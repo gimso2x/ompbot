@@ -13,7 +13,7 @@ import {
 	SECRET_MODE,
 } from "../config";
 import { DiscordRest } from "../discord/rest";
-import { buildChildEnv } from "../omp/env";
+import { buildChildEnv, withOmpProfile } from "../omp/env";
 import { checkOmpRuntime } from "../omp/runtime-check";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
@@ -40,14 +40,20 @@ function listening(host: string, port: number): Promise<boolean> {
  * login and no API key: every turn would fail with "No default model selected", so doctor says so before the first DM.
  * A string is the reason the count could not be read (timeout, exit code, unparsable output).
  */
-export async function countOmpModels(ompExecutable: string, timeoutMs = 30_000): Promise<number | string> {
+export async function countOmpModels(
+	ompExecutable: string,
+	timeoutMs = 30_000,
+	/** Config `ompProfile`: the bot profile's models and login (`withOmpProfile`). */
+	ompProfile?: string,
+	base: Record<string, string | undefined> = process.env,
+): Promise<number | string> {
 	let proc: Bun.Subprocess<"ignore", "pipe", "ignore">;
 	try {
 		proc = Bun.spawn([ompExecutable, "models", "--json"], {
 			stdout: "pipe",
 			stderr: "ignore",
 			stdin: "ignore",
-			env: buildChildEnv(),
+			env: withOmpProfile(buildChildEnv({}, base), ompProfile),
 		});
 	} catch (error) {
 		return `cannot run ${ompExecutable} (${(error as NodeJS.ErrnoException).code ?? String(error)})`;
@@ -135,7 +141,33 @@ export async function checkDiscord(
 }
 
 /**
- * Prints one `ok`/`fail` line per check. Only paths, modes, token *prefixes* and public ids are printed; token values
+ * The `backup bundle` line. The bundle carries the conversation memory and operator files (sessions/, config.json,
+ * workspace/, scripts/); a home that only backs up the ledger is half protected, so the stamp must name a bundle that
+ * still exists and is fresh. A ledger-only home has no bundle sources at all — `runBackup` correctly writes no bundle
+ * there, so that stamp passes.
+ */
+export function checkBackupBundle(homeDir: string, report: Report, warn: (name: string, detail: string) => void): void {
+	const stamp = readStamp(join(homeDir, "backups"));
+	const bundleSources = BUNDLE_SOURCES.filter((name) => existsSync(join(homeDir, name)));
+	if (stamp === undefined && !existsSync(join(homeDir, "ompbot.db"))) {
+		// The daemon has never started: there is nothing to back up yet, and its first start makes the first backup.
+		warn("backup bundle", "stamp=missing (first install: the daemon makes the first backup when it starts)");
+	} else if (stamp === undefined) {
+		report(false, "backup bundle", "stamp=missing (run ompbot backup once and enable ompbot-backup.timer)");
+	} else if (stamp.bundle === undefined && bundleSources.length > 0) {
+		report(false, "backup bundle", "bundle=none (run ompbot backup again)");
+	} else if (stamp.bundle === undefined) {
+		report(true, "backup bundle", "sources=none (ledger-only home)");
+	} else if (!existsSync(join(homeDir, "backups", stamp.bundle))) {
+		report(false, "backup bundle", `bundle=${stamp.bundle} missing`);
+	} else {
+		const hours = (Date.now() - stamp.ts.getTime()) / 3_600_000;
+		report(hours <= BACKUP_MAX_AGE_MS / 3_600_000, "backup bundle", `bundle=${stamp.bundle} hours=${hours.toFixed(1)}`);
+	}
+}
+
+/**
+ * Prints one `ok`/`fail` line per check (`warn` lines never count as failures). Only paths, modes, token *prefixes* and public ids are printed; token values
  * never leave `readSlackTokens`. Returns 0 when every check passed.
  */
 export async function runDoctor(homeDir: string, write: (line: string) => void): Promise<number> {
@@ -144,6 +176,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 		if (!ok) failures += 1;
 		write(`${ok ? "ok" : "fail"} ${name}: ${detail}`);
 	};
+	const warn = (name: string, detail: string): void => write(`warn ${name}: ${detail}`);
 
 	let config: OmpbotConfig | undefined;
 	try {
@@ -171,10 +204,16 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 		}
 	}
 	if (config) {
-		for (const [name, path, prefix] of [
-			["slack-bot-token", config.slack.botTokenFile, "xoxb-"],
-			["slack-app-token", config.slack.appTokenFile, "xapp-"],
-		] as const) {
+		// Slack off: one line says so, and no Slack token file or auth.test line follows.
+		if (config.slack === undefined) report(true, "slack", "off (channels.slack not set)");
+		const slackTokenFiles =
+			config.slack === undefined
+				? []
+				: ([
+						["slack-bot-token", config.slack.botTokenFile, "xoxb-"],
+						["slack-app-token", config.slack.appTokenFile, "xapp-"],
+					] as const);
+		for (const [name, path, prefix] of slackTokenFiles) {
 			const problem = secretProblem(path, prefix);
 			if (problem !== undefined) tokensOk = false;
 			report(
@@ -220,7 +259,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 		}
 
 		if ((config.agent ?? "omp") === "omp" && existsSync(config.ompExecutable)) {
-			const models = await countOmpModels(config.ompExecutable);
+			const models = await countOmpModels(config.ompExecutable, 30_000, config.ompProfile);
 			report(
 				typeof models === "number" && models > 0,
 				"omp models",
@@ -289,38 +328,27 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 			report(present, "agy auth", present ? `${credentials} present` : `no ${credentials} (run: agy, then sign in)`);
 		}
 	}
+	// The version beside the path is that bun's own answer; the bun running this report is named only when it differs.
 	const bunPath = Bun.which("bun");
-	report(bunPath !== null, "bun", `${bunPath ?? "not on PATH"} ${Bun.version}`);
+	const pathBunVersion = bunPath === null ? undefined : await readVersion([bunPath, "--version"]);
+	report(
+		bunPath !== null,
+		"bun",
+		bunPath === null
+			? `not on PATH (running ${Bun.version})`
+			: `${bunPath} ${pathBunVersion}${pathBunVersion === Bun.version ? "" : ` (running ${Bun.version})`}`,
+	);
 
-	// The bundle carries the conversation memory and operator files (sessions/, config.json, workspace/, scripts/); a home that only backs up the ledger
-	// is half protected, so the stamp must name a bundle that still exists and is fresh. A ledger-only home has
-	// no bundle sources at all — `runBackup` correctly writes no bundle there, so that stamp passes.
-	const stamp = readStamp(join(homeDir, "backups"));
-	const bundleSources = BUNDLE_SOURCES.filter((name) => existsSync(join(homeDir, name)));
-	if (stamp === undefined) {
-		report(
-			false,
-			"backup bundle",
-			"stamp=missing (expected on a first install: start the daemon, then run backup once and enable ompbot-backup.timer)",
-		);
-	} else if (stamp.bundle === undefined && bundleSources.length > 0) {
-		report(false, "backup bundle", "bundle=none (run ompbot backup again)");
-	} else if (stamp.bundle === undefined) {
-		report(true, "backup bundle", "sources=none (ledger-only home)");
-	} else if (!existsSync(join(homeDir, "backups", stamp.bundle))) {
-		report(false, "backup bundle", `bundle=${stamp.bundle} missing`);
-	} else {
-		const hours = (Date.now() - stamp.ts.getTime()) / 3_600_000;
-		report(hours <= BACKUP_MAX_AGE_MS / 3_600_000, "backup bundle", `bundle=${stamp.bundle} hours=${hours.toFixed(1)}`);
-	}
+	checkBackupBundle(homeDir, report, warn);
 
 	if (config && !tokensOk) {
 		report(false, "slack auth.test", "skipped: fix the secret lines above first");
-	} else if (config) {
+	} else if (config?.slack !== undefined) {
+		const slack = config.slack;
 		try {
 			const { botToken } = readSlackTokens(config);
 			const auth = await new WebClient(botToken).auth.test();
-			const idMatches = config.slack.botUserId === undefined || config.slack.botUserId === auth.user_id;
+			const idMatches = slack.botUserId === undefined || slack.botUserId === auth.user_id;
 			report(
 				auth.ok === true && idMatches,
 				"slack auth.test",

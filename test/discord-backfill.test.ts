@@ -9,7 +9,6 @@ import { Daemon } from "../src/daemon/daemon";
 import type { DiscordAdapter } from "../src/discord/adapter";
 import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import { DiscordCallError, type DiscordMessageEvent, DiscordRateLimitedError } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
@@ -25,6 +24,7 @@ import {
 	WaitingTransport,
 	withDiscord,
 } from "./helpers/bot-home";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const STRANGER = "100000000000000002";
 const BOT = "500000000000000000";
@@ -96,7 +96,12 @@ const eyes = () => calls("addReaction").filter((c) => c.emoji === "👀");
 beforeEach(() => {
 	home = makeHome("ompbot-discord-backfill-");
 	config = withDiscord(home);
-	store = openStore({ path: join(home.dir, "test.db"), clock: { now: () => Date.now() }, redact });
+	store = openStore({
+		timezone: "Asia/Seoul",
+		path: join(home.dir, "test.db"),
+		clock: { now: () => Date.now() },
+		redact,
+	});
 	transport = new FakeDiscordTransport({ botUserId: BOT });
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	inbound = [];
@@ -306,11 +311,21 @@ describe("daemon start", () => {
 	test("a DM sent while the daemon was down is answered after the start", async () => {
 		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
 		store.close();
-		const ledger = openStore({ path: join(home.dir, "ompbot.db"), clock: { now: () => Date.now() }, redact });
+		const ledger = openStore({
+			timezone: "Asia/Seoul",
+			path: join(home.dir, "ompbot.db"),
+			clock: { now: () => Date.now() },
+			redact,
+		});
 		ledger.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "sessions", "dm"));
 		ledger.setCursor(`dc:${DM}`, WATERMARK);
 		ledger.close();
-		store = openStore({ path: join(home.dir, "test.db"), clock: { now: () => Date.now() }, redact });
+		store = openStore({
+			timezone: "Asia/Seoul",
+			path: join(home.dir, "test.db"),
+			clock: { now: () => Date.now() },
+			redact,
+		});
 
 		const discord = new WaitingDiscordTransport();
 		discord.history.set(DM, [dm("100000000000000001", DISCORD_OWNER, "자는 동안 보낸 질문")]);

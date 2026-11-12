@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
 
+/** Open gates of the home only: `host_pressure`·`disk_low` read the test machine's real load and disk. */
+const homeGates = <T extends { name: string }>(gates: T[]): T[] =>
+	gates.filter((gate) => gate.name !== "host_pressure" && gate.name !== "disk_low");
+
 let home: TestHome;
 
 beforeEach(() => {
@@ -22,14 +26,17 @@ test("real daemon process: status --json schema, second instance refused, SIGTER
 
 	const status = await runMain(home.dir, ["status", "--json"]);
 	expect(status.code).toBe(0);
-	expect(JSON.parse(status.stdout)).toEqual({
+	const parsed = JSON.parse(status.stdout);
+	parsed.openGates = homeGates(parsed.openGates);
+	expect(parsed).toEqual({
 		ompVersion: "omp-stub 0.0.0",
+		timezone: "Asia/Seoul",
 		daemonRunning: true,
 		origins: [],
 		ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
 		inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
 		monitors: { count: 0, next: null },
-		openGates: [{ name: "backup_age", detail: "stamp=missing" }], // makeHome writes no backup stamp
+		openGates: [], // makeHome writes no backup stamp; the boot backup writes the first one
 	});
 
 	const second = spawnDaemon(home.dir, transportFile);
@@ -52,4 +59,5 @@ test("real daemon process: status --json schema, second instance refused, SIGTER
 	const after = await runMain(home.dir, ["status", "--json"]);
 	expect(after.code).toBe(0);
 	expect(JSON.parse(after.stdout)).toMatchObject({ daemonRunning: false });
-});
+	// Six bun children start one after another: on a saturated host that alone outlasts bun's 5 s default.
+}, 30_000);

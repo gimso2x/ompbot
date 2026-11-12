@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { acquireLock, LockHeldError } from "../daemon/lock";
 import { BACKUP_FILE_PATTERN, backupStamp, fsyncPath } from "./backup";
@@ -43,6 +43,16 @@ export interface RestoreResult {
 }
 
 const SIDECARS = ["", "-wal", "-shm"] as const;
+/** Core ledger tables every ompbot db has: a restore source without them is not an ompbot ledger. */
+const REQUIRED_TABLES = ["origins", "inbound", "deliveries"] as const;
+
+/** `backups/pre-restore-<stamp>`, or `-2`, `-3`… when a restore in the same second already used that name. */
+function freshPreRestoreDir(homeDir: string, stamp: string): string {
+	const base = join(homeDir, "backups", `pre-restore-${stamp}`);
+	let dir = base;
+	for (let n = 2; existsSync(dir); n += 1) dir = `${base}-${n}`;
+	return dir;
+}
 
 /** Maps the CLI argument to the backup file: a daily name (or `backups/<name>`) inside the home, or an absolute file. */
 export function resolveRestoreSource(homeDir: string, source: string): string {
@@ -66,13 +76,19 @@ export function resolveRestoreSource(homeDir: string, source: string): string {
 		throw new RestoreError("bad_source", `${path} does not exist`);
 	}
 	if (!stat.isFile()) throw new RestoreError("bad_source", `${path} is not a regular file`);
+	// A hard link hides where its other names live, and a live ledger's -wal sits beside one of those: refuse it.
+	if (stat.nlink > 1) {
+		throw new RestoreError("bad_source", `${path} is a hard link (${stat.nlink} names): copy the backup file first`);
+	}
 	// A -wal next to the source means the file is a live or crashed ledger, not a self-contained backup: copying only
-	// the main file would silently drop its newest pages.
-	if (existsSync(`${path}-wal`)) {
-		throw new RestoreError(
-			"bad_source",
-			`${path}-wal exists: the source is not a self-contained backup (checkpoint it or use a backup file)`,
-		);
+	// the main file would silently drop its newest pages. A symlink is checked at its real path too.
+	for (const candidate of new Set([path, realpathSync(path)])) {
+		if (existsSync(`${candidate}-wal`)) {
+			throw new RestoreError(
+				"bad_source",
+				`${candidate}-wal exists: the source is not a self-contained backup (checkpoint it or use a backup file)`,
+			);
+		}
 	}
 	return path;
 }
@@ -89,7 +105,7 @@ export async function runRestore(options: RestoreOptions): Promise<RestoreResult
 	const source = resolveRestoreSource(homeDir, options.source);
 	const target = join(homeDir, "ompbot.db");
 	const stamp = backupStamp(options.now ?? new Date());
-	const preRestoreDir = join(homeDir, "backups", `pre-restore-${stamp}`);
+	const preRestoreDir = freshPreRestoreDir(homeDir, stamp);
 	const plan: RestorePlan = {
 		source,
 		target,
@@ -135,14 +151,28 @@ function install(plan: RestorePlan, rename: (from: string, to: string) => void):
 		chmodSync(tmp, 0o600);
 		const copy = new Database(tmp, { readonly: true, strict: true });
 		let check: string;
+		let missing: string[];
 		try {
 			check = (copy.query("PRAGMA quick_check").get() as { quick_check?: string } | undefined)?.quick_check ?? "";
+			// quick_check passes an empty file and any foreign sqlite db alike; the daemon would not start on either.
+			const tables = new Set(
+				(copy.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+					(row) => row.name,
+				),
+			);
+			missing = REQUIRED_TABLES.filter((table) => !tables.has(table));
 		} catch (error) {
 			throw new RestoreError("integrity_check_failed", error instanceof Error ? error.message : String(error));
 		} finally {
 			copy.close();
 		}
 		if (check !== "ok") throw new RestoreError("integrity_check_failed", `quick_check=${check}`);
+		if (missing.length > 0) {
+			throw new RestoreError(
+				"integrity_check_failed",
+				`not an ompbot ledger: missing table${missing.length > 1 ? "s" : ""} ${missing.join(", ")}`,
+			);
+		}
 		rmSync(`${tmp}-wal`, { force: true });
 		rmSync(`${tmp}-shm`, { force: true });
 		fsyncPath(tmp);

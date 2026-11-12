@@ -35,10 +35,11 @@ let drivers: FakeOmpDriver[];
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-thread-context-"));
 	clock = new FakeClock();
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	drivers = [];
 	const sessionStore = new FakeSessionStore();
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(dir, "sessions"),

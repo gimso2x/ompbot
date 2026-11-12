@@ -1,6 +1,6 @@
 import type { Server } from "bun";
 import type { LiveView } from "../core/live-turn";
-import { type BoardPanel, type BoardSource, type BoardTaskRef, boardView } from "./board";
+import { type BoardPanel, type BoardPromptRef, type BoardSource, type BoardTaskRef, boardView } from "./board";
 import { renderDashboardPage } from "./html";
 import type { MonitorDetail } from "./monitor-detail";
 import { proxyPaneGet } from "./proxy";
@@ -13,6 +13,8 @@ export interface DashboardBoardOptions {
 	source: BoardSource;
 	/** Open TASKs the cards are matched against (read-only database read per board view). */
 	tasks: () => BoardTaskRef[];
+	/** The newest recorded prompt of each (host, agent) for the cards' 마지막 지시 (read per board view); absent = none. */
+	prompts?: () => BoardPromptRef[];
 	/** herdr-web-ui address for the cards' "herdr에서 답하기" links; absent = no link. */
 	herdrWebUrl?: string;
 	/** Comment line sent on an idle `api/board/events` stream. Default 15 s. */
@@ -311,6 +313,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 		if (state === undefined) return { ok: false, error: "herdr_unreachable" };
 		return boardView(state, {
 			tasks: board.tasks(),
+			...(board.prompts === undefined ? {} : { prompts: board.prompts() }),
 			now: now(),
 			...(board.herdrWebUrl === undefined ? {} : { herdrWebUrl: board.herdrWebUrl }),
 		});

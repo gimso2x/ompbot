@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { normalizeInbound } from "../src/core/normalize";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import {
@@ -12,6 +13,8 @@ import {
 	channelCursorKey,
 	compareSlackTs,
 	continuationKey,
+	QUARANTINE_RETRY_MS,
+	quarantineKey,
 	runBackfillPass,
 	type ScanPageArgs,
 	type ThreadTarget,
@@ -73,7 +76,7 @@ function fakeHistoryFeed(history: HistoryMessage[]) {
 
 interface Harness extends BackfillDeps {
 	ingested: SlackMessageEvent[];
-	notices: Array<{ channel: string; text: string }>;
+	notices: Array<{ channel: string; text: string; threadTs?: string }>;
 	cursors: CursorStore & { data: Map<string, string> };
 }
 
@@ -86,7 +89,7 @@ function makeDeps(overrides: {
 	maxPages?: number;
 }): Harness {
 	const ingested: SlackMessageEvent[] = [];
-	const notices: Array<{ channel: string; text: string }> = [];
+	const notices: Array<{ channel: string; text: string; threadTs?: string }> = [];
 	const cursors = memCursors();
 	const logger = createLogger({ sink: () => undefined, clock: { now: () => NOW_MS }, redact });
 	const history = overrides.history ?? [];
@@ -108,8 +111,8 @@ function makeDeps(overrides: {
 				ingested.push(event);
 				return Promise.resolve("recorded" as const);
 			}),
-		notifier: (channel, text) => {
-			notices.push({ channel, text });
+		notifier: (channel, text, threadTs) => {
+			notices.push({ channel, text, ...(threadTs === undefined ? {} : { threadTs }) });
 			return Promise.resolve();
 		},
 		cursors,
@@ -138,7 +141,7 @@ describe("compareSlackTs", () => {
 });
 
 describe("runBackfillPass", () => {
-	test("recovers missed messages oldest-first, advances the watermark, and posts one notice", async () => {
+	test("recovers missed messages oldest-first, advances the watermark, and posts one notice in the first one's thread", async () => {
 		const deps = makeDeps({
 			history: [
 				{ ts: ts(1_792_800_100, "300000"), text: "셋째", user: "UOWNER" },
@@ -153,7 +156,11 @@ describe("runBackfillPass", () => {
 		expect(deps.cursors.data.get(channelCursorKey("D1"))).toBe(ts(1_792_800_100, "300000"));
 		expect(summary.recovered).toBe(2);
 		expect(deps.notices).toEqual([
-			{ channel: "D1", text: "⏬ 봇이 응답하지 못한 동안 도착한 메시지 2건을 처리합니다" },
+			{
+				channel: "D1",
+				text: "⏬ 봇이 응답하지 못한 동안 도착한 메시지 2건을 처리합니다",
+				threadTs: ts(1_792_800_100, "200000"),
+			},
 		]);
 	});
 
@@ -244,6 +251,52 @@ describe("runBackfillPass", () => {
 		expect(fourth.targets[0]?.skipped).toBe(true);
 	});
 
+	test("strikes survive a daemon restart: fresh in-memory state reaches quarantine and skips without reading", async () => {
+		const deps = makeDeps({ history: [] });
+		let reads = 0;
+		deps.transport = {
+			...deps.transport,
+			conversationsHistory: async () => {
+				reads += 1;
+				throw new SlackCallError("definitive", "slack_platform_error:not_in_channel");
+			},
+		} as SlackTransport;
+		// One pass per daemon lifetime, each with new in-memory state (the 11-11 pattern: 13 restarts, never 3 strikes).
+		await runPass(deps);
+		await runPass(deps);
+		const third = await runPass(deps);
+		expect(third.targets[0]?.skipped).toBe(true);
+		expect(deps.cursors.data.get(quarantineKey(channelCursorKey("D1")))).toBe(`3:${NOW_MS}`);
+		const afterRestart = await runPass(deps);
+		expect(afterRestart.targets[0]?.skipped).toBe(true);
+		expect(reads).toBe(3);
+	});
+
+	test("a quarantined channel is read again after a day and a good read clears the stored strikes", async () => {
+		const deps = makeDeps({ history: [{ ts: ts(1_792_800_100), text: "돌아옴", user: "UOWNER" }] });
+		deps.cursors.setCursor(quarantineKey(channelCursorKey("D1")), `3:${NOW_MS - QUARANTINE_RETRY_MS - 1}`);
+		const summary = await runPass(deps);
+		expect(summary.targets[0]?.skipped).toBe(false);
+		expect(deps.ingested.map((event) => event.text)).toEqual(["돌아옴"]);
+		expect(deps.cursors.data.has(quarantineKey(channelCursorKey("D1")))).toBe(false);
+	});
+
+	test("a channel quarantined by an earlier daemon keeps its threads skipped too", async () => {
+		const deps = makeDeps({ history: [], threads: [{ channel: "D1", rootTs: ts(1_792_800_100) }] });
+		deps.cursors.setCursor(quarantineKey(channelCursorKey("D1")), `3:${NOW_MS}`);
+		let replies = 0;
+		deps.transport = {
+			...deps.transport,
+			conversationsReplies: async () => {
+				replies += 1;
+				return { messages: [], nextCursor: undefined };
+			},
+		} as unknown as SlackTransport;
+		const summary = await runPass(deps);
+		expect(summary.targets.every((target) => target.skipped)).toBe(true);
+		expect(replies).toBe(0);
+	});
+
 	test("an empty first pass stores the bootstrap floor so older history is never rescanned", async () => {
 		const deps = makeDeps({ history: [] });
 		await runPass(deps);
@@ -263,6 +316,42 @@ describe("runBackfillPass", () => {
 		});
 		await runPass(deps);
 		expect(deps.ingested.map((event) => [event.text, event.thread_ts])).toEqual([["reply2", ts(1_792_800_100)]]);
+	});
+
+	test("a DM thread target's replies keep the live slack/dm origin; a channel thread keeps its thread origin", async () => {
+		const root = ts(1_792_800_100);
+		const deps = makeDeps({
+			withChannels: false,
+			history: [{ ts: ts(1_792_800_100, "900000"), text: "아까 그거 이어서", user: "UOWNER", thread_ts: root }],
+			threads: [
+				{ channel: "D0123456789", rootTs: root },
+				{ channel: "C0123456789", rootTs: root },
+			],
+		});
+		await runPass(deps);
+		const originOf = (event: SlackMessageEvent): string | undefined => {
+			const result = normalizeInbound({
+				userId: event.user,
+				botUserId: "UBOT",
+				ownerUserId: "UOWNER",
+				quoted: [],
+				channel: event.channel,
+				channelType: event.channel_type,
+				ts: event.ts,
+				threadTs: event.thread_ts,
+				subtype: event.subtype,
+				text: event.text ?? "",
+			});
+			return result.accept ? result.inbound.originKey : undefined;
+		};
+		const [dm, channel] = deps.ingested;
+		expect(dm?.channel_type).toBe("im");
+		if (dm === undefined || channel === undefined) throw new Error("both replies must be ingested");
+		// The live socket event for the same DM thread reply carries channel_type "im".
+		expect(originOf(dm)).toBe(originOf({ ...dm, channel_type: "im" }));
+		expect(originOf(dm)).toBe("slack/dm/D0123456789");
+		expect(channel.channel_type).toBe("channel");
+		expect(originOf(channel)).toBe(`slack/ch/C0123456789/t/${root}`);
 	});
 
 	test("BackfillRunner coalesces triggers into a follow-up pass instead of stacking", async () => {

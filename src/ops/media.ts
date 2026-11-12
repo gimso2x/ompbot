@@ -13,6 +13,8 @@ export const MEDIA_MAX_AGE_MS = 24 * 60 * 60_000;
  * emptied it or its own mtime is already past the cutoff - a directory a download is about to write into survives.
  */
 export function pruneMediaFiles(mediaRoot: string, now: number, maxAgeMs = MEDIA_MAX_AGE_MS): number {
+	// The root itself is never followed either: a symlinked (or non-directory) media root is skipped as a whole.
+	if (lstatSync(mediaRoot, { throwIfNoEntry: false })?.isDirectory() !== true) return 0;
 	return prune(mediaRoot, now - maxAgeMs);
 }
 

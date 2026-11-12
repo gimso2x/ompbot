@@ -8,6 +8,7 @@ import {
 	platformOfConversationId,
 } from "../core/origin-key";
 import { COMMAND_OP_REF, parseCommand } from "../core/types";
+import { previewLine } from "../dashboard/snapshot";
 import {
 	assertLaneTransition,
 	LANE_ORIGIN_PREFIX,
@@ -49,6 +50,8 @@ const STEER_NOTICE_SUFFIX = ":steer:";
 const STEER_NOTICE_HEAD = "↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어";
 /** Op ref infix of a text a running turn sent before its end (`<opRef>:interim:<n>`); it never finishes the status. */
 export const INTERIM_INFIX = ":interim:";
+/** Origin key prefix of Teams guest/qa deliveries (`teams-qa/<alias>`): no session, no inbound row behind them. */
+export const TEAMS_QA_ORIGIN_PREFIX = "teams-qa/";
 /** Head of a failed-turn notice delivery (`failedNotice` in the mailbox); never recall material. */
 const TURN_FAILED_HEAD = "[turn failed]";
 /** How far back recall candidates reach. */
@@ -84,6 +87,8 @@ export interface StoreClock {
 export interface StoreOptions {
 	path: string;
 	clock: StoreClock;
+	/** The bot's zone (`config.timezone`): task ids are dated in it. */
+	timezone: string;
 	/** Applied to every body / text / error string before it is stored. */
 	redact: (text: string) => string;
 	/** Fallback Slack channel for monitor output before any owner DM is known. */
@@ -95,7 +100,24 @@ export interface StoreOptions {
 		afterInboundAnswered?: () => void;
 		/** Observes every delivery state change (`from` is "new" for a freshly inserted row). Must not throw. */
 		onDeliveryState?: (change: { deliveryId: number; from: DeliveryState | "new"; to: DeliveryState }) => void;
+		/** A notice for the owner had no destination (`ownerHome()` undefined) and was not recorded. Must not throw. */
+		onOwnerNoticeUnroutable?: (info: { originKey: string; opRef: string }) => void;
 	};
+}
+
+/** A Teams conversation behind its ledger alias (`teams_conversations`). */
+export interface TeamsConversation {
+	alias: string;
+	conversationId: string;
+	serviceUrl: string;
+	tenantId: string;
+	kind: "dm" | "ch";
+}
+
+/** Where owner notices go when nothing else names a conversation (`Store.ownerHome()`). */
+export interface OwnerHome {
+	platform: ChatPlatform;
+	conversationId: string;
 }
 
 export interface OriginRow {
@@ -290,6 +312,42 @@ const toTurnSnapshot = (r: TurnSnapshotSql): TurnSnapshotRow => ({
 /** Rows kept per origin: an old turn's `!undo` target stops being reachable long before `gc` runs. */
 export const TURN_SNAPSHOT_ROWS_KEPT = 20;
 
+/**
+ * The last instructions given to herdr agents, for the dashboard card's 마지막 지시 line
+ * (doc/plans/dashboard-model-and-last-prompt.md §B): one masked one-line preview per prompt, never the text itself.
+ * `host` is '' for local herdr.
+ */
+export const HERDR_PROMPTS_DDL = `CREATE TABLE IF NOT EXISTS herdr_prompts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	host TEXT NOT NULL,
+	agent TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('start','followup','remind')),
+	preview TEXT NOT NULL,
+	origin_key TEXT,
+	at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS herdr_prompts_agent ON herdr_prompts(agent, id);`;
+
+/** start: a new agent (a resume that starts one too) · followup: a prompt to a running one · remind: the sweep's nudge. */
+export type HerdrPromptKind = "start" | "followup" | "remind";
+
+/** One prompt herdr took; `host` null = local herdr. */
+export interface HerdrPromptInput {
+	host: string | null;
+	agent: string;
+	kind: HerdrPromptKind;
+	/** The prompt as sent; only its masked preview is stored. */
+	text: string;
+	originKey: string | null;
+}
+
+/** Rows kept per agent. */
+export const HERDR_PROMPT_ROWS_KEPT = 20;
+/** Rows older than this are dropped on the next record. */
+export const HERDR_PROMPT_KEEP_MS = 30 * 24 * 60 * 60_000;
+/** Longest stored preview. */
+export const HERDR_PROMPT_PREVIEW_CHARS = 120;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS origins (
 	origin_key TEXT PRIMARY KEY,
@@ -355,6 +413,31 @@ CREATE TABLE IF NOT EXISTS alert_incidents (
 	alerted_at INTEGER NOT NULL,
 	UNIQUE (scope, signature)
 );
+CREATE TABLE IF NOT EXISTS owner_home (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	platform TEXT NOT NULL,
+	conversation_id TEXT NOT NULL,
+	set_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS teams_conversations (
+	alias TEXT PRIMARY KEY,
+	conversation_id TEXT NOT NULL,
+	service_url TEXT NOT NULL,
+	tenant_id TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('dm','ch')),
+	updated_at INTEGER NOT NULL,
+	owner_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS teams_qa (
+	id INTEGER PRIMARY KEY,
+	alias TEXT NOT NULL,
+	asker_aad TEXT NOT NULL,
+	asker_name TEXT,
+	question TEXT NOT NULL,
+	answer TEXT,
+	at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS teams_qa_alias_at ON teams_qa(alias, at);
 CREATE TABLE IF NOT EXISTS thread_mutes (
 	thread_ref TEXT PRIMARY KEY,
 	muted_at INTEGER NOT NULL
@@ -368,6 +451,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 );
 ${FEEDBACK_DDL}
 ${TURN_SNAPSHOTS_DDL}
+${HERDR_PROMPTS_DDL}
 `;
 
 interface LaneSql {
@@ -546,7 +630,7 @@ export class Store {
 		this.db.run(SCHEMA);
 		this.migrate();
 		this.monitors = new MonitorLedger(this.db, { clock: options.clock, redact: options.redact });
-		this.tasks = new TaskLedger(this.db, { clock: options.clock });
+		this.tasks = new TaskLedger(this.db, { clock: options.clock, timezone: options.timezone });
 		this.feedback = new FeedbackLedger(this.db, { clock: options.clock });
 		this.recoveredInflight = this.db
 			.query("UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'inflight'")
@@ -1226,16 +1310,190 @@ export class Store {
 		return row?.origin_key;
 	}
 
-	/** Slack channel for monitor output: the owner's known DM, else the owner user id (Slack opens that DM). */
+	/**
+	 * Slack only: the owner's known Slack DM, else the Slack owner user id (Slack opens that DM), else `""`. Owner
+	 * notices route through `ownerHome()` instead, which never yields an empty conversation.
+	 */
 	ownerChannel(): string {
 		const origin = this.ownerDmOrigin();
 		const dm = origin === undefined ? undefined : parseChatOrigin(origin)?.conversationId;
 		return dm ?? this.slackOwnerUserId ?? "";
 	}
 
-	/** Thread ref of a top-level (non-threaded) post in the owner DM. */
+	/** Slack only: thread ref of a top-level post in the Slack owner DM (`ownerChannel()`). */
 	topLevelThreadRef(): string {
 		return `${this.ownerChannel()}:${TOP_LEVEL_TS}`;
+	}
+
+	/** `!home`: the conversation owner notices go to from now on, ahead of every fallback of `ownerHome()`. */
+	setOwnerHome(home: OwnerHome): void {
+		this.db
+			.query(
+				`INSERT INTO owner_home (id, platform, conversation_id, set_at) VALUES (1, ?, ?, ?)
+				 ON CONFLICT(id) DO UPDATE SET platform = excluded.platform, conversation_id = excluded.conversation_id,
+				 set_at = excluded.set_at`,
+			)
+			.run(home.platform, home.conversationId, this.clock.now());
+	}
+
+	/**
+	 * Where daemon-level owner notices and channel-less monitor reports go: ① the home registered with `!home`, ② the
+	 * Slack owner DM when Slack is on (its known DM, else the owner user id — the long-standing behavior), ③ the
+	 * owner's newest 1:1 conversation on any platform, ④ the conversation the owner last wrote in. `undefined` before
+	 * any of them exists (a fresh install whose owner has not written yet): callers warn and never post to an empty id.
+	 */
+	ownerHome(): OwnerHome | undefined {
+		const registered = this.db.query("SELECT platform, conversation_id FROM owner_home WHERE id = 1").get() as {
+			platform: string;
+			conversation_id: string;
+		} | null;
+		if (registered !== null) {
+			const ref = parseChatOrigin(`${registered.platform}/ch/${registered.conversation_id}`);
+			if (ref !== undefined) return { platform: ref.platform, conversationId: ref.conversationId };
+		}
+		const slackDm = this.ownerDmOrigin("slack");
+		const slackDmId = slackDm === undefined ? undefined : parseChatOrigin(slackDm)?.conversationId;
+		if (slackDmId !== undefined) return { platform: "slack", conversationId: slackDmId };
+		if (this.slackOwnerUserId !== undefined) return { platform: "slack", conversationId: this.slackOwnerUserId };
+		// A Teams 1:1 the owner wrote in counts even when no session came of it (`ownerMode: qa`), by `owner_at`.
+		const dms = this.db
+			.query(
+				`SELECT origin_key, updated_at AS at FROM origins WHERE origin_key LIKE '%/dm/%'
+				 UNION ALL
+				 SELECT 'teams/dm/' || alias, owner_at FROM teams_conversations WHERE kind = 'dm' AND owner_at IS NOT NULL
+				 ORDER BY at DESC`,
+			)
+			.all() as Array<{ origin_key: string }>;
+		for (const { origin_key } of dms) {
+			const ref = parseChatOrigin(origin_key);
+			if (ref?.kind === "dm") return { platform: ref.platform, conversationId: ref.conversationId };
+		}
+		// Owner rows only (a peer bot's request carries its user id); monitor and lane origins are not conversations.
+		// A Teams group chat has other people in it: a daemon notice must never land there.
+		const spoken = this.db
+			.query(
+				`SELECT origin_key FROM inbound WHERE peer_user_id IS NULL
+				 AND (origin_key LIKE 'slack/%' OR origin_key LIKE 'discord/%' OR origin_key LIKE 'telegram/%'
+				      OR origin_key LIKE 'teams/dm/%')
+				 ORDER BY inbound_id DESC LIMIT 50`,
+			)
+			.all() as Array<{ origin_key: string }>;
+		for (const { origin_key } of spoken) {
+			const ref = parseChatOrigin(origin_key);
+			if (ref !== undefined) return { platform: ref.platform, conversationId: ref.conversationId };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Records (or refreshes) the Teams conversation behind `alias`: where the Bot Connector takes posts for it. Its
+	 * `serviceUrl` can move, so the newest Activity's wins.
+	 */
+	upsertTeamsConversation(conversation: TeamsConversation): void {
+		this.db
+			.query(
+				`INSERT INTO teams_conversations (alias, conversation_id, service_url, tenant_id, kind, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?)
+				 ON CONFLICT(alias) DO UPDATE SET conversation_id = excluded.conversation_id,
+				 service_url = excluded.service_url, tenant_id = excluded.tenant_id, kind = excluded.kind,
+				 updated_at = excluded.updated_at`,
+			)
+			.run(
+				conversation.alias,
+				conversation.conversationId,
+				conversation.serviceUrl,
+				conversation.tenantId,
+				conversation.kind,
+				this.clock.now(),
+			);
+	}
+
+	/** The Teams conversation an alias stands for; `undefined` before an Activity of it was taken. */
+	teamsConversation(alias: string): TeamsConversation | undefined {
+		const row = this.db
+			.query("SELECT alias, conversation_id, service_url, tenant_id, kind FROM teams_conversations WHERE alias = ?")
+			.get(alias) as {
+			alias: string;
+			conversation_id: string;
+			service_url: string;
+			tenant_id: string;
+			kind: "dm" | "ch";
+		} | null;
+		return row === null
+			? undefined
+			: {
+					alias: row.alias,
+					conversationId: row.conversation_id,
+					serviceUrl: row.service_url,
+					tenantId: row.tenant_id,
+					kind: row.kind,
+				};
+	}
+
+	/** The owner just wrote in this Teams conversation: a 1:1 then stays an `ownerHome()` candidate. */
+	markTeamsOwnerSpoke(alias: string): void {
+		this.db.query("UPDATE teams_conversations SET owner_at = ? WHERE alias = ?").run(this.clock.now(), alias);
+	}
+
+	/** One guest/qa question of a Teams conversation (`teams_qa`, context copy only); returns its row id. */
+	recordTeamsQuestion(input: {
+		alias: string;
+		askerAad: string;
+		askerName?: string | undefined;
+		question: string;
+	}): number {
+		const row = this.db
+			.query("INSERT INTO teams_qa (alias, asker_aad, asker_name, question, at) VALUES (?, ?, ?, ?, ?) RETURNING id")
+			.get(input.alias, input.askerAad, input.askerName ?? null, input.question, this.clock.now()) as { id: number };
+		return row.id;
+	}
+
+	/** The answer the guest/qa run gave to `recordTeamsQuestion`'s row. */
+	recordTeamsAnswer(id: number, answer: string): void {
+		this.db.query("UPDATE teams_qa SET answer = ? WHERE id = ?").run(answer, id);
+	}
+
+	/**
+	 * A Teams guest/qa answer (or its one-line notice) as a plain delivery under `teams-qa/<alias>`: no inbound row is
+	 * closed, no origin is touched, no log-channel copy is made. Re-recording the same op is a no-op.
+	 */
+	recordGuestAnswer(input: { alias: string; opRef: string; threadRef: string; body: string }): DeliveryRow {
+		return this.insertDelivery(
+			{ originKey: `${TEAMS_QA_ORIGIN_PREFIX}${input.alias}`, opRef: input.opRef, threadRef: input.threadRef },
+			0,
+			input.body,
+		);
+	}
+
+	/** The newest answered question/answer pairs of one Teams conversation, oldest first; `before` excludes that row on. */
+	teamsQaContext(
+		alias: string,
+		limit: number,
+		before?: number,
+	): Array<{ askerName: string | undefined; question: string; answer: string }> {
+		const rows = this.db
+			.query(
+				`SELECT asker_name, question, answer FROM teams_qa
+				 WHERE alias = ? AND answer IS NOT NULL AND id < ? ORDER BY at DESC, id DESC LIMIT ?`,
+			)
+			.all(alias, before ?? Number.MAX_SAFE_INTEGER, limit) as Array<{
+			asker_name: string | null;
+			question: string;
+			answer: string;
+		}>;
+		return rows.reverse().map((row) => ({
+			askerName: row.asker_name ?? undefined,
+			question: row.question,
+			answer: row.answer,
+		}));
+	}
+
+	/** Top-level thread ref in `ownerHome()`; `undefined` (and the unroutable hook) when there is none. */
+	private ownerTopLevelThreadRef(input: { originKey: string; opRef: string }): string | undefined {
+		const home = this.ownerHome();
+		if (home !== undefined) return threadRefOf(home.conversationId, TOP_LEVEL_TS);
+		this.hooks.onOwnerNoticeUnroutable?.(input);
+		return undefined;
 	}
 
 	/** Monitor event ids of the dispatched inbound rows of an op (message ids are `monitor:<id>:<event>:<attempt>`). */
@@ -1278,7 +1536,8 @@ export class Store {
 					);
 					continue;
 				}
-				delivered.push(this.postMonitorReport(input, part, eventId, settled.monitorName, monitor, text));
+				const report = this.postMonitorReport(input, part, eventId, settled.monitorName, monitor, text);
+				if (report !== undefined) delivered.push(report);
 			}
 			return delivered;
 		})();
@@ -1320,19 +1579,16 @@ export class Store {
 		monitorName: string,
 		monitor: MonitorRow | undefined,
 		text: string,
-	): DeliveryRow {
+	): DeliveryRow | undefined {
 		const channel = monitor?.channel;
 		const body = `⏰ ${monitorName}\n${text}`;
-		const row = this.insertDelivery(
-			{
-				originKey: input.originKey,
-				opRef: input.opRef,
-				threadRef: channel ? threadRefOf(channel, TOP_LEVEL_TS) : this.topLevelThreadRef(),
-			},
-			part,
-			body,
-		);
-		this.monitors.attachDelivery(eventId, row.deliveryId);
+		// The scheduler holds channel-less events while there is no owner home, so this is only a home lost meanwhile.
+		const threadRef = channel ? threadRefOf(channel, TOP_LEVEL_TS) : this.ownerTopLevelThreadRef(input);
+		const row =
+			threadRef === undefined
+				? undefined
+				: this.insertDelivery({ originKey: input.originKey, opRef: input.opRef, threadRef }, part, body);
+		if (row !== undefined) this.monitors.attachDelivery(eventId, row.deliveryId);
 		this.insertMonitorCopy(input, part, monitor, body);
 		return row;
 	}
@@ -1376,12 +1632,11 @@ export class Store {
 			if (!incident.notify) return undefined;
 			const reason = error.replace(/^\[turn failed\]\s*/, "").replace(/\s+—.*$/, "");
 			const repeat = incident.count > 1 ? ` · 반복 ${incident.count}회차` : "";
+			const target = { originKey: monitorOrigin(settled.event.monitorId), opRef: `monitor-notice:${eventId}` };
+			const threadRef = this.ownerTopLevelThreadRef(target);
+			if (threadRef === undefined) return undefined;
 			return this.insertDelivery(
-				{
-					originKey: monitorOrigin(settled.event.monitorId),
-					opRef: `monitor-notice:${eventId}`,
-					threadRef: this.topLevelThreadRef(),
-				},
+				{ ...target, threadRef },
 				0,
 				`⏰ ${settled.monitorName}\n⚠️ 모니터 실행이 ${settled.event.attempts}번 실패해 재시도를 멈췄습니다 (failed_no_retry${repeat}): ${reason}`,
 			);
@@ -1390,7 +1645,7 @@ export class Store {
 
 	// ---- daily cost ledger (`costCap`, src/ops/cost-cap.ts) ----
 
-	/** Adds one finished turn's priced cost to the KST day's row of its origin. */
+	/** Adds one finished turn's priced cost to the day's row of its origin (`day` keyed in the bot's zone). */
 	addDailyUsage(input: { day: string; originKey: string; cost: number; calls: number }): void {
 		this.db
 			.query(
@@ -1455,6 +1710,34 @@ export class Store {
 		} else {
 			this.db.query("DELETE FROM thread_mutes WHERE thread_ref = ?").run(threadRef);
 		}
+	}
+
+	// ---- herdr prompts (dashboard 마지막 지시) ----
+
+	/**
+	 * Records one prompt herdr took as a masked one-line preview, then keeps the agent's newest
+	 * `HERDR_PROMPT_ROWS_KEPT` rows and drops every row older than `HERDR_PROMPT_KEEP_MS`.
+	 */
+	recordHerdrPrompt(input: HerdrPromptInput): void {
+		const now = this.clock.now();
+		this.db.transaction(() => {
+			this.db
+				.query("INSERT INTO herdr_prompts (host, agent, kind, preview, origin_key, at) VALUES (?, ?, ?, ?, ?, ?)")
+				.run(
+					input.host ?? "",
+					input.agent,
+					input.kind,
+					previewLine(input.text, undefined, HERDR_PROMPT_PREVIEW_CHARS),
+					input.originKey,
+					now,
+				);
+			this.db
+				.query(
+					"DELETE FROM herdr_prompts WHERE agent = ? AND id NOT IN (SELECT id FROM herdr_prompts WHERE agent = ? ORDER BY id DESC LIMIT ?)",
+				)
+				.run(input.agent, input.agent, HERDR_PROMPT_ROWS_KEPT);
+			this.db.query("DELETE FROM herdr_prompts WHERE at < ?").run(now - HERDR_PROMPT_KEEP_MS);
+		})();
 	}
 
 	// ---- turn snapshots (`!undo`) ----
@@ -1799,6 +2082,10 @@ export class Store {
 		}
 		if (!deliveryColumns.some((column) => column.name === "reply_ts")) {
 			this.db.run("ALTER TABLE deliveries ADD COLUMN reply_ts TEXT");
+		}
+		const teamsColumns = this.db.query("PRAGMA table_info(teams_conversations)").all() as Array<{ name: string }>;
+		if (!teamsColumns.some((column) => column.name === "owner_at")) {
+			this.db.run("ALTER TABLE teams_conversations ADD COLUMN owner_at INTEGER");
 		}
 		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
 		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");

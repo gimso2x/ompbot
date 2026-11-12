@@ -24,7 +24,7 @@ let drivers: FakeOmpDriver[];
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-recovery-"));
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	store.ensureOrigin(ORIGIN, SESSION_DIR);
 	sessions = new FakeSessionStore();
 	logLines = [];
@@ -326,7 +326,7 @@ describe("inbound.thread_ref migration", () => {
 			INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at) VALUES ('D1:9.9', '${ORIGIN}', 1, 'old', 1);
 		`);
 		old.close();
-		const migrated = openBotStore(path, clock);
+		const migrated = openBotStore(path, clock, "Asia/Seoul");
 		try {
 			expect(migrated.getInbound("D1:9.9")?.threadRef).toBe("D1:9.9");
 			migrated.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:10.1", textRef: "new", threadRef: "D1:9.9" });

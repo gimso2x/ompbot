@@ -1,3 +1,5 @@
+import { buildChildEnv } from "../omp/env";
+
 /** Bound on waiting for a killed group's orphans to be reaped by init after the group SIGKILL. */
 const GROUP_REAP_WAIT_MS = 500;
 
@@ -21,11 +23,17 @@ async function groupGone(pgid: number): Promise<void> {
  * First stdout line of `<command...>` (e.g. `omp --version`); `unknown` when it cannot be run, exits non-zero or is
  * still running after `timeoutMs`. The command runs in its own process group, and on timeout the whole group is
  * killed (a launcher's grandchild holding stdout open would otherwise keep the read waiting) and the child reaped.
+ * The command gets `env`, by default the turn child's env (`buildChildEnv`: no `SLACK_`/`OMPBOT_` keys), never the
+ * daemon's own.
  */
-export async function readVersion(command: string[], timeoutMs = 5_000): Promise<string> {
+export async function readVersion(
+	command: string[],
+	timeoutMs = 5_000,
+	env: Record<string, string> = buildChildEnv(),
+): Promise<string> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const proc = Bun.spawn(command, { stdout: "pipe", stderr: "ignore", stdin: "ignore", detached: true });
+		const proc = Bun.spawn(command, { stdout: "pipe", stderr: "ignore", stdin: "ignore", detached: true, env });
 		const timedOut = new Promise<"timeout">((resolve) => {
 			timer = setTimeout(() => resolve("timeout"), timeoutMs);
 		});

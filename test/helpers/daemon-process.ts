@@ -31,6 +31,7 @@ export function spawnDaemon(homeDir: string, transportFile: string, env: Record<
 			OMPBOT_HOME: homeDir,
 			OMPBOT_TEST_HOOKS: "1",
 			OMPBOT_TEST_TRANSPORT: transportFile,
+			OMPBOT_TEST_HOST_LOAD: "idle", // gates judge an idle host, not this machine's load
 			...env,
 		},
 		stdin: "ignore",

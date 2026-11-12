@@ -1,14 +1,23 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { discordThreadHref, renderDashboardPage, slackThreadHref } from "../src/dashboard/html";
+import { QUOTED_HEADER } from "../src/core/normalize";
+import {
+	discordThreadHref,
+	renderDashboardPage,
+	renderFlowChain,
+	renderTaskFacts,
+	slackThreadHref,
+} from "../src/dashboard/html";
 import {
 	buildSnapshot,
 	type DashboardSnapshot,
 	type FlowChainInfo,
+	previewLine,
 	type SnapshotDeps,
 	type TaskInfo,
 } from "../src/dashboard/snapshot";
+import { INJECTION_WARNING_HEAD } from "../src/safety/injection";
 import { openStore } from "../src/store/db";
 import type { TaskHostOps } from "../src/tasks/host";
 import { makeHome, type TestHome } from "./helpers/bot-home";
@@ -82,7 +91,7 @@ function seed(db: Database, tasks: Seed[]): void {
  * were registered 10 days ago, so F is no flow and they push E's closed TASK out of the snapshot's closed TASKs.
  */
 function seedDatabase(): void {
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	for (const thread of ["A", "B"]) {
 		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, '/s', ?)", [
@@ -194,6 +203,7 @@ const hostOps = (): TaskHostOps => ({
 const deps = (): SnapshotDeps => ({
 	homeDir: home.dir,
 	repoDir: "/srv/ompbot",
+	timezone: "Asia/Seoul",
 	config: undefined,
 	now: () => NOW,
 	callDaemon: async () => Promise.reject(new Error("no daemon")),
@@ -317,8 +327,8 @@ describe("flow view", () => {
 		expect(JSON.stringify(snapshot)).not.toContain(TOKEN);
 		expect(html).not.toContain("https://example.test/pr/1");
 		expect(html).toContain("1/3 끝남");
-		// The flow view stays reachable by its address but is not in the side nav.
-		expect(html).not.toContain('data-view="flow"');
+		// The flow view is in the side nav, current on its own page.
+		expect(html).toContain('data-view="flow" aria-current="page"');
 		// The request box opens its conversation in the turns view; a TASK box opens its panel here.
 		expect(html).toContain('href="?view=turns&amp;item=slack%2Fch%2FC1%2Ft%2FA"');
 		expect(html).toContain('href="?view=flow&amp;item=T-A2" data-item="T-A2"');
@@ -446,5 +456,297 @@ describe("flow view", () => {
 		const openHead = /<div id="detail-head"[^>]*>([\s\S]*?)<\/div>\n<section id="detail-plan"/.exec(open)?.[1] ?? "";
 		expect(openHead).toContain("title T-A2");
 		expect(openHead).toContain("구현 중");
+	});
+});
+
+describe("request preview without ompbot's quote wrapping", () => {
+	const fence = (id: string, body: string): string => `<<<quoted-${id}>>>\n${body}\n<<<end-quoted-${id}>>>`;
+	const QUOTE = `${QUOTED_HEADER}\n${fence("0123456789abcdef", "인용된 글 <https://x.test|링크>")}`;
+	const clean = (line: string): void => {
+		expect(line).not.toContain("인용·전달된 자료");
+		expect(line).not.toContain("<<<");
+	};
+
+	test("AC-3 (a)(b)(d): only the owner's own words remain, in order; an unclosed open marker drops the rest", () => {
+		const a = previewLine(`github.com/jin-doh/traceknot 분석\n\n${QUOTE}`);
+		expect(a).toBe("github.com/jin-doh/traceknot 분석");
+		clean(a);
+		const b = previewLine(
+			`앞 글\n${QUOTE}\n뒤에 붙인 글\n${INJECTION_WARNING_HEAD} 1곳 있다.\n${QUOTED_HEADER}\n${fence("fedcba9876543210", "둘째 인용")}`,
+		);
+		expect(b).toBe("앞 글 뒤에 붙인 글");
+		clean(b);
+		const d = previewLine(`표지 앞 글\n${QUOTED_HEADER}\n<<<quoted-0123456789abcdef>>>\n닫히지 않은 인용`);
+		expect(d).toBe("표지 앞 글");
+		clean(d);
+	});
+
+	test("AC-3 (c)(e): with nothing of the owner's left, the line is [첨부] and the file name or the fallback title", () => {
+		const c = previewLine(QUOTE);
+		expect(c).toBe("[첨부]");
+		clean(c);
+		expect(previewLine(QUOTE, "title T-D1")).toBe("[첨부] title T-D1");
+		expect(previewLine("[첨부: a.png]")).toBe("[첨부] a.png");
+		expect(previewLine("[첨부: /home/u/.ompbot/media/img_1.png (image/png)]")).toBe("[첨부] img_1.png");
+		expect(previewLine("[첨부: a.png]", "title T-D1")).toBe("[첨부] title T-D1");
+		expect(previewLine(`봐 줘 [첨부: a.png] ${TOKEN}`)).toBe("봐 줘 [첨부] [REDACTED]");
+	});
+
+	test("AC-3 (c)(e): a flow whose request is a quote only or an attachment only is titled [첨부] + its first TASK", async () => {
+		const db = new Database(dbPath, { strict: true });
+		db.run(
+			`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, thread_ref)
+			 VALUES ('d1', 'slack/ch/C1/t/D', 1, ?, 'answered', ?, 'D')`,
+			[QUOTE, NOW - 8 * DAY],
+		);
+		const quoted = chain(flowsOf(await buildSnapshot(deps())), "D");
+		expect(quoted.title).toBe("[첨부] title T-D1");
+		db.run("UPDATE inbound SET text_ref = '[첨부: a.png]' WHERE platform_message_id = 'd1'");
+		db.close();
+		expect(chain(flowsOf(await buildSnapshot(deps())), "D").title).toBe("[첨부] title T-D1");
+	});
+});
+
+/** A flow of TASKs registered/closed at the given `+09:00` times (`closed` undefined = still open). */
+const flowOf = (tasks: Array<{ id: string; created: string; closed?: string }>): FlowChainInfo => ({
+	threadRef: "Q",
+	originKey: "slack/ch/C1/t/Q",
+	place: "채널 C1 스레드",
+	title: "qa 50개",
+	requestedAt: "2026-11-12T01:07:00+09:00",
+	updatedAt: "2026-11-12T08:04:34+09:00",
+	done: tasks.filter((task) => task.closed !== undefined).length,
+	total: tasks.length,
+	here: tasks.find((task) => task.closed === undefined)?.id ?? null,
+	now: "지금 줄",
+	tasks: tasks.map((task) => ({
+		taskId: task.id,
+		title: `title ${task.id}`,
+		status: task.closed === undefined ? "working" : "done",
+		risk: "L1",
+		host: "local",
+		branch: `task/${task.id}`,
+		createdAt: task.created,
+		...(task.closed === undefined ? {} : { closedAt: task.closed }),
+		acTotal: 3,
+		stage:
+			task.closed === undefined ? { label: "구현 중", msg: "", tone: "run" } : { label: "끝남", msg: "", tone: "done" },
+	})),
+});
+const at = (time: string): string => `2026-11-12T${time}+09:00`;
+/** The TASK ids of each parallel group, in drawing order. */
+const groupsIn = (html: string): string[][] =>
+	html
+		.split('<div class="flow-group"')
+		.slice(1)
+		.map((group) => [...group.matchAll(/<b>(T-[^<]+)<\/b>/g)].map((match) => match[1] ?? ""));
+const gapsIn = (html: string): string[] =>
+	[...html.matchAll(/class="flow-gap">대기 ([^<]*)</g)].map((match) => match[1] ?? "");
+/** The qa50 request's real times: three rounds of 3 · 3 · 2 parallel TASKs. */
+const QA50 = flowOf([
+	{ id: "T-20261112-02", created: at("01:07:55"), closed: at("01:33:31") },
+	{ id: "T-20261112-03", created: at("01:08:21"), closed: at("01:33:33") },
+	{ id: "T-20261112-04", created: at("01:08:42"), closed: at("01:33:34") },
+	{ id: "T-20261112-05", created: at("01:46:01"), closed: at("02:33:56") },
+	{ id: "T-20261112-06", created: at("01:46:05"), closed: at("02:33:57") },
+	{ id: "T-20261112-07", created: at("01:46:11"), closed: at("01:59:25") },
+	{ id: "T-20261112-08", created: at("07:34:58"), closed: at("08:01:19") },
+	{ id: "T-20261112-09", created: at("07:35:18"), closed: at("08:04:34") },
+]);
+
+/** A judged TASK with `n` steps, the first `done` of them done and `current` as PROGRESS `current`. */
+const taskOf = (n: number, done: number, current: string, extra: Partial<TaskInfo> = {}): TaskInfo => ({
+	taskId: "T-20261112-99",
+	title: "띠",
+	risk: "L1",
+	status: "working",
+	host: "local",
+	agent: "t-20261112-99",
+	branch: "task/T-20261112-99",
+	open: true,
+	updatedAt: at("09:00:00"),
+	acChecked: 1,
+	acTotal: 8,
+	stepsDone: done,
+	stepsTotal: n,
+	progress: { status: "working", updated: at("09:00:00"), current, blockedReason: "" },
+	steps: Array.from({ length: n }, (_, index) => ({
+		id: `S${index + 1}`,
+		text: `단계 ${index + 1}`,
+		done: index < done,
+	})),
+	...extra,
+});
+/** The band's cells as `text[:tone]`, `+here` on the cell with 지금 여기. */
+const bandOf = (html: string): string[] => {
+	const band = /<ol class="band[^"]*" aria-label="진행 띠">([\s\S]*?)<\/ol>/.exec(html)?.[1];
+	if (band === undefined) return [];
+	return [...band.matchAll(/<li class="band-cell( is-[a-z]+)?"[^>]*>([^<]*)(<span class="([^"]+)")?/g)].map(
+		(match) =>
+			`${match[2]}${match[1] === undefined ? "" : `:${match[1].trim().slice(3)}`}${match[4] === "flow-here-chip" ? "+here" : ""}`,
+	);
+};
+
+describe("parallel groups in a flow", () => {
+	test("AC-1: the qa50 times draw three groups of 3 · 3 · 2 with 12분 and 5시간 1분 between them", () => {
+		const html = renderFlowChain(QA50, "", false);
+		expect(groupsIn(html)).toEqual([
+			["T-20261112-02", "T-20261112-03", "T-20261112-04"],
+			["T-20261112-05", "T-20261112-06", "T-20261112-07"],
+			["T-20261112-08", "T-20261112-09"],
+		]);
+		expect(gapsIn(html)).toEqual(["12분", "5시간 1분"]);
+		expect(html).toContain("<b>1차 · 병렬 3</b><span>25분</span>");
+		expect(html).toContain("<b>3차 · 병렬 2</b><span>29분</span>");
+		expect(html).not.toContain("flow-arr");
+		// Inside a panel the same groups, boxes without data-item.
+		const panel = renderFlowChain(QA50, "T-20261112-05", true);
+		expect(groupsIn(panel).map((group) => group.length)).toEqual([3, 3, 2]);
+		expect(panel).not.toContain("data-item=");
+		expect(panel).toMatch(/class="flow-box t-done is-selected" href="\?view=flow&amp;item=T-20261112-05"/);
+	});
+
+	test("AC-2: open TASKs join for 10 minutes only, closed-then-registered chains split, unparsable times go last", () => {
+		// (a) Three open TASKs within a minute are one group; the next group after them shows no wait.
+		const together = renderFlowChain(
+			flowOf([
+				{ id: "T-1", created: at("10:00:00") },
+				{ id: "T-2", created: at("10:00:20") },
+				{ id: "T-3", created: at("10:00:50") },
+				{ id: "T-4", created: at("10:30:00") },
+			]),
+			"",
+			false,
+		);
+		expect(groupsIn(together)).toEqual([["T-1", "T-2", "T-3"], ["T-4"]]);
+		expect(gapsIn(together)).toEqual([]);
+		expect(together).toContain("<b>1차 · 병렬 3</b><span>진행 중</span>");
+		expect(together).toContain("<b>2차</b>");
+
+		// (b) An open TASK does not swallow a TASK registered two hours later.
+		const later = renderFlowChain(
+			flowOf([
+				{ id: "T-1", created: at("10:00:00") },
+				{ id: "T-2", created: at("12:00:00") },
+			]),
+			"",
+			false,
+		);
+		expect(groupsIn(later)).toEqual([["T-1"], ["T-2"]]);
+
+		// (c) Each TASK registered after the one before closed is its own group.
+		const chainHtml = renderFlowChain(
+			flowOf([
+				{ id: "T-1", created: at("10:00:00"), closed: at("10:30:00") },
+				{ id: "T-2", created: at("10:40:00"), closed: at("11:00:00") },
+				{ id: "T-3", created: at("11:00:00"), closed: at("11:20:00") },
+			]),
+			"",
+			false,
+		);
+		expect(groupsIn(chainHtml)).toEqual([["T-1"], ["T-2"], ["T-3"]]);
+		// 10 minutes, then none (registered right at the close: under a minute).
+		expect(gapsIn(chainHtml)).toEqual(["10분"]);
+
+		// (d) A TASK whose registration time does not parse is last, alone; the rest keep their groups and order.
+		const broken = renderFlowChain(
+			flowOf([
+				{ id: "T-1", created: at("10:00:00"), closed: at("10:30:00") },
+				{ id: "T-X", created: "?", closed: at("10:35:00") },
+				{ id: "T-2", created: at("10:05:00"), closed: at("10:20:00") },
+				{ id: "T-3", created: at("11:00:00"), closed: at("11:20:00") },
+			]),
+			"",
+			false,
+		);
+		expect(groupsIn(broken)).toEqual([["T-1", "T-2"], ["T-3"], ["T-X"]]);
+		expect(gapsIn(broken)).toEqual(["30분"]);
+	});
+});
+
+describe("a TASK's step band", () => {
+	test("AC-2b: 12 steps fold the done run before the current step and the steps past the next two", () => {
+		expect(bandOf(renderTaskFacts(taskOf(12, 7, "S8 구현")))).toEqual([
+			"스펙:done",
+			"S1–S6 끝남:done",
+			"S7:done",
+			"S8:now+here",
+			"S9",
+			"S10",
+			"+2 남음",
+			"판정 1/8",
+			"리뷰",
+			"착지",
+		]);
+		// With S2 current nothing before it folds.
+		const early = bandOf(renderTaskFacts(taskOf(12, 1, "S2")));
+		expect(early.slice(0, 3)).toEqual(["스펙:done", "S1:done", "S2:now+here"]);
+		expect(early.some((cell) => cell.includes("끝남"))).toBe(false);
+	});
+
+	test("AC-4: a working TASK's band marks only its current step and shows the AC count", () => {
+		const html = renderTaskFacts(taskOf(4, 2, "S3: 구현"));
+		expect(bandOf(html)).toEqual(["스펙:done", "S1:done", "S2:done", "S3:now+here", "S4", "판정 1/8", "리뷰", "착지"]);
+		const band = /<ol class="band"[\s\S]*?<\/ol>/.exec(html)?.[0] ?? "";
+		expect(band.split("지금 여기").length - 1).toBe(1);
+		// The band comes before the AC and step lists.
+		expect(html.indexOf('aria-label="진행 띠"')).toBeLessThan(html.indexOf('aria-label="단계 목록"'));
+	});
+
+	test("AC-5: blocked shows one red cell and its reason, done is all done, no steps no band", () => {
+		const blocked = renderTaskFacts(
+			taskOf(4, 2, "S3", {
+				status: "blocked",
+				progress: { status: "blocked", updated: at("09:00:00"), current: "S3", blockedReason: "토큰 없음" },
+			}),
+		);
+		expect(bandOf(blocked).filter((cell) => cell.includes(":blocked"))).toEqual(["S3:blocked"]);
+		expect(blocked).toContain('<p class="band-blocked">막힘 토큰 없음</p>');
+		// No current step: the 판정 cell turns red.
+		const noStep = renderTaskFacts(
+			taskOf(4, 2, "", {
+				status: "blocked",
+				progress: { status: "blocked", updated: at("09:00:00"), current: "", blockedReason: "x" },
+			}),
+		);
+		expect(bandOf(noStep).filter((cell) => cell.includes(":blocked"))).toEqual(["판정 1/8:blocked"]);
+
+		const done = bandOf(renderTaskFacts(taskOf(4, 3, "S4", { status: "done", open: false })));
+		expect(done.length).toBe(8);
+		expect(done.every((cell) => cell.endsWith(":done"))).toBe(true);
+
+		const bare = renderTaskFacts(taskOf(4, 0, "", { steps: undefined }));
+		expect(bare).not.toContain("진행 띠");
+		expect(renderTaskFacts(taskOf(0, 0, ""))).not.toContain("진행 띠");
+	});
+
+	test("review puts 지금 여기 on 리뷰; cancelled dims the band", () => {
+		expect(bandOf(renderTaskFacts(taskOf(3, 3, "S3", { status: "review" }))).slice(-3)).toEqual([
+			"판정 1/8:done",
+			"리뷰:now+here",
+			"착지",
+		]);
+		expect(renderTaskFacts(taskOf(3, 1, "S2", { status: "cancelled" }))).toContain('<ol class="band is-dim"');
+	});
+});
+
+describe("shipped renderers", () => {
+	test("AC-6: renderFlowChain and renderTaskFacts evaluated alone from toString() draw what the server draws", () => {
+		const names = ["Date", "Math", "String", "Number", "Array", "Object", "encodeURIComponent"] as const;
+		const values = [Date, Math, String, Number, Array, Object, encodeURIComponent];
+		const isolated = <T>(fn: T): T => new Function(...names, `"use strict"; return (${String(fn)});`)(...values) as T;
+		const flow = isolated(renderFlowChain);
+		const facts = isolated(renderTaskFacts);
+		const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+		for (const [focus, panel] of [
+			["", false],
+			["T-20261112-05", true],
+		] as const) {
+			expect(flow(copy(QA50), focus, panel)).toBe(renderFlowChain(QA50, focus, panel));
+		}
+		const task = taskOf(4, 2, "S3: 구현");
+		expect(facts(copy(task))).toBe(renderTaskFacts(task));
+		const folded = taskOf(12, 7, "S8");
+		expect(facts(copy(folded))).toBe(renderTaskFacts(folded));
 	});
 });

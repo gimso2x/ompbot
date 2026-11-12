@@ -1,4 +1,4 @@
-import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, linkSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 
 export interface LockInfo {
 	pid: number;
@@ -6,10 +6,18 @@ export interface LockInfo {
 	startedAt: number;
 }
 
+/** An unreadable lock younger than this may be a starter between create and write: it is held, not stale. */
+export const UNREADABLE_LOCK_GRACE_MS = 10_000;
+
 export class LockHeldError extends Error {
-	readonly holder: LockInfo;
-	constructor(path: string, holder: LockInfo) {
-		super(`already_running: lock ${path} is held by pid ${holder.pid}`);
+	/** Undefined: the lock file is unreadable but too fresh to be called stale. */
+	readonly holder: LockInfo | undefined;
+	constructor(path: string, holder: LockInfo | undefined) {
+		super(
+			holder === undefined
+				? `already_running: lock ${path} is unreadable and newer than ${UNREADABLE_LOCK_GRACE_MS / 1000}s (another starter is writing it)`
+				: `already_running: lock ${path} is held by pid ${holder.pid}`,
+		);
 		this.name = "LockHeldError";
 		this.holder = holder;
 	}
@@ -54,25 +62,48 @@ function readLock(path: string): LockInfo | undefined {
 	}
 }
 
+/** Age of the lock file by mtime; a file that vanished meanwhile counts as old (the retry recreates it). */
+function lockAgeMs(path: string, now: number): number {
+	try {
+		return now - statSync(path).mtimeMs;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
 export interface Lock {
 	info: LockInfo;
 	release(): void;
 }
 
 /**
- * Exclusive create of `path` holding `{pid, bootId, startedAt}`. An existing lock is stale (and replaced) when its
- * process is dead, its boot id differs from this boot, or the file is unreadable; otherwise acquisition is refused.
+ * Exclusive create of `path` holding `{pid, bootId, startedAt}`. The content is written to a private file first and
+ * hard-linked into place, so the lock never exists empty. An existing lock is stale (and replaced) when its process
+ * is dead, its boot id differs from this boot, or the file is unreadable and older than `UNREADABLE_LOCK_GRACE_MS`;
+ * otherwise acquisition is refused.
  */
 export function acquireLock(path: string, now: number = Date.now()): Lock {
 	const info: LockInfo = { pid: process.pid, bootId: currentBootId(), startedAt: now };
 	for (let attempt = 0; attempt < 3; attempt++) {
+		const staged = `${path}.${process.pid}.tmp`;
+		const fd = openSync(staged, "w", 0o600);
 		try {
-			const fd = openSync(path, "wx", 0o600);
-			try {
-				writeSync(fd, JSON.stringify(info));
-			} finally {
-				closeSync(fd);
+			writeSync(fd, JSON.stringify(info));
+		} finally {
+			closeSync(fd);
+		}
+		let linked = false;
+		try {
+			linkSync(staged, path);
+			linked = true;
+		} catch (error) {
+			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
+				unlinkSync(staged);
+				throw error;
 			}
+		}
+		unlinkSync(staged);
+		if (linked) {
 			return {
 				info,
 				release() {
@@ -80,11 +111,11 @@ export function acquireLock(path: string, now: number = Date.now()): Lock {
 					if (held?.pid === info.pid && held.bootId === info.bootId) unlinkSync(path);
 				},
 			};
-		} catch (error) {
-			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
 		}
 		const holder = readLock(path);
 		if (holder && holder.bootId === info.bootId && isAlive(holder.pid)) throw new LockHeldError(path, holder);
+		if (holder === undefined && lockAgeMs(path, now) < UNREADABLE_LOCK_GRACE_MS)
+			throw new LockHeldError(path, undefined);
 		try {
 			unlinkSync(path);
 		} catch {

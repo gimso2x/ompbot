@@ -10,7 +10,7 @@ export const MAX_PAGES = 10;
 export const MAX_MESSAGE_ATTEMPTS = 3;
 /** A message ts further than this past "now" is treated as clock skew and never moves a watermark. */
 const FUTURE_TS_SLACK_S = 300;
-/** Unreadable-channel strikes before the target is skipped until the daemon restarts (upstream: 3). */
+/** Unreadable-target strikes before the target is skipped for `QUARANTINE_RETRY_MS` (upstream: 3). */
 export const QUARANTINE_ATTEMPTS = 3;
 
 export interface ChannelTarget {
@@ -34,7 +34,8 @@ export interface BackfillDeps {
 	transport: SlackTransport;
 	/** The adapter's live ingest path; the outcome decides watermark movement. */
 	ingest(event: SlackMessageEvent): Promise<"recorded" | "duplicate" | "dropped">;
-	notifier(channel: string, text: string): Promise<void>;
+	/** `threadTs` set: the notice goes into that thread instead of the channel root. */
+	notifier(channel: string, text: string, threadTs?: string): Promise<void>;
 	cursors: CursorStore;
 	log: Logger;
 	now: number;
@@ -78,6 +79,23 @@ export function channelCursorKey(channel: string): string {
 
 export function threadCursorKey(channel: string, rootTs: string): string {
 	return `thr:${channel}:${rootTs}`;
+}
+
+/**
+ * Unreadable-target strikes kept in the ledger as `<strikes>:<epoch ms of the last strike>`, so a left or deleted
+ * channel is not re-read on every daemon restart (the in-memory count started over each time and never reached
+ * quarantine). Not under the `ch:` prefix: it must not become a channel target itself.
+ */
+export function quarantineKey(key: string): string {
+	return `bfq:${key}`;
+}
+
+/** A quarantined target is read again once a day, so a re-invited bot or restored channel comes back by itself. */
+export const QUARANTINE_RETRY_MS = 24 * 60 * 60 * 1000;
+
+function readStrikes(cursors: CursorStore, key: string): { strikes: number; at: number } | undefined {
+	const match = /^(\d+):(\d+)$/.exec(cursors.getCursor(quarantineKey(key)) ?? "");
+	return match ? { strikes: Number(match[1]), at: Number(match[2]) } : undefined;
 }
 
 /** Contination marker for a truncated pass: the oldest ts the truncated scan reached. */
@@ -213,7 +231,11 @@ async function backfillTarget(input: {
 	bootstrapFloor: string;
 	scan: (page: ScanPageArgs) => Promise<{ messages: HistoryMessage[]; nextCursor?: string | undefined }>;
 	toEvent: (message: HistoryMessage) => SlackMessageEvent;
-	notice: (recovered: number) => { channel: string; text: string } | undefined;
+	/** `threadTs` is the thread of the oldest recovered message (its root's ts for a root message). */
+	notice: (
+		recovered: number,
+		threadTs: string | undefined,
+	) => { channel: string; text: string; threadTs?: string } | undefined;
 	attempts: Map<string, number>;
 	quarantine: Map<string, number>;
 }): Promise<TargetSummary> {
@@ -222,6 +244,13 @@ async function backfillTarget(input: {
 	const storedWatermark = deps.cursors.getCursor(input.watermarkKey);
 	const watermark = storedWatermark ?? input.bootstrapFloor;
 	const continuation = deps.cursors.getCursor(continuationKey(input.key));
+	const stored = readStrikes(deps.cursors, input.key);
+	if (stored !== undefined && stored.strikes >= QUARANTINE_ATTEMPTS && deps.now - stored.at < QUARANTINE_RETRY_MS) {
+		// Quarantined by an earlier daemon: skip quietly; the in-memory count lets this channel's threads follow it.
+		input.quarantine.set(input.key, stored.strikes);
+		summary.skipped = true;
+		return summary;
+	}
 
 	let scan: ScanResult;
 	try {
@@ -233,10 +262,12 @@ async function backfillTarget(input: {
 				: await scanAscending(input.scan, watermark, maxPages, input.rootTs);
 		// Strikes count CONSECUTIVE unreadable passes: a good read (bot re-invited) starts the count over.
 		input.quarantine.delete(input.key);
+		if (stored !== undefined) deps.cursors.deleteCursor(quarantineKey(input.key));
 	} catch (error) {
 		if (isUnreadableChannelError(error)) {
-			const strikes = (input.quarantine.get(input.key) ?? 0) + 1;
+			const strikes = Math.max(input.quarantine.get(input.key) ?? 0, stored?.strikes ?? 0) + 1;
 			input.quarantine.set(input.key, strikes);
+			deps.cursors.setCursor(quarantineKey(input.key), `${strikes}:${deps.now}`);
 			if (strikes >= QUARANTINE_ATTEMPTS) {
 				summary.skipped = true;
 				deps.log.warn("backfill_quarantined", { target: input.key, strikes, error: String(error) });
@@ -258,6 +289,7 @@ async function backfillTarget(input: {
 	const futureCutoff = String(Math.floor(deps.now / 1000) + FUTURE_TS_SLACK_S);
 	let lastHandled: string | undefined;
 	let futureSeen = false;
+	let firstRecoveredThread: string | undefined;
 	for (const message of scan.messages) {
 		const stopAt = lastHandled;
 		if (compareSlackTs(message.ts, futureCutoff) > 0) {
@@ -269,7 +301,10 @@ async function backfillTarget(input: {
 		const attemptKey = `${input.key}:${message.ts}`;
 		try {
 			const outcome = await input.deps.ingest(input.toEvent(message));
-			if (outcome === "recorded") summary.recovered += 1;
+			if (outcome === "recorded") {
+				summary.recovered += 1;
+				firstRecoveredThread ??= message.thread_ts ?? message.ts;
+			}
 			input.attempts.delete(attemptKey);
 		} catch (error) {
 			if (countsTowardDeadLetter(error)) {
@@ -337,10 +372,10 @@ async function backfillTarget(input: {
 	}
 
 	if (summary.recovered > 0) {
-		const notice = input.notice(summary.recovered);
+		const notice = input.notice(summary.recovered, firstRecoveredThread);
 		if (notice !== undefined) {
 			try {
-				await deps.notifier(notice.channel, notice.text);
+				await deps.notifier(notice.channel, notice.text, notice.threadTs);
 			} catch (error) {
 				// The notice is best effort: the messages are already handled and the watermark moved.
 				deps.log.warn("backfill_notice_failed", { target: input.key, error: String(error) });
@@ -369,10 +404,7 @@ export async function runBackfillPass(
 
 	for (const target of deps.channels) {
 		const key = channelCursorKey(target.channel);
-		if ((quarantine.get(key) ?? 0) >= QUARANTINE_ATTEMPTS) {
-			targets.push({ key, scanned: 0, recovered: 0, truncated: false, skipped: true });
-			continue;
-		}
+		// Quarantine is decided inside backfillTarget from the ledger strikes (skipped for a day, then read again).
 		targets.push(
 			await backfillTarget({
 				key,
@@ -401,9 +433,11 @@ export async function runBackfillPass(
 					files: message.files,
 					attachments: message.attachments,
 				}),
-				notice: (recovered) => ({
+				// In the oldest recovered message's thread, never the channel root (the owner keeps the root for requests).
+				notice: (recovered, threadTs) => ({
 					channel: target.channel,
 					text: `⏬ 봇이 응답하지 못한 동안 도착한 메시지 ${recovered}건을 처리합니다`,
+					...(threadTs === undefined ? {} : { threadTs }),
 				}),
 				attempts,
 				quarantine,
@@ -413,10 +447,6 @@ export async function runBackfillPass(
 
 	for (const thread of deps.threads) {
 		const key = threadCursorKey(thread.channel, thread.rootTs);
-		if ((quarantine.get(key) ?? 0) >= QUARANTINE_ATTEMPTS) {
-			targets.push({ key, scanned: 0, recovered: 0, truncated: false, skipped: true });
-			continue;
-		}
 		// The channel read already failed as unreadable (left, archived, deleted): its threads would fail the same way,
 		// one warning each. Follow the channel's strikes instead — retried while it is striking, skipped once it is
 		// quarantined, read again as soon as a channel read succeeds (which clears the strikes).
@@ -446,7 +476,8 @@ export async function runBackfillPass(
 				toEvent: (message) => ({
 					type: "message",
 					channel: thread.channel,
-					channel_type: "channel",
+					// A DM (`D…`) thread reply arrives live as `im`: the same type keeps it on the DM's origin.
+					channel_type: thread.channel.startsWith("D") ? "im" : "channel",
 					user: message.user,
 					bot_id: message.bot_id,
 					text: message.text,

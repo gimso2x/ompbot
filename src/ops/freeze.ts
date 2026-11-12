@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** `<home>/FROZEN`: while it exists the bot takes no autonomous action; owner conversation turns stay allowed. */
@@ -17,6 +17,24 @@ const MAX_REASON_CHARS = 200;
 
 export function freezePath(homeDir: string): string {
 	return join(homeDir, "FROZEN");
+}
+
+/**
+ * `<home>/unfrozen-at`: ISO instant of the last `clearFreeze`. FROZEN itself is gone by then, so this is how
+ * `monitors_stalled` knows the monitors the freeze held back have only just been let go.
+ */
+export function unfrozenAtPath(homeDir: string): string {
+	return join(homeDir, "unfrozen-at");
+}
+
+/** When the last freeze was lifted (ms epoch); `undefined` without a readable stamp. */
+export function readUnfrozenAt(homeDir: string): number | undefined {
+	try {
+		const at = Date.parse(readFileSync(unfrozenAtPath(homeDir), "utf8").trim());
+		return Number.isNaN(at) ? undefined : at;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -47,17 +65,45 @@ export function writeFreeze(homeDir: string, input: { reason?: string; by: strin
 		by: input.by,
 	};
 	const path = freezePath(homeDir);
+	// Renaming over a FROZEN directory fails; removing it first would open an unfrozen window. Name the fix instead.
+	if (lstatSync(path, { throwIfNoEntry: false })?.isDirectory() === true) {
+		throw new Error(`${path}: FROZEN is not a regular file; run \`ompbot unfreeze\` first`);
+	}
 	const tmp = `${path}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-	renameSync(tmp, path);
+	try {
+		writeFileSync(tmp, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+		renameSync(tmp, path);
+	} catch (error) {
+		rmSync(tmp, { force: true });
+		throw error;
+	}
 	return state;
 }
 
-/** Removes FROZEN; true when a freeze was in place. */
-export function clearFreeze(homeDir: string): boolean {
-	const was = existsSync(freezePath(homeDir));
-	rmSync(freezePath(homeDir), { force: true });
-	return was;
+/**
+ * Removes FROZEN (a directory too); true when a freeze was in place. Lifting one stamps `unfrozen-at` first, so no
+ * reader sees neither; a removal that fails puts the previous stamp back, so a freeze still in place is never stamped lifted.
+ */
+export function clearFreeze(homeDir: string, now: number = Date.now()): boolean {
+	const path = freezePath(homeDir);
+	const was = lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+	if (!was) return false;
+	const stampPath = unfrozenAtPath(homeDir);
+	let previous: string | undefined;
+	try {
+		previous = readFileSync(stampPath, "utf8");
+	} catch {
+		previous = undefined;
+	}
+	writeFileSync(stampPath, `${new Date(now).toISOString()}\n`, { mode: 0o600 });
+	try {
+		rmSync(path, { recursive: true, force: true });
+	} catch (error) {
+		if (previous === undefined) rmSync(stampPath, { force: true });
+		else writeFileSync(stampPath, previous, { mode: 0o600 });
+		throw error;
+	}
+	return true;
 }
 
 /** Cached `readFreeze` for hot paths (a monitor tick, every dispatch call); refreshes after `FREEZE_CACHE_MS`. */

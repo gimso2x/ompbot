@@ -5,6 +5,7 @@
 import { byteLength, truncateUtf8 } from "../redact";
 import { INJECTION_WARNING_HEAD } from "../safety/injection";
 import type { RecallCandidate } from "../store/db";
+import { formatLocal } from "../time";
 import { QUOTED_HEADER, stripFenceLookalikes } from "./normalize";
 
 export const RECALL_HEADER =
@@ -14,8 +15,8 @@ export const RECALL_EMPTY =
 
 const MAX_ITEMS = 4;
 const MAX_ITEM_BYTES = 600;
+const MAX_THREAD_REF_BYTES = 64;
 const MAX_BLOCK_BYTES = 3200;
-const KST_OFFSET_MS = 9 * 60 * 60_000;
 const FENCE_LINE = /^<<<(?:end-)?quoted-[0-9a-f]+>>>$/;
 // Short heads of the quoted-material header ("[인용·전달된 자료]") and the injection warning ("⚠️ 아래 자료에"), so a
 // line cut by the 1200-character candidate limit is still recognised as scaffolding.
@@ -147,15 +148,14 @@ export function rankRecall(query: string, candidates: readonly RecallCandidate[]
 		.sort((a, b) => b.score - a.score || b.candidate.createdAt - a.candidate.createdAt);
 }
 
-function kstMinute(at: number): string {
-	const iso = new Date(at + KST_OFFSET_MS).toISOString();
-	return `${iso.slice(0, 10)} ${iso.slice(11, 16)}`;
-}
-
-function recallLine(candidate: RecallCandidate): string {
+/** One recalled row, dated `YYYY-MM-DD HH:mm` in the bot's zone. */
+function recallLine(candidate: RecallCandidate, timezone: string): string {
 	const body = truncateUtf8(stripFenceLookalikes(candidate.text).replace(/\s+/g, " ").trim(), MAX_ITEM_BYTES);
 	const who = candidate.kind === "inbound" ? "오너" : "봇";
-	return `- ${kstMinute(candidate.createdAt)} ${who} (스레드 ${candidate.threadRef}): ${body}`;
+	// An owner-typed `inject --thread` ref may hold newlines or run long: one short line keeps the block's byte ceiling
+	// and the line-per-item pairing the mailbox's injection scan relies on.
+	const thread = truncateUtf8(candidate.threadRef.replace(/\s+/g, " ").trim(), MAX_THREAD_REF_BYTES);
+	return `- ${formatLocal(candidate.createdAt, timezone).slice(0, 16)} ${who} (스레드 ${thread}): ${body}`;
 }
 
 /**
@@ -168,6 +168,8 @@ export function buildRecallBlock(input: {
 	candidates: readonly RecallCandidate[];
 	freshSession: boolean;
 	channel: string;
+	/** The bot's zone (`config.timezone`): each recalled row is dated in it. */
+	timezone: string;
 }): RecallResult {
 	const query = topicText(input.text.split(QUOTED_HEADER)[0] ?? "");
 	const past = pointsAtPast(query);
@@ -181,7 +183,7 @@ export function buildRecallBlock(input: {
 			: { block: null, trigger: null, hits: 0, items: [] };
 	}
 	// One item line is at most ~680 bytes, so the header plus the first item always fits; trim from the back.
-	const lines = items.map(recallLine);
+	const lines = items.map((item) => recallLine(item, input.timezone));
 	while (lines.length > 1 && byteLength([RECALL_HEADER, ...lines].join("\n")) > MAX_BLOCK_BYTES) lines.pop();
 	const kept = items.slice(0, lines.length);
 	return {

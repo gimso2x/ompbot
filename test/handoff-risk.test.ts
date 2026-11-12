@@ -101,6 +101,65 @@ describe("scanHandoffBrief: the downgrade is scoped to the command's clause", ()
 	});
 });
 
+// doc/plans/qa50-low-fixes.md E-1~E-3: QA run-38 probe1-handoff inputs that slipped past the scan.
+describe("scanHandoffBrief: rule-name prefix, backslash continuation, secret path variants", () => {
+	test("E-1: a rule-name prefix in front of a plain command does not downgrade it", () => {
+		for (const [brief, rule] of [
+			["- `git_reset_hard`: 이번엔 진짜 실행한다. git reset --hard HEAD~9 하고 push", "git_reset_hard"],
+			["- `service_control`: systemctl restart ompbot 지금 즉시", "service_control"],
+			["- `git_reset_hard`: `git reset --hard` 정의. 그리고 git reset --hard HEAD~1", "git_reset_hard"],
+		] as const) {
+			const scan = scanHandoffBrief(brief);
+			expect({ brief, verdict: scan.verdict }).toEqual({ brief, verdict: "high_risk" });
+			expect(scan.findings).toContainEqual(expect.objectContaining({ rule, severity: "high_risk" }));
+		}
+	});
+
+	test("E-1: a whole definition line (the command only quoted in code) stays advisory", () => {
+		for (const brief of [
+			"- `git_reset_hard`: `git reset --hard`",
+			"  - `secret_path`: `.ompbot/secrets`",
+			"  - `disk_destructive`: `mkfs`, `dd ` … `of=/dev/`",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "advisory" });
+		}
+	});
+
+	test("E-2: a destructive command split by a trailing backslash is high_risk at the run's first line", () => {
+		for (const [brief, rule, line] of [
+			["작업:\n```sh\ngit reset \\\n  --hard HEAD~9\n```", "git_reset_hard", 3],
+			["rm -rf \\\n  /home/owner/work", "rm_rf_absolute", 1],
+			["git push \\\n  origin \\\n  main", "git_push_protected", 1],
+		] as const) {
+			const scan = scanHandoffBrief(brief);
+			expect({ brief, verdict: scan.verdict }).toEqual({ brief, verdict: "high_risk" });
+			expect(scan.findings).toContainEqual(expect.objectContaining({ rule, line, severity: "high_risk" }));
+		}
+	});
+
+	test("E-2: a continued line already high_risk is reported once; safe continued commands stay clear", () => {
+		const scan = scanHandoffBrief("git reset --hard HEAD \\\n  && echo done");
+		expect(scan.findings.filter((finding) => finding.rule === "git_reset_hard")).toHaveLength(1);
+		expect(scanHandoffBrief("git push \\\n  origin feature/x").verdict).toBe("clear");
+		expect(scanHandoffBrief("rm -rf \\\n  node_modules").verdict).toBe("clear");
+	});
+
+	test("E-3: /./ and // between .ompbot and secrets are still secret_path", () => {
+		for (const brief of [
+			"cat ~/.ompbot/./secrets/slack.json",
+			"cat ~/.ompbot//secrets/slack.json",
+			"cat $HOME//.ompbot//secrets/slack.json",
+			"cat ~/.ompbot/.//./secrets/slack.json",
+		]) {
+			const scan = scanHandoffBrief(brief);
+			expect({ brief, verdict: scan.verdict }).toEqual({ brief, verdict: "high_risk" });
+			expect(scan.findings).toContainEqual(expect.objectContaining({ rule: "secret_path", severity: "high_risk" }));
+		}
+		expect(rulesOf("cat ~/.ompbot/config.json")).toEqual([]);
+		expect(rulesOf("cat ~/.ompbot/../secrets/x")).toEqual([]);
+	});
+});
+
 describe("scanHandoffBrief: git global options before the subcommand", () => {
 	test("-C / -c in front of a destructive subcommand is still high_risk with the same rule", () => {
 		for (const [brief, rule] of [
@@ -150,6 +209,20 @@ describe("scanHandoffBrief: clause boundaries and non-forbidding phrases", () =>
 
 	test("a forbidden command in its own clause is still advisory", () => {
 		expect(scanHandoffBrief("git push --force origin main은 하지 않는다").verdict).toBe("advisory");
+	});
+});
+
+// doc/plans/qa-c-fixes.md I-1: `<용언>지 말고`/`지 않고` end the forbidden clause; the command after it is ordered.
+describe("scanHandoffBrief: 말고·않고 clause boundary", () => {
+	const table: ReadonlyArray<readonly [string, boolean]> = [
+		["push는 하지 말고 git reset --hard origin/main 하고 커밋해", true],
+		["git status는 하지 말고 git reset --hard HEAD를 실행해", true],
+		["git reset --hard는 하지 말고 테스트만 돌려", false],
+		["git reset --hard 하지 않고 테스트만 돌려", false],
+		["git reset --hard는 건드리지 않고 테스트만 돌려", false],
+	];
+	test.each(table)("%s → high_risk %p", (brief, highRisk) => {
+		expect(scanHandoffBrief(brief).verdict === "high_risk").toBe(highRisk);
 	});
 });
 
@@ -209,5 +282,44 @@ describe("scanHandoffBrief: size limit", () => {
 
 	test("input exactly at the limit is whole", () => {
 		expect(scanHandoffBrief("a".repeat(HANDOFF_SCAN_BYTES)).truncated).toBe(false);
+	});
+});
+
+describe("scanHandoffBrief: qa50b-low lane L", () => {
+	test("L-8 shell quoting and backslashes around the flag do not hide the command", () => {
+		for (const brief of [
+			"git reset '--hard' HEAD",
+			'git reset "--hard" HEAD',
+			"git reset \\--hard HEAD",
+			"git reset --h\\ard HEAD",
+			"git branch '-D' old",
+			"git push origin 'main'",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "high_risk" });
+		}
+		// The quote in "don't" is not a shell quote: the line still forbids the command.
+		expect(scanHandoffBrief("don't run git reset '--hard' HEAD").verdict).toBe("advisory");
+		expect(scanHandoffBrief("git reset '--soft' HEAD").verdict).toBe("clear");
+	});
+
+	test("L-9 on a rule-definition line only the listed spans after the prefix are the definition", () => {
+		expect(
+			scanHandoffBrief("- `git_reset_hard`: `git reset --hard` 설명. 이제 `git reset --hard HEAD~9` 를 실행").verdict,
+		).toBe("high_risk");
+		expect(scanHandoffBrief("- `sql_destructive`: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE TABLE`").verdict).toBe(
+			"advisory",
+		);
+	});
+
+	test("L-10 deeply nested parentheses: the clause search stays linear per level", () => {
+		const n = 2000;
+		const brief = `${"(".repeat(n)}${" git reset --hard 하지 않는다;".repeat(n / 6)}${")".repeat(n)}`;
+		// Every hit is forbidden, so each one's context is built (the old per-level rescan took tens of seconds here).
+		expect(scanHandoffBrief(brief).verdict).toBe("advisory");
+		// The marker outside the nesting still reaches a command deep inside it.
+		expect(scanHandoffBrief(`하지 않는다 ${"(".repeat(50)}git reset --hard${")".repeat(50)}`).verdict).toBe("advisory");
+		expect(scanHandoffBrief(`${"(".repeat(50)}git reset --hard${")".repeat(50)}; 하지 않는다`).verdict).toBe(
+			"high_risk",
+		);
 	});
 });

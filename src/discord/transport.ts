@@ -176,6 +176,7 @@ export interface EditInteractionResponseArgs {
 	token: string;
 	content?: string | undefined;
 	components?: readonly unknown[] | undefined;
+	allowedMentions?: AllowedMentions | undefined;
 }
 
 /** One chat-input (slash) command as `PUT …/commands` takes it. */

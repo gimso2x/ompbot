@@ -14,16 +14,17 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import { type FakeCall, FakeSlackTransport } from "../src/slack/fake-transport";
 import type { TaskJudgement } from "../src/tasks/checker";
-import { acceptanceItems, formatKst } from "../src/tasks/docs";
+import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskEvaluation } from "../src/tasks/evaluate";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { STALE_NOTICE_MS, type TaskSweepDeps, TaskSweeper } from "../src/tasks/sweeper";
+import { localIso } from "../src/time";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
 import { makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
+import { type FakeCall, FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 // herdr TASK pause (doc/plans/lane-task-parity.md E절): the pause lives in the ledger's notices as `pause:<ms>` /
 // `unpause:<ms>` marks, the sweep holds every prompt and the stale notice of a paused task (judging goes on), the
@@ -40,11 +41,12 @@ function judgement(over: Partial<TaskJudgement> = {}): TaskJudgement {
 		stepsDone: 0,
 		stepsTotal: 1,
 		status: "working",
-		updatedAt: formatKst(T0),
+		updatedAt: localIso(T0, "Asia/Seoul"),
 		updatedAtMs: T0,
 		specChanged: false,
 		specKey: "spec1",
 		blocked: false,
+		needsOwner: false,
 		blockedReason: "",
 		decision: { question: "", recommend: "", impact: "" },
 		current: "S1",
@@ -86,7 +88,10 @@ interface Rig {
 
 function rig(over: Partial<TaskSweepDeps> = {}): Rig {
 	const clock = { ms: T0 };
-	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => clock.ms } });
+	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), {
+		timezone: "Asia/Seoul",
+		clock: { now: () => clock.ms },
+	});
 	const row = ledger.register({
 		title: "로그 회전",
 		risk: "L2",

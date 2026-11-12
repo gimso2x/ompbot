@@ -2,11 +2,12 @@ import { Database } from "bun:sqlite";
 import { dirname } from "node:path";
 import { isThreadOrigin } from "../core/normalize";
 import { chatOriginKey, parseChatOrigin } from "../core/origin-key";
-import { DEFAULT_TIMEZONE, formatLocal } from "../monitors/cron";
 import { type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
 import { type FreezeState, readFreeze } from "../ops/freeze";
 import { collectGates } from "../ops/gates";
+import type { HostLoadReader } from "../ops/host-resources";
 import type { DeliveryState, InboundState, Store } from "../store/db";
+import { formatLocal } from "../time";
 
 export interface OriginStatus {
 	originKey: string;
@@ -18,6 +19,8 @@ export interface OriginStatus {
 
 export interface StatusReport {
 	ompVersion: string;
+	/** The bot's zone (`config.timezone`): the text output shows the next monitor fire in it. */
+	timezone: string;
 	/** True when the report came from the running daemon; false when read from the database file only. */
 	daemonRunning: boolean;
 	origins: OriginStatus[];
@@ -92,13 +95,16 @@ export function openGateSummary(
 	dbPath: string,
 	now = Date.now(),
 	offsiteConfigured = false,
-	dailyCapUsd?: number,
+	dailyCap?: { usd: number; timezone: string },
+	/** Test seam for `host_pressure` (default this machine's readings). */
+	hostLoad?: Partial<HostLoadReader>,
 ): OpenGateSummary[] {
 	return collectGates({
 		homeDir: dirname(dbPath),
 		now,
 		offsiteConfigured,
-		...(dailyCapUsd === undefined ? {} : { dailyCapUsd }),
+		...(dailyCap === undefined ? {} : { dailyCap }),
+		...(hostLoad === undefined ? {} : { hostLoad }),
 	})
 		.filter((gate) => gate.state === "open")
 		.map((gate) => ({ name: gate.name, detail: gate.detail }));
@@ -108,6 +114,7 @@ export function openGateSummary(
 export function buildStatus(
 	store: Store,
 	ompVersion: string,
+	timezone: string,
 	live: (originKey: string) => LiveOrigin,
 	openGates: OpenGateSummary[] = [],
 ): StatusReport {
@@ -122,6 +129,7 @@ export function buildStatus(
 	}
 	return {
 		ompVersion,
+		timezone,
 		daemonRunning: true,
 		origins,
 		ledger: ledgerFrom(deliveryCounts),
@@ -135,44 +143,78 @@ export function buildStatus(
 export function readStatusFromDb(
 	dbPath: string,
 	ompVersion: string,
+	timezone: string,
 	offsiteConfigured = false,
 	dailyCapUsd?: number,
+	hostLoad?: Partial<HostLoadReader>,
 ): StatusReport {
-	const db = new Database(dbPath, { readonly: true, strict: true });
+	const openGates = (): OpenGateSummary[] =>
+		openGateSummary(
+			dbPath,
+			Date.now(),
+			offsiteConfigured,
+			dailyCapUsd === undefined ? undefined : { usd: dailyCapUsd, timezone },
+			hostLoad,
+		);
+	let db: Database | undefined;
+	let counts: Pick<StatusReport, "inbound" | "ledger" | "origins" | "monitors">;
 	try {
-		const inbound = emptyInbound();
-		for (const row of db.query("SELECT state, COUNT(*) AS n FROM inbound GROUP BY state").all() as Array<{
-			state: InboundState;
-			n: number;
-		}>) {
-			inbound[row.state] = row.n;
-		}
-		const deliveryCounts: Partial<Record<DeliveryState, number>> = {};
-		for (const row of db.query("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{
-			state: DeliveryState;
-			n: number;
-		}>) {
-			deliveryCounts[row.state] = row.n;
-		}
-		const origins = (
-			db.query("SELECT origin_key, epoch FROM origins ORDER BY origin_key").all() as Array<{
-				origin_key: string;
-				epoch: number;
-			}>
-		).map((row) => ({ originKey: row.origin_key, epoch: row.epoch, ompPid: null, busy: false }));
+		db = new Database(dbPath, { readonly: true, strict: true });
+		counts = readCoreCounts(db);
+	} catch (error) {
+		// A 0-byte, corrupt or table-less ledger: the report still comes out (as JSON with --json), naming the gate the
+		// `gates` command opens for the same file, instead of a raw SQLiteError and an empty stdout.
+		const reason = error instanceof Error ? error.message : String(error);
+		const gates = openGates();
 		return {
 			ompVersion,
+			timezone,
 			daemonRunning: false,
-			origins,
-			ledger: ledgerFrom(deliveryCounts),
-			inbound,
-			monitors: readMonitorsStatus(db),
-			openGates: openGateSummary(dbPath, Date.now(), offsiteConfigured, dailyCapUsd),
+			origins: [],
+			ledger: ledgerFrom({}),
+			inbound: emptyInbound(),
+			monitors: { count: 0, next: null },
+			openGates: gates.some((gate) => gate.name === "ledger_unreadable")
+				? gates
+				: [{ name: "ledger_unreadable", detail: `error=${reason.replace(/\s+/g, " ").slice(0, 120)}` }, ...gates],
 			...frozenField(dirname(dbPath)),
 		};
 	} finally {
-		db.close();
+		db?.close();
 	}
+	return {
+		ompVersion,
+		timezone,
+		daemonRunning: false,
+		...counts,
+		openGates: openGates(),
+		...frozenField(dirname(dbPath)),
+	};
+}
+
+/** Inbound and delivery counts, origins and monitors of a read-only handle; throws on an unreadable ledger. */
+function readCoreCounts(db: Database): Pick<StatusReport, "inbound" | "ledger" | "origins" | "monitors"> {
+	const inbound = emptyInbound();
+	for (const row of db.query("SELECT state, COUNT(*) AS n FROM inbound GROUP BY state").all() as Array<{
+		state: InboundState;
+		n: number;
+	}>) {
+		inbound[row.state] = row.n;
+	}
+	const deliveryCounts: Partial<Record<DeliveryState, number>> = {};
+	for (const row of db.query("SELECT state, COUNT(*) AS n FROM deliveries GROUP BY state").all() as Array<{
+		state: DeliveryState;
+		n: number;
+	}>) {
+		deliveryCounts[row.state] = row.n;
+	}
+	const origins = (
+		db.query("SELECT origin_key, epoch FROM origins ORDER BY origin_key").all() as Array<{
+			origin_key: string;
+			epoch: number;
+		}>
+	).map((row) => ({ originKey: row.origin_key, epoch: row.epoch, ompPid: null, busy: false }));
+	return { inbound, ledger: ledgerFrom(deliveryCounts), origins, monitors: readMonitorsStatus(db) };
 }
 
 /** Monitor count and next fire from a read-only handle; a database that predates monitors has none. */
@@ -186,10 +228,10 @@ function readMonitorsStatus(db: Database): MonitorsStatus {
 	}
 }
 
-function renderMonitorsLine(monitors: MonitorsStatus): string {
+function renderMonitorsLine(monitors: MonitorsStatus, timezone: string): string {
 	if (monitors.count === 0) return "모니터 0개";
 	const next = monitors.next
-		? `다음 발사 ${monitors.next.name} ${formatLocal(Date.parse(monitors.next.at), DEFAULT_TIMEZONE)} (${DEFAULT_TIMEZONE})`
+		? `다음 발사 ${monitors.next.name} ${formatLocal(Date.parse(monitors.next.at), timezone)} (${timezone})`
 		: "다음 발사 없음";
 	return `모니터 ${monitors.count}개 · ${next}`;
 }
@@ -220,7 +262,7 @@ export function renderStatusText(report: StatusReport): string {
 		...renderOriginLines(report.origins),
 		`장부 p/i/c/a/e: ${ledger.pending}/${ledger.inflight}/${ledger.confirmed}/${ledger.ambiguous}/${ledger.expired}`,
 		`입수 pending=${inbound.pending} dispatched=${inbound.dispatched} answered=${inbound.answered} failed=${inbound.failed_notified} discarded=${inbound.discarded}`,
-		renderMonitorsLine(report.monitors),
+		renderMonitorsLine(report.monitors, report.timezone),
 	];
 	if (report.frozen !== undefined) {
 		const { since, reason, by } = report.frozen;

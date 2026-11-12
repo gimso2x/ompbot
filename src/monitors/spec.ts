@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
-import { assertTimezone, CronError, DEFAULT_TIMEZONE, parseCron, zonedToUtc } from "./cron";
+import { assertTimezone, CronError, parseCron, zonedToUtc } from "./cron";
 
 export const MAX_INSTRUCTION_CHARS = 4000;
 export const MAX_NAME_CHARS = 80;
 export const MIN_SCRIPT_INTERVAL_MS = 60_000;
+/** One leap year: past it a next fire time soon leaves what a `Date` can hold. */
+export const MAX_SCRIPT_INTERVAL_MS = 366 * 24 * 60 * 60 * 1000;
 export const SCRIPT_TIMEOUT_MS = 60_000;
 export const MIN_WATCHER_DEBOUNCE_MS = 100;
 export const MAX_WATCHER_DEBOUNCE_MS = 60_000;
@@ -92,6 +94,10 @@ export interface SpecContext {
 	workspaceDir?: string | undefined;
 	/** `config.webhook`: without it a webhook trigger cannot be created. */
 	webhook?: { port: number; bind?: string } | undefined;
+	/** `config.timezone`: a cron without `timezone` is stored with it, an `at` without an offset is read in it. */
+	defaultTimezone: string;
+	/** `config.channels.slack` absent: a Slack channel id names nothing the bot can post to, so it is refused. */
+	slackOff?: boolean | undefined;
 }
 
 const SPEC_KEYS = [
@@ -133,7 +139,7 @@ const ISO_LOCAL = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\
 const ISO_WITH_OFFSET = /(?:Z|[+-]\d{2}:?\d{2})$/i;
 
 /** ISO instant to epoch ms. A value without an offset is wall-clock time in `timezone`. */
-export function parseAt(text: string, timezone = DEFAULT_TIMEZONE): number {
+export function parseAt(text: string, timezone: string): number {
 	const trimmed = text.trim();
 	let ms: number;
 	if (ISO_WITH_OFFSET.test(trimmed)) {
@@ -274,7 +280,8 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 		rejectUnknown(obj, ["kind", "schedule", "timezone"], "trigger");
 		const prev = base?.kind === "cron" ? base : undefined;
 		const schedule = obj.schedule ?? prev?.schedule;
-		const timezone = obj.timezone ?? prev?.timezone ?? DEFAULT_TIMEZONE;
+		// Filled at parse time, so every stored cron row names its zone and a later config change leaves it alone.
+		const timezone = obj.timezone ?? prev?.timezone ?? ctx.defaultTimezone;
 		if (typeof schedule !== "string") throw new MonitorSpecError("trigger.schedule must be a string");
 		if (typeof timezone !== "string") throw new MonitorSpecError("trigger.timezone must be a string");
 		try {
@@ -293,7 +300,10 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 		if (obj.timezone !== undefined && typeof obj.timezone !== "string") {
 			throw new MonitorSpecError("trigger.timezone must be a string");
 		}
-		return { kind: "at", at: new Date(parseAt(at, obj.timezone as string | undefined)).toISOString() };
+		return {
+			kind: "at",
+			at: new Date(parseAt(at, (obj.timezone as string | undefined) ?? ctx.defaultTimezone)).toISOString(),
+		};
 	}
 	if (kind === "script") {
 		rejectUnknown(obj, ["kind", "command", "intervalMs", "fire", "once", "suppressUnchanged"], "trigger");
@@ -304,8 +314,15 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 			throw new MonitorSpecError("trigger.command must be a non-empty array of strings");
 		}
 		const intervalMs = obj.intervalMs ?? prev?.intervalMs;
-		if (typeof intervalMs !== "number" || !Number.isInteger(intervalMs) || intervalMs < MIN_SCRIPT_INTERVAL_MS) {
-			throw new MonitorSpecError(`trigger.intervalMs must be an integer >= ${MIN_SCRIPT_INTERVAL_MS}`);
+		if (
+			typeof intervalMs !== "number" ||
+			!Number.isInteger(intervalMs) ||
+			intervalMs < MIN_SCRIPT_INTERVAL_MS ||
+			intervalMs > MAX_SCRIPT_INTERVAL_MS
+		) {
+			throw new MonitorSpecError(
+				`trigger.intervalMs must be an integer between ${MIN_SCRIPT_INTERVAL_MS} and ${MAX_SCRIPT_INTERVAL_MS}`,
+			);
 		}
 		resolveScript(command as string[], ctx.scriptsRoot);
 		const fire = obj.fire ?? prev?.fire ?? "edge";
@@ -349,7 +366,7 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 	throw new MonitorSpecError('trigger.kind must be "cron", "at", "script", "watcher" or "webhook"');
 }
 
-/** Validates a full spec (`monitors add`). Defaults: overlap queue, enabled true, cron timezone Asia/Seoul. */
+/** Validates a full spec (`monitors add`). Defaults: overlap queue, enabled true, cron timezone `ctx.defaultTimezone`. */
 export function parseMonitorSpec(input: unknown, ctx: SpecContext): MonitorSpec {
 	return mergeMonitorSpec(undefined, input, ctx);
 }
@@ -385,6 +402,16 @@ export function mergeMonitorSpec(current: MonitorSpec | undefined, patch: unknow
 	const copyChannel = obj.copyChannel === null ? undefined : (obj.copyChannel ?? current?.copyChannel);
 	if (copyChannel !== undefined && !isChannelId(copyChannel)) {
 		throw new MonitorSpecError("copyChannel must be a Slack channel id like C0123456789 or a Discord channel id");
+	}
+	if (ctx.slackOff === true) {
+		for (const [key, value] of [
+			["channel", channel],
+			["copyChannel", copyChannel],
+		] as const) {
+			if (typeof value === "string" && CHANNEL_ID.test(value)) {
+				throw new MonitorSpecError(`${key} is a Slack channel id but Slack is not configured (channels.slack)`);
+			}
+		}
 	}
 	// `model: null` / `thinking: null` unpin the field.
 	const model = obj.model === null ? undefined : (obj.model ?? current?.model);

@@ -34,11 +34,11 @@ import {
 	channelCursorKey,
 	compareSlackTs,
 	continuationKey,
+	QUARANTINE_RETRY_MS,
 	runBackfillPass,
 	type ThreadTarget,
 	threadCursorKey,
 } from "../src/slack/backfill";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import {
 	type HistoryMessage,
 	type HistoryPage,
@@ -48,6 +48,7 @@ import {
 	type SlackTransport,
 } from "../src/slack/transport";
 import { openStore } from "../src/store/db";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 let dir: string;
 let cleanups: Array<() => void | Promise<void>>;
@@ -585,7 +586,10 @@ describe("backfill: threads, quarantine, isolation, runner", () => {
 		expect(replyReads.filter((channel) => channel === "C1")).toEqual([]);
 
 		archived = false; // re-invited / unarchived: the channel read clears the strikes and its threads come back
-		state.quarantine.clear(); // quarantine lasts until restart; a restart starts with an empty map
+		state.quarantine.clear(); // a restart starts with an empty map, but the strikes stay in the ledger
+		await runBackfillPass(deps, state);
+		expect(replyReads.filter((channel) => channel === "C1")).toEqual([]); // still quarantined right after restart
+		deps.now += QUARANTINE_RETRY_MS; // a day later the channel is read again
 		await runBackfillPass(deps, state);
 		expect(replyReads.filter((channel) => channel === "C1")).toHaveLength(2);
 	});
@@ -677,7 +681,7 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2
 
 async function buildAdapter(opts: { mediaRoot?: string | null } = {}) {
 	const clock = { now: () => LIVE_MS };
-	const store = openStore({ path: join(dir, "bot.db"), clock, redact });
+	const store = openStore({ timezone: "Asia/Seoul", path: join(dir, "bot.db"), clock, redact });
 	const transport = new FakeSlackTransport("UBOT");
 	const downloadCalls: string[] = [];
 	const origDownload = transport.downloadAttachment.bind(transport);
@@ -1393,7 +1397,7 @@ describe("store cursors", () => {
 	test("round-trip, overwrite, delete, unicode/odd keys, key-space separation and persistence across reopen", () => {
 		const clock = { now: () => 1_800_000_000_000 };
 		const path = join(dir, "cursors.db");
-		let store = openStore({ path, clock, redact });
+		let store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		const keys = [
 			channelCursorKey("C1"),
 			continuationKey(channelCursorKey("C1")),
@@ -1424,7 +1428,7 @@ describe("store cursors", () => {
 		expect(store.getCursor(keys[2] as string)).toBe("1800000002.000000");
 
 		store.close();
-		store = openStore({ path, clock, redact });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		cleanups.push(() => store.close());
 		expect(store.getCursor(keys[2] as string)).toBe("1800000002.000000");
 		expect(store.getCursor(keys[1] as string)).toBeUndefined();

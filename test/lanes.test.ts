@@ -61,7 +61,7 @@ interface Harness {
 	/** Every log line the manager and router wrote. */
 	logs: string[];
 	advance(ms: number): void;
-	/** Resolves once every mailbox call the manager started has been handled. */
+	/** Resolves once every mailbox call and background verdict the manager started has been handled. */
 	settle(): Promise<void>;
 	updates(ts: string): string[];
 	close(): void;
@@ -76,7 +76,7 @@ function harness(
 ): Harness {
 	let now = START;
 	const clock = { now: () => now };
-	const store = openBotStore(join(home.dir, "ompbot.db"), clock);
+	const store = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
 	const transport = new WaitingTransport();
 	const sessions = new FakeSessionStore();
 	const drivers = new Map<string, FakeOmpDriver>();
@@ -84,6 +84,7 @@ function harness(
 	const logs: string[] = [];
 	const log = createLogger({ sink: (line) => logs.push(line), clock, redact });
 	const router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		log,
@@ -97,6 +98,7 @@ function harness(
 	});
 	const pending: Promise<unknown>[] = [];
 	const manager = new LaneManager({
+		timezone: "Asia/Seoul",
 		store,
 		channels: registryOf(new SlackChannel(transport)),
 		clock,
@@ -139,6 +141,7 @@ function harness(
 		},
 		settle: async () => {
 			await Promise.all(pending);
+			await manager.settledInBackground();
 		},
 		updates: (ts) =>
 			transport.calls.flatMap((call) => (call.method === "updateMessage" && call.ts === ts ? [call.text] : [])),
@@ -669,11 +672,13 @@ describe("done claims are verified by the core", () => {
 
 		h.advance(CLAIM_GRACE_MS - 1);
 		await h.manager.tick();
+		await h.manager.settledInBackground();
 		expect(calls).toBe(1);
 		expect(h.store.getLane(lane.name)?.status).toBe("done-claimed");
 
 		h.advance(1);
 		await h.manager.tick();
+		await h.manager.settledInBackground();
 		expect(calls).toBe(2);
 		expect(h.store.getLane(lane.name)).toMatchObject({ status: "closed", meta: { sha: SHA } });
 		h.close();

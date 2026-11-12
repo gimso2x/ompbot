@@ -3,22 +3,27 @@
  * in the task worktree itself before the outcome, so an agent's "bun test → 0 fail" line is never the only proof.
  * The grammar follows omp-dori's Done signals, `command` and `file` only (no network, no PR flow):
  *
- *   command ["argv","as","json"] [stdout~"regex"]     no shell, worktree cwd, 120 s
+ *   command ["argv","as","json"] [stdout~"regex"]     no shell, worktree cwd, 300 s
  *   file <worktree-relative path> [sha256=<hex>] [json:.a.b=<json value>]
  */
 import { createHash } from "node:crypto";
 
-export const CHECK_TIMEOUT_MS = 120_000;
+export const CHECK_TIMEOUT_MS = 300_000;
 
 export type Signal =
 	| { kind: "command"; argv: string[]; stdout?: RegExp }
 	| { kind: "file"; path: string; sha256?: string; json?: { path: (string | number)[]; value: unknown } };
 
-/** One signal's verdict; `detail` is a short Korean line, never the command's whole output. */
+/**
+ * One signal's verdict; `detail` is a short Korean line, never the command's whole output. `inconclusive`: the command
+ * did not finish within `CHECK_TIMEOUT_MS` — not a violation, and never reused (the next judgement runs it again).
+ * Every other failure (any exit code, a signal kill, a missing file, a malformed signal) is a violation.
+ */
 export interface SignalCheck {
 	signal: string;
 	ok: boolean;
 	detail: string;
+	inconclusive?: true;
 }
 
 export class SignalSyntaxError extends Error {
@@ -55,16 +60,22 @@ function closingBracket(s: string, open: number): number {
 
 /**
  * The signals of the `[check: …]` that ends `text`; `[]` when the text does not end in one (a `[check:` quoted in the
- * middle of a sentence is prose). An unterminated trailing `[check:` is a syntax error, not prose.
+ * middle of a sentence is prose). An unterminated trailing `[check:` is a syntax error, not prose, unless an earlier
+ * block ending the text encloses it (a quoted argument such as `["grep","[check:"]`).
  */
 export function checkSignalsOf(text: string): string[] {
 	const t = text.trim();
 	const last = t.lastIndexOf(CHECK_OPEN);
 	if (last === -1) return [];
-	const close = closingBracket(t, last);
-	if (close === -1) throw new SignalSyntaxError(`[check: …]가 닫히지 않았습니다: ${t.slice(last, last + 60)}`);
-	if (close !== t.length - 1) return [];
-	const body = t.slice(last + CHECK_OPEN.length, close);
+	let open = last;
+	while (open !== -1 && closingBracket(t, open) !== t.length - 1)
+		open = open === 0 ? -1 : t.lastIndexOf(CHECK_OPEN, open - 1);
+	if (open === -1) {
+		if (closingBracket(t, last) === -1)
+			throw new SignalSyntaxError(`[check: …]가 닫히지 않았습니다: ${t.slice(last, last + 60)}`);
+		return [];
+	}
+	const body = t.slice(open + CHECK_OPEN.length, t.length - 1);
 	const parts: string[] = [];
 	let start = 0;
 	for (let i = 0; i < body.length; i++) {
@@ -80,6 +91,45 @@ export function checkSignalsOf(text: string): string[] {
 	const signals = parts.map((part) => part.trim());
 	if (signals.some((signal) => signal === "")) throw new SignalSyntaxError("[check: …]에 빈 신호가 있습니다");
 	return signals;
+}
+
+/**
+ * Registration rule (judgement keeps reading the trailing block only): one `[check: …]` per criterion, at its very end.
+ * `[check:` inside a double-quoted string or inline code (a backtick run closed by a run of the same length) is a
+ * quotation and does not count. Throws `SignalSyntaxError` on a second block or on text after the block.
+ */
+export function assertCheckPlacement(text: string): void {
+	const blocks: Array<[number, number]> = [];
+	for (let i = 0; i < text.length; i++) {
+		const c = text[i];
+		if (c === '"') {
+			i = skipString(text, i) - 1;
+		} else if (c === "`") {
+			let run = i;
+			while (text[run] === "`") run += 1;
+			const ticks = text.slice(i, run);
+			let close = text.indexOf(ticks, run);
+			while (close !== -1 && text[close + ticks.length] === "`") {
+				let past = close;
+				while (text[past] === "`") past += 1;
+				close = text.indexOf(ticks, past);
+			}
+			i = close === -1 ? run - 1 : close + ticks.length - 1;
+		} else if (text.startsWith(CHECK_OPEN, i)) {
+			const close = closingBracket(text, i);
+			// An unterminated block is `parseChecks`' syntax error.
+			if (close === -1) break;
+			blocks.push([i, close]);
+			i = close;
+		}
+	}
+	if (blocks.length > 1)
+		throw new SignalSyntaxError(
+			"한 수락기준에 [check: …]는 하나만 둘 수 있습니다 — 신호를 세미콜론(;)으로 한 블록에 묶거나 기준을 나누세요",
+		);
+	const close = blocks[0]?.[1];
+	const after = close === undefined ? "" : text.slice(close + 1).trim();
+	if (after !== "") throw new SignalSyntaxError(`[check: …]는 수락기준 맨 끝에 와야 합니다: ${after.slice(0, 40)}`);
 }
 
 /** Parses every check of `text`; throws `SignalSyntaxError` on the first malformed one. */
@@ -206,7 +256,9 @@ const tail = (text: string): string => {
 function dig(value: unknown, path: readonly (string | number)[]): { found: boolean; value: unknown } {
 	let current = value;
 	for (const key of path) {
-		if (current === null || typeof current !== "object" || !(key in current)) return { found: false, value: undefined };
+		// Own fields only: `__proto__`/`constructor` are not fields of the file.
+		if (current === null || typeof current !== "object" || !Object.hasOwn(current, key))
+			return { found: false, value: undefined };
 		current = (current as Record<string | number, unknown>)[key];
 	}
 	return { found: true, value: current };
@@ -224,7 +276,13 @@ export async function runSignal(raw: string, io: SignalIo): Promise<SignalCheck>
 	const verdict = (ok: boolean, detail: string): SignalCheck => ({ signal, ok, detail });
 	if (parsed.kind === "command") {
 		const result = await io.runCheck(parsed.argv);
-		if (result.timedOut) return verdict(false, `${CHECK_TIMEOUT_MS / 1000}초 안에 끝나지 않았습니다`);
+		if (result.timedOut)
+			return {
+				signal,
+				ok: false,
+				detail: `${CHECK_TIMEOUT_MS / 1000}초 안에 끝나지 않았습니다(확인 불가)`,
+				inconclusive: true,
+			};
 		if (result.code !== 0) return verdict(false, `exit ${result.code}: ${tail(result.output) || "(출력 없음)"}`);
 		if (parsed.stdout !== undefined && !parsed.stdout.test(result.output))
 			return verdict(false, `exit 0, 출력이 ${parsed.stdout}와 맞지 않습니다: ${tail(result.output) || "(출력 없음)"}`);

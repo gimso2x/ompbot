@@ -4,10 +4,10 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { CoreSink, DeliverySource, InboundMessage } from "../src/channel/types";
 import { DiscordAdapter, type DiscordAdapterOptions } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import { DiscordCallError, type DiscordMessageEvent } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -153,6 +153,33 @@ describe("owner DM", () => {
 	});
 });
 
+describe("message edits carry no mentions", () => {
+	test("the running status, its final label and a slash command answer are edited with allowedMentions parse []", async () => {
+		const made = await adapter({
+			core: { ...core(), onCommand: () => "@everyone 확인 <@&999>" },
+		});
+		await made.commandsReady();
+		const dm = message("todo @everyone", { channel_id: DM, guild_id: undefined });
+		await transport.emitMessage(dm);
+		const threadRef = `${DM}:${dm.id}`;
+		await made.setStalled(threadRef, true);
+		await made.finishStatus(threadRef, "done", "update");
+		await transport.emitInteraction({
+			id: "810000000000000001",
+			application_id: "600000000000000000",
+			type: 2,
+			token: "tok-1",
+			channel_id: DM,
+			channel: { id: DM, type: 1 },
+			user: { id: OWNER },
+			data: { name: "status-ompbot" },
+		});
+		const edits = [...calls("editMessage"), ...calls("editInteractionResponse")];
+		expect(edits.map((c) => c.method)).toEqual(["editMessage", "editMessage", "editInteractionResponse"]);
+		for (const edit of edits) expect(edit.allowedMentions).toEqual({ parse: [] });
+	});
+});
+
 describe("server channel", () => {
 	test("② a mention at the root starts a thread once and takes the message on the thread origin, mention removed", async () => {
 		await adapter();
@@ -285,5 +312,19 @@ describe("server channel", () => {
 		const root = message(`<@${BOT}> 이미 스레드`);
 		await transport.emitMessage(root);
 		expect(inbound.map((m) => m.threadRef)).toEqual([`${CH}:${root.id}`]);
+	});
+});
+
+describe("qa50b K-12: a refused thread start retried", () => {
+	test("the channel notice is posted once per message, not on every retry", async () => {
+		await adapter();
+		const refused = () => new DiscordCallError("definitive", "discord_http_403:50013 Missing Permissions", 403, 50013);
+		transport.failNext.startThread = [refused(), refused(), refused()];
+		const root = message(`<@${BOT}> 스레드 못 만듦`);
+		await transport.emitMessage(root);
+		await transport.emitMessage(root);
+		await transport.emitMessage(root);
+		expect(failures).toBe(3);
+		expect(calls("createMessage")).toHaveLength(1);
 	});
 });

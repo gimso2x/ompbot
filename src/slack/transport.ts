@@ -110,6 +110,8 @@ export interface SlackTransport {
 		threadTs?: string | undefined;
 		/** Block Kit blocks (approval buttons); `text` stays the notification fallback. */
 		blocks?: readonly unknown[] | undefined;
+		/** Legacy attachments (a toned card: `{ color, blocks }`, the colour bar on the left edge). */
+		attachments?: readonly unknown[] | undefined;
 	}): Promise<{ ts: string }>;
 	/** `blocks: []` removes the blocks of an earlier message (buttons gone after a decision). */
 	updateMessage(args: {

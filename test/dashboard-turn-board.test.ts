@@ -25,6 +25,7 @@ function deps(): SnapshotDeps {
 	return {
 		homeDir: home,
 		repoDir: "/srv/ompbot",
+		timezone: "Asia/Seoul",
 		config: undefined,
 		now: () => NOW,
 		callDaemon: async () => {
@@ -52,7 +53,7 @@ interface Row {
 /** Origins and their inbound rows, written through raw SQL after the schema exists. */
 function seed(rows: Row[]): void {
 	const dbPath = join(home, "ompbot.db");
-	openStore({ path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	for (const origin of new Set(rows.map((row) => row.origin))) {
 		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, ?, ?)", [
@@ -269,6 +270,52 @@ describe("turn board snapshot", () => {
 		expect(eyebrow("slack/dm/UY")).toEndWith(" · DM");
 		expect(eyebrow(thread)).toEndWith(" · Discord 111111111111111111");
 		expect(eyebrow(main)).toEndWith(" · Discord 111111111111111111 채널 메인");
+	});
+});
+
+describe("turn board model chip", () => {
+	test("threads carry the session model; the card and the detail draw its chip, a fallback with 폴백, none without", async () => {
+		seed([
+			{ origin: "slack/ch/CA/t/1.0", text: "A", state: "answered", createdAt: NOW - MINUTE },
+			{ origin: "slack/ch/CB/t/1.0", text: "B", state: "answered", createdAt: NOW - MINUTE },
+			{ origin: "slack/ch/CC/t/1.0", text: "C", state: "answered", createdAt: NOW - MINUTE },
+		]);
+		const write = (origin: string, lines: unknown[]): void => {
+			const dir = join(home, "sessions", encodeURIComponent(origin));
+			mkdirSync(dir, { recursive: true });
+			appendFileSync(join(dir, "s.jsonl"), lines.map((value) => `${JSON.stringify(value)}\n`).join(""));
+		};
+		const opus = [
+			{ type: "model_change", model: "anthropic/claude-opus-5-5", resolvedModelIsFallback: false },
+			{ type: "thinking_level_change", thinkingLevel: "high", configured: null },
+			{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-opus-5-5" } },
+		];
+		write("slack/ch/CA/t/1.0", opus);
+		write("slack/ch/CB/t/1.0", [
+			...opus,
+			{ type: "model_change", role: "fallback", model: "zai/glm-5.3", resolvedModelIsFallback: true },
+		]);
+		const snapshot = await buildSnapshot(deps());
+		const model = Object.fromEntries(
+			threadsOf(snapshot).map((thread) => [thread.originKey.split("/")[2], thread.model]),
+		);
+		expect(model).toEqual({
+			CA: { model: "anthropic/claude-opus-5-5", thinking: "high", fallback: false },
+			CB: { model: "anthropic/claude-opus-5-5", thinking: "high", fallback: true },
+			CC: undefined,
+		});
+		const cardOf = (html: string, key: string): string =>
+			new RegExp(`<a class="card[^"]*"[^>]*data-row="${key}"[\\s\\S]*?</a>`).exec(html)?.[0] ?? "";
+		const board = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+		expect(cardOf(board, "slack/ch/CA/t/1.0")).toContain(
+			'<span class="badge model-chip" title="anthropic/claude-opus-5-5">claude-opus-5-5 · high</span>',
+		);
+		expect(cardOf(board, "slack/ch/CB/t/1.0")).toContain(
+			'<span class="badge model-chip is-warning" title="anthropic/claude-opus-5-5">폴백 · claude-opus-5-5 · high</span>',
+		);
+		expect(cardOf(board, "slack/ch/CC/t/1.0")).not.toContain("model-chip");
+		expect(renderItemDetail(snapshot, "turns", "slack/ch/CB/t/1.0")).toContain("폴백 · claude-opus-5-5 · high");
+		expect(renderItemDetail(snapshot, "turns", "slack/ch/CC/t/1.0")).not.toContain("model-chip");
 	});
 });
 

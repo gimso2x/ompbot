@@ -28,7 +28,7 @@ let now = NOW;
 let scriptsRoot: string;
 let workspaceDir: string;
 
-const ctx = () => ({ scriptsRoot, workspaceDir, webhook: { port: 1 } });
+const ctx = () => ({ scriptsRoot, workspaceDir, webhook: { port: 1 }, defaultTimezone: "Asia/Seoul" });
 const log = () => createLogger({ sink: (line) => logLines.push(line), clock: { now: () => now }, redact });
 
 beforeEach(() => {
@@ -77,7 +77,9 @@ describe("webhook trigger spec", () => {
 
 	test("refused without config.webhook, and extra trigger fields are refused", () => {
 		const input = { name: "h", trigger: { kind: "webhook" }, instruction: "x" };
-		expect(() => parseMonitorSpec(input, { scriptsRoot, workspaceDir })).toThrow(/webhook/);
+		expect(() => parseMonitorSpec(input, { scriptsRoot, workspaceDir, defaultTimezone: "Asia/Seoul" })).toThrow(
+			/webhook/,
+		);
 		expect(() => parseMonitorSpec({ ...input, trigger: { kind: "webhook", token: "mine" } }, ctx())).toThrow(
 			MonitorSpecError,
 		);
@@ -421,7 +423,7 @@ describe("daemon with a webhook monitor", () => {
 						instruction: "배포 알림을 요약",
 						procedureFiles: [join(workspaceDir, "procedure.md")],
 					},
-					{ scriptsRoot, workspaceDir, webhook: { port } },
+					{ scriptsRoot, workspaceDir, webhook: { port }, defaultTimezone: "Asia/Seoul" },
 				),
 			);
 			const response = await fetch(`http://127.0.0.1:${port}/hook/${idOf(row)}`, {

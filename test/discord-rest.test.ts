@@ -292,7 +292,7 @@ describe("DiscordRest", () => {
 		);
 		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base, applicationId: "600" });
 		await client.respondInteraction({ interactionId: "77", token: "itok", response: { type: 6 } });
-		await client.editInteractionResponse({ token: "itok", content: "done" });
+		await client.editInteractionResponse({ token: "itok", content: "done", allowedMentions: { parse: [] } });
 		await client.deleteInteractionResponse({ token: "itok" });
 		expect(server.seen.map((r) => `${r.method} ${r.path}`)).toEqual([
 			"POST /api/v10/interactions/77/itok/callback",
@@ -300,6 +300,7 @@ describe("DiscordRest", () => {
 			"DELETE /api/v10/webhooks/600/itok/messages/@original",
 		]);
 		expect(JSON.parse(server.seen[0]?.body ?? "")).toEqual({ type: 6 });
+		expect(JSON.parse(server.seen[1]?.body ?? "")).toEqual({ content: "done", allowed_mentions: { parse: [] } });
 	});
 
 	test("command registration overwrites the global set, or one server's with a guild id", async () => {

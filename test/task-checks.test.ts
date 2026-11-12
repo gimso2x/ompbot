@@ -6,15 +6,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { SlackChannel } from "../src/slack/channel";
-import { FakeSlackTransport } from "../src/slack/fake-transport";
 import { checkTask, digest } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf, parseSpec, renderProgress, renderSpec } from "../src/tasks/docs";
-import { evaluateTask, type TaskCheckCache } from "../src/tasks/evaluate";
+import { evaluateTask, runWorktreeChecks, type TaskCheckCache } from "../src/tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { formatReachedNotice } from "../src/tasks/notify";
-import { TaskSweeper } from "../src/tasks/sweeper";
+import type { SignalCheck } from "../src/tasks/signals";
+import { BLOCKED_CHECKS_PASS_HEAD, TaskSweeper } from "../src/tasks/sweeper";
 import { registryOf } from "./helpers/channels";
+import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const T0 = Date.parse("2026-11-04T01:00:00Z");
 /** The sweeper's in-memory check results; a fresh one per evaluation unless a test shares it. */
@@ -31,7 +32,10 @@ interface Task {
 
 /** A registered task whose three documents are complete: every AC checked with `test:` evidence. */
 function task(acceptance: string[], repo = "/r/repo"): Task {
-	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), { clock: { now: () => T0 } });
+	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), {
+		timezone: "Asia/Seoul",
+		clock: { now: () => T0 },
+	});
 	const row = ledger.register({
 		title: "check",
 		risk: "L2",
@@ -50,6 +54,7 @@ function task(acceptance: string[], repo = "/r/repo"): Task {
 		agent: row.agent,
 		threadLink: "x",
 		registeredAt: T0,
+		timezone: "Asia/Seoul",
 	};
 	const spec = renderSpec(
 		meta,
@@ -69,7 +74,7 @@ function task(acceptance: string[], repo = "/r/repo"): Task {
 		row,
 		files: {
 			[`${dir}/spec.md`]: spec,
-			[`${dir}/PROGRESS.md`]: renderProgress(row.taskId, T0),
+			[`${dir}/PROGRESS.md`]: renderProgress(row.taskId, T0, "Asia/Seoul"),
 			[`${dir}/outcome.md`]: outcome,
 		},
 	};
@@ -152,7 +157,7 @@ describe("[check: …] signals in the judgement", () => {
 		const failedProblems = failed.ok ? failed.judgement.problems : [];
 		expect(failedProblems).toHaveLength(1);
 		expect(failedProblems[0]).toStartWith("check AC-1 실패: ");
-		expect(exit1.runs).toEqual([{ worktree: row.worktree, argv: ["bun", "test"], timeoutMs: 120_000 }]);
+		expect(exit1.runs).toEqual([{ worktree: row.worktree, argv: ["bun", "test"], timeoutMs: 300_000 }]);
 
 		const mismatch = fakeHost(files, { run: () => ({ code: 0, output: "3 pass\n 2 fail\n" }) });
 		const unmatched = await evaluateTask(row, mismatch.ops, cache());
@@ -234,6 +239,106 @@ describe("[check: …] signals in the judgement", () => {
 		head = HEAD_B;
 		await sweeper.check(t.ledger.require(t.row.taskId));
 		expect(host.runs).toHaveLength(2);
+	});
+
+	test("blocked with nothing else unmet: checks still run; all passing marks the HEAD, the worker hears it once", async () => {
+		const t = task([`bun test가 통과한다 ${BUN_TEST}`]);
+		const dir = docsDirOf(t.row.worktree, t.row.taskId);
+		const progress = t.files[`${dir}/PROGRESS.md`] ?? "";
+		const blocked = {
+			...t.files,
+			[`${dir}/PROGRESS.md`]: progress
+				.replace("status: working", "status: blocked")
+				.replace("blocked_reason:", "blocked_reason: npm: command not found"),
+		};
+
+		const failing = fakeHost(blocked, { run: () => ({ code: 127, output: "npm: command not found" }) });
+		const stillBad = await evaluateTask(t.row, failing.ops, cache());
+		expect(failing.runs).toHaveLength(1);
+		expect(stillBad.ok && stillBad.judgement).toMatchObject({ reached: false, blocked: true, checks: [] });
+		expect(stillBad.ok && stillBad.judgement.blockedChecksPassHead).toBeUndefined();
+
+		const unchecked = { ...blocked, [`${dir}/spec.md`]: blocked[`${dir}/spec.md`]?.replace("- [x]", "- [ ]") ?? "" };
+		const incomplete = fakeHost(unchecked);
+		await evaluateTask(t.row, incomplete.ops, cache());
+		expect(incomplete.runs).toHaveLength(0);
+
+		const host = fakeHost(blocked);
+		const reminders: string[] = [];
+		const sweeper = new TaskSweeper({
+			ledger: t.ledger,
+			evaluate: (row, checks) => evaluateTask(row, host.ops, checks),
+			remind: async (_row, text) => {
+				reminders.push(text);
+				return { ok: true };
+			},
+			agentStatus: async () => ({ ok: true, status: "idle" }),
+			readAgent: async () => ({ ok: true, output: "" }),
+			channels: registryOf(new SlackChannel(new FakeSlackTransport())),
+			ownerUserId: "UOWN",
+			now: () => T0,
+			log: { info() {}, warn() {} },
+		});
+		// Sweep 1 sends the one retry prompt and holds; sweep 2 reports the block and tells the worker the checks pass.
+		for (let i = 0; i < 3; i += 1) await sweeper.check(t.ledger.require(t.row.taskId));
+		const judged = await evaluateTask(t.row, host.ops, cache());
+		expect(judged.ok && judged.judgement).toMatchObject({
+			reached: false,
+			blocked: true,
+			blockedChecksPassHead: HEAD_A,
+		});
+		expect(t.ledger.require(t.row.taskId).status).toBe("blocked");
+		expect(reminders.filter((text) => text === BLOCKED_CHECKS_PASS_HEAD)).toHaveLength(1);
+	});
+
+	test("a timed-out check is inconclusive and never reused: the next call runs it again, other results stay", async () => {
+		let timedOut = true;
+		const host = fakeHost(
+			{},
+			{
+				run: (argv) =>
+					argv[0] === "slow"
+						? { code: timedOut ? null : 0, output: "", timedOut }
+						: argv[0] === "false"
+							? { code: 1, output: "boom" }
+							: { code: 0, output: "" },
+			},
+		);
+		const known = new Map<string, SignalCheck>();
+		const requests = [
+			{ id: "AC-1", signal: 'command ["true"]' },
+			{ id: "AC-2", signal: 'command ["false"]' },
+			{ id: "AC-3", signal: 'command ["slow"]' },
+		];
+		const first = await runWorktreeChecks(host.ops, "/r/wt", () => known, requests);
+		expect(first).toEqual({
+			head: HEAD_A,
+			results: [
+				{ id: "AC-1", signal: 'command ["true"]', ok: true, detail: "exit 0" },
+				{ id: "AC-2", signal: 'command ["false"]', ok: false, detail: "exit 1: boom" },
+				{
+					id: "AC-3",
+					signal: 'command ["slow"]',
+					ok: false,
+					detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+					inconclusive: true,
+				},
+			],
+		});
+		expect([...known.keys()]).toEqual(['command ["true"]', 'command ["false"]']);
+		expect(host.runs.map((run) => run.argv[0])).toEqual(["true", "false", "slow"]);
+
+		timedOut = false;
+		const second = await runWorktreeChecks(host.ops, "/r/wt", () => known, requests);
+		expect(host.runs.map((run) => run.argv[0])).toEqual(["true", "false", "slow", "slow"]);
+		expect("results" in second && second.results.map((r) => [r.ok, r.inconclusive])).toEqual([
+			[true, undefined],
+			[false, undefined],
+			[true, undefined],
+		]);
+		// Now conclusive, it is reused like any other result.
+		await runWorktreeChecks(host.ops, "/r/wt", () => known, requests);
+		expect(host.runs).toHaveLength(4);
 	});
 
 	test("AC-5: uncommitted changes in the worktree defer the checks and hold the outcome", async () => {
@@ -343,6 +448,9 @@ describe("host runCheck / headOf", () => {
 					"ConnectTimeout=8",
 					"wsl",
 					"--",
+					"export",
+					'PATH="$HOME/.local/bin:$PATH"',
+					"&&",
 					"cd",
 					"'/r/wt'",
 					"&&",

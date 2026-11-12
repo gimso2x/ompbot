@@ -73,6 +73,8 @@ interface Harness {
 	ack: boolean;
 	/** When false, Identify gets no READY (the test answers by hand). */
 	autoReady: boolean;
+	/** When false, a new connection gets no HELLO. */
+	hello: boolean;
 	notify(): void;
 	until(cond: () => boolean): Promise<void>;
 	send(conn: number, payload: unknown): void;
@@ -87,6 +89,7 @@ function startHarness(): Harness {
 		conns: [],
 		ack: true,
 		autoReady: true,
+		hello: true,
 		notify: () => {
 			for (const w of waiters.splice(0)) w();
 		},
@@ -121,7 +124,7 @@ function startHarness(): Harness {
 		websocket: {
 			open(ws) {
 				h.conns.push({ ws, path: ws.data.path, search: ws.data.search, received: [], closed: false });
-				ws.send(JSON.stringify({ op: 10, d: { heartbeat_interval: INTERVAL } }));
+				if (h.hello) ws.send(JSON.stringify({ op: 10, d: { heartbeat_interval: INTERVAL } }));
 				h.notify();
 			},
 			message(ws, raw) {
@@ -173,6 +176,7 @@ interface Recorded {
 	ready: Array<{ resumed: boolean }>;
 	fatal: DiscordGatewayFatalError[];
 	reconnects: string[];
+	errors: string[];
 }
 
 let harness: Harness | undefined;
@@ -193,7 +197,15 @@ function make(
 	timers: FakeTimers,
 	extra: Partial<DiscordGatewayOptions> = {},
 ): { gw: DiscordGateway; rec: Recorded } {
-	const rec: Recorded = { messages: [], reactions: [], interactions: [], ready: [], fatal: [], reconnects: [] };
+	const rec: Recorded = {
+		messages: [],
+		reactions: [],
+		interactions: [],
+		ready: [],
+		fatal: [],
+		reconnects: [],
+		errors: [],
+	};
 	const handlers: DiscordHandlers = {
 		message: async (event) => {
 			rec.messages.push(event);
@@ -227,6 +239,10 @@ function make(
 		},
 		onReconnect: (reason) => {
 			rec.reconnects.push(reason);
+			h.notify();
+		},
+		onError: (error) => {
+			rec.errors.push(error.message);
 			h.notify();
 		},
 		...extra,
@@ -425,6 +441,114 @@ describe("DiscordGateway", () => {
 		expect(opsOf(h.conns[2])).not.toContain(6);
 	});
 
+	test("a gateway url that is no URL is reported and looked up again after the backoff; start still resolves", async () => {
+		const h = startHarness();
+		harness = h;
+		const timers = new FakeTimers();
+		let lookups = 0;
+		const { gw, rec } = make(h, timers, {
+			url: async () => {
+				lookups += 1;
+				return lookups === 1 ? "::not a gateway url::" : `ws://localhost:${h.port}/gateway`;
+			},
+		});
+		const started = gw.start();
+		await h.until(() => rec.errors.length === 1);
+		expect(h.conns).toHaveLength(0);
+		expect(timers.delays()).toEqual([100]);
+		timers.advance(100);
+		expect(await started).toEqual({ botUserId: BOT, applicationId: APP });
+		expect(lookups).toBe(2);
+		expect(h.conns[0]?.path).toBe("/gateway");
+	});
+
+	test("a resume url that is no URL drops the session: reported, then a new Identify on the gateway url", async () => {
+		const h = startHarness();
+		harness = h;
+		h.autoReady = false;
+		const timers = new FakeTimers();
+		const { gw, rec } = make(h, timers);
+		const started = gw.start();
+		await h.until(() => opsOf(h.conns[0]).includes(2));
+		h.send(0, {
+			op: 0,
+			t: "READY",
+			s: 1,
+			d: { session_id: "sess-x", resume_gateway_url: "::not a url::", user: { id: BOT }, application: { id: APP } },
+		});
+		await started;
+		h.send(0, { op: 7, d: null });
+		await h.until(() => rec.errors.length === 1);
+		expect(gw.session().sessionId).toBeUndefined();
+		const backoff = timers.delays().filter((ms) => ms !== 250 && ms !== INTERVAL);
+		expect(backoff).toEqual([100]);
+		timers.advance(100);
+		await h.until(() => opsOf(h.conns[1]).includes(2));
+		expect(h.conns[1]?.path).toBe("/gateway");
+		expect(opsOf(h.conns[1])).not.toContain(6);
+	});
+
+	test("no HELLO within 30 s: the socket is closed and reconnected after the backoff; start does not reject", async () => {
+		const h = startHarness();
+		harness = h;
+		h.hello = false;
+		const timers = new FakeTimers();
+		const { gw, rec } = make(h, timers);
+		let rejected: unknown;
+		const started = gw.start().catch((e: unknown) => {
+			rejected = e;
+			return undefined;
+		});
+		await h.until(() => h.conns.length === 1);
+		expect(timers.delays()).toEqual([30_000]);
+		timers.advance(29_999);
+		expect(rec.reconnects).toEqual([]);
+		timers.advance(1);
+		await h.until(() => h.conns[0]?.closed === true);
+		expect(rec.reconnects).toEqual(["hello timeout"]);
+		expect(timers.delays()).toEqual([100]);
+		h.hello = true;
+		timers.advance(100);
+		expect(await started).toEqual({ botUserId: BOT, applicationId: APP });
+		expect(rejected).toBeUndefined();
+		expect(h.conns).toHaveLength(2);
+	});
+
+	test("a READY without resume_gateway_url is reported, closed and identified anew after the backoff", async () => {
+		const h = startHarness();
+		harness = h;
+		h.autoReady = false;
+		const timers = new FakeTimers();
+		const { gw, rec } = make(h, timers);
+		let rejected: unknown;
+		const started = gw.start().catch((e: unknown) => {
+			rejected = e;
+			return undefined;
+		});
+		await h.until(() => opsOf(h.conns[0]).includes(2));
+		h.send(0, { op: 0, t: "READY", s: 1, d: { session_id: "sess-bad", user: { id: BOT }, application: { id: APP } } });
+		await h.until(() => rec.reconnects.length === 1 && h.conns[0]?.closed === true);
+		expect(rec.errors).toEqual(["discord ready without session or ids"]);
+		expect(gw.session().sessionId).toBeUndefined();
+		expect(timers.delays()).toEqual([100]);
+		timers.advance(100);
+		await h.until(() => opsOf(h.conns[1]).includes(2));
+		expect(h.conns[1]?.path).toBe("/gateway");
+		h.send(1, {
+			op: 0,
+			t: "READY",
+			s: 1,
+			d: {
+				session_id: "sess-ok",
+				resume_gateway_url: `ws://localhost:${h.port}/resume`,
+				user: { id: BOT },
+				application: { id: APP },
+			},
+		});
+		expect(await started).toEqual({ botUserId: BOT, applicationId: APP });
+		expect(rejected).toBeUndefined();
+	});
+
 	test("Dispatch events reach the message, reaction and interaction handlers; other events are ignored", async () => {
 		const h = startHarness();
 		harness = h;
@@ -477,6 +601,37 @@ describe("DiscordGateway", () => {
 		await h.until(() => errors.includes("handler boom"));
 		expect(gw.connectionState().state).toBe("up");
 		expect(h.conns[0]?.closed).toBe(false);
+		expect(h.conns).toHaveLength(1);
+	});
+
+	test("null, array and number frames are reported once each and dropped; the next dispatch still arrives", async () => {
+		const h = startHarness();
+		harness = h;
+		const timers = new FakeTimers();
+		const errors: string[] = [];
+		const { gw, rec } = make(h, timers, {
+			onError: (error) => {
+				errors.push(error.message);
+				h.notify();
+			},
+		});
+		await gw.start();
+		let seq = 1;
+		for (const frame of ["null", "[]", "1"]) {
+			const before = errors.length;
+			h.conns[0]?.ws.send(frame);
+			seq += 1;
+			h.send(0, {
+				op: 0,
+				t: "MESSAGE_CREATE",
+				s: seq,
+				d: { id: String(seq), channel_id: "2", author: { id: "3" }, content: "", type: 0 },
+			});
+			await h.until(() => rec.messages.length === seq - 1);
+			expect(errors.slice(before)).toEqual(["non-object discord gateway frame"]);
+		}
+		expect(gw.session().seq).toBe(seq);
+		expect(gw.connectionState().state).toBe("up");
 		expect(h.conns).toHaveLength(1);
 	});
 

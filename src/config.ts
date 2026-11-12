@@ -2,11 +2,13 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { TASK_RISKS, type TaskRisk } from "./tasks/docs";
+import { hostTimezone, isTimezone } from "./time";
 
 export type ConfigErrorCode =
 	| "home_missing"
 	| "home_permissions"
 	| "config_missing"
+	| "config_unreadable"
 	| "config_invalid_json"
 	| "config_invalid"
 	| "secret_missing"
@@ -55,14 +57,98 @@ export interface DiscordChannelConfig {
 	laneChannelId?: string;
 }
 
-/** Per-platform chat settings: who the owner is on each platform the bot talks on. Slack is required, Discord optional. */
+/** `channels.teams`: present → the daemon also takes Bot Framework messages from Microsoft Teams (owner only). */
+export interface TeamsChannelConfig {
+	/** The bot's Microsoft App ID (Entra client id); the `aud` every inbound token must carry. */
+	appId: string;
+	/** The owner's Entra tenant: Activities and Entra-issued tokens of any other tenant are refused. */
+	tenantId: string;
+	/** Absolute, resolved against the config directory; one line, mode 0600. */
+	clientSecretFile: string;
+	/** The owner's Entra object id (`from.aadObjectId`); only this user's messages are taken. */
+	ownerAadObjectId: string;
+	/** `host:port` the Bot Framework endpoint (`/api/messages`) listens on. Default `127.0.0.1:3978`. */
+	listen: string;
+	/** Tenant the outbound Bot Connector token is asked from. Default `tenantId`; `botframework.com` for a multi-tenant bot. */
+	tokenTenant?: string;
+	/** Entra object ids whose mentions get a read-only answer (web search only), never the owner's session. */
+	guestAadObjectIds?: string[];
+	/** `qa`: the owner's Teams messages take the guests' read-only one-shot path too. Default `full`. */
+	ownerMode?: "full" | "qa";
+	/** `--model` of the guest/qa runs; absent: omp's default. */
+	guestModel?: string;
+}
+
+/**
+ * Per-platform chat settings: who the owner is on each platform the bot talks on. Each platform is optional, but at
+ * least one is set; Slack is on exactly when `slack` is here (then the top-level `slack` token block is too).
+ */
 export interface ChannelsConfig {
-	slack: { ownerUserId: string };
+	slack?: { ownerUserId: string };
 	discord?: DiscordChannelConfig;
+	teams?: TeamsChannelConfig;
+}
+
+/**
+ * The owner id core-authored mentions use when no platform is implied: the Slack owner, else the Discord owner, else the Teams owner. A
+ * loaded config always has one of them (`config_invalid field=channels` otherwise).
+ */
+export function primaryOwnerUserId(channels: ChannelsConfig): string {
+	const owner = channels.slack?.ownerUserId ?? channels.discord?.ownerUserId ?? channels.teams?.ownerAadObjectId;
+	if (owner === undefined) throw new Error("no chat channel is configured");
+	return owner;
 }
 
 /** Old top-level keys still read, each with the key that replaced it (the daemon warns about them at startup). */
 export const DEPRECATED_KEYS = { ownerSlackUserId: "channels.slack.ownerUserId" } as const;
+
+export interface ConfigWarning {
+	field: string;
+	reason: "unknown_key" | "unsafe_name" | "unusable";
+}
+
+/** omp's own profile name rule (`OMP_PROFILE`); `ompProfile` must match it. */
+export const OMP_PROFILE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** Top-level keys `loadConfig` reads; any other one is reported as a `ConfigWarning`, not refused. */
+const ROOT_KEYS = new Set([
+	"schemaVersion",
+	"channels",
+	"ownerSlackUserId",
+	"slack",
+	"ompExecutable",
+	"ompProfile",
+	"workspaceDir",
+	"agent",
+	"claudeExecutable",
+	"agyExecutable",
+	"model",
+	"thinking",
+	"sessionRetentionDays",
+	"maxBundleBytes",
+	"offsite",
+	"idleTimeoutMinutes",
+	"skillReviewTurns",
+	"mentionFreeChannels",
+	"peerBots",
+	"requireMention",
+	"peerHopLimit",
+	"costCap",
+	"herdr",
+	"workerOmpArgs",
+	"dispatchHosts",
+	"herdrBoard",
+	"taskAutoLand",
+	"escalationChannel",
+	"logChannel",
+	"restartNotice",
+	"recallEnabled",
+	"watcherRoots",
+	"turnSnapshot",
+	"webhook",
+	"dashboard",
+	"briefing",
+]);
 
 /** One `dispatchHosts` entry: ssh target, remote work directory, remote herdr binary, worker omp extra arguments. */
 export interface DispatchHostConfig {
@@ -77,11 +163,28 @@ export interface OmpbotConfig {
 	homeDir: string;
 	configPath: string;
 	channels: ChannelsConfig;
+	/**
+	 * Settings the file has that load but do nothing or cannot work (the daemon warns about them at startup, field
+	 * names only): an unknown top-level key, a `dispatchHosts` name with control characters, an `offsite.remoteDir`
+	 * that is only slashes. Absent when there are none.
+	 */
+	warnings?: ConfigWarning[];
 	/** Deprecated keys the file still uses (see `DEPRECATED_KEYS`); absent when it uses none. */
 	deprecated?: Array<keyof typeof DEPRECATED_KEYS>;
-	slack: SlackConfig;
+	/** Slack app tokens; present exactly when `channels.slack` is. */
+	slack?: SlackConfig;
 	ompExecutable: string;
+	/**
+	 * omp profile of the bot's own omp children (`OMP_PROFILE`): their agent dir becomes
+	 * `~/.omp/profiles/<name>/agent`, filled by `ompbot omp sync`. Unset → the inherited agent dir, as before.
+	 */
+	ompProfile?: string;
 	workspaceDir: string;
+	/**
+	 * IANA time zone of every day boundary, displayed time and default monitor zone (`Europe/Berlin`). Always set on a
+	 * loaded config: the file's value, else the host zone (`UTC` when the host reports none).
+	 */
+	timezone: string;
 	/** Child agent behind chat origins: omp (`omp --mode rpc`), the Claude Code CLI or the Antigravity CLI. Default "omp". */
 	agent?: AgentKind;
 	/** Absolute claude CLI path for `agent: "claude"`; default resolves `claude` on the child PATH. */
@@ -120,7 +223,7 @@ export interface OmpbotConfig {
 	peerHopLimit?: { turns: number; windowMinutes: number };
 	/**
 	 * Cost ceiling in dollars as omp prices it (`usage.cost.total`, not the real bill): a turn that reaches `turnUsd`
-	 * is steered to wrap up and one that reaches 1.5x is stopped; a day (KST) whose session-file total passes
+	 * is steered to wrap up and one that reaches 1.5x is stopped; a day (in `timezone`) whose session-file total passes
 	 * `dailyUsd` stops monitor fires until midnight or `!budget off`. Each key off when absent or not positive.
 	 */
 	costCap?: { turnUsd?: number; dailyUsd?: number };
@@ -151,9 +254,11 @@ export interface OmpbotConfig {
 	 * at most `maxRisk` (default L2), and whose outcome stands on at least one passing re-run check without warnings
 	 * is merged without a question — a task gets "머지해" from the bot, a lane is landed by the core
 	 * (`src/lanes/land.ts`). Unset → every reached task and closed lane waits for the owner. Works without `herdr`
-	 * (lanes); the [TASK] sweep itself only runs with it.
+	 * (lanes); the [TASK] sweep itself only runs with it. `review` (lanes only): before an auto-merge a fresh read-only
+	 * `omp -p --model <model>` reviews the claim commit's diff against the lane's spec, and only its `CLEAR` receipt
+	 * for that commit lets the lane merge unasked (`timeoutMs` default 600000, at most 1800000). Unset → no review.
 	 */
-	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk };
+	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk; review?: { model: string; timeoutMs?: number } };
 	/** Slack channel id that receives approval cards (owner mention, link back to the asking thread). Default: the asking conversation. */
 	escalationChannel?: string;
 	/** Slack channel id of the #log ledger: completion reports are copied there and nothing said there becomes a turn. */
@@ -200,11 +305,25 @@ export const OFFSITE_SSH = /^([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-
 /** Absolute or `~/` path of plain characters, so it can sit unquoted in the remote shell command. */
 export const OFFSITE_DIR = /^(\/|~\/)[A-Za-z0-9._+=@%:/-]+$/;
 
+/**
+ * The one `offsite.remoteDir` predicate for config load and the off-site run: `OFFSITE_DIR`, no `..` segment
+ * (`a..b` is a plain name), and something left besides `/` or `~` once repeated and trailing slashes go.
+ */
+export function isOffsiteDir(dir: string): boolean {
+	if (!OFFSITE_DIR.test(dir) || dir.split("/").some((part) => part === "..")) return false;
+	const collapsed = dir.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+	return collapsed !== "" && collapsed !== "~";
+}
+
 export const HOME_MODE = 0o700;
 export const SECRET_MODE = 0o600;
+/** `taskAutoLand.review.timeoutMs`: default and upper bound of one lane review run. */
+export const LANE_REVIEW_TIMEOUT_MS = 600_000;
+export const LANE_REVIEW_TIMEOUT_MAX_MS = 1_800_000;
 
 export function defaultHomeDir(env: Record<string, string | undefined> = process.env): string {
-	return env.OMPBOT_HOME ?? join(homedir(), ".ompbot");
+	// An empty value is "unset", never "" (which `resolve` would turn into the current directory).
+	return env.OMPBOT_HOME || join(homedir(), ".ompbot");
 }
 
 function modeString(mode: number): string {
@@ -254,13 +373,15 @@ function parseChannels(
 	const legacy = optionalString(configPath, root, "ownerSlackUserId");
 	let owner: string | undefined;
 	let discord: DiscordChannelConfig | undefined;
+	let teams: TeamsChannelConfig | undefined;
 	if (root.channels !== undefined) {
 		const channels = asRecord(root.channels);
 		if (channels === undefined) invalid(configPath, "channels");
 		for (const key of Object.keys(channels)) {
-			if (key !== "slack" && key !== "discord") invalid(configPath, `channels.${key}`);
+			if (key !== "slack" && key !== "discord" && key !== "teams") invalid(configPath, `channels.${key}`);
 		}
 		if (channels.discord !== undefined) discord = parseDiscordChannel(configPath, channels.discord, home);
+		if (channels.teams !== undefined) teams = parseTeamsChannel(configPath, channels.teams, home);
 		if (channels.slack !== undefined) {
 			const slack = asRecord(channels.slack);
 			if (slack === undefined) invalid(configPath, "channels.slack");
@@ -274,9 +395,16 @@ function parseChannels(
 		invalid(configPath, "channels.slack.ownerUserId");
 	}
 	const ownerUserId = owner ?? legacy;
-	if (ownerUserId === undefined) invalid(configPath, "channels.slack.ownerUserId");
+	// A Slack token block without a Slack owner is a half-configured Slack, not "Slack off".
+	if (ownerUserId === undefined && (root.slack !== undefined || (discord === undefined && teams === undefined))) {
+		invalid(configPath, root.slack !== undefined ? "channels.slack.ownerUserId" : "channels");
+	}
 	return {
-		channels: { slack: { ownerUserId }, ...(discord === undefined ? {} : { discord }) },
+		channels: {
+			...(ownerUserId === undefined ? {} : { slack: { ownerUserId } }),
+			...(discord === undefined ? {} : { discord }),
+			...(teams === undefined ? {} : { teams }),
+		},
 		deprecated: legacy === undefined ? [] : ["ownerSlackUserId"],
 	};
 }
@@ -333,6 +461,79 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 		...(mentionFreeChannels === undefined ? {} : { mentionFreeChannels }),
 		...(requireMention === undefined ? {} : { requireMention }),
 		...(laneChannelId === undefined ? {} : { laneChannelId }),
+	};
+}
+
+/** An Entra id (app, tenant, user object): a GUID. */
+const ENTRA_GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TEAMS_KEYS: Record<string, true> = {
+	appId: true,
+	tenantId: true,
+	clientSecretFile: true,
+	ownerAadObjectId: true,
+	listen: true,
+	tokenTenant: true,
+	guestAadObjectIds: true,
+	ownerMode: true,
+	guestModel: true,
+};
+export const TEAMS_DEFAULT_LISTEN = "127.0.0.1:3978";
+
+/**
+ * `host:port` of a loopback listener (`127.0.0.1`, `[::1]`, `localhost`): the public HTTPS in front of it is a tunnel
+ * outside the daemon. `undefined` for anything else.
+ */
+export function parseLoopbackListen(listen: string): { hostname: string; port: number } | undefined {
+	const match = /^(127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/.exec(listen);
+	const port = Number(match?.[2]);
+	if (match === null || !Number.isInteger(port) || port < 1 || port > 65_535) return undefined;
+	return { hostname: match[1] === "[::1]" ? "::1" : (match[1] ?? ""), port };
+}
+
+function parseTeamsChannel(configPath: string, value: unknown, home: string): TeamsChannelConfig {
+	const record = asRecord(value);
+	if (record === undefined) invalid(configPath, "channels.teams");
+	for (const key of Object.keys(record)) {
+		if (!Object.hasOwn(TEAMS_KEYS, key)) invalid(configPath, `channels.teams.${key}`);
+	}
+	const guid = (key: string): string => {
+		const id = record[key];
+		if (typeof id !== "string" || !ENTRA_GUID.test(id)) invalid(configPath, `channels.teams.${key}`);
+		return id.toLowerCase();
+	};
+	const listen = optionalString(configPath, record, "listen", "channels.teams.listen") ?? TEAMS_DEFAULT_LISTEN;
+	if (parseLoopbackListen(listen) === undefined) invalid(configPath, "channels.teams.listen");
+	const tokenTenant = optionalString(configPath, record, "tokenTenant", "channels.teams.tokenTenant");
+	if (tokenTenant !== undefined && !/^[A-Za-z0-9.-]+$/.test(tokenTenant)) {
+		invalid(configPath, "channels.teams.tokenTenant");
+	}
+	const guestsRaw = record.guestAadObjectIds;
+	let guestAadObjectIds: string[] | undefined;
+	if (guestsRaw !== undefined) {
+		if (!Array.isArray(guestsRaw)) invalid(configPath, "channels.teams.guestAadObjectIds");
+		guestAadObjectIds = guestsRaw.map((id) => {
+			if (typeof id !== "string" || !ENTRA_GUID.test(id)) invalid(configPath, "channels.teams.guestAadObjectIds");
+			return id.toLowerCase();
+		});
+	}
+	const ownerMode = record.ownerMode;
+	if (ownerMode !== undefined && ownerMode !== "full" && ownerMode !== "qa") {
+		invalid(configPath, "channels.teams.ownerMode");
+	}
+	const guestModel = optionalString(configPath, record, "guestModel", "channels.teams.guestModel");
+	return {
+		appId: guid("appId"),
+		tenantId: guid("tenantId"),
+		clientSecretFile: resolve(
+			home,
+			requiredString(configPath, record, "clientSecretFile", "channels.teams.clientSecretFile"),
+		),
+		ownerAadObjectId: guid("ownerAadObjectId"),
+		listen,
+		...(tokenTenant === undefined ? {} : { tokenTenant }),
+		...(guestAadObjectIds === undefined ? {} : { guestAadObjectIds }),
+		...(ownerMode === undefined ? {} : { ownerMode }),
+		...(guestModel === undefined ? {} : { guestModel }),
 	};
 }
 
@@ -407,9 +608,11 @@ function readSecretFile(path: string): string {
 
 /** Reads the token files again (permission and prefix checks included) and returns the values. */
 export function readSlackTokens(config: OmpbotConfig): SlackTokens {
+	const slack = config.slack;
+	if (slack === undefined) throw new Error("channels.slack is not configured");
 	return {
-		botToken: readSecret(config.slack.botTokenFile, "xoxb-"),
-		appToken: readSecret(config.slack.appTokenFile, "xapp-"),
+		botToken: readSecret(slack.botTokenFile, "xoxb-"),
+		appToken: readSecret(slack.appTokenFile, "xapp-"),
 	};
 }
 
@@ -427,10 +630,30 @@ export function readDiscordToken(config: OmpbotConfig): string {
 	return value;
 }
 
+/** Reads the Teams client secret file again (0600, one non-empty line); the value never leaves memory. */
+export function readTeamsClientSecret(config: OmpbotConfig): string {
+	const teams = config.channels.teams;
+	if (teams === undefined) throw new Error("channels.teams is not configured");
+	const value = readSecretFile(teams.clientSecretFile);
+	if (value === "" || /[\r\n]/.test(value)) {
+		throw new ConfigError("config_invalid", teams.clientSecretFile, "field=channels.teams.clientSecretFile");
+	}
+	return value;
+}
+
 /**
  * Loads and validates `<homeDir>/config.json`. Credential-file and workspace paths resolve against the config dir.
  * `checkTokens: false` skips reading the token files — for processes that never talk to Slack (`ompbot dashboard`).
  */
+/** A CLI's zone: the home's `config.timezone`, or the zone a config without the key gets when there is no usable one. */
+export function timezoneOfHome(homeDir: string): string {
+	try {
+		return loadConfig(homeDir, { checkTokens: false }).timezone;
+	} catch {
+		return hostTimezone();
+	}
+}
+
 export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkTokens?: boolean } = {}): OmpbotConfig {
 	const home = resolve(homeDir);
 	checkHome(home);
@@ -439,12 +662,15 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	let raw: string;
 	try {
 		raw = readFileSync(configPath, "utf8");
-	} catch {
-		throw new ConfigError("config_missing", configPath);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") throw new ConfigError("config_missing", configPath);
+		throw new ConfigError("config_unreadable", configPath, code ?? "read failed");
 	}
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(raw);
+		// A Windows editor may save a byte-order mark first; JSON.parse refuses it as an unnamed token.
+		parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
 	} catch (error) {
 		// The parser names what it expected but not where; the usual culprits are named so the file can be scanned.
 		// Quoted text in its message can be file content (a token pasted into the wrong place), so it is masked.
@@ -459,11 +685,15 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	const root = asRecord(parsed);
 	if (!root) invalid(configPath, "<root>");
 	if (root.schemaVersion !== 1) invalid(configPath, "schemaVersion");
-	const slack = asRecord(root.slack);
-	if (!slack) invalid(configPath, "slack");
+	const warnings: ConfigWarning[] = [];
+	for (const key of Object.keys(root)) if (!ROOT_KEYS.has(key)) warnings.push({ field: key, reason: "unknown_key" });
+	const slack = root.slack === undefined ? undefined : asRecord(root.slack);
+	if (root.slack !== undefined && slack === undefined) invalid(configPath, "slack");
 
 	const ompExecutable = requiredString(configPath, root, "ompExecutable");
 	if (!isAbsolute(ompExecutable)) invalid(configPath, "ompExecutable");
+	const ompProfile = optionalString(configPath, root, "ompProfile");
+	if (ompProfile !== undefined && !OMP_PROFILE_PATTERN.test(ompProfile)) invalid(configPath, "ompProfile");
 
 	const agent = root.agent;
 	if (agent !== undefined && agent !== "omp" && agent !== "claude" && agent !== "agy") invalid(configPath, "agent");
@@ -472,12 +702,17 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	const agyExecutable = optionalString(configPath, root, "agyExecutable");
 	if (agyExecutable !== undefined && !isAbsolute(agyExecutable)) invalid(configPath, "agyExecutable");
 
+	const timezoneRaw = optionalString(configPath, root, "timezone");
+	if (timezoneRaw !== undefined && !isTimezone(timezoneRaw)) invalid(configPath, "timezone");
+
 	const sessionRetentionDays = optionalInt(configPath, root, "sessionRetentionDays", 1);
 	const maxBundleBytes = optionalInt(configPath, root, "maxBundleBytes", 1);
 	const idleTimeoutMinutes = optionalInt(configPath, root, "idleTimeoutMinutes", 0);
 	const skillReviewTurns = optionalInt(configPath, root, "skillReviewTurns", 0);
 
 	const { channels, deprecated } = parseChannels(configPath, root, home);
+	if (channels.slack !== undefined && slack === undefined) invalid(configPath, "slack");
+	const slackOff = channels.slack === undefined;
 
 	const mentionFreeChannels = root.mentionFreeChannels;
 	if (
@@ -487,17 +722,19 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	) {
 		invalid(configPath, "mentionFreeChannels");
 	}
+	// Top-level channel and user ids are Slack ids: without Slack they would name nothing the bot can reach.
+	if (slackOff && mentionFreeChannels !== undefined) invalid(configPath, "mentionFreeChannels");
 
 	const peerBotsRaw = root.peerBots;
 	if (peerBotsRaw !== undefined) {
-		if (!Array.isArray(peerBotsRaw)) invalid(configPath, "peerBots");
+		if (!Array.isArray(peerBotsRaw) || slackOff) invalid(configPath, "peerBots");
 		peerBotsRaw.forEach((entry, i) => {
 			const record = asRecord(entry);
 			if (record === undefined || typeof record.userId !== "string" || !SLACK_USER_ID.test(record.userId)) {
 				invalid(configPath, `peerBots.${i}.userId`);
 			}
 			// The owner is never a peer: a peer message carries no owner authority, so listing the owner would only shadow it.
-			if (record.userId === channels.slack.ownerUserId) invalid(configPath, `peerBots.${i}.userId`);
+			if (record.userId === channels.slack?.ownerUserId) invalid(configPath, `peerBots.${i}.userId`);
 			if (typeof record.name !== "string" || record.name.length < 1 || record.name.length > 32) {
 				invalid(configPath, `peerBots.${i}.name`);
 			}
@@ -550,6 +787,10 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			}
 			optionalArgList(configPath, record, "ompArgs", `dispatchHosts.${name}.ompArgs`);
 		}
+		// A name is printed into doctor lines and reports; a control character in it could forge a line there.
+		if (Object.keys(hosts ?? {}).some((name) => /[\p{Cc}\p{Cf}]/u.test(name))) {
+			warnings.push({ field: "dispatchHosts", reason: "unsafe_name" });
+		}
 	}
 	const workerOmpArgs = optionalArgList(configPath, root, "workerOmpArgs");
 
@@ -567,12 +808,16 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		) {
 			invalid(configPath, "offsite.remoteDir");
 		}
+		// `~//x` would make scp's path absolute and `//` leave no directory: repeated slashes collapse here, and a
+		// value that is only slashes still loads (it always did) but is flagged, and the off-site run refuses it.
+		const remoteDir = (record.remoteDir as string).replace(/\/{2,}/g, "/");
+		if (!isOffsiteDir(remoteDir)) warnings.push({ field: "offsite.remoteDir", reason: "unusable" });
 		if (record?.keep !== undefined && (!Number.isSafeInteger(record.keep) || (record.keep as number) < 1)) {
 			invalid(configPath, "offsite.keep");
 		}
 		offsite = {
 			ssh: record?.ssh as string,
-			remoteDir: record?.remoteDir as string,
+			remoteDir,
 			...(record?.keep === undefined ? {} : { keep: record.keep as number }),
 		};
 	}
@@ -602,11 +847,36 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			invalid(configPath, "taskAutoLand.maxRisk");
 		}
 		for (const key of Object.keys(record)) {
-			if (key !== "repos" && key !== "maxRisk") invalid(configPath, `taskAutoLand.${key}`);
+			if (key !== "repos" && key !== "maxRisk" && key !== "review") invalid(configPath, `taskAutoLand.${key}`);
+		}
+		let review: { model: string; timeoutMs?: number } | undefined;
+		if (record.review !== undefined) {
+			const reviewRecord = asRecord(record.review);
+			if (reviewRecord === undefined) invalid(configPath, "taskAutoLand.review");
+			const model = reviewRecord.model;
+			// `cursor` is in the reviewer's disabledProviders overlay (its discovery), which also disables that model provider.
+			if (typeof model !== "string" || model.trim() === "" || model.trim().startsWith("cursor/")) {
+				invalid(configPath, "taskAutoLand.review.model");
+			}
+			const timeoutMs = reviewRecord.timeoutMs;
+			if (
+				timeoutMs !== undefined &&
+				(typeof timeoutMs !== "number" ||
+					!Number.isInteger(timeoutMs) ||
+					timeoutMs <= 0 ||
+					timeoutMs > LANE_REVIEW_TIMEOUT_MAX_MS)
+			) {
+				invalid(configPath, "taskAutoLand.review.timeoutMs");
+			}
+			for (const key of Object.keys(reviewRecord)) {
+				if (key !== "model" && key !== "timeoutMs") invalid(configPath, `taskAutoLand.review.${key}`);
+			}
+			review = { model, ...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }) };
 		}
 		taskAutoLand = {
 			repos: (repos as string[]).map((repo) => repo.replace(/(?<=.)\/+$/, "")),
 			...(maxRisk === undefined ? {} : { maxRisk: maxRisk as TaskRisk }),
+			...(review === undefined ? {} : { review }),
 		};
 	}
 
@@ -626,6 +896,8 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 
 	const escalationChannel = optionalChannelId(configPath, root, "escalationChannel");
 	const logChannel = optionalChannelId(configPath, root, "logChannel");
+	if (slackOff && escalationChannel !== undefined) invalid(configPath, "escalationChannel");
+	if (slackOff && logChannel !== undefined) invalid(configPath, "logChannel");
 
 	const restartNotice = root.restartNotice;
 	if (restartNotice !== undefined && typeof restartNotice !== "boolean") invalid(configPath, "restartNotice");
@@ -714,20 +986,25 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		homeDir: home,
 		configPath,
 		channels,
-		slack: {
-			botTokenFile: resolve(home, requiredString(configPath, slack, "botTokenFile", "slack.botTokenFile")),
-			appTokenFile: resolve(home, requiredString(configPath, slack, "appTokenFile", "slack.appTokenFile")),
-		},
 		ompExecutable,
 		workspaceDir: resolve(home, requiredString(configPath, root, "workspaceDir")),
+		timezone: timezoneRaw ?? hostTimezone(),
 	};
 	if (deprecated.length > 0) config.deprecated = deprecated;
-	const appId = optionalString(configPath, slack, "appId", "slack.appId");
-	const teamId = optionalString(configPath, slack, "teamId", "slack.teamId");
-	const botUserId = optionalString(configPath, slack, "botUserId", "slack.botUserId");
-	if (appId !== undefined) config.slack.appId = appId;
-	if (teamId !== undefined) config.slack.teamId = teamId;
-	if (botUserId !== undefined) config.slack.botUserId = botUserId;
+	if (warnings.length > 0) config.warnings = warnings;
+	if (slack !== undefined) {
+		const slackConfig: SlackConfig = {
+			botTokenFile: resolve(home, requiredString(configPath, slack, "botTokenFile", "slack.botTokenFile")),
+			appTokenFile: resolve(home, requiredString(configPath, slack, "appTokenFile", "slack.appTokenFile")),
+		};
+		const appId = optionalString(configPath, slack, "appId", "slack.appId");
+		const teamId = optionalString(configPath, slack, "teamId", "slack.teamId");
+		const botUserId = optionalString(configPath, slack, "botUserId", "slack.botUserId");
+		if (appId !== undefined) slackConfig.appId = appId;
+		if (teamId !== undefined) slackConfig.teamId = teamId;
+		if (botUserId !== undefined) slackConfig.botUserId = botUserId;
+		config.slack = slackConfig;
+	}
 	const model = optionalString(configPath, root, "model");
 	const thinking = optionalString(configPath, root, "thinking");
 	if (model !== undefined) config.model = model;
@@ -735,6 +1012,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (agent !== undefined) config.agent = agent;
 	if (claudeExecutable !== undefined) config.claudeExecutable = claudeExecutable;
 	if (agyExecutable !== undefined) config.agyExecutable = agyExecutable;
+	if (ompProfile !== undefined) config.ompProfile = ompProfile;
 	if (sessionRetentionDays !== undefined) config.sessionRetentionDays = sessionRetentionDays;
 	if (maxBundleBytes !== undefined) config.maxBundleBytes = maxBundleBytes;
 	if (offsite !== undefined) config.offsite = offsite;
@@ -774,8 +1052,9 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 
 	if (options.checkTokens !== false) {
 		// Fail at startup on permissions/prefix/shape; values are discarded here.
-		readSlackTokens(config);
+		if (config.slack !== undefined) readSlackTokens(config);
 		if (config.channels.discord !== undefined) readDiscordToken(config);
+		if (config.channels.teams !== undefined) readTeamsClientSecret(config);
 	}
 	return config;
 }

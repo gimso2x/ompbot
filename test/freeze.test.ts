@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli/index";
@@ -45,6 +45,34 @@ describe("FROZEN file", () => {
 		expect(clearFreeze(dir)).toBe(true);
 		expect(readFreeze(dir)).toBeUndefined();
 		expect(clearFreeze(dir)).toBe(false);
+	});
+
+	test("a FROZEN directory: freeze fails with a clear error and no tmp, unfreeze removes it and stamps unfrozen-at (J-4)", () => {
+		mkdirSync(join(freezePath(dir), "inner"), { recursive: true });
+		expect(readFreeze(dir)).toBeDefined();
+		expect(() => writeFreeze(dir, { reason: "dir", by: "cli", now: Date.now() })).toThrow(
+			/FROZEN is not a regular file.*ompbot unfreeze/,
+		);
+		expect(existsSync(`${freezePath(dir)}.tmp`)).toBe(false);
+		expect(readFreeze(dir)).toBeDefined(); // still frozen (fail closed)
+
+		expect(clearFreeze(dir, Date.parse("2026-11-12T01:00:00Z"))).toBe(true);
+		expect(existsSync(freezePath(dir))).toBe(false);
+		expect(readFileSync(join(dir, "unfrozen-at"), "utf8").trim()).toBe("2026-11-12T01:00:00.000Z");
+	});
+
+	test("a failed unfreeze does not stamp unfrozen-at (J-4)", () => {
+		const locked = join(freezePath(dir), "locked");
+		mkdirSync(locked, { recursive: true });
+		writeFileSync(join(locked, "f"), "x");
+		chmodSync(locked, 0o500); // FROZEN cannot be removed
+		try {
+			expect(() => clearFreeze(dir)).toThrow();
+		} finally {
+			chmodSync(locked, 0o700);
+		}
+		expect(existsSync(join(dir, "unfrozen-at"))).toBe(false);
+		expect(readFreeze(dir)).toBeDefined();
 	});
 
 	test("an unparseable FROZEN still means frozen (fail closed)", () => {

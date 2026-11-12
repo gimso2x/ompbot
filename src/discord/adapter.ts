@@ -77,6 +77,8 @@ const STRING_OPTION = 3;
 const EPHEMERAL = 64;
 /** Interaction ids remembered against gateway replays; the oldest are forgotten past this. */
 const SEEN_INTERACTIONS_MAX = 1000;
+/** Messages whose refused-thread notice was posted; the set is emptied past this. */
+const THREAD_NOTICE_MEMORY = 1000;
 
 /** What each slash command does, as its picker shows it (Slack's manifest wording; Discord allows 1–100 characters). */
 const COMMAND_DESCRIPTIONS: Record<CommandKind, string> = {
@@ -198,6 +200,8 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #recovery: DiscordBackfill | undefined;
 	/** Interactions already handled (a resumed gateway can replay one): insertion-ordered, capped. */
 	readonly #seenInteractions = new Set<string>();
+	/** Messages whose refused thread start already left the channel notice (`#startThread`). */
+	readonly #threadNoticeSent = new Set<string>();
 	#ready: Promise<string | undefined> = Promise.resolve(undefined);
 	/** The start-time slash command registration; settles (never rejects) once every scope was tried. */
 	#commands: Promise<void> = Promise.resolve();
@@ -348,6 +352,7 @@ export class DiscordAdapter implements ChannelAdapter {
 				type: 0,
 			},
 			input.quoted ?? [],
+			input.injected === true,
 		);
 	}
 
@@ -565,6 +570,7 @@ export class DiscordAdapter implements ChannelAdapter {
 				await this.#transport.editInteractionResponse({
 					token,
 					content: cutCodePointSafe(mrkdwnToDiscord(text), MESSAGE_CONTENT_LIMIT),
+					allowedMentions: { parse: [] },
 				});
 			}
 		} catch (err) {
@@ -592,7 +598,12 @@ export class DiscordAdapter implements ChannelAdapter {
 		return "dropped";
 	}
 
-	async #processMessage(event: DiscordMessageEvent, quoted: readonly string[]): Promise<IngestOutcome> {
+	/** `injected`: an `ompbot inject` message (`OwnerIngest.injected`), which may not answer a card. */
+	async #processMessage(
+		event: DiscordMessageEvent,
+		quoted: readonly string[],
+		injected = false,
+	): Promise<IngestOutcome> {
 		if (!READ_TYPES.has(event.type)) return this.#drop(event, "subtype");
 		const botUserId = await this.#ready;
 		if (botUserId === undefined) return "dropped";
@@ -628,7 +639,7 @@ export class DiscordAdapter implements ChannelAdapter {
 				(event.mentions?.some((user) => user.id === botUserId) ?? false);
 			for (const token of tokens) text = text.split(token).join(" ");
 			text = text.trim();
-			const cardReply = await this.#processCardReply(event, conversationId, threadId, text, spot);
+			const cardReply = await this.#processCardReply(event, conversationId, threadId, text, spot, injected);
 			if (cardReply !== undefined) return cardReply;
 			const threadRef = threadId === undefined ? undefined : threadRefOf(conversationId, threadId);
 			const muteRef = threadRefOf(conversationId, threadId ?? event.id);
@@ -644,7 +655,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			}
 			muteContext = { ref: muteRef, mentioned, muted, command };
 		} else {
-			const cardReply = await this.#processCardReply(event, conversationId, undefined, text, spot);
+			const cardReply = await this.#processCardReply(event, conversationId, undefined, text, spot, injected);
 			if (cardReply !== undefined) return cardReply;
 		}
 		const args = {
@@ -747,6 +758,10 @@ export class DiscordAdapter implements ChannelAdapter {
 				await this.#transport.startThread({ channelId: conversationId, messageId: event.id, name });
 			} catch (err) {
 				if (!(err instanceof DiscordCallError && err.code === THREAD_EXISTS)) {
+					// Once per message: a backfill retry of the same refused message fails again without a second notice.
+					if (this.#threadNoticeSent.has(event.id)) throw err;
+					if (this.#threadNoticeSent.size >= THREAD_NOTICE_MEMORY) this.#threadNoticeSent.clear();
+					this.#threadNoticeSent.add(event.id);
 					await this.#postText(
 						conversationId,
 						event.id,
@@ -770,6 +785,7 @@ export class DiscordAdapter implements ChannelAdapter {
 		threadId: string | undefined,
 		text: string,
 		spot: MessageSpot,
+		injected: boolean,
 	): Promise<IngestOutcome | undefined> {
 		const onCardReply = this.#core.onCardReply;
 		if (onCardReply === undefined || text === "") return undefined;
@@ -779,8 +795,9 @@ export class DiscordAdapter implements ChannelAdapter {
 		);
 		for (const card of cards) {
 			const threadRef = threadRefOf(conversationId, card);
-			const result = onCardReply({ threadRef, platformMessageId, text });
+			const result = onCardReply({ threadRef, platformMessageId, text, injected });
 			if (result === undefined) continue;
+			if (result.kind === "injected_rejected") return "card_rejected";
 			if (result.kind === "duplicate") {
 				this.#log.info("inbound_duplicate", { id: platformMessageId });
 				return "duplicate";
@@ -934,7 +951,12 @@ export class DiscordAdapter implements ChannelAdapter {
 		const content = runningStatusText(entry.stalled, this.#clock.now() - entry.startedAt, entry.progress);
 		try {
 			await this.#call("edit", () =>
-				this.#transport.editMessage({ channelId: statusChannel, messageId: statusId, content }),
+				this.#transport.editMessage({
+					channelId: statusChannel,
+					messageId: statusId,
+					content,
+					allowedMentions: { parse: [] },
+				}),
 			);
 			entry.lastUpdateAt = this.#clock.now();
 		} catch (err) {
@@ -1003,7 +1025,12 @@ export class DiscordAdapter implements ChannelAdapter {
 				const content = `${FINAL_MARKS[outcome].label} · ${formatElapsed(this.#clock.now() - entry.startedAt)}`;
 				try {
 					await this.#call("edit", () =>
-						this.#transport.editMessage({ channelId: statusChannel, messageId: statusId, content }),
+						this.#transport.editMessage({
+							channelId: statusChannel,
+							messageId: statusId,
+							content,
+							allowedMentions: { parse: [] },
+						}),
 					);
 					entry.statusDone = true;
 				} catch (err) {

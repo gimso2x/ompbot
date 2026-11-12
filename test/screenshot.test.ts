@@ -2,7 +2,7 @@
 // `<title>` (clamped 400..4000, non-numeric 1600), timeout kills and throws, a failure carries the last stderr line
 // (or the stdout of a spawn failure), a second render while one runs is rejected at once, and no temp HTML is left.
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
@@ -124,6 +124,47 @@ describe("AC-2: renderPng", () => {
 		await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
 			/만들지 못/,
 		);
+	});
+
+	test("exit 0 with a stale file already at --out is a failure carrying the browser's words (J-16, J-18)", async () => {
+		const out = join(tmpdir(), `ompbot-shot-${process.pid}-stale.png`);
+		writeFileSync(out, "old png");
+		const run: ProcessRunner = async (cmd) =>
+			cmd.some((arg) => arg.startsWith("--screenshot="))
+				? { code: 0, stdout: "", stderr: "warn\nERROR: could not write screenshot", timedOut: false }
+				: { code: 0, stdout: "<title>1200</title>", timedOut: false };
+		try {
+			await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
+				/만들지 못했습니다: ERROR: could not write screenshot/,
+			);
+		} finally {
+			rmSync(out, { force: true });
+		}
+	});
+
+	test("a directory at --out is not a success either (J-16)", async () => {
+		const out = mkdtempSync(join(tmpdir(), `ompbot-shot-${process.pid}-dir-`));
+		const run: ProcessRunner = async (cmd) => ({
+			code: 0,
+			stdout: cmd.includes("--dump-dom") ? "<title>1200</title>" : "",
+			timedOut: false,
+		});
+		try {
+			await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
+				/만들지 못/,
+			);
+		} finally {
+			rmSync(out, { recursive: true, force: true });
+		}
+	});
+
+	test("the timeout message does not repeat 중 (J-19)", async () => {
+		const out = join(tmpdir(), `ompbot-shot-${process.pid}-timeout-text.png`);
+		const { run } = fakeRunner([{ code: null, stdout: "", timedOut: true }]);
+		const error = await renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1500, run }).catch(
+			(e: Error) => e,
+		);
+		expect((error as Error).message).toBe("브리핑 높이를 재는 중 시간 초과(1500ms): 프로세스를 중단했습니다");
 	});
 
 	test("a second render while one runs is rejected at once with BriefingBusyError", async () => {

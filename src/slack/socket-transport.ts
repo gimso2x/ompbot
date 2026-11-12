@@ -198,6 +198,7 @@ export class SocketModeTransport implements SlackTransport {
 		text: string;
 		threadTs?: string | undefined;
 		blocks?: readonly unknown[] | undefined;
+		attachments?: readonly unknown[] | undefined;
 	}): Promise<{ ts: string }> {
 		const res = await guarded(() =>
 			this.web.chat.postMessage({
@@ -205,6 +206,7 @@ export class SocketModeTransport implements SlackTransport {
 				text: args.text,
 				...(args.threadTs ? { thread_ts: args.threadTs } : {}),
 				...(args.blocks ? { blocks: [...args.blocks] as never } : {}),
+				...(args.attachments ? { attachments: [...args.attachments] as never } : {}),
 				mrkdwn: true,
 				unfurl_links: false,
 			}),

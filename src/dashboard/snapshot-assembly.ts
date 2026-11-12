@@ -6,19 +6,30 @@ import { readVersion } from "../daemon/tools";
 import { DEFAULT_BOARD_API } from "../dispatch/board";
 import { realProcessRunner } from "../dispatch/omp";
 import { resolveTaskHost } from "../tasks/host";
+import { hostTimezone } from "../time";
 import { BoardSource, type BoardState } from "./board";
 import { buildSnapshot, createSnapshotCache, type DashboardSnapshot, type SnapshotDeps } from "./snapshot";
 
 /** The checkout this file belongs to (src/dashboard → repo root): its short HEAD is shown on the page and the picture. */
 export const REPO_DIR = resolve(import.meta.dir, "..", "..");
 
-/** The agent board source: only with config `herdrBoard` (read from its `api`, default the local herdr-web-ui). */
+/** Where the board keeps each card's status and since across dashboard restarts. */
+const BOARD_SINCE_FILE = "dashboard-board-since.json";
+
+/**
+ * The agent board source: only with config `herdrBoard` (read from its `api`, default the local herdr-web-ui). With
+ * `homeDir` the card times are kept in `<home>/dashboard-board-since.json`.
+ */
 export function boardSourceFor(
 	config: Pick<OmpbotConfig, "herdrBoard"> | undefined,
+	homeDir?: string,
 	Board: typeof BoardSource = BoardSource,
 ): BoardSource | undefined {
 	if (config?.herdrBoard === undefined) return undefined;
-	return new Board({ origin: config.herdrBoard.api ?? DEFAULT_BOARD_API });
+	return new Board({
+		origin: config.herdrBoard.api ?? DEFAULT_BOARD_API,
+		...(homeDir === undefined ? {} : { sinceFile: join(homeDir, BOARD_SINCE_FILE) }),
+	});
 }
 
 /** What the assembler needs that only its caller knows: where the home is and how the daemon's status is reached. */
@@ -51,6 +62,8 @@ export function assembleSnapshotDeps(options: SnapshotAssemblyOptions): Snapshot
 		homeDir,
 		repoDir: options.repoDir ?? REPO_DIR,
 		config,
+		// A home without config.json takes the zone a config without `timezone` gets.
+		timezone: config?.timezone ?? hostTimezone(),
 		now,
 		callDaemon: options.callDaemon ?? callDaemon,
 		run,

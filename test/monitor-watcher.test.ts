@@ -36,7 +36,7 @@ let closed: number;
 let watchFails: Error | undefined;
 
 const trigger = (root: string, extra: Record<string, unknown> = {}) => ({ kind: "watcher", root, ...extra });
-const ctx = () => ({ scriptsRoot: join(dir, "scripts"), watcherRoots: [allowed] });
+const ctx = () => ({ scriptsRoot: join(dir, "scripts"), watcherRoots: [allowed], defaultTimezone: "Asia/Seoul" });
 
 /** Resolves once `seen` satisfies `done` (bounded wait; no polling interval). */
 function waitSeen(done: (rels: Array<string | null>) => boolean): Promise<void> {
@@ -86,7 +86,13 @@ beforeEach(() => {
 	closed = 0;
 	watchFails = undefined;
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
-	store = openStore({ path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: "UOWNER" });
+	store = openStore({
+		timezone: "Asia/Seoul",
+		path: join(dir, "ompbot.db"),
+		clock,
+		redact,
+		slackOwnerUserId: "UOWNER",
+	});
 	scheduler = new MonitorScheduler({
 		store,
 		router: {
@@ -152,7 +158,7 @@ describe("watcher trigger spec", () => {
 			expect(() =>
 				parseMonitorSpec(
 					{ name: "w", trigger: trigger(join(allowed, "proj")), instruction: "x" },
-					{ scriptsRoot: join(dir, "scripts"), watcherRoots },
+					{ scriptsRoot: join(dir, "scripts"), watcherRoots, defaultTimezone: "Asia/Seoul" },
 				),
 			).toThrow(/watcherRoots/);
 		}
@@ -304,6 +310,42 @@ describe("watcher runtime", () => {
 		clock.advance(100);
 		expect((await scheduler.tick()).claimed).toBe(1);
 		expect(store.monitors.listEvents({ monitorId: monitor.id })).toHaveLength(1);
+	});
+
+	test("a deleted root is noticed on the next tick (fs.watch gives no error) and watched again once recreated", async () => {
+		const root = join(allowed, "proj");
+		const monitor = add(root, { debounceMs: 100 });
+		await scheduler.tick();
+		rmSync(root, { recursive: true, force: true });
+		await scheduler.tick();
+		expect(logLines.filter((line) => line.includes("monitor_watch_error") && line.includes(root))).toHaveLength(1);
+		expect(closed).toBe(1);
+		await scheduler.tick();
+		expect(logLines.filter((line) => line.includes("monitor_watch_error"))).toHaveLength(1);
+
+		mkdirSync(root);
+		await scheduler.tick();
+		writeFileSync(join(root, "back.txt"), "x");
+		await waitSeen((rels) => rels.includes("back.txt"));
+		clock.advance(100);
+		expect((await scheduler.tick()).claimed).toBe(1);
+		expect(store.monitors.listEvents({ monitorId: monitor.id })[0]?.payload).toContain("back.txt");
+	});
+
+	test("a root replaced by another directory of the same name is reopened", async () => {
+		const root = join(allowed, "proj");
+		add(root, { debounceMs: 100 });
+		await scheduler.tick();
+		rmSync(root, { recursive: true, force: true });
+		mkdirSync(root);
+		await scheduler.tick();
+		expect(logLines.filter((line) => line.includes("monitor_watch_error") && line.includes(root))).toHaveLength(1);
+		expect(closed).toBe(1);
+		await scheduler.tick();
+		writeFileSync(join(root, "new.txt"), "x");
+		await waitSeen((rels) => rels.includes("new.txt"));
+		clock.advance(100);
+		expect((await scheduler.tick()).claimed).toBe(1);
 	});
 
 	test("a monitor whose root left watcherRoots never starts a watch", async () => {

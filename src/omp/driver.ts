@@ -22,6 +22,7 @@ export type OmpDriverErrorCode =
 	| "bun_missing"
 	| "omp_rpc_client_missing"
 	| "omp_launcher_standalone"
+	| "omp_launcher_unreadable"
 	| "bun_too_old"
 	| "claude_executable_missing"
 	| "claude_not_authenticated"

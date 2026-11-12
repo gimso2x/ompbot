@@ -7,10 +7,10 @@ import type { CoreSink, DeliverySource } from "../src/channel/types";
 import { COMMAND_TEXT } from "../src/core/types";
 import { DiscordAdapter, type DiscordAdapterOptions } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import { DiscordCallError, type DiscordInteraction } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -182,7 +182,12 @@ describe("command interactions", () => {
 			userId: OWNER,
 		});
 		expect(calls("editInteractionResponse")).toEqual([
-			{ method: "editInteractionResponse", token: "tok-1", content: "모델: **sonnet** [문서](https://x.y)" },
+			{
+				method: "editInteractionResponse",
+				token: "tok-1",
+				content: "모델: **sonnet** [문서](https://x.y)",
+				allowedMentions: { parse: [] },
+			},
 		]);
 		expect(calls("deleteInteractionResponse")).toHaveLength(0);
 	});

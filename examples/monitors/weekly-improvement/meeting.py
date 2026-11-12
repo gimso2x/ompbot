@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """주간 개선 회의록 도구: 형식 게이트(check)와 오너 결정 기록(decide).
 
-회의록 경로는 ~/.ompbot/workspace/meetings/<YYYY>-W<ww>.md(ISO 주차, KST)이고 형식은
+회의록 경로는 ~/.ompbot/workspace/meetings/<YYYY>-W<ww>.md(ISO 주차, 봇 시간대)이고 형식은
 같은 디렉터리의 README.md(회의록 형식)를 따른다.
 
 사용:

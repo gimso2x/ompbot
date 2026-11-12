@@ -11,13 +11,18 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeDeps } from "../src/cli/apply";
 import {
 	type ApplyDeps,
 	type ApplyOptions,
 	type ApplyReceipt,
+	createApplyLock,
 	findDaemonUnits,
 	type PeerApply,
+	parseApplyLock,
 	type RunResult,
+	reclaimStaleApplyLock,
+	releaseApplyLock,
 	revertCommandFor,
 	runApply,
 } from "../src/ops/apply";
@@ -64,6 +69,10 @@ interface World {
 	drainResult: Awaited<ReturnType<ApplyDeps["drain"]>>;
 	injects: unknown[];
 	injectError: boolean;
+	/** Inject calls that fail to connect (daemon socket down) before one goes through. */
+	injectConnectFailures: number;
+	injectResponse: unknown;
+	drains: number;
 	backups: number;
 	/** Runs when `systemctl restart` is requested; lets a test change config.json as the new code would. */
 	onRestart: (n: number) => void;
@@ -87,10 +96,15 @@ function makeWorld(): World {
 		drainResult: { ok: true, counts: { turns: 0, hostTools: 0, approvals: 0 } },
 		injects: [],
 		injectError: false,
+		injectConnectFailures: 0,
+		injectResponse: { ok: true, nonce: "n", threadRef: "t" },
+		drains: 0,
 		backups: 0,
 		onRestart: () => {},
 	};
 }
+
+let nextPid = 40_000;
 
 function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 	let restarts = 0;
@@ -136,12 +150,17 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 			if (op === "inject") {
 				world.injects.push(request);
 				if (world.injectError) throw new Error("socket gone");
-				return { ok: true, nonce: "n", threadRef: "t" };
+				if (world.injects.length <= world.injectConnectFailures)
+					throw Object.assign(new Error("Failed to connect"), { code: "ECONNREFUSED" });
+				return world.injectResponse;
 			}
 			if (op === "drain_cancel") world.drainCancels += 1;
 			return { ok: true, status: {} };
 		},
-		drain: async () => world.drainResult,
+		drain: async () => {
+			world.drains += 1;
+			return world.drainResult;
+		},
 		backup: () => {
 			world.backups += 1;
 			return { file: join(home, "backups", "ompbot-20261030-050000.db") } as BackupResult;
@@ -149,6 +168,8 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 		gates: () => gates,
 		doctor: async () => ({ code: 1, lines: ["ok home: x", "fail omp: missing"] }),
 		lockStartedAt: () => world.lockStartedAt,
+		pid: nextPid++,
+		isAlive: () => true,
 		isExecutable: (path) => path === "/h/.local/bin/bun",
 		log: () => {},
 		...over,
@@ -218,6 +239,70 @@ describe("runApply precheck", () => {
 		const again = await runApply({ ...base, mergedAt: new Date(T0) }, makeDeps(older));
 		expect(again.receipt.status).toBe("ok");
 		expect(restartCommands(older)).toHaveLength(1);
+	});
+});
+
+describe("runApply bot omp profile sync (omp-isolation AC-6)", () => {
+	test("with ompProfile the sync runs before the drain and its count is in the receipt", async () => {
+		const world = makeWorld();
+		let drainsAtSync = -1;
+		const deps = makeDeps(world, {
+			ompSync: () => {
+				drainsAtSync = world.drains;
+				return { changed: 3 };
+			},
+		});
+		const { exitCode, receipt } = await runApply(base, deps);
+		expect(exitCode).toBe(0);
+		expect(drainsAtSync).toBe(0);
+		expect(receipt.steps.map((s) => s.name)).toEqual([
+			"preflight",
+			"backup",
+			"omp_sync",
+			"drain",
+			"restart",
+			"ready",
+			"verify",
+			"last_good",
+		]);
+		expect(receipt.steps.find((s) => s.name === "omp_sync")?.detail).toBe("omp_profile_sync changed=3");
+		expect(restartCommands(world)).toHaveLength(1);
+	});
+
+	test("the CLI wires the sync only for a home whose config sets ompProfile", () => {
+		const config = {
+			schemaVersion: 1,
+			channels: { slack: { ownerUserId: "UOWNER0" } },
+			slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+			ompExecutable: "/usr/local/bin/omp",
+			workspaceDir: "workspace",
+		};
+		mkdirSync(join(home, "secrets"), { mode: 0o700 });
+		writeFileSync(join(home, "secrets", "bot.token"), "xoxb-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(home, "secrets", "app.token"), "xapp-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(home, "config.json"), JSON.stringify(config));
+		expect(homeDeps(home, "ompbot", "/usr/bin").ompSync).toBeUndefined();
+		writeFileSync(join(home, "config.json"), JSON.stringify({ ...config, ompProfile: "ompbot" }));
+		expect(homeDeps(home, "ompbot", "/usr/bin").ompSync).toBeFunction();
+	});
+
+	test("a failed sync ends the apply: no drain, no restart, exit 1", async () => {
+		const world = makeWorld();
+		const deps = makeDeps(world, {
+			ompSync: () => {
+				throw new Error("source agent dir /x does not exist");
+			},
+		});
+		const { exitCode, receipt } = await runApply(base, deps);
+		expect(exitCode).toBe(1);
+		expect(receipt.status).toBe("failed");
+		expect(receipt.steps.at(-1)).toMatchObject({
+			name: "omp_sync",
+			ok: false,
+			detail: "source agent dir /x does not exist",
+		});
+		expect(world.drains).toBe(0);
+		expect(restartCommands(world)).toHaveLength(0);
 	});
 });
 
@@ -583,5 +668,333 @@ describe("runApply report", () => {
 		await runApply(base, makeDeps(world));
 		expect(world.injects).toHaveLength(0);
 		expect(existsSync(join(home, "logs", "apply-20261030-140000.json"))).toBe(true);
+	});
+});
+
+describe("runApply apply lock (one apply per home)", () => {
+	const SECOND = "20261030-140100";
+	const OTHER = "20261030-130000";
+	const lockPath = () => join(home, "apply.lock");
+	const okPeer: PeerApply = { unit: "ompbot-tteok", status: "ok", exitCode: 0, receiptPath: "/t/logs/apply-x.json" };
+
+	/**
+	 * Starts a first apply whose drain is held on a promise, then a second one on the same home whose every poll
+	 * sleep waits for the first to finish. Resolves once the second has reported that it is waiting.
+	 */
+	async function overlap(input: {
+		first: World;
+		second: World;
+		peers: () => Promise<PeerApply[]>;
+		firstOver?: Partial<ApplyDeps>;
+	}) {
+		const drainHeld = Promise.withResolvers<void>();
+		const firstDeps = makeDeps(input.first, {
+			peers: input.peers,
+			drain: async () => {
+				input.first.drains += 1;
+				await drainHeld.promise;
+				return input.first.drainResult;
+			},
+			...input.firstOver,
+		});
+		const first = runApply(base, firstDeps);
+		const waiting = Promise.withResolvers<void>();
+		const second = runApply(
+			{ ...base, stamp: SECOND },
+			makeDeps(input.second, {
+				peers: input.peers,
+				log: (line) => {
+					if (line.includes("wait_apply waiting for apply 20261030-140000")) waiting.resolve();
+				},
+				sleep: async (ms) => {
+					input.second.clock += ms;
+					await first.catch(() => undefined);
+				},
+			}),
+		);
+		await waiting.promise;
+		return { first, second, firstDeps, release: () => drainHeld.resolve() };
+	}
+
+	test("a second apply waits without drain or restart, then ends already_applied by the first (one restart, one peer run)", async () => {
+		const firstWorld = makeWorld();
+		const secondWorld = makeWorld();
+		let peerCalls = 0;
+		const peers = async () => {
+			peerCalls += 1;
+			return [okPeer];
+		};
+		const run = await overlap({ first: firstWorld, second: secondWorld, peers });
+		// while waiting: nothing of the second apply has touched the daemon, and the first still holds the lock
+		expect(secondWorld.drains).toBe(0);
+		expect(restartCommands(secondWorld)).toHaveLength(0);
+		expect(secondWorld.commands).toHaveLength(0);
+		expect(parseApplyLock(readFileSync(lockPath(), "utf8"))).toMatchObject({
+			pid: run.firstDeps.pid,
+			stamp: base.stamp,
+		});
+		run.release();
+		const [a, b] = await Promise.all([run.first, run.second]);
+		expect(a.receipt.status).toBe("ok");
+		expect(b.exitCode).toBe(0);
+		expect(b.receipt.status).toBe("already_applied");
+		expect(b.receipt.steps.map((s) => [s.name, s.ok])).toEqual([
+			["wait_apply", true],
+			["preflight", true],
+			["prior_apply", true],
+		]);
+		expect(b.receipt.steps[0]?.detail).toContain("waited for apply 20261030-140000");
+		expect(b.receipt.steps[2]?.detail).toBe("applied by apply-20261030-140000");
+		expect(restartCommands(firstWorld).length + restartCommands(secondWorld).length).toBe(1);
+		expect(peerCalls).toBe(1);
+		expect(secondWorld.drains).toBe(0);
+		expect(secondWorld.backups).toBe(0);
+		expect(existsSync(lockPath())).toBe(false);
+	});
+
+	test("a first apply that failed (drain, ready/rollback, a peer) makes the second run the full apply from backup", async () => {
+		const failures: Array<{ name: string; setup: (first: World) => void; peerFails: boolean }> = [
+			{
+				name: "drain",
+				setup: (w) => {
+					w.drainResult = { ok: false, reason: "timeout", counts: { turns: 1, hostTools: 0, approvals: 0 } };
+				},
+				peerFails: false,
+			},
+			{
+				name: "ready",
+				setup: (w) => {
+					w.restartMakesFreshDaemon = false;
+				},
+				peerFails: false,
+			},
+			{ name: "peers", setup: () => {}, peerFails: true },
+		];
+		for (const failure of failures) {
+			rmSync(join(home, "logs"), { recursive: true, force: true });
+			const firstWorld = makeWorld();
+			failure.setup(firstWorld);
+			const secondWorld = makeWorld();
+			let peerCalls = 0;
+			const peers = async () => {
+				peerCalls += 1;
+				return peerCalls === 1 && failure.peerFails
+					? [{ ...okPeer, status: "failed" as const, exitCode: 1 as const }]
+					: [okPeer];
+			};
+			const run = await overlap({ first: firstWorld, second: secondWorld, peers });
+			run.release();
+			const [a, b] = await Promise.all([run.first, run.second]);
+			expect(a.receipt.status).toBe("failed");
+			expect(b.receipt.status).toBe("ok");
+			const prior = b.receipt.steps.find((s) => s.name === "prior_apply");
+			expect(prior?.detail).toContain("status=failed");
+			expect(b.receipt.steps.map((s) => s.name)).toContain("backup");
+			expect(secondWorld.backups).toBe(1);
+			expect(secondWorld.drains).toBe(1);
+			expect(restartCommands(secondWorld)).toHaveLength(1);
+			if (failure.peerFails) {
+				// the first restarted and ran the peers once; the second does both again
+				expect(restartCommands(firstWorld).length + restartCommands(secondWorld).length).toBe(2);
+				expect(peerCalls).toBe(2);
+			} else expect(peerCalls).toBe(1);
+			expect(existsSync(lockPath())).toBe(false);
+		}
+	});
+
+	test("a first apply that ended ok on another HEAD does not cover the second: full apply", async () => {
+		const firstWorld = makeWorld();
+		const secondWorld = makeWorld();
+		secondWorld.headSha = "c".repeat(40);
+		secondWorld.mainSha = secondWorld.headSha;
+		let peerCalls = 0;
+		const peers = async () => {
+			peerCalls += 1;
+			return [okPeer];
+		};
+		const run = await overlap({ first: firstWorld, second: secondWorld, peers });
+		run.release();
+		const [a, b] = await Promise.all([run.first, run.second]);
+		expect(a.receipt.status).toBe("ok");
+		expect(b.receipt.status).toBe("ok");
+		expect(b.receipt.steps.find((s) => s.name === "prior_apply")?.detail).toContain("is not HEAD");
+		expect(restartCommands(firstWorld).length + restartCommands(secondWorld).length).toBe(2);
+		expect(peerCalls).toBe(2);
+	});
+
+	test("a lock of a dead pid or broken JSON is taken over without waiting and the apply runs", async () => {
+		for (const [text, named] of [
+			[`${JSON.stringify({ pid: 999, stamp: OTHER, startedAt: new Date(T0).toISOString() })}\n`, OTHER],
+			['{"pid": 12', "(unreadable)"],
+			["", "(unreadable)"],
+		] as const) {
+			writeFileSync(lockPath(), text, { mode: 0o600 });
+			const world = makeWorld();
+			const { exitCode, receipt } = await runApply(base, makeDeps(world, { isAlive: (pid) => pid !== 999 }));
+			expect(exitCode).toBe(0);
+			expect(receipt.steps[0]).toMatchObject({
+				name: "wait_apply",
+				ok: true,
+				detail: `stale lock ${named} taken over`,
+			});
+			expect(receipt.steps.map((s) => s.name)).not.toContain("prior_apply");
+			expect(world.clock).toBe(T0); // never slept
+			expect(restartCommands(world)).toHaveLength(1);
+			expect(existsSync(lockPath())).toBe(false);
+			expect(readdirSync(home).filter((name) => name.startsWith("apply.lock"))).toEqual([]);
+		}
+	});
+
+	test("two reclaimers of the same stale lock: exactly one owns the lock, the other puts the new lock back", () => {
+		const stale = `${JSON.stringify({ pid: 999, stamp: OTHER, startedAt: "x" })}\n`;
+		writeFileSync(lockPath(), stale, { mode: 0o600 });
+		const a = { pid: 101, stamp: base.stamp ?? "", startedAt: "a" };
+		const b = { pid: 202, stamp: SECOND, startedAt: "b" };
+		// both read the same stale lock; A renames it first and locks, then B's rename moves A's new lock
+		expect(reclaimStaleApplyLock(lockPath(), stale, a.pid).outcome).toBe("taken");
+		expect(createApplyLock(lockPath(), a)).toBe(true);
+		expect(reclaimStaleApplyLock(lockPath(), stale, b.pid).outcome).toBe("changed");
+		expect(createApplyLock(lockPath(), b)).toBe(false);
+		expect(parseApplyLock(readFileSync(lockPath(), "utf8"))).toEqual(a);
+		expect(readdirSync(home).filter((name) => name.startsWith("apply.lock"))).toEqual(["apply.lock"]);
+		// B never removes A's lock; A removes its own
+		expect(releaseApplyLock(lockPath(), b)).toBe(false);
+		expect(parseApplyLock(readFileSync(lockPath(), "utf8"))).toEqual(a);
+		expect(releaseApplyLock(lockPath(), a)).toBe(true);
+		// the lock vanished before B's rename: nothing to reclaim, B tries again
+		expect(reclaimStaleApplyLock(lockPath(), stale, b.pid).outcome).toBe("changed");
+	});
+
+	test("the lock is a complete 0600 JSON from the moment it exists", async () => {
+		const world = makeWorld();
+		const seen: unknown[] = [];
+		const deps = makeDeps(world, {
+			log: (line) => {
+				if (line.startsWith("apply lock taken")) {
+					seen.push(parseApplyLock(readFileSync(lockPath(), "utf8")));
+					seen.push(statSync(lockPath()).mode & 0o777);
+				}
+			},
+		});
+		await runApply(base, deps);
+		expect(seen).toEqual([{ pid: deps.pid, stamp: base.stamp, startedAt: new Date(T0).toISOString() }, 0o600]);
+		const direct = { pid: 7, stamp: OTHER, startedAt: "s" };
+		expect(createApplyLock(lockPath(), direct)).toBe(true);
+		expect(parseApplyLock(readFileSync(lockPath(), "utf8"))).toEqual(direct);
+	});
+
+	test("a live lock past the limit fails with no drain and leaves the other lock as it was", async () => {
+		const text = `${JSON.stringify({ pid: 777, stamp: OTHER, startedAt: new Date(T0).toISOString() })}\n`;
+		writeFileSync(lockPath(), text, { mode: 0o600 });
+		const world = makeWorld();
+		const { exitCode, receipt } = await runApply(base, makeDeps(world));
+		expect(exitCode).toBe(1);
+		expect(receipt.status).toBe("failed");
+		expect(receipt.steps).toHaveLength(1);
+		expect(receipt.steps[0]).toMatchObject({ name: "wait_apply", ok: false });
+		expect(receipt.steps[0]?.detail).toBe(`apply ${OTHER} still running after 7 min`);
+		expect(world.drains).toBe(0);
+		expect(world.commands).toHaveLength(0);
+		expect(world.clock - T0).toBeGreaterThanOrEqual(7 * 60_000);
+		expect(readFileSync(lockPath(), "utf8")).toBe(text);
+	});
+
+	test("a lock this very apply holds (same pid and stamp) fails at once instead of waiting on itself", async () => {
+		const world = makeWorld();
+		const deps = makeDeps(world);
+		const text = `${JSON.stringify({ pid: deps.pid, stamp: base.stamp, startedAt: "s" })}\n`;
+		writeFileSync(lockPath(), text, { mode: 0o600 });
+		const { receipt } = await runApply(base, deps);
+		expect(receipt.steps[0]?.detail).toContain("held by this apply");
+		expect(world.clock).toBe(T0);
+		expect(readFileSync(lockPath(), "utf8")).toBe(text);
+	});
+
+	test("ok, failed, SKIP and a thrown apply all remove their own lock, only after the receipt carries the report", async () => {
+		const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+		const cases: Array<[ApplyReceipt["status"], (w: World) => void]> = [
+			["ok", () => {}],
+			[
+				"failed",
+				(w) => {
+					w.drainResult = { ok: false, reason: "timeout", counts: { turns: 0, hostTools: 0, approvals: 0 } };
+				},
+			],
+			[
+				"skipped",
+				(w) => {
+					w.branch = "other";
+				},
+			],
+		];
+		for (const [status, setup] of cases) {
+			const world = makeWorld();
+			setup(world);
+			const atRelease: Array<ApplyReceipt["report"] | boolean> = [];
+			const receiptFile = join(home, "logs", `apply-${base.stamp}.json`);
+			const { receipt } = await runApply(
+				report,
+				makeDeps(world, {
+					log: (line) => {
+						if (line.startsWith("apply lock released")) {
+							atRelease.push(existsSync(lockPath()));
+							atRelease.push((JSON.parse(readFileSync(receiptFile, "utf8")) as ApplyReceipt).report);
+						}
+					},
+				}),
+			);
+			expect(receipt.status).toBe(status);
+			expect(atRelease[0]).toBe(false);
+			expect(atRelease[1]).toMatchObject({ ok: true, detail: "injected attempts=1" });
+			expect(existsSync(lockPath())).toBe(false);
+		}
+		const world = makeWorld();
+		const thrown = runApply(
+			base,
+			makeDeps(world, {
+				log: (line) => {
+					if (line.startsWith("apply step=drain")) throw new Error("log sink broke");
+				},
+			}),
+		);
+		await expect(thrown).rejects.toThrow("log sink broke");
+		expect(existsSync(lockPath())).toBe(false);
+	});
+});
+
+describe("runApply report inject retry", () => {
+	const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+
+	test("two refused connections then a delivery: report ok on attempt 3, 5 s apart", async () => {
+		const world = makeWorld();
+		world.injectConnectFailures = 2;
+		const { exitCode, receipt } = await runApply(report, makeDeps(world));
+		expect(exitCode).toBe(0);
+		expect(world.injects).toHaveLength(3);
+		expect(world.clock - T0).toBe(10_000);
+		expect(readReceipt(receipt).report).toMatchObject({ ok: true, detail: "injected attempts=3" });
+	});
+
+	test("an answered ok:false refusal is asked once", async () => {
+		const world = makeWorld();
+		world.injectResponse = { ok: false, error: "origin_unknown" };
+		const { exitCode, receipt } = await runApply(report, makeDeps(world));
+		expect(exitCode).toBe(0);
+		expect(world.injects).toHaveLength(1);
+		expect(readReceipt(receipt).report).toMatchObject({ ok: false });
+		expect(readReceipt(receipt).report?.detail).toContain("inject refused attempts=1");
+	});
+
+	test("six refused connections give up: report ok=false, exit code unchanged", async () => {
+		for (const drainOk of [true, false]) {
+			const world = makeWorld();
+			if (!drainOk) world.drainResult = { ok: false, reason: "unreachable", error: "x" };
+			world.injectConnectFailures = 99;
+			const { exitCode, receipt } = await runApply(report, makeDeps(world));
+			expect(world.injects).toHaveLength(6);
+			expect(readReceipt(receipt).report).toMatchObject({ ok: false });
+			expect(readReceipt(receipt).report?.detail).toBe("inject failed attempts=6: Failed to connect");
+			expect(exitCode).toBe(drainOk ? 0 : 1); // the same exit as an apply without a report
+		}
 	});
 });

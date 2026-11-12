@@ -1,5 +1,4 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
-import { FAKE_ID_BASE } from "./fake-transport";
 import type {
 	CreateMessageArgs,
 	DiscordChannelInfo,
@@ -15,6 +14,9 @@ import type {
 	StartThreadArgs,
 	UploadFileArgs,
 } from "./transport";
+
+/** First id the fakes hand out; snowflake-sized so id handling sees realistic values. */
+export const FAKE_ID_BASE = 900_000_000_000_000_000n;
 
 /** Calls that mint a message id; their log lines also count the ids already handed out. */
 const ID_METHODS = /"method":"(createMessage|uploadFile)"/;

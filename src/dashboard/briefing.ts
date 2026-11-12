@@ -1,11 +1,8 @@
 import { redact } from "../redact";
-import { formatKst } from "../tasks/docs";
+import { formatLocal, localIso, nextLocalMidnight } from "../time";
 import { columnFor } from "./board";
 import { alertText, gateText } from "./html";
 import type { DashboardSnapshot, MonitorInfo, Section, TaskInfo, TurnInfo } from "./snapshot";
-
-/** KST is a fixed offset (no daylight saving), the same one `formatKst` applies. */
-const KST_OFFSET_MS = 9 * 60 * 60_000;
 
 /** The one-page drawing's column; the same 1080px the page's own layout uses. */
 const PAGE_WIDTH = 1080;
@@ -23,19 +20,12 @@ export function renderBriefingHtml(snapshot: DashboardSnapshot, now: number): st
 	const attention = attentionLines(snapshot);
 	const working = workingLines(snapshot);
 	const monitoring = monitorLines(snapshot, now);
-	const counts = {
-		attention: attention.length,
-		tasks: openTasks(snapshot).length,
-		lanes: snapshot.lanes.ok ? snapshot.lanes.items.filter((lane) => lane.status !== "closed").length : 0,
-		approvals: snapshot.approvals.ok ? snapshot.approvals.items.length : 0,
-		gates: openGates(snapshot).length,
-		monitorFailures: failedMonitors(snapshot).length,
-	};
-	const summary = `주의 ${counts.attention} · 진행 TASK ${counts.tasks} · 레인 ${counts.lanes} · 승인 대기 ${counts.approvals} · 게이트 열림 ${counts.gates} · 모니터 실패 ${counts.monitorFailures}`;
+	const counts = summaryCounts(snapshot);
+	const summary = counts.map(([label, value]) => `${label} ${value}`).join(" · ");
 	const body = [
-		`<h1>${esc(redact(`ompbot 브리핑 · ${kstMinute(now)}`))}</h1>`,
+		`<h1>${esc(redact(`ompbot 브리핑 · ${minuteOf(now, snapshot.timezone)}`))}</h1>`,
 		`<p class="meta">${esc(redact(daemonLine(snapshot)))}</p>`,
-		`<p class="summary${counts.attention > 0 ? " warn" : ""}">${esc(redact(summary))}</p>`,
+		`<p class="summary${attention.length > 0 ? " warn" : ""}">${esc(redact(summary))}</p>`,
 		section("주의", attention, snapshot.gates),
 		section("진행 중", working),
 		monitorSection(snapshot, monitoring),
@@ -46,18 +36,24 @@ export function renderBriefingHtml(snapshot: DashboardSnapshot, now: number): st
 
 /** The one-line comment that rides along with the image: the same numbers as the page's summary. */
 export function briefingSummaryLine(snapshot: DashboardSnapshot): string {
-	const counts = [
-		["주의", attentionLines(snapshot).length],
-		["진행 TASK", openTasks(snapshot).length],
-		["승인 대기", snapshot.approvals.ok ? snapshot.approvals.items.length : 0],
-		["게이트 열림", openGates(snapshot).length],
-	] as const;
 	return (
-		counts
+		summaryCounts(snapshot)
 			.filter(([, value]) => value > 0)
 			.map(([label, value]) => `${label} ${value}`)
 			.join(" · ") || "이상 없음"
 	);
+}
+
+/** The six numbers of the page's summary line, in its order; the image comment shows the non-zero ones. */
+function summaryCounts(snapshot: DashboardSnapshot): (readonly [string, number])[] {
+	return [
+		["주의", attentionLines(snapshot).length],
+		["진행 TASK", openTasks(snapshot).length],
+		["레인", snapshot.lanes.ok ? snapshot.lanes.items.filter((lane) => lane.status !== "closed").length : 0],
+		["승인 대기", snapshot.approvals.ok ? snapshot.approvals.items.length : 0],
+		["게이트 열림", openGates(snapshot).length],
+		["모니터 실패", failedMonitors(snapshot).length],
+	];
 }
 
 const CSS = `body{margin:0;padding:28px 32px;background:#f7f7f5;color:#1d1d1b;font-family:"NanumBarunGothic","NanumGothic",sans-serif;font-size:15px;line-height:1.5}
@@ -175,13 +171,14 @@ function workingLines(snapshot: DashboardSnapshot): string[] {
 function monitorLines(snapshot: DashboardSnapshot, now: number): string[] {
 	if (!snapshot.monitors.ok) return [];
 	const lines: string[] = [];
-	const endOfDay = kstStartOfNextDay(now);
+	// The snapshot's zone (`config.timezone`) says where "today" ends.
+	const endOfDay = nextLocalMidnight(now, snapshot.timezone);
 	for (const monitor of snapshot.monitors.items) {
 		// A failing monitor is its own line below; listing it twice would spend the cap on the same name.
 		if (monitor.failStreak > 0) continue;
 		const next = monitor.nextFireAt === null ? undefined : Date.parse(monitor.nextFireAt);
 		if (next === undefined || Number.isNaN(next) || next >= endOfDay) continue;
-		lines.push(esc(redact(`${monitor.name} · ${kstMinute(next)}`)));
+		lines.push(esc(redact(`${monitor.name} · ${minuteOf(next, snapshot.timezone)}`)));
 	}
 	return lines;
 }
@@ -215,7 +212,7 @@ function footerLines(snapshot: DashboardSnapshot): string[] {
 	const parts: string[] = [];
 	if (snapshot.backup.ok && snapshot.backup.local !== undefined) {
 		parts.push(
-			`백업 ${kstMinute(Date.parse(snapshot.backup.local.at))} (${coarseAge(snapshot.backup.local.ageMs)} 전)`,
+			`백업 ${minuteOf(Date.parse(snapshot.backup.local.at), snapshot.timezone)} (${coarseAge(snapshot.backup.local.ageMs)} 전)`,
 		);
 	} else if (!snapshot.backup.ok) {
 		parts.push("백업 기록 읽지 못함");
@@ -223,7 +220,7 @@ function footerLines(snapshot: DashboardSnapshot): string[] {
 		parts.push("백업 기록 없음");
 	}
 	const generated = Date.parse(snapshot.generatedAt);
-	parts.push(`기준 ${Number.isNaN(generated) ? redact(snapshot.generatedAt) : kstMinute(generated)}`);
+	parts.push(`기준 ${Number.isNaN(generated) ? redact(snapshot.generatedAt) : minuteOf(generated, snapshot.timezone)}`);
 	return parts.map((line) => esc(redact(line)));
 }
 
@@ -231,22 +228,15 @@ function threadTitle(thread: { originKey: string; threadRef: string | null }): s
 	return thread.threadRef ?? thread.originKey;
 }
 
-/** `YYYYMMDD-HHmmss` in KST: the file-name stamp of the rendered picture. */
-export function kstFileName(ms: number): string {
-	const iso = formatKst(ms);
+/** `YYYYMMDD-HHmmss` in the bot's zone (`config.timezone`): the file-name stamp of the rendered picture. */
+export function briefingFileName(ms: number, timezone: string): string {
+	const iso = localIso(ms, timezone);
 	return `${iso.slice(0, 10).replaceAll("-", "")}-${iso.slice(11, 19).replaceAll(":", "")}`;
 }
 
-/** `YYYY-MM-DD HH:mm` in KST. */
-function kstMinute(ms: number): string {
-	return formatKst(ms).slice(0, 16).replace("T", " ");
-}
-
-/** The first moment of the next KST day: a monitor firing after it is not "today". */
-function kstStartOfNextDay(now: number): number {
-	const kst = new Date(now + KST_OFFSET_MS);
-	const nextDay = Date.UTC(kst.getUTCFullYear(), kst.getUTCMonth(), kst.getUTCDate() + 1);
-	return nextDay - KST_OFFSET_MS;
+/** `YYYY-MM-DD HH:mm` in the zone. */
+function minuteOf(ms: number, timezone: string): string {
+	return formatLocal(ms, timezone).slice(0, 16);
 }
 
 /** A stamp's age in whole units: `3시간 전` reads better than `3시간 30분 전` in the footer. */

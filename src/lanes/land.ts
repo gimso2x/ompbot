@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { TASK_RISKS } from "../tasks/docs";
-import type { AutoLandPolicy } from "../tasks/notify";
-import { INTEGRITY_APPROVED, type LaneRow } from "./status";
+import { type AutoLandPolicy, checkBlockers } from "../tasks/notify";
+import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneRow } from "./status";
 import { defaultGit, type GitResult, type GitRunner, gitRunner } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
 
@@ -30,10 +31,13 @@ export interface LandRequest {
 }
 
 export type LandResult =
-	/** Merged, cleaned up, and pushed to `pushed` (absent: no push was asked for, or the repository has no `origin`). */
-	| { state: "landed"; preSha: string; pushed?: string }
-	/** Merged and cleaned up; `origin` refused the push. */
-	| { state: "merged-not-pushed"; preSha: string; reason: string }
+	/**
+	 * Merged and pushed to `pushed` (absent: no push was asked for, or the repository has no `origin`). `cleanup` says
+	 * what of the worktree and branch is left (absent: both are gone).
+	 */
+	| { state: "landed"; preSha: string; pushed?: string; cleanup?: string }
+	/** Merged; `origin` refused the push. `cleanup` as for `landed`. */
+	| { state: "merged-not-pushed"; preSha: string; reason: string; cleanup?: string }
 	/** Nothing changed; the owner has to look. */
 	| { state: "blocked"; reason: string }
 	/** Nothing changed; the base branch is no ancestor of the claim any more. */
@@ -64,6 +68,60 @@ function failureLine(result: GitResult): string {
 		.filter((line) => line !== "");
 	const telling = lines.find((line) => /rejected|error|fatal|denied/i.test(line));
 	return (telling ?? lines[0] ?? `exit ${result.code}`).slice(0, 200);
+}
+
+/** The `git status --porcelain` lines of `dir`, or why git could not tell. */
+async function statusOf(git: GitRunner, dir: string): Promise<{ dirty: string[] } | { failed: string }> {
+	const status = await git(["-C", dir, "status", "--porcelain"]);
+	if (status.code !== 0) return { failed: `git status 실패(${dir}): ${failureLine(status)}` };
+	const dirty = status.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line !== "");
+	return { dirty };
+}
+
+const shownOf = (dirty: string[]): string =>
+	`${dirty.slice(0, DIRTY_SHOWN).join("; ")}${dirty.length > DIRTY_SHOWN ? "; …" : ""}`;
+
+/**
+ * What in the lane's worktree is not the claim: uncommitted changes, or a HEAD that moved (a commit on a detached
+ * HEAD leaves the branch tip alone). `undefined` = clean at the claim, or no worktree at that path.
+ */
+async function worktreeDrift(
+	git: GitRunner,
+	worktree: string,
+	sha: string,
+): Promise<{ dirty: string[] } | { head: string } | { failed: string } | undefined> {
+	if (!existsSync(worktree)) return undefined;
+	const status = await statusOf(git, worktree);
+	if ("failed" in status || status.dirty.length > 0) return status;
+	const head = await git(["-C", worktree, "rev-parse", "HEAD"]);
+	if (head.code !== 0) return { failed: `git rev-parse HEAD 실패(${worktree}): ${failureLine(head)}` };
+	const headSha = head.stdout.trim();
+	return headSha === sha ? undefined : { head: headSha };
+}
+
+/**
+ * Removes the merged lane's worktree and branch unless the worktree holds work the claim does not (only a landing
+ * cut off after its merge can find that: the merge refuses it). `undefined` = both are gone; else what is left.
+ */
+async function cleanUp(git: GitRunner, request: LandRequest, deps: LanderDeps): Promise<string | undefined> {
+	const { repo, worktree, branch, sha } = request;
+	const drift = await worktreeDrift(git, worktree, sha);
+	if (drift !== undefined) {
+		if ("failed" in drift)
+			return `${drift.failed} — worktree를 지우지 않았습니다: ${worktree}. 확인 뒤 손으로 지우세요`;
+		const what = "dirty" in drift ? `미커밋 변경 ${drift.dirty.length}건` : `HEAD ${drift.head.slice(0, 12)}`;
+		return `${what}이 있어 worktree를 지우지 않았습니다: ${worktree} — 확인 뒤 손으로 지우세요`;
+	}
+	await deps.removeWorktree({ repo, worktree, branch });
+	const left: string[] = [];
+	if (existsSync(worktree)) left.push(`worktree ${worktree}`);
+	if ((await git(["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0) {
+		left.push(`브랜치 ${branch}`);
+	}
+	return left.length === 0 ? undefined : `worktree·브랜치 정리 실패: ${left.join(", ")} — 손으로 지우세요`;
 }
 
 /** The worktree of `repo` (itself included) that has `baseBranch` checked out; `undefined` when none has. */
@@ -140,18 +198,27 @@ export async function landLane(request: LandRequest, deps: LanderDeps, hooks: La
 	if (already.code === 1) {
 		const checkout = await checkoutOf(git, repo, baseBranch);
 		if (checkout !== undefined) {
-			const status = await git(["-C", checkout, "status", "--porcelain"]);
-			if (status.code !== 0) return blocked(`git status 실패(${checkout}): ${failureLine(status)}`);
-			const dirty = status.stdout
-				.split("\n")
-				.map((line) => line.trim())
-				.filter((line) => line !== "");
-			if (dirty.length > 0) {
-				const shown = dirty.slice(0, DIRTY_SHOWN).join("; ");
+			const status = await statusOf(git, checkout);
+			if ("failed" in status) return blocked(status.failed);
+			if (status.dirty.length > 0) {
 				return blocked(
-					`${baseBranch}가 체크아웃된 ${checkout}에 커밋되지 않은 변경 ${dirty.length}건: ${shown}${dirty.length > DIRTY_SHOWN ? "; …" : ""}`,
+					`${baseBranch}가 체크아웃된 ${checkout}에 커밋되지 않은 변경 ${status.dirty.length}건: ${shownOf(status.dirty)}`,
 				);
 			}
+		}
+		// The cleanup removes the worktree: changes not in the claim (uncommitted, or a commit on a detached HEAD) would
+		// go with it while the merge never had them.
+		const drift = await worktreeDrift(git, request.worktree, sha);
+		if (drift !== undefined) {
+			if ("failed" in drift) return blocked(drift.failed);
+			if ("dirty" in drift) {
+				return blocked(
+					`레인 worktree ${request.worktree}에 커밋되지 않은 변경 ${drift.dirty.length}건: ${shownOf(drift.dirty)} — ${baseBranch}는 바뀌지 않았습니다. 커밋해 다시 클레임하거나 지운 뒤 다시 머지하세요`,
+				);
+			}
+			return blocked(
+				`레인 worktree HEAD(${drift.head.slice(0, 12)})가 클레임 커밋 ${sha.slice(0, 12)}과 다릅니다 — ${baseBranch}는 바뀌지 않았습니다. 클레임 뒤 커밋을 살리려면 \`!reopen\`으로 다시 클레임하게 하세요`,
+			);
 		}
 		const ff = await git(["-C", repo, "merge-base", "--is-ancestor", baseRef, sha]);
 		if (ff.code === 1) {
@@ -172,11 +239,12 @@ export async function landLane(request: LandRequest, deps: LanderDeps, hooks: La
 		return blocked(`머지 뒤 ${baseBranch}에 ${sha.slice(0, 12)}이 없습니다`);
 	}
 	const push = request.push ? await pushOnce(git, deps.pushGit ?? gitRunner(PUSH_TIMEOUT_MS), request) : undefined;
-	await deps.removeWorktree({ repo, worktree: request.worktree, branch: request.branch });
+	const cleanup = await cleanUp(git, request, deps);
+	const left = cleanup === undefined ? {} : { cleanup: cleanup.slice(0, REASON_MAX) };
 	if (push !== undefined && "refused" in push) {
-		return { state: "merged-not-pushed", preSha, reason: push.refused.slice(0, REASON_MAX) };
+		return { state: "merged-not-pushed", preSha, reason: push.refused.slice(0, REASON_MAX), ...left };
 	}
-	return { state: "landed", preSha, ...(push === undefined ? {} : { pushed: push.pushed }) };
+	return { state: "landed", preSha, ...(push === undefined ? {} : { pushed: push.pushed }), ...left };
 }
 
 /** `landLane` with the landings of one repository run one after the other (two lanes never race for a base branch). */
@@ -196,11 +264,17 @@ export function createLaneLander(deps: LanderDeps): LandLane {
 	};
 }
 
+/** `laneLandBlockers` reasons of the independent review (`taskAutoLand.review`); all start with `독립 리뷰`. */
+export const REVIEW_MISSING = "독립 리뷰 없음";
+export const REVIEW_BLOCK = "독립 리뷰 BLOCK";
+export const REVIEW_INCONCLUSIVE = "독립 리뷰 확인 불가";
+
 /**
  * Why a closed lane is not merged without asking; `[]` = merge it. The rules are `autoLandBlockers`' (tasks), as far
  * as they apply to a lane: `repoMatched` is the git common-directory comparison against `taskAutoLand.repos`, the
- * checks are the ones the core re-ran at the claim commit, and a lane the owner let through an integrity refusal is
- * never merged unasked. `frozen`: auto-merge is autonomous, so a freeze holds it.
+ * checks are the ones the core re-ran at the claim commit (a timed-out one is counted apart from a failed one, and holds
+ * the merge too), and a lane the owner let through an integrity refusal or timed-out checks is never merged unasked. `frozen`: auto-merge is autonomous, so a freeze holds it. With `policy.review` only a `CLEAR` receipt for
+ * the claim commit (`meta.review.sha === meta.sha`) lets the lane through.
  */
 export function laneLandBlockers(
 	lane: LaneRow,
@@ -214,11 +288,17 @@ export function laneLandBlockers(
 	if (TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf(policy.maxRisk)) blockers.push(`위험 ${risk} > ${policy.maxRisk}`);
 	const recorded = lane.meta.checks;
 	const checks = recorded !== undefined && recorded.head === lane.meta.sha ? recorded.results : [];
-	const failed = checks.filter((check) => !check.ok).length;
 	if (checks.length === 0) blockers.push("재실행 검사 없음");
-	else if (failed > 0) blockers.push(`재실행 검사 실패 ${failed}/${checks.length}`);
+	else blockers.push(...checkBlockers(checks));
 	const held = lane.meta.land?.autoLandHeld;
-	if (held !== undefined) blockers.push(held === INTEGRITY_APPROVED ? `${held}으로 통과` : held);
+	if (held !== undefined)
+		blockers.push(held === INTEGRITY_APPROVED || held === INCONCLUSIVE_APPROVED ? `${held}으로 통과` : held);
+	if (policy.review !== undefined) {
+		const review = lane.meta.review;
+		if (review === undefined || review.sha !== lane.meta.sha) blockers.push(REVIEW_MISSING);
+		else if (review.verdict === "BLOCK") blockers.push(REVIEW_BLOCK);
+		else if (review.verdict === "inconclusive") blockers.push(`${REVIEW_INCONCLUSIVE}(${review.reason ?? "?"})`);
+	}
 	if (frozen) blockers.push("동결 중");
 	return blockers;
 }

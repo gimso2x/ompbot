@@ -194,7 +194,7 @@ export function normalizeInbound(input: NormalizeInput): NormalizeResult {
 	const quotedBlock = wrapQuoted(
 		input.quoted,
 		fence,
-		platform === "slack" ? "전달·인용된 Slack 글" : "전달·인용된 Discord 글",
+		`전달·인용된 ${platform === "slack" ? "Slack" : platform === "teams" ? "Teams" : "Discord"} 글`,
 	);
 	if (body === "" && quotedBlock === "") return { accept: false, reason: "empty" };
 	// The origin reads the exact text the mailbox parses, so a root stays on the channel origin iff it runs as a command.

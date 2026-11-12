@@ -2,12 +2,20 @@
 
 `meeting.py`가 검사·기록하는 회의록 형식이다. 설치 방법은 [docs/guide.md의 모니터 절](../../../docs/guide.md#모니터)을 본다.
 
-회의록 경로: `~/.ompbot/workspace/meetings/<YYYY>-W<ww>.md`(ISO 주차, KST). 형식:
+## 검토자 모델 고르기
+
+제안자는 봇 기본 모델(`monitor.json`에 `model` 칸이 없음)이고, 검토자는 설치하는 사람이 고른다. `procedure.md`의 `model: "@REVIEWER_MODEL@"` 줄이 3단계 검토 하위의 모델이다.
+
+- 제안자와 **다른 공급자** 모델을 넣는다(같은 모델이 자기 안건을 검토하면 반박이 약하다). 봇을 돌리는 계정의 `omp models`에 나오는 id여야 한다.
+- 설치할 때 `sed -e "s|@REVIEWER_MODEL@|<모델 id>|g"`로 바꾼다.
+- 쓸 만한 다른 공급자 모델이 없으면 그 줄을 지운다(`sed -e "/@REVIEWER_MODEL@/d"`). 그러면 검토 하위가 기본 모델로 검토한다.
+
+회의록 경로: `~/.ompbot/workspace/meetings/<YYYY>-W<ww>.md`(ISO 주차, 봇 시간대). 형식:
 
 ```
 # 주간 개선 회의 2026-W45
-기간: 2026-11-02 ~ 2026-11-08 (KST)
-제안자: anthropic/claude-opus-5-5 · 검토자: google-antigravity/gemini-4-argon
+기간: 2026-11-02 ~ 2026-11-08 (봇 시간대)
+제안자: 메인 모델 · 검토자: 검토 모델
 
 ## 안건
 | ID | 제목 | 근거 | 제안 | 검토 | 결정 | TASK |

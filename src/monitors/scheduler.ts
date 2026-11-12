@@ -170,6 +170,8 @@ export class MonitorScheduler {
 	#tickTail: Promise<unknown> = Promise.resolve();
 	readonly #background = new Set<Promise<void>>();
 	readonly #scriptsRunning = new Set<string>();
+	/** Events held for lack of an owner home, warned about once each (memory only). */
+	readonly #unroutableWarned = new Set<number>();
 	readonly #watchers: WatcherSet;
 	/** Due `at` monitors already logged as held during the current freeze (one log line per monitor per freeze). */
 	readonly #heldAt = new Set<string>();
@@ -249,6 +251,14 @@ export class MonitorScheduler {
 					this.#claimWatcher(monitor, monitor.trigger.debounceMs, now, summary, skip);
 				else if (monitor.trigger.kind === "script" && skip === undefined)
 					this.#kickScript(monitor, monitor.trigger, now);
+				// The day's ceiling skips a due check like a cron slot: its schedule moves on, so monitors_stalled
+				// does not read the held monitor as overdue.
+				else if (
+					monitor.trigger.kind === "script" &&
+					skip === BUDGET_SKIP &&
+					now >= monitor.cursorAt + monitor.trigger.intervalMs
+				)
+					store.monitors.setCursor(monitor.id, now);
 				// webhook events are admitted by the listener (monitors/webhook), not claimed on a schedule.
 			} catch (error) {
 				this.#deps.log.error("monitor_tick_failed", { monitor: monitor.id, error: String(error) });
@@ -320,7 +330,8 @@ export class MonitorScheduler {
 
 	#claimAt(monitor: MonitorRow, at: string, now: number, summary: TickSummary, skip: string | undefined): void {
 		const { store, log } = this.#deps;
-		const slotAt = parseAt(at);
+		// A stored `at` is always a UTC ISO string (`…Z`), so the fallback zone is never consulted.
+		const slotAt = parseAt(at, "UTC");
 		if (slotAt > now) return;
 		if (skip === FROZEN_SKIP && now - slotAt <= CATCHUP_MAX_AGE_MS) {
 			// Not claimed and not disabled: a claimed slot could never fire again, and the one-shot would be lost.
@@ -466,6 +477,16 @@ export class MonitorScheduler {
 				}
 				continue;
 			}
+			// No channel and no owner home yet (nobody to post to): the event stays queued for a later tick instead of
+			// running into a report with a broken `:-` thread ref.
+			const destination = monitor.channel ?? store.ownerHome()?.conversationId;
+			if (destination === undefined) {
+				if (!this.#unroutableWarned.has(event.eventId)) {
+					this.#unroutableWarned.add(event.eventId);
+					log.warn("owner_notice_unroutable", { monitor: monitor.id, event: event.eventId, action: "deferred" });
+				}
+				continue;
+			}
 			if (monitor.deliver === "verbatim") {
 				if (this.#deliverVerbatim(monitor, event)) {
 					dispatched += 1;
@@ -498,8 +519,7 @@ export class MonitorScheduler {
 									scriptsRoot: this.#deps.scriptsRoot,
 								}),
 							),
-							threadRef:
-								monitor.channel === null ? store.topLevelThreadRef() : threadRefOf(monitor.channel, TOP_LEVEL_TS),
+							threadRef: threadRefOf(destination, TOP_LEVEL_TS),
 						})
 						.catch((error: unknown) => {
 							log.error("monitor_route_failed", { monitor: monitor.id, event: event.eventId, error: String(error) });

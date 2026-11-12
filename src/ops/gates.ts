@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { DEFAULT_SWEEP_MS, readSweepHeartbeat } from "../daemon/heartbeat";
 import { nextFireOf, toMonitor } from "../monitors/ledger";
 import { checkOmpRuntime } from "../omp/runtime-check";
-import { kstDay } from "../tasks/docs";
+import { localDay } from "../time";
 import { readStamp } from "./backup";
-import { readFreeze } from "./freeze";
+import { readFreeze, readUnfrozenAt } from "./freeze";
 import { HERDR_HEALTH_STALE_MS, HERDR_UNREACHABLE_AFTER, readHerdrHealth } from "./herdr-health";
 import {
 	type DiskView,
@@ -80,17 +80,20 @@ export interface GatesOptions {
 	ompExecutable?: string;
 	/** True when config.json has an `offsite` target; only then does the `offsite_age` gate exist. */
 	offsiteConfigured?: boolean;
-	/** Paths whose filesystems `disk_low` judges; default the bot home and `~/.omp/agent` (when it exists). */
+	/** Paths whose filesystems `disk_low` judges; default `defaultDiskPaths`. */
 	diskPaths?: string[];
+	/** Config `ompProfile`: its agent dir joins the default `disk_low` paths. */
+	ompProfile?: string;
 	/** Test seam: filesystem stats per path (default `statfsSync`). */
 	statfs?: StatfsReader;
 	/** Test seam: load average, CPU count and /proc/meminfo for `host_pressure` (default this machine's). */
 	hostLoad?: Partial<HostLoadReader>;
 	/**
-	 * `costCap.dailyUsd`. With a ceiling the `cost_cap` gate exists and opens while today's ledger total has reached it
-	 * (the day `!budget off` lifted it stays closed); without one there is nothing to judge and no gate.
+	 * `costCap.dailyUsd` and the bot's zone (`config.timezone`, where "today" is). With a ceiling the `cost_cap` gate
+	 * exists and opens while today's ledger total has reached it (the day `!budget off` lifted it stays closed); without
+	 * one there is nothing to judge and no gate.
 	 */
-	dailyCapUsd?: number;
+	dailyCap?: { usd: number; timezone: string };
 }
 
 function gate(name: string, open: boolean, detail: string): Gate {
@@ -126,7 +129,7 @@ function scalar(db: Database, sql: string): number {
 	return row == null ? 0 : Number(Object.values(row)[0] ?? 0);
 }
 
-/** Today's `usage_daily` total (`src/ops/cost-cap.ts` keys it by the KST day). */
+/** Today's `usage_daily` total (`src/ops/cost-cap.ts` keys it by the bot zone's day). */
 function dailySpend(db: Database, day: string): number {
 	const row = db.query("SELECT COALESCE(SUM(cost), 0) AS cost FROM usage_daily WHERE day = ?").get(day) as {
 		cost: number;
@@ -140,13 +143,24 @@ function cursorExists(db: Database, cursorKey: string): boolean {
 }
 
 /**
- * Enabled monitors whose next fire is 15+ minutes past. Closed while draining (drain stops monitor ticks) and for a
- * heartbeat without the `draining` field (a daemon older than this gate: ops-check runs the new CLI against it).
+ * Enabled monitors whose next fire is 15+ minutes past. Closed while draining (drain stops monitor ticks), while frozen
+ * (the freeze holds every monitor back on purpose; the `frozen` gate reports it) and for a heartbeat without the
+ * `draining` field (a daemon older than this gate: ops-check runs the new CLI against it). A fire the freeze held back
+ * counts as due at the unfreeze (`unfrozenAt`), so it only opens if it still has not fired 15 minutes after it.
  */
-function monitorsStalled(db: Database, heartbeat: ReturnType<typeof readSweepHeartbeat>, now: number): Gate {
+function monitorsStalled(
+	db: Database,
+	heartbeat: ReturnType<typeof readSweepHeartbeat>,
+	now: number,
+	frozen: boolean,
+	unfrozenAt: number | undefined,
+): Gate {
 	const name = "monitors_stalled";
 	if (heartbeat?.draining === undefined) return gate(name, false, "heartbeat=old");
 	if (heartbeat.draining) return gate(name, false, "draining");
+	if (frozen) return gate(name, false, "frozen");
+	// A stamp from the future (clock jump, corruption) would hide stalls until then: ignore it.
+	const thawedAt = unfrozenAt !== undefined && unfrozenAt <= now ? unfrozenAt : undefined;
 	if (
 		!tableExists(db, "monitors") ||
 		!["trigger_json", "cursor_at", "enabled"].every((c) => columnExists(db, "monitors", c))
@@ -161,7 +175,9 @@ function monitorsStalled(db: Database, heartbeat: ReturnType<typeof readSweepHea
 		} catch {
 			continue;
 		}
-		if (next !== null && next <= now - MONITOR_OVERDUE_MS) overdue++;
+		if (next === null) continue;
+		const due = thawedAt !== undefined && next < thawedAt ? thawedAt : next;
+		if (due <= now - MONITOR_OVERDUE_MS) overdue++;
 	}
 	return gate(name, overdue > 0, `overdue=${overdue}`);
 }
@@ -215,6 +231,18 @@ function hostPressureGate(read: Partial<HostLoadReader> | undefined): Gate {
  * `failed_ambiguous` deliveries are intentionally NOT a gate: the state is sticky by design, already surfaced in
  * `ompbot status`, and has no CLI resolution path yet - gating on it would alert forever.
  */
+/**
+ * The default `disk_low` paths: the bot home, `~/.omp/agent` and, with `ompProfile`, the profile's agent dir
+ * (`~/.omp/profiles/<profile>/agent`); an omp dir that does not exist is left out.
+ */
+export function defaultDiskPaths(homeDir: string, ompProfile?: string, userHome: string = homedir()): string[] {
+	const agentDirs = [
+		join(userHome, ".omp", "agent"),
+		...(ompProfile === undefined ? [] : [join(userHome, ".omp", "profiles", ompProfile, "agent")]),
+	];
+	return [homeDir, ...agentDirs.filter((dir) => existsSync(dir))];
+}
+
 export function collectGates(options: GatesOptions): Gate[] {
 	const { homeDir, now } = options;
 	const gates: Gate[] = [];
@@ -262,12 +290,15 @@ export function collectGates(options: GatesOptions): Gate[] {
 		gates.push(unknownGate("slack_disconnected", "stamp=missing"));
 	} else if (heartbeat.socket?.state === "down") {
 		const downMs = now - heartbeat.socket.since.getTime();
+		// A since in the future (clock stepped back) cannot be aged: open, like the other stamps, rather than hide it.
 		gates.push(
-			gate(
-				"slack_disconnected",
-				downMs >= SOCKET_DOWN_MS,
-				`socket=down minutes=${Math.max(0, Math.floor(downMs / 60_000))}`,
-			),
+			downMs < -BACKUP_FUTURE_TOLERANCE_MS
+				? gate("slack_disconnected", true, "socket=down ts_in_future")
+				: gate(
+						"slack_disconnected",
+						downMs >= SOCKET_DOWN_MS,
+						`socket=down minutes=${Math.max(0, Math.floor(downMs / 60_000))}`,
+					),
 		);
 	} else {
 		// A stamp without the socket field comes from a daemon older than this gate: closed, as before.
@@ -301,8 +332,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 	if (options.ompExecutable !== undefined) gates.push(ompRuntimeGate(options.ompExecutable));
 
 	// Host resources, like the stamps, report even when the ledger is unreadable: a full disk is often why it is.
-	const ompAgentDir = join(homedir(), ".omp", "agent");
-	const diskPaths = options.diskPaths ?? [homeDir, ...(existsSync(ompAgentDir) ? [ompAgentDir] : [])];
+	const diskPaths = options.diskPaths ?? defaultDiskPaths(homeDir, options.ompProfile);
 	gates.push(diskGate(diskPaths, options.statfs));
 	gates.push(hostPressureGate(options.hostLoad));
 
@@ -414,7 +444,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 				: 0;
 		ledger.push(gate("monitors_failed", failedMonitors > 0, `failed_recent=${failedMonitors}`));
 
-		ledger.push(monitorsStalled(db, heartbeat, now));
+		ledger.push(monitorsStalled(db, heartbeat, now, freeze !== undefined, readUnfrozenAt(homeDir)));
 
 		// Monitor failures never write a `[turn failed]` delivery (their notices are `⏰ …`), so this counts chat turns
 		// only. The columns are guarded like `last_event_at`: a pre-migration ledger must stay readable, never throw.
@@ -430,16 +460,16 @@ export function collectGates(options: GatesOptions): Gate[] {
 		// The daily cost ceiling (`costCap.dailyUsd`): open while today's spend has reached it and monitors are stopped.
 		// A day the owner switched off with `!budget off` is closed (the brake is lifted, so nothing is wrong), and a
 		// ledger without the table (a daemon that never finished a turn) reads as zero spend.
-		if (options.dailyCapUsd !== undefined) {
-			const day = kstDay(now);
+		if (options.dailyCap !== undefined) {
+			const day = localDay(now, options.dailyCap.timezone);
 			const spend = tableExists(db, "usage_daily") ? dailySpend(db, day) : 0;
 			const off = tableExists(db, "slack_cursors") && cursorExists(db, `cost-cap-off:${day}`);
-			const over = spend >= options.dailyCapUsd && !off;
+			const over = spend >= options.dailyCap.usd && !off;
 			ledger.push(
 				gate(
 					"cost_cap",
 					over,
-					`today=${spend.toFixed(2)} cap=${options.dailyCapUsd.toFixed(2)}${off ? " off=today" : ""}`,
+					`today=${spend.toFixed(2)} cap=${options.dailyCap.usd.toFixed(2)}${off ? " off=today" : ""}`,
 				),
 			);
 		}

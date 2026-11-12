@@ -7,7 +7,8 @@ export interface IntegrityRefusal {
 		| "skipped_test"
 		| "stub_implementation"
 		| "guard_deletion_without_adversarial_regression"
-		| "unproven_claim_word";
+		| "unproven_claim_word"
+		| "lane_diff_unavailable";
 	excerpt: string;
 	remedy: string;
 }
@@ -59,29 +60,43 @@ function unquoteGitPath(raw: string): string {
 }
 
 /**
- * Splits a unified diff into added/removed code lines, dropping non-code files. A `--- ` line is a file header only when
- * a `+++ ` line follows it (otherwise it is a removed line whose text starts with `-- `). For a deleted file the `+++`
- * side is /dev/null, so the `---` path names the file.
+ * Splits a unified diff into added/removed code lines, dropping non-code files. A `--- ` line is a file header only in a
+ * file's header block (before its first `@@`, reset by the next `diff ` line) and only when a `+++ ` line follows it:
+ * inside a hunk, `--- x`/`+++ x` are a removed `-- x` and an added `++ x` line. For a deleted file the `+++` side is
+ * /dev/null, so the `---` path names the file.
  */
 function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 	const added: DiffLine[] = [];
 	const removed: DiffLine[] = [];
 	const lines = diff.split("\n");
-	let file = "";
+	// Removed lines belong to the old path, added ones to the new: a rename to a non-code name keeps its removals judged.
+	let oldFile = "";
+	let newFile = "";
+	let inHunk = false;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] as string;
-		if (line.startsWith("--- ") && (lines[i + 1] as string | undefined)?.startsWith("+++ ")) {
+		if (line.startsWith("diff ")) {
+			inHunk = false;
+			continue;
+		}
+		if (!inHunk && line.startsWith("--- ") && (lines[i + 1] as string | undefined)?.startsWith("+++ ")) {
 			// `a/`/`b/` prefixes are dropped after unquoting git's C-style quoting.
 			const oldPath = unquoteGitPath(line.slice(4)).replace(/^[ab]\//, "");
 			const newPath = unquoteGitPath((lines[i + 1] as string).slice(4)).replace(/^[ab]\//, "");
-			file = newPath === "/dev/null" ? oldPath : newPath;
+			oldFile = oldPath === "/dev/null" ? newPath : oldPath;
+			newFile = newPath === "/dev/null" ? oldPath : newPath;
 			i += 1;
 			continue;
 		}
-		if (line.startsWith("@@") || line.startsWith("diff ")) continue;
-		if (!CODE_EXT.test(file)) continue;
-		if (line.startsWith("+")) added.push({ file, text: line.slice(1) });
-		else if (line.startsWith("-")) removed.push({ file, text: line.slice(1) });
+		if (line.startsWith("@@")) {
+			inHunk = true;
+			continue;
+		}
+		if (line.startsWith("+")) {
+			if (CODE_EXT.test(newFile)) added.push({ file: newFile, text: line.slice(1) });
+		} else if (line.startsWith("-")) {
+			if (CODE_EXT.test(oldFile)) removed.push({ file: oldFile, text: line.slice(1) });
+		}
 	}
 	return { added, removed };
 }
@@ -142,6 +157,8 @@ function refusal(category: IntegrityRefusal["category"], file: string, text: str
 		guard_deletion_without_adversarial_regression:
 			"삭제한 가드/부정 테스트를 복원하거나, 같은 동작을 증명하는 부정 케이스 테스트를 추가하세요.",
 		unproven_claim_word: "보고의 '통과/검증됨' 주장에 실제 실행한 검증 명령(bun test 등)을 함께 적으세요.",
+		lane_diff_unavailable:
+			"base 브랜치를 읽지 못해 레인의 변경을 가려낼 수 없습니다. base 브랜치가 저장소에 있는지 확인하고 다시 완료를 알리세요.",
 	};
 	return { category, excerpt: `${file}: ${text.trim().slice(0, 120)}`, remedy: remedies[category] };
 }
@@ -181,23 +198,65 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 	return refusals.slice(0, MAX_REFUSALS);
 }
 
-/** `git diff base..sha` of the lane's repository; "" when it cannot be read (the classifier then only sees the claim). */
+/** Where a lane's diff starts: the commit it started (or was reopened) at, and the branch it lands on. */
+export interface LaneDiffRange {
+	baseSha?: string;
+	baseBranch?: string;
+}
+
+/** The base branch or its tip could not be read: the lane's own changes cannot be told apart, so the check fails closed. */
+export class LaneDiffUnavailable extends Error {}
+
+/** The refusal an unreadable base becomes (the owner can still approve the claim from its card). */
+export function laneDiffUnavailableRefusal(error: LaneDiffUnavailable): IntegrityRefusal {
+	return refusal("lane_diff_unavailable", "base", error.message);
+}
+
+/**
+ * `git diff <from>..sha` of the lane's repository. With a base branch, `from` is the merge-base of that branch's
+ * current tip and `sha` — a lane rebased onto a moved base does not answer for the base's commits — unless `baseSha`
+ * (a reopened lane's previous claim) is newer and still in `sha`'s history. A base branch that cannot be read throws
+ * `LaneDiffUnavailable`; without one, `from` is `baseSha`. "" when the repository, a merge-base with `sha` or the diff
+ * cannot be read (the classifier then only sees the claim).
+ */
 export async function collectLaneDiff(
 	laneCwd: string,
-	baseSha: string,
+	range: LaneDiffRange,
 	sha: string,
 	git: GitRunner = defaultGit,
 ): Promise<string> {
 	const top = await git(["-C", laneCwd, "rev-parse", "--show-toplevel"]);
 	const root = top.stdout.trim();
 	if (top.code !== 0 || root === "") return "";
+	let from = range.baseSha;
+	if (range.baseBranch !== undefined) {
+		const { baseBranch } = range;
+		const tip = await git(["-C", root, "rev-parse", "--verify", "--quiet", `refs/heads/${baseBranch}^{commit}`]);
+		const tipSha = tip.stdout.trim();
+		if (tip.code !== 0 || tipSha === "")
+			throw new LaneDiffUnavailable(`base 브랜치 ${baseBranch}의 tip을 읽지 못했습니다`);
+		const base = await git(["-C", root, "merge-base", tipSha, sha]);
+		const mergeBase = base.stdout.trim();
+		// No common history with the claim commit: the diff cannot be read, like any other unreadable diff.
+		if (base.code !== 0 || mergeBase === "") return "";
+		from = mergeBase;
+		const { baseSha } = range;
+		if (baseSha !== undefined && baseSha !== mergeBase) {
+			const newer = await git(["-C", root, "merge-base", "--is-ancestor", mergeBase, baseSha]);
+			const inHistory = await git(["-C", root, "merge-base", "--is-ancestor", baseSha, sha]);
+			if (newer.code === 0 && inHistory.code === 0) from = baseSha;
+		}
+	}
+	if (from === undefined) return "";
 	const diff = await git([
 		"-C",
 		root,
 		"-c",
 		"core.quotepath=false",
 		"diff",
-		`${baseSha}..${sha}`,
+		"--no-ext-diff",
+		"--no-textconv",
+		`${from}..${sha}`,
 		"--no-color",
 		"--unified=0",
 	]);

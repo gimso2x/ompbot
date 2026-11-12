@@ -5,13 +5,13 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
-import type { FakeCall } from "../src/slack/fake-transport";
 import { SlackCallError } from "../src/slack/transport";
 import type { TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskRow } from "../src/tasks/ledger";
 import { buildBlockedCard, formatBlockedNotice, parseTaskRecommendActionId } from "../src/tasks/notify";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import type { FakeCall } from "./helpers/slack-fake-transport";
 
 const CHANNEL = "C1";
 const THREAD = "1700.000100";
@@ -188,6 +188,13 @@ describe("blocked card: 추천대로 button", () => {
 		const without = buildBlockedCard(row, judged(""), OWNER);
 		expect(without.buttons).toBeUndefined();
 		expect(without.note).toBeUndefined();
+	});
+
+	test("a block that already had its retry prompt says so at the end of the reason line", () => {
+		const card = buildBlockedCard(row, judged(""), OWNER, undefined, true);
+		expect(card.text.split("\n")).toContain("*사유*: DB 경로를 정해야 함 (재도전 1회 뒤)");
+		expect(card.body?.split("\n")[0]).toBe("*사유*: DB 경로를 정해야 함 (재도전 1회 뒤)");
+		expect(buildBlockedCard(row, judged(""), OWNER).text).not.toContain("재도전");
 	});
 
 	test("formatBlockedNotice is byte for byte what it was before the button", () => {

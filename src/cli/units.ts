@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -9,7 +9,8 @@ export const UNITS_USAGE = `  units render [--out <dir>] [--dry-run] [--instance
                                  --dry-run prints '# <file>' + content instead; an existing file with other content is
                                  never overwritten (exit 2, nothing written); never runs systemctl;
                                  --instance <name> (^[a-z][a-z0-9-]{0,23}$, needs OMPBOT_HOME) renders a second install
-                                 as ompbot-<name>[-backup|-gc].service|timer, without the dashboard unit
+                                 as ompbot-<name>[-backup|-gc].service|timer, without the dashboard unit; backup, gc,
+                                 dashboard and names ending in -backup/-gc/-dashboard are taken by other units' names
 `;
 
 const INSTANCE_NAME = /^[a-z][a-z0-9-]{0,23}$/;
@@ -49,7 +50,12 @@ function renderUnit(name: string, template: string, values: UnitValues): string 
 		.replaceAll("@HOME@", values.home)
 		.replaceAll("@PATH@", path);
 	if (values.ompbotHome !== undefined && name.endsWith(".service")) {
-		text = text.replace(/^\[Service\]\n/m, `[Service]\nEnvironment=OMPBOT_HOME=${values.ompbotHome}\n`);
+		// systemd splits an unquoted value at spaces and expands `%`; a plain path stays unquoted so installed units match.
+		const assignment = `OMPBOT_HOME=${values.ompbotHome}`;
+		const line = /^[\w/.,:@+=-]+$/.test(assignment)
+			? `Environment=${assignment}`
+			: `Environment="${assignment.replace(/[\\"]/g, "\\$&").replaceAll("%", "%%")}"`;
+		text = text.replace(/^\[Service\]\n/m, () => `[Service]\n${line}\n`);
 	}
 	return text;
 }
@@ -100,15 +106,22 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 	} catch (error) {
 		return usage(error instanceof Error ? error.message : String(error));
 	}
-	if (env.OMPBOT_HOME === "") return usage("OMPBOT_HOME is set but empty; unset it to use ~/.ompbot");
+	// An empty OMPBOT_HOME is unset, as in config.ts: the default ~/.ompbot, no Environment= line.
+	const ompbotHome = env.OMPBOT_HOME === undefined || env.OMPBOT_HOME === "" ? undefined : resolve(env.OMPBOT_HOME);
+	if (ompbotHome !== undefined && /[\n\r\0]/.test(ompbotHome))
+		return usage("OMPBOT_HOME contains a newline or NUL; a unit file cannot carry it");
+	if (values.out === "") return usage("--out is empty; leave it out to use ~/.config/systemd/user");
 	const instance = values.instance;
 	if (instance !== undefined) {
 		if (!INSTANCE_NAME.test(instance)) return usage(`--instance must match ${INSTANCE_NAME.source}`);
 		// `ompbot-backup.service` etc. already name the default install's units: such an instance would overwrite them.
 		if (["backup", "gc", "dashboard"].includes(instance))
 			return usage(`--instance ${instance} collides with the default install's ompbot-${instance} units`);
-		if (env.OMPBOT_HOME === undefined)
-			return usage("--instance needs OMPBOT_HOME (a second install needs its own home)");
+		// `ompbot-a-backup.service` is instance `a`'s backup unit: an instance `a-backup` would share its file names.
+		const suffix = /-(backup|gc|dashboard)$/.exec(instance)?.[1];
+		if (suffix !== undefined)
+			return usage(`--instance ${instance} ends in -${suffix}, the name of another instance's ${suffix} units`);
+		if (ompbotHome === undefined) return usage("--instance needs OMPBOT_HOME (a second install needs its own home)");
 	}
 	const home = homedir();
 	const units = renderUnits(
@@ -116,7 +129,7 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 			bun: process.execPath,
 			repoDir: REPO_DIR,
 			home,
-			...(env.OMPBOT_HOME === undefined ? {} : { ompbotHome: resolve(env.OMPBOT_HOME) }),
+			...(ompbotHome === undefined ? {} : { ompbotHome }),
 		},
 		instance,
 	);
@@ -126,6 +139,14 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 	}
 
 	const outDir = resolve(values.out ?? join(home, ".config", "systemd", "user"));
+	// The nearest existing ancestor must be a directory, or mkdir fails halfway with a raw EEXIST/ENOTDIR.
+	let existing = outDir;
+	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	if (!statSync(existing).isDirectory()) return usage(`--out ${outDir}: ${existing} is not a directory`);
+	for (const unit of units) {
+		const path = join(outDir, unit.name);
+		if (existsSync(path) && !statSync(path).isFile()) return usage(`--out ${outDir}: ${path} is not a file`);
+	}
 	const plan = units.map((unit) => {
 		const path = join(outDir, unit.name);
 		const existing = existsSync(path) ? readFileSync(path, "utf8") : undefined;

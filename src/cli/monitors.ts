@@ -1,7 +1,6 @@
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, type OmpbotConfig } from "../config";
-import { DEFAULT_TIMEZONE, formatLocal } from "../monitors/cron";
 import {
 	describeMonitorTrigger,
 	type MonitorLedger,
@@ -15,6 +14,7 @@ import { runScript } from "../monitors/script";
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../monitors/spec";
 import { webhookUrl } from "../monitors/webhook";
 import { readFreeze } from "../ops/freeze";
+import { formatLocal, hostTimezone } from "../time";
 
 export const MONITORS_USAGE = `  monitors add --json <spec>     create a monitor ({name, trigger (cron|at|script|watcher|webhook), instruction, overlap?, enabled?, channel?, copyChannel?, model?, thinking?, deliver?, procedureFiles? (<=5 files in the workspace or scripts dir, re-read on every fire)}; trigger webhook needs "webhook" in config.json
   monitors list [--json]         monitors with effective time zone and next fire
@@ -31,10 +31,10 @@ interface Schedule {
 	nextFireAt: string | null;
 }
 
-function scheduleOf(row: MonitorRow): Schedule {
+function scheduleOf(row: MonitorRow, timezone: string): Schedule {
 	const next = nextFireOf(row);
 	return {
-		effectiveTimezone: row.trigger.kind === "cron" ? row.trigger.timezone : DEFAULT_TIMEZONE,
+		effectiveTimezone: row.trigger.kind === "cron" ? row.trigger.timezone : timezone,
 		nextFireAt: next === null ? null : new Date(next).toISOString(),
 	};
 }
@@ -136,7 +136,15 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 	// The sweep runs script checks with cwd = config.workspaceDir (monitors/scheduler.ts); `test` must verify the same
 	// conditions, so a home without a usable config falls back to the home itself.
 	const workspaceDir = config?.workspaceDir ?? homeDir;
-	const ctx = { scriptsRoot, watcherRoots: config?.watcherRoots, workspaceDir, webhook: config?.webhook };
+	const ctx = {
+		scriptsRoot,
+		watcherRoots: config?.watcherRoots,
+		workspaceDir,
+		webhook: config?.webhook,
+		// A home without a usable config takes the zone a config without `timezone` gets.
+		defaultTimezone: config?.timezone ?? hostTimezone(),
+		slackOff: config !== undefined && config.channels.slack === undefined,
+	};
 	if (sub === "export" || sub === "apply") return portableCommand(sub, rest, homeDir, ctx);
 	if (sub !== "add" && sub !== "list" && sub !== "show" && sub !== "update" && sub !== "remove" && sub !== "test") {
 		process.stderr.write(`usage: ompbot monitors <add|list|show|update|remove|test|export|apply>\n${MONITORS_USAGE}`);
@@ -154,12 +162,12 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 		const out = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 		if (sub === "add") {
 			const row = ledger.addMonitor(parseMonitorSpec(parseJson(values.json, "monitors add"), ctx));
-			out({ monitor: row, schedule: scheduleOf(row) });
+			out({ monitor: row, schedule: scheduleOf(row, ctx.defaultTimezone) });
 			return 0;
 		}
 		if (sub === "list") {
 			const monitors = ledger.listMonitors();
-			const schedules = Object.fromEntries(monitors.map((row) => [row.id, scheduleOf(row)]));
+			const schedules = Object.fromEntries(monitors.map((row) => [row.id, scheduleOf(row, ctx.defaultTimezone)]));
 			if (listJson) out({ monitors: monitors.map(masked), schedules });
 			else if (monitors.length === 0) process.stdout.write("no monitors\n");
 			else for (const row of monitors) process.stdout.write(`${describe(row, schedules[row.id] as Schedule)}\n`);
@@ -170,7 +178,7 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 			const { trigger } = row;
 			out({
 				monitor: row,
-				schedule: scheduleOf(row),
+				schedule: scheduleOf(row, ctx.defaultTimezone),
 				...(trigger.kind === "webhook"
 					? { webhook: { url: webhookUrl(config?.webhook, trigger.id), token: trigger.token } }
 					: {}),
@@ -193,7 +201,7 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 			};
 			const next = mergeMonitorSpec(current, parseJson(values.json, "monitors update"), ctx);
 			const updated = ledger.updateMonitor(row.id, next);
-			out({ monitor: masked(updated), schedule: scheduleOf(updated) });
+			out({ monitor: masked(updated), schedule: scheduleOf(updated, ctx.defaultTimezone) });
 			return 0;
 		}
 		if (sub === "remove") {

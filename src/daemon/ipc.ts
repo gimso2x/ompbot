@@ -50,12 +50,18 @@ export function startIpcServer(path: string, handler: IpcHandler): IpcServer {
 	};
 }
 
-/** Sends one request to the daemon socket and resolves with its response; rejects when nothing is listening. */
+/** The daemon took the request but gave no answer (timeout, or it closed first): it may still be acting on it. */
+export class IpcNoResponse extends Error {}
+
+/**
+ * Sends one request to the daemon socket and resolves with its response; rejects when nothing is listening, and with
+ * `IpcNoResponse` when the request went out but no answer came.
+ */
 export async function callDaemon(path: string, request: unknown, timeoutMs = 120_000): Promise<unknown> {
 	const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 	let buffer = "";
 	let settled = false;
-	const timer = setTimeout(() => finish(new Error(`ipc timeout after ${timeoutMs}ms`)), timeoutMs);
+	const timer = setTimeout(() => finish(new IpcNoResponse(`ipc timeout after ${timeoutMs}ms`)), timeoutMs);
 	function finish(error: Error | undefined, value?: unknown): void {
 		if (settled) return;
 		settled = true;
@@ -80,7 +86,7 @@ export async function callDaemon(path: string, request: unknown, timeoutMs = 120
 				}
 			},
 			close() {
-				finish(new Error("ipc connection closed without a response"));
+				finish(new IpcNoResponse("ipc connection closed without a response"));
 			},
 			error(_s, error) {
 				finish(error);

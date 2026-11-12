@@ -1,13 +1,14 @@
 // Discord cards (doc/plans/discord-channel.md §10): an OutboundMessage card (title/body/fields) and a ```card fence in
 // an answer both go out as one embed, within Discord's embed limits; an invalid fence stays a code block.
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { CoreSink, DeliveryItem, DeliverySource } from "../src/channel/types";
 import { DiscordAdapter } from "../src/discord/adapter";
+import * as discordCard from "../src/discord/card";
 import { DiscordChannel } from "../src/discord/channel";
-import { type FakeDiscordCall, FakeDiscordTransport } from "../src/discord/fake-transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { CARD_SKELETONS } from "../src/safety/prompt";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
 const BOT = "500000000000000000";
@@ -23,6 +24,7 @@ interface Embed {
 	description?: string;
 	fields?: Array<{ name: string; value: string; inline?: boolean }>;
 	image?: { url: string };
+	color?: number;
 }
 
 type Create = Extract<FakeDiscordCall, { method: "createMessage" }>;
@@ -187,6 +189,34 @@ describe("```card fence in an answer → embed", () => {
 		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(false);
 	});
 
+	test("tone: a card without one is the same embed as before; danger colours it 0xE01E5A; an unknown one is ignored", async () => {
+		const decision = (props: Record<string, unknown>) =>
+			fence(
+				spec({
+					c: el("Card", { title: "요약", ...props }, ["f"]),
+					f: el("Fields", {}, ["a", "b"]),
+					a: el("Field", { label: "성공", value: "12" }),
+					b: el("Field", { label: "실패", value: "1" }),
+				}),
+			);
+		const before = {
+			title: "요약",
+			fields: [
+				{ name: "성공", value: "12", inline: true },
+				{ name: "실패", value: "1", inline: true },
+			],
+		};
+		const posts = await deliver([decision({}), decision({ tone: "danger" }), decision({ tone: "purple" })].join("\n"));
+		expect(posts.map((p) => embedsOf(p))).toEqual([[before], [{ ...before, color: 0xe01e5a }], [before]]);
+		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(false);
+	});
+
+	test("a card with only a tone still has nothing to show and stays a code block", async () => {
+		const posts = await deliver(`설명\n${fence(spec({ c: el("Card", { tone: "ok" }, ["d"]), d: el("Divider") }))}`);
+		expect(posts.flatMap((p) => embedsOf(p))).toHaveLength(0);
+		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
+	});
+
 	test("Table and Chart become ASCII code blocks in the description", async () => {
 		const posts = await deliver(`${fence(CARD_SKELETONS[1])}\n${fence(CARD_SKELETONS[2])}`);
 		const embeds = posts.flatMap((p) => embedsOf(p));
@@ -206,11 +236,55 @@ describe("```card fence in an answer → embed", () => {
 		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
 	});
 
+	test("a chart with a repeated category stays a code block instead of an ASCII table with wrong values (#83)", async () => {
+		const dup = spec({
+			c: el("Card", { title: "추이" }, ["g"]),
+			g: el("Chart", {
+				title: "일별",
+				chart: { type: "line", categories: ["A", "B", "A"], series: [{ name: "턴", values: [1, 2, 3] }] },
+			}),
+		});
+		const posts = await deliver(`설명\n${fence(dup)}`);
+		expect(posts.flatMap((p) => embedsOf(p))).toHaveLength(0);
+		expect(posts.map((p) => p.content ?? "").join("\n")).toContain("```card");
+		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
+	});
+
 	test("a valid card with nothing to show stays a code block instead of an empty message", async () => {
 		const posts = await deliver(`설명\n${fence(spec({ c: el("Card", {}, ["d"]), d: el("Divider") }))}`);
 		expect(posts.flatMap((p) => embedsOf(p))).toHaveLength(0);
 		expect(posts.map((p) => p.content ?? "").join("\n")).toContain("```card");
 		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
+	});
+
+	test("a __proto__ element id is refused: the card stays a code block and the answer is still posted", async () => {
+		const json = `{"root":"c","elements":{"c":{"type":"Card","props":{"title":"오염"},"children":["__proto__"]},"__proto__":{"type":"Table","props":{},"children":[]}}}`;
+		const posts = await deliver(`답 시작\n${fence(json)}\n답 끝`);
+		expect(posts.length).toBeGreaterThanOrEqual(1);
+		expect(posts.flatMap((p) => embedsOf(p))).toHaveLength(0);
+		const content = posts.map((p) => p.content ?? "").join("\n");
+		expect(content).toContain("답 시작");
+		expect(content).toContain("```card");
+		expect(content).toContain("답 끝");
+		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
+	});
+
+	test("a card whose embed rendering throws falls back to its code block; the answer is still posted", async () => {
+		const spy = spyOn(discordCard, "cardToEmbed").mockImplementation(() => {
+			throw new Error("render boom");
+		});
+		try {
+			const posts = await deliver(`앞 문장\n${fence(CARD_SKELETONS[0])}\n뒤 문장`);
+			expect(posts.length).toBeGreaterThanOrEqual(1);
+			expect(posts.flatMap((p) => embedsOf(p))).toHaveLength(0);
+			const content = posts.map((p) => p.content ?? "").join("\n");
+			expect(content).toContain("앞 문장");
+			expect(content).toContain("```card");
+			expect(content).toContain("뒤 문장");
+			expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	test("at most three cards per answer: the fourth stays text", async () => {

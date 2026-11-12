@@ -86,7 +86,13 @@ export async function drainCommand(args: string[], homeDir: string): Promise<num
 		args,
 		options: { wait: { type: "boolean" }, timeout: { type: "string" }, cancel: { type: "boolean" } },
 	});
-	const timeoutMin = values.timeout === undefined ? DEFAULT_TIMEOUT_MIN : Number(values.timeout);
+	// `Number("")` is 0: the value must look like a number, as `apply --timeout` requires.
+	const timeoutMin =
+		values.timeout === undefined
+			? DEFAULT_TIMEOUT_MIN
+			: /^\d+(\.\d+)?$/.test(values.timeout)
+				? Number(values.timeout)
+				: Number.NaN;
 	if (!Number.isFinite(timeoutMin) || timeoutMin < 0) {
 		process.stderr.write("drain: --timeout must be a non-negative number of minutes\n");
 		return 2;

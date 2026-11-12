@@ -2,13 +2,15 @@
 // FakeSlackTransport runs scenarios ①–⑪ and the call log plus the delivery ledger must equal the frozen JSON. The JSON
 // was written once from the code before the split; a change here is a Slack behaviour change, never a fixture refresh.
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, type Mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore, type FakeTurnMessage } from "../src/omp/fake-driver";
+import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { redact } from "../src/redact";
 import { approvalActionId, choiceActionId } from "../src/safety/approval";
 import { SlackBinding } from "../src/slack/binding";
@@ -214,7 +216,11 @@ function record(step: string, result?: unknown): void {
 	steps.push({ step, calls: calls.map(normalize), ...(result === undefined ? {} : { result: normalize(result) }) });
 }
 
+/** The host's real load would open `host_pressure` in the status lines on a busy machine: the golden pins it idle. */
+let loadavgSpy: Mock<typeof os.loadavg> | undefined;
+
 beforeAll(async () => {
+	loadavgSpy = spyOn(os, "loadavg").mockReturnValue([0, 0, 0]);
 	home = makeHome("ompbot-golden-");
 	transport = new GoldenTransport();
 	slack = new SlackChannel(transport);
@@ -235,6 +241,7 @@ beforeAll(async () => {
 		ompVersion: "omp-test 0",
 		bootId: "golden-boot",
 		clock,
+		hostLoad: IDLE_HOST_LOAD, // the frozen status lines never depend on this machine's load
 		sweepMs: 3_600_000,
 		gateSweepMs: 0,
 		taskSweepMs: 0,
@@ -255,6 +262,7 @@ beforeAll(async () => {
 afterAll(async () => {
 	await daemon.stop();
 	home.remove();
+	loadavgSpy?.mockRestore();
 });
 
 test("Slack scenarios ①–⑪ produce the frozen call log and delivery ledger", async () => {

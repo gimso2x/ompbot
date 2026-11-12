@@ -99,6 +99,79 @@ describe("DeliveryPump", () => {
 		expect(lines.filter((line) => line.includes("event=delivery_failed"))).toHaveLength(2);
 	});
 
+	test("a send that throws is failed as ambiguous and the batch goes on; nothing stays claimed", async () => {
+		const items = [item(11, { sentParts: 1 }), item(12)];
+		const calls: string[] = [];
+		const lines: string[] = [];
+		const pump = new DeliveryPump({
+			source: {
+				claimDue: () => {
+					calls.push("claimDue");
+					return items;
+				},
+				confirm: (id) => void calls.push(`confirm:${id}`),
+				fail: (id, error, outcome) => void calls.push(`fail:${id}:${error}:${outcome}`),
+				defer: (id) => void calls.push(`defer:${id}`),
+			},
+			sender: {
+				isBlocked: () => false,
+				blockedUntil: () => NOW,
+				blockedReason: () => "chat.postMessage",
+				send: async (d) => {
+					calls.push(`send:${d.deliveryId}`);
+					if (d.deliveryId === 11) throw new Error("render boom");
+					return { kind: "sent", parts: 1 };
+				},
+				afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+			},
+			clock,
+			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
+		});
+		expect(await pump.pump()).toBe(1);
+		expect(calls).toEqual([
+			"claimDue",
+			"send:11",
+			"fail:11:render boom:ambiguous",
+			"send:12",
+			"confirm:12",
+			"afterSent:12",
+		]);
+		const failed = lines.find((line) => line.includes("event=delivery_failed")) ?? "";
+		expect(failed).toContain("sent_parts=1");
+		expect(failed).toContain("outcome=ambiguous");
+	});
+
+	test("an afterSent that throws keeps the confirm (it was sent) and the batch goes on", async () => {
+		const calls: string[] = [];
+		const lines: string[] = [];
+		const pump = new DeliveryPump({
+			source: {
+				claimDue: () => [item(13), item(14)],
+				confirm: (id) => void calls.push(`confirm:${id}`),
+				fail: (id) => void calls.push(`fail:${id}`),
+				defer: (id) => void calls.push(`defer:${id}`),
+			},
+			sender: {
+				isBlocked: () => false,
+				blockedUntil: () => NOW,
+				blockedReason: () => "chat.postMessage",
+				send: async (d) => {
+					calls.push(`send:${d.deliveryId}`);
+					return { kind: "sent", parts: 2 };
+				},
+				afterSent: async (d) => {
+					calls.push(`afterSent:${d.deliveryId}`);
+					if (d.deliveryId === 13) throw new Error("status boom");
+				},
+			},
+			clock,
+			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
+		});
+		expect(await pump.pump()).toBe(2);
+		expect(calls).toEqual(["send:13", "confirm:13", "afterSent:13", "send:14", "confirm:14", "afterSent:14"]);
+		expect(lines.some((line) => line.includes("event=delivery_after_sent_failed"))).toBe(true);
+	});
+
 	test("blocked before the claim: nothing is claimed, nothing is sent", async () => {
 		const { pump, calls, block } = harness([item(5), item(6)], new Map());
 		block();
@@ -155,5 +228,60 @@ describe("DeliveryPump", () => {
 			`defer:9:ratelimited:${JSON.stringify(retry)}`,
 			`defer:10:chat.postMessage:${JSON.stringify({ at: NOW + 30_000, sentParts: 0 })}`,
 		]);
+	});
+});
+
+describe("qa50b K-13: a throwing ledger call", () => {
+	test("confirm, fail and defer that throw are logged and the rest of the batch still goes out", async () => {
+		const items = [item(21), item(22), item(23), item(24)];
+		const calls: string[] = [];
+		const lines: string[] = [];
+		const results = new Map<number, DeliverySendResult>([
+			[22, { kind: "failed", error: "x", outcome: "definitive", sentParts: 0 }],
+			[23, { kind: "deferred", error: "429", retry: { at: NOW + 1000, sentParts: 0 } }],
+		]);
+		const pump = new DeliveryPump({
+			source: {
+				claimDue: () => items,
+				confirm: (id) => {
+					calls.push(`confirm:${id}`);
+					if (id === 21) throw new Error("SQLITE_FULL");
+				},
+				fail: (id) => {
+					calls.push(`fail:${id}`);
+					throw new Error("SQLITE_BUSY");
+				},
+				defer: (id) => {
+					calls.push(`defer:${id}`);
+					throw new Error("SQLITE_BUSY");
+				},
+			},
+			sender: {
+				isBlocked: () => false,
+				blockedUntil: () => NOW,
+				blockedReason: () => "chat.postMessage",
+				send: async (d) => {
+					calls.push(`send:${d.deliveryId}`);
+					return results.get(d.deliveryId) ?? { kind: "sent", parts: 1 };
+				},
+				afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+			},
+			clock,
+			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
+		});
+		expect(await pump.pump()).toBe(1);
+		expect(calls).toEqual([
+			"send:21",
+			"confirm:21",
+			"afterSent:21",
+			"send:22",
+			"fail:22",
+			"send:23",
+			"defer:23",
+			"send:24",
+			"confirm:24",
+			"afterSent:24",
+		]);
+		expect(lines.filter((line) => line.includes("event=delivery_ledger_failed"))).toHaveLength(3);
 	});
 });

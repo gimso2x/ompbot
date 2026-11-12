@@ -8,7 +8,6 @@ import type { OmpbotConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
-import type { FakeDiscordCall } from "../src/discord/fake-transport";
 import { DiscordCallError } from "../src/discord/transport";
 import { laneDiscardActionId, laneMergeActionId, lanePauseActionId, laneResumeActionId } from "../src/lanes/card";
 import { PROGRESS_INTERVAL_MS } from "../src/lanes/manager";
@@ -16,7 +15,7 @@ import type { LaneRow } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { floorsArgs } from "../src/safety/prompt";
+import { floorsSystemPrompt } from "../src/safety/prompt";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import {
@@ -27,6 +26,7 @@ import {
 	WaitingTransport,
 	withDiscord,
 } from "./helpers/bot-home";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -212,7 +212,7 @@ describe("a lane started from a Discord server thread", () => {
 		const names = daemon.hostToolsFor(lane.originKey).map((tool) => tool.name);
 		expect(names).toContain("discord_send_file");
 		expect(names).not.toContain("slack_send_file");
-		const prompt = floorsArgs(
+		const prompt = floorsSystemPrompt(
 			"/s",
 			lane.originKey,
 			undefined,
@@ -221,7 +221,7 @@ describe("a lane started from a Discord server thread", () => {
 			false,
 			false,
 			daemon.floorsSurfaceFor(lane.originKey),
-		)[1];
+		);
 		expect(prompt).toContain("discord_send_file");
 		expect(prompt).not.toContain("slack_send_file");
 	});
@@ -369,7 +369,7 @@ describe("lanes asked for from a Discord DM", () => {
 		expect(names).toContain("ompbot_monitor_add");
 		// A server thread needs no setting: the lane opens in its own channel.
 		expect(daemon.hostToolsFor(THREAD_ORIGIN).map((tool) => tool.name)).toContain("ompbot_work_start");
-		const prompt = floorsArgs(
+		const prompt = floorsSystemPrompt(
 			"/s",
 			DM_ORIGIN,
 			undefined,
@@ -378,10 +378,10 @@ describe("lanes asked for from a Discord DM", () => {
 			false,
 			false,
 			daemon.floorsSurfaceFor(DM_ORIGIN),
-		)[1];
+		);
 		expect(prompt).toContain("channels.discord.laneChannelId");
 		expect(
-			floorsArgs(
+			floorsSystemPrompt(
 				"/s",
 				"slack/dm/D1",
 				undefined,
@@ -390,7 +390,7 @@ describe("lanes asked for from a Discord DM", () => {
 				false,
 				false,
 				daemon.floorsSurfaceFor("slack/dm/D1"),
-			)[1],
+			),
 		).not.toContain("laneChannelId");
 
 		const repo = makeRepo(repos);

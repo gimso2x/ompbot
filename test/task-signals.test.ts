@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseTaskSpecInput, TaskSpecError } from "../src/tasks/docs";
-import { checkSignalsOf, parseSignal, runSignal, SignalSyntaxError } from "../src/tasks/signals";
+import { CHECK_TIMEOUT_MS, checkSignalsOf, parseSignal, runSignal, SignalSyntaxError } from "../src/tasks/signals";
 
 const spec = (acceptance: string[]) => ({
 	title: "check",
@@ -47,6 +47,28 @@ describe("AC-1: [check: …] at registration", () => {
 		expect(refusal(['빈 신호 [check: command ["x"];]'])).toContain("빈 신호");
 		expect(refusal(["첫째", "둘째 [check: file ../x]"])).toStartWith("taskSpec.acceptance[1]의 check 형식 오류");
 	});
+
+	test("two blocks or text after the block are refused; the two-block refusal points to semicolons", () => {
+		const two = refusal(['x [check: command ["bun","test"]] [check: command ["echo","ok"]]']);
+		expect(two).toStartWith("taskSpec.acceptance[0]의 check 형식 오류");
+		expect(two).toContain("하나만");
+		expect(two).toContain("세미콜론(;)");
+		const after = refusal(['테스트 통과 [check: command ["bun","test"]] (근거는 outcome.md)']);
+		expect(after).toStartWith("taskSpec.acceptance[0]의 check 형식 오류");
+		expect(after).toContain("맨 끝에 와야 합니다: (근거는 outcome.md)");
+	});
+
+	test("one trailing block registers, including a quoted `[check:` argument and a backticked quotation", () => {
+		expect(refusal(['테스트 [check: command ["bun","test"]]'])).toBe("");
+		expect(refusal(['문법 검사 [check: command ["grep","[check:","x"]]'])).toBe("");
+		expect(refusal(['설명의 `[check:]` 인용과 ``[check: x] `y` ``는 문구다 [check: command ["bun","test"]]'])).toBe("");
+	});
+
+	test("judgement still reads the last block of an old two-block text without throwing", () => {
+		expect(checkSignalsOf('x [check: command ["bun","test"]] [check: command ["echo","ok"]]')).toEqual([
+			'command ["echo","ok"]',
+		]);
+	});
 });
 
 describe("signal grammar", () => {
@@ -85,7 +107,8 @@ describe("signal grammar", () => {
 		});
 	});
 
-	test("a timed-out command fails with the limit, not its output", async () => {
+	test("a timed-out command is inconclusive with the 300 s limit, not its output", async () => {
+		expect(CHECK_TIMEOUT_MS).toBe(300_000);
 		const io = {
 			runCheck: async () => ({ code: null, output: "partial", timedOut: true }),
 			readFile: async () => undefined,
@@ -93,7 +116,35 @@ describe("signal grammar", () => {
 		expect(await runSignal('command ["sleep","999"]', io)).toEqual({
 			signal: 'command ["sleep","999"]',
 			ok: false,
-			detail: "120초 안에 끝나지 않았습니다",
+			detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+			inconclusive: true,
 		});
+	});
+
+	test("only a timeout is inconclusive: every other failure is a violation", async () => {
+		const body = "hello\n";
+		const commandIo = (code: number | null, output = "") => ({
+			runCheck: async () => ({ code, output, timedOut: false }),
+			readFile: async () => undefined,
+		});
+		const fileIo = {
+			runCheck: commandIo(0).runCheck,
+			readFile: async (path: string) => (path === "a.txt" ? body : undefined),
+		};
+		const violations = [
+			await runSignal('command ["false"]', commandIo(1, "boom")),
+			await runSignal('command ["./run.sh"]', commandIo(126, "permission denied")),
+			await runSignal('command ["nope"]', commandIo(127, "not found")),
+			await runSignal('command ["crash"]', commandIo(null, "killed")),
+			await runSignal('command ["bun","test"] stdout~" 0 fail"', commandIo(0, "1 fail")),
+			await runSignal("file missing.txt", fileIo),
+			await runSignal(`file a.txt sha256=${"0".repeat(64)}`, fileIo),
+			await runSignal("command bun test", commandIo(0)),
+		];
+		for (const check of violations) {
+			expect(check.ok).toBe(false);
+			expect(check.inconclusive).toBeUndefined();
+			expect(check.detail).not.toContain("확인 불가");
+		}
 	});
 });

@@ -230,11 +230,15 @@ async function answerAsk(
 	const buttons = askButtons(questions);
 	const labels = buttons.map((button) => button.label);
 	const buttoned = new Set(buttons.map((button) => button.question));
+	const recommended = buttons.flatMap((button, index) =>
+		questions[button.question]?.recommended === button.option ? [index] : [],
+	);
 	const card = await broker.choose(
 		origin,
 		{
 			text: askText(questions, answers, buttoned),
 			buttons: labels,
+			recommended,
 			fallback: ASK_FALLBACK,
 			timeoutMs: deadlineOf(request),
 		},
@@ -260,7 +264,9 @@ async function answerAsk(
 			// omp's own fallback, so the card says what omp picks.
 			questions.forEach((question, q) => {
 				if (answers[q] !== undefined) return;
-				const label = question.options[question.recommended ?? 0]?.label;
+				// Clamped into the option range, as omp's `timedOutAskDialogResult` does.
+				const pick = Math.min(Math.max(question.recommended ?? 0, 0), question.options.length - 1);
+				const label = question.options[pick]?.label;
 				answers[q] = { selectedOptions: label === undefined ? [] : [label] };
 			});
 			// Nothing answered: omp fills every question itself and marks the result `timedOut` for the model.

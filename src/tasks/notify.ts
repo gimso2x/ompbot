@@ -8,7 +8,7 @@ import {
 import type { ChannelRegistry } from "../channel/registry";
 import { parseThreadRef } from "../core/normalize";
 import { redact } from "../redact";
-import type { TaskJudgement } from "./checker";
+import type { TaskCheck, TaskJudgement } from "./checker";
 import { TASK_RISKS, type TaskRisk } from "./docs";
 import { TASK_STATUSES, type TaskRow, type TaskStatus } from "./ledger";
 
@@ -244,6 +244,18 @@ const evidenceLine = (row: TaskRow): string =>
 export interface AutoLandPolicy {
 	repos: string[];
 	maxRisk: TaskRisk;
+	/** Lanes only: the independent review a lane's claim commit needs a `CLEAR` receipt from before it merges unasked. */
+	review?: { model: string; timeoutMs: number };
+}
+
+/** The auto-merge blockers of re-run checks: failed (a violation) and inconclusive (timed out) counted apart. */
+export function checkBlockers(checks: readonly TaskCheck[]): string[] {
+	const failed = checks.filter((check) => !check.ok && !check.inconclusive).length;
+	const inconclusive = checks.filter((check) => check.inconclusive === true).length;
+	return [
+		...(failed > 0 ? [`재실행 검사 실패 ${failed}/${checks.length}`] : []),
+		...(inconclusive > 0 ? [`재실행 검사 확인 불가 ${inconclusive}/${checks.length}`] : []),
+	];
 }
 
 /**
@@ -262,9 +274,8 @@ export function autoLandBlockers(
 	if (TASK_RISKS.indexOf(row.risk) > TASK_RISKS.indexOf(policy.maxRisk)) {
 		blockers.push(`위험 ${row.risk} > ${policy.maxRisk}`);
 	}
-	const failed = judgement.checks.filter((check) => !check.ok).length;
 	if (judgement.checks.length === 0) blockers.push("재실행 검사 없음");
-	else if (failed > 0) blockers.push(`재실행 검사 실패 ${failed}/${judgement.checks.length}`);
+	else blockers.push(...checkBlockers(judgement.checks));
 	if (judgement.integrityWarnings.length > 0) blockers.push(`무결성 경고 ${judgement.integrityWarnings.length}건`);
 	if (sharedCommitWarnings(row, judgement).length > 0) blockers.push("공유 커밋 증거 경고");
 	const unfinished = (judgement.steps ?? []).filter((step) => !step.done);
@@ -395,11 +406,20 @@ export function buildMergeSettledCard(row: TaskRow, note: string): TaskCard {
 	};
 }
 
-/** A blocked task is a decision request (hub `[DECISION]`): reason, then the question/recommendation/impact the agent wrote. */
-export function buildBlockedCard(row: TaskRow, judgement: TaskJudgement, ownerUserId: string, link?: string): TaskCard {
+/**
+ * A blocked task is a decision request (hub `[DECISION]`): reason, then the question/recommendation/impact the agent
+ * wrote. `retried`: the agent was already sent the retry prompt for this block, said at the end of the reason line.
+ */
+export function buildBlockedCard(
+	row: TaskRow,
+	judgement: TaskJudgement,
+	ownerUserId: string,
+	link?: string,
+	retried = false,
+): TaskCard {
 	const { question, recommend, impact } = judgement.decision;
 	const decision = [
-		`*사유*: ${judgement.blockedReason === "" ? "(적지 않음)" : judgement.blockedReason}`,
+		`*사유*: ${judgement.blockedReason === "" ? "(적지 않음)" : judgement.blockedReason}${retried ? " (재도전 1회 뒤)" : ""}`,
 		...(question === "" ? [] : [`*질문*: ${question}`]),
 		...(recommend === "" ? [] : [`*추천*: ${recommend}`]),
 		...(impact === "" ? [] : [`*영향*: ${impact}`]),

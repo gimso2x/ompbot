@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Store } from "../store/db";
-import { kstDay } from "../tasks/docs";
+import { localDay } from "../time";
 import { usageOf } from "./usage";
 
 /** Sub-agents of sub-agents are read this deep for a turn's transcript cost (the dashboard trace uses the same). */
@@ -25,11 +25,12 @@ export function usd(value: number): string {
 }
 
 /**
- * The `usage_daily` key of `ms`: the KST calendar day (`YYYYMMDD`). The daily ceiling and its `!budget off` flag both
- * key on it, so midnight KST clears the day's spend and any off flag together.
+ * The `usage_daily` key of `ms`: the calendar day (`YYYYMMDD`) in the bot's zone (`config.timezone`). The daily
+ * ceiling and its `!budget off` flag both key on it, so that zone's midnight clears the day's spend and any off flag
+ * together.
  */
-export function ledgerDay(ms: number): string {
-	return kstDay(ms);
+export function ledgerDay(ms: number, timezone: string): string {
+	return localDay(ms, timezone);
 }
 
 /**
@@ -94,11 +95,14 @@ export async function sessionWindowCost(input: {
 	return totals;
 }
 
-/** The `<stem>/<name>.jsonl` files of a session, down to `SUB_AGENT_DEPTH`. */
+/**
+ * The `<stem>/<name>.jsonl` files of a session, down to `SUB_AGENT_DEPTH`: one level per call, then each
+ * transcript's own `<name>/` directory one level deeper, so every file is listed exactly once.
+ */
 function subAgentFiles(dir: string, depth: number): string[] {
 	if (depth >= SUB_AGENT_DEPTH || !existsSync(dir)) return [];
 	const out: string[] = [];
-	for (const rel of new Bun.Glob("**/*.jsonl").scanSync({ cwd: dir })) {
+	for (const rel of new Bun.Glob("*.jsonl").scanSync({ cwd: dir })) {
 		const file = join(dir, rel);
 		out.push(file);
 		const nested = file.replace(/\.jsonl$/, "");
@@ -158,10 +162,10 @@ export function turnCapStopReason(cap: number, spent: number): string {
 }
 
 /** The owner notice of the first daily-cap breach; the key `cost-cap-daily:<day>` keeps it to one a day. */
-export function dailyCapNotice(cap: number, cost: number): string {
+export function dailyCapNotice(cap: number, cost: number, timezone: string): string {
 	return [
 		`⛔ 오늘 비용(정가 환산) ${usd(cost)}가 하루 상한 ${usd(cap)}를 넘어 모니터를 멈췄습니다.`,
-		"자정(KST)에 풀립니다. 지금 풀려면 `!budget off`.",
+		`자정(${timezone})에 풀립니다. 지금 풀려면 \`!budget off\`.`,
 	].join("\n");
 }
 
@@ -170,7 +174,7 @@ export function dailyNoticeKey(day: string): string {
 	return `cost-cap-daily:${day}`;
 }
 
-/** Ledger key of the day's `!budget off` flag; the day inside the key is why KST midnight lifts it by itself. */
+/** Ledger key of the day's `!budget off` flag; the day inside the key is why the bot zone's midnight lifts it by itself. */
 export function dailyOffKey(day: string): string {
 	return `cost-cap-off:${day}`;
 }

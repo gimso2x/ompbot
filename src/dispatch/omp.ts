@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { withOmpProfile } from "../omp/env";
 import { recordProcessCall } from "./audit";
 
 export interface RunProcessResult {
@@ -16,6 +17,8 @@ export interface RunProcessOptions {
 	stdoutCap?: number;
 	/** Drops Slack and bot credential prefixes plus inherited git overrides, like every other child ompbot spawns. */
 	env?: Record<string, string>;
+	/** Aborting it kills the whole process group like the timeout does (`timedOut` stays false); the run still resolves. */
+	signal?: AbortSignal;
 }
 
 export type ProcessRunner = (cmd: string[], opts: RunProcessOptions) => Promise<RunProcessResult>;
@@ -35,6 +38,9 @@ export function dispatchEnv(inherited: Record<string, string | undefined>): Reco
 	env.OMP_NONINTERACTIVE = "1";
 	return env;
 }
+
+/** After a timeout or abort kills the group, how long a child that has not exited yet gets before the run ends anyway. */
+const KILL_GRACE_MS = 2_000;
 
 const spawnProcess: ProcessRunner = (cmd, opts) => {
 	const child = spawn(cmd[0] as string, cmd.slice(1), {
@@ -58,16 +64,42 @@ const spawnProcess: ProcessRunner = (cmd, opts) => {
 	const done = Promise.withResolvers<{ code: number | null; spawnError?: string }>();
 	child.once("error", (error) => done.resolve({ code: null, spawnError: error.message }));
 	child.once("close", (code) => done.resolve({ code }));
-	const timer = setTimeout(() => {
-		timedOut = true;
+	// A killed run ends at its child's exit (or after a grace): a grandchild that left the group (`setsid`) may still
+	// hold stdout/stderr, and `close` would wait for it. A run that ends on its own still collects until `close`.
+	let exited = false;
+	let killed = false;
+	let grace: NodeJS.Timeout | undefined;
+	const endKilled = () => {
+		child.stdout?.destroy();
+		child.stderr?.destroy();
+		done.resolve({ code: child.exitCode });
+	};
+	child.once("exit", () => {
+		exited = true;
+		if (killed) endKilled();
+	});
+	const killGroup = () => {
 		try {
 			if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
 		} catch {
 			child.kill("SIGKILL");
 		}
+		if (killed) return;
+		killed = true;
+		if (exited) endKilled();
+		else grace = setTimeout(endKilled, KILL_GRACE_MS);
+	};
+	const timer = setTimeout(() => {
+		timedOut = true;
+		killGroup();
 	}, opts.timeoutMs ?? 600_000);
+	const { signal } = opts;
+	signal?.addEventListener("abort", killGroup, { once: true });
+	if (signal?.aborted) killGroup();
 	return done.promise.then(({ code, spawnError }) => {
 		clearTimeout(timer);
+		clearTimeout(grace);
+		signal?.removeEventListener("abort", killGroup);
 		if (spawnError !== undefined) return { code: null, stdout: `spawn failed: ${spawnError}`, timedOut };
 		return { code, stdout, stderr, timedOut };
 	});
@@ -94,22 +126,68 @@ export interface OmpPrintOptions {
 	maxChars?: number;
 	inheritedEnv?: Record<string, string | undefined>;
 	run?: ProcessRunner;
+	/** `--model <model>` (absent: omp's own default). */
+	model?: string;
+	/** `--tools <list>`, e.g. `read,grep,glob` for a read-only run (absent: omp's own default). */
+	tools?: string;
+	/** Aborting it kills the run's process group (the runner's `signal`). */
+	signal?: AbortSignal;
+	/**
+	 * A run that must not take anything from its cwd or the user's discovery (the lane reviewer): `--config <configPath>`
+	 * (an overlay) and `--no-extensions --no-skills --no-rules --no-context-files` right after `--no-session`.
+	 */
+	isolation?: { configPath: string };
+	/** Variables set on top of the cleaned inherited env (`PI_CODING_AGENT_DIR` of a Teams guest/qa run). */
+	env?: Record<string, string>;
+	/** Config `ompProfile`: `OMP_PROFILE` in the child env and the inherited `PI_CODING_AGENT_DIR` dropped (`withOmpProfile`). */
+	ompProfile?: string;
 }
 
-/** `omp -p <task>`: one-shot agent run for simple tasks. Output is capped; timeout kills the process group. */
-export async function runOmpPrint(options: OmpPrintOptions): Promise<{ ok: boolean; output: string }> {
+/** The flags an isolated `omp -p` gets after `--config <overlay>`. */
+export const OMP_ISOLATION_FLAGS = ["--no-extensions", "--no-skills", "--no-rules", "--no-context-files"] as const;
+
+export interface OmpPrintResult {
+	ok: boolean;
+	output: string;
+	/** The process exit code (`null`: killed, or it never started). */
+	code: number | null;
+	timedOut: boolean;
+}
+
+/**
+ * `omp -p … -- <task>`: one-shot agent run for simple tasks. The task comes last after `--`, so a task starting with
+ * `-` is the prompt, never an omp flag. Output is capped; timeout kills the process group.
+ */
+export async function runOmpPrint(options: OmpPrintOptions): Promise<OmpPrintResult> {
 	const maxChars = options.maxChars ?? 8_000;
 	const result = await (options.run ?? realProcessRunner)(
-		[options.ompBin, "-p", options.task, "--no-session", "--append-system-prompt", options.systemPromptAppendix],
+		[
+			options.ompBin,
+			"-p",
+			"--no-session",
+			...(options.isolation === undefined ? [] : ["--config", options.isolation.configPath, ...OMP_ISOLATION_FLAGS]),
+			"--append-system-prompt",
+			options.systemPromptAppendix,
+			...(options.model === undefined ? [] : ["--model", options.model]),
+			...(options.tools === undefined ? [] : ["--tools", options.tools]),
+			"--",
+			options.task,
+		],
 		{
 			cwd: options.cwd,
 			timeoutMs: options.timeoutMs ?? 600_000,
-			env: dispatchEnv(options.inheritedEnv ?? process.env),
+			env: { ...withOmpProfile(dispatchEnv(options.inheritedEnv ?? process.env), options.ompProfile), ...options.env },
+			...(options.signal === undefined ? {} : { signal: options.signal }),
 		},
 	);
 	const suffix = result.timedOut ? "\n\n[시간 초과로 중단됨 — 출력 일부만 수집]" : "";
 	const output = `${result.stdout.trim().slice(0, maxChars)}${suffix}`.trim();
-	return { ok: !result.timedOut && result.code === 0, output: output === "" ? "(빈 출력)" : output };
+	return {
+		ok: !result.timedOut && result.code === 0,
+		output: output === "" ? "(빈 출력)" : output,
+		code: result.code,
+		timedOut: result.timedOut,
+	};
 }
 
 export interface HerdrRunnerOptions {
@@ -170,11 +248,14 @@ type HerdrTabCreated = { result?: { tab?: { tab_id?: string }; root_pane?: { pan
 
 /** JSON.parse at the herdr output boundary: unparseable output reads as `undefined`, never throws. */
 function parseHerdrJson<T>(stdout: string): T | undefined {
+	let parsed: unknown;
 	try {
-		return JSON.parse(stdout) as T;
+		parsed = JSON.parse(stdout);
 	} catch {
 		return undefined;
 	}
+	// herdr answers with an object; `null` or a bare number is as unusable as text that is not JSON.
+	return parsed !== null && typeof parsed === "object" ? (parsed as T) : undefined;
 }
 
 /**
@@ -228,6 +309,11 @@ export async function herdrStartAgent(input: {
 	cwd: string;
 	/** Extra omp arguments (config `workerOmpArgs`), passed after `--`; empty/absent → none. */
 	agentArgs?: string[];
+	/**
+	 * Close the workspace this call created when the first prompt fails (a [TASK] start, whose caller then removes the
+	 * worktree). Default false: a plain herdr dispatch keeps the agent up so the same name can be prompted again.
+	 */
+	closeOnPromptFailure?: boolean;
 	options?: HerdrRunnerOptions;
 }): Promise<{ ok: true; agentName: string; paneId: string } | { ok: false; error: string }> {
 	const { name, task, cwd } = input;
@@ -237,12 +323,18 @@ export async function herdrStartAgent(input: {
 	if ("error" in ws) return { ok: false, error: ws.error };
 	const started = await herdrRun(agentStartArgs(name, ws.paneId, input.agentArgs), options);
 	if (started.code !== 0) {
-		// Like the remote start: close only the workspace this call created. A failed prompt leaves the agent up.
+		// Like the remote start: close only the workspace this call created.
 		if (ws.workspaceId !== undefined) await herdrRun(["workspace", "close", ws.workspaceId], options);
 		return { ok: false, error: `agent start failed: ${herdrFailure(started)}` };
 	}
 	const prompted = await herdrRun(["agent", "prompt", name, task], options);
-	if (prompted.code !== 0) return { ok: false, error: `agent prompt failed: ${herdrFailure(prompted)}` };
+	if (prompted.code !== 0) {
+		// herdr has no agent stop: closing the workspace ends the agent running in its pane.
+		if (input.closeOnPromptFailure === true && ws.workspaceId !== undefined) {
+			await herdrRun(["workspace", "close", ws.workspaceId], options);
+		}
+		return { ok: false, error: `agent prompt failed: ${herdrFailure(prompted)}` };
+	}
 	return { ok: true, agentName: name, paneId: ws.paneId };
 }
 
@@ -255,6 +347,8 @@ export interface RemoteHerdrStartInput {
 	workspacesLabel?: string;
 	/** Extra omp arguments (that host's `dispatchHosts.<h>.ompArgs`), passed after `--`; empty/absent → none. */
 	agentArgs?: string[];
+	/** Close the tab (or the workspace) this call created when the first prompt fails; see `herdrStartAgent`. */
+	closeOnPromptFailure?: boolean;
 	options?: HerdrRunnerOptions;
 }
 
@@ -327,14 +421,18 @@ export async function herdrRemoteStart(
 	}
 
 	await herdrRun(["tab", "rename", tabId, name], runner);
+	// Hub fleet cleanup: close only what this call created above; the shared owners workspace is never closed.
+	const closeCreated = createdWorkspace ? ["workspace", "close", workspaceId] : ["tab", "close", tabId];
 	const start = await herdrRun(agentStartArgs(name, paneId, input.agentArgs), runner);
 	if (start.code !== 0) {
-		// Hub fleet cleanup: close only what this call created above.
-		await herdrRun(createdWorkspace ? ["workspace", "close", workspaceId] : ["tab", "close", tabId], runner);
+		await herdrRun(closeCreated, runner);
 		return { ok: false, error: `agent start failed: ${herdrFailure(start, 140)}` };
 	}
 	const prompted = await herdrRun(["agent", "prompt", name, task], runner);
-	if (prompted.code !== 0) return { ok: false, error: `agent prompt failed: ${herdrFailure(prompted, 140)}` };
+	if (prompted.code !== 0) {
+		if (input.closeOnPromptFailure === true) await herdrRun(closeCreated, runner);
+		return { ok: false, error: `agent prompt failed: ${herdrFailure(prompted, 140)}` };
+	}
 	return { ok: true, agentName: name, paneId, tabId, workspaceId, createdWorkspace };
 }
 

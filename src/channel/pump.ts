@@ -55,7 +55,22 @@ export class DeliveryPump {
 				});
 				continue;
 			}
-			const result = await sender.send(delivery);
+			let result: DeliverySendResult;
+			try {
+				result = await sender.send(delivery);
+			} catch (err) {
+				// The claim already holds it in flight. A send that throws instead of answering may have posted any number
+				// of parts, so it is ambiguous (never resent blindly); the rest of the batch still goes out.
+				const error = errorText(err);
+				log.warn("delivery_failed", {
+					id: delivery.deliveryId,
+					sent_parts: delivery.sentParts ?? 0,
+					outcome: "ambiguous",
+					error,
+				});
+				await this.#ledger(delivery, "fail", () => source.fail(delivery.deliveryId, error, "ambiguous"));
+				continue;
+			}
 			if (result.kind === "deferred") {
 				await this.#defer(delivery, errorText(result.error), result.retry);
 				continue;
@@ -67,18 +82,25 @@ export class DeliveryPump {
 					outcome: result.outcome,
 					error: result.error,
 				});
-				await source.fail(delivery.deliveryId, result.error, result.outcome);
+				await this.#ledger(delivery, "fail", () => source.fail(delivery.deliveryId, result.error, result.outcome));
 				continue;
 			}
-			await source.confirm(delivery.deliveryId);
-			log.info("delivery_sent", {
-				id: delivery.deliveryId,
-				parts: result.parts,
-				...(result.path === undefined ? {} : { path: result.path }),
-				redelivered: delivery.redelivered,
-			});
-			await sender.afterSent(delivery);
-			confirmed += 1;
+			// The answer is out either way: a confirm that throws is logged, never resent, and the status still finishes.
+			if (await this.#ledger(delivery, "confirm", () => source.confirm(delivery.deliveryId))) {
+				log.info("delivery_sent", {
+					id: delivery.deliveryId,
+					parts: result.parts,
+					...(result.path === undefined ? {} : { path: result.path }),
+					redelivered: delivery.redelivered,
+				});
+				confirmed += 1;
+			}
+			try {
+				await sender.afterSent(delivery);
+			} catch (err) {
+				// The answer is out and confirmed with its parts; only the status finish failed.
+				log.warn("delivery_after_sent_failed", { id: delivery.deliveryId, parts: result.parts, error: errorText(err) });
+			}
 		}
 		return confirmed;
 	}
@@ -92,6 +114,20 @@ export class DeliveryPump {
 			retry_in_ms: Math.max(0, retry.at - clock.now()),
 			error,
 		});
-		await source.defer(delivery.deliveryId, error, retry);
+		await this.#ledger(delivery, "defer", () => source.defer(delivery.deliveryId, error, retry));
+	}
+
+	/**
+	 * One ledger write (confirm/fail/defer). A throw (SQLITE_FULL/BUSY) is logged and the batch goes on; the row stays
+	 * in flight as claimed, which the next start recovers. False when it threw.
+	 */
+	async #ledger(delivery: DeliveryItem, call: string, write: () => Promise<void> | void): Promise<boolean> {
+		try {
+			await write();
+			return true;
+		} catch (err) {
+			this.#options.log.error("delivery_ledger_failed", { id: delivery.deliveryId, call, error: errorText(err) });
+			return false;
+		}
 	}
 }

@@ -22,14 +22,16 @@ export function sessionDirFor(sessionsRoot: string, originKey: string, epoch: nu
 }
 
 /** The store with the todo 4 redactor wired in: every stored body, text and error is masked. */
-export function openBotStore(path: string, clock: MailboxClock): Store {
-	return openStore({ path, clock, redact });
+export function openBotStore(path: string, clock: MailboxClock, timezone: string): Store {
+	return openStore({ path, clock, timezone, redact });
 }
 
 export interface OriginRouterDeps {
 	store: Store;
 	driverFactory: DriverFactory;
 	clock: MailboxClock;
+	/** Passed to every mailbox: the bot's zone (`config.timezone`); see `MailboxDeps.timezone`. */
+	timezone: string;
 	statusProvider: StatusProvider;
 	/** Passed to every mailbox: the `/usage-ompbot` answer; see `MailboxDeps`. */
 	usageProvider?: MailboxDeps["usageProvider"];

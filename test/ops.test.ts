@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
+	lutimesSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -10,6 +11,7 @@ import {
 	realpathSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -33,8 +35,8 @@ import {
 	STALL_NOTIFY_MS,
 	STALL_RELEASE_MS,
 } from "../src/core/types";
-import { Daemon, GATE_RESOLVE_CLOSED_SWEEPS } from "../src/daemon/daemon";
-import { runDoctor } from "../src/daemon/doctor";
+import { Daemon, type DaemonOptions, GATE_RESOLVE_CLOSED_SWEEPS } from "../src/daemon/daemon";
+import { checkBackupBundle, runDoctor } from "../src/daemon/doctor";
 import { SWEEP_HEARTBEAT_FILE } from "../src/daemon/heartbeat";
 import { renderStatusText } from "../src/daemon/status";
 import { herdrSshArgv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
@@ -42,9 +44,10 @@ import { createLogger } from "../src/log";
 import { MONITOR_SCHEMA } from "../src/monitors/ledger";
 import { OmpDriverError, type OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import { STAMP_FILE } from "../src/ops/backup";
+import { BackupError, readStamp, runBackup, STAMP_FILE } from "../src/ops/backup";
 import { collectGates, INBOUND_STARVATION_MS, SWEEP_STALLED_MS, TURNS_FAILING_WINDOW_MS } from "../src/ops/gates";
 import { gcSessions } from "../src/ops/gc";
+import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { LOG_FILES, LOG_MAX_BYTES, LogDirError, openLogSink, rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
@@ -135,7 +138,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-ops-"));
 		clock = new FakeClock();
-		store = openBotStore(join(dir, "ompbot.db"), clock);
+		store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 		drivers = [];
 		lines = [];
 		stalls = [];
@@ -145,6 +148,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		driverOptions = { holdTurns: true };
 		const sessions = new FakeSessionStore();
 		router = new OriginRouter({
+			timezone: "Asia/Seoul",
 			store,
 			clock,
 			sessionsRoot: join(dir, "sessions"),
@@ -731,6 +735,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
+			hostLoad: IDLE_HOST_LOAD, // status is read twice (slash, CLI): live load would differ between the readings
 			driverFactory: (_origin, sessionDir) => {
 				const driver = new OpsDriver({ sessionDir, store: sessions, holdTurns, ...(toolCalls ? { toolCalls } : {}) });
 				drivers.push(driver);
@@ -824,8 +829,11 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const cli = await runMain(home.dir, ["status"]);
 		expect(cli.code, cli.stderr).toBe(0);
 		expect(ack?.text).toContain("데몬 실행 중");
-		expect(cli.stdout).toBe(`${ack?.text}\n`);
-		expect(ack?.text).toBe(renderStatusText(daemon.status()));
+		// host_pressure reads this machine's live load and memory at each call: its numbers may move between the reads.
+		const steady = (text: string | undefined) =>
+			text?.replace(/host_pressure load15=\S+ cpus=\d+ mem_avail_pct=\S+/, "host_pressure <live>");
+		expect(steady(cli.stdout)).toBe(`${steady(ack?.text)}\n`);
+		expect(steady(ack?.text)).toBe(steady(renderStatusText(daemon.status())));
 	});
 
 	test("/model-ompbot answers at the top level where it was typed: empty ack, no placeholder root post", async () => {
@@ -848,7 +856,7 @@ describe("alert incidents: owner-notice repeat suppression (store)", () => {
 	test("first occurrence notifies, the same sign stays quiet 24h, then re-alerts; resolve re-arms", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ompbot-incidents-"));
 		const clock = new FakeClock();
-		const store = openBotStore(join(dir, "ompbot.db"), clock);
+		const store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 		try {
 			const scope = "turns:slack/dm/D1";
 			expect(store.recordAlertIncident(scope, "Could not restore model: x", clock.now())).toMatchObject({
@@ -910,7 +918,13 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		home.remove();
 	});
 
-	async function startDaemon(options: { gateSweepMs?: number; failPrompts?: number } = {}): Promise<void> {
+	/**
+	 * `bootBackup` defaults to one that fails, so `backup_age` stays open from boot: most tests here use it as the
+	 * gate they open and close. The boot backup itself is tested with `runBackup`.
+	 */
+	async function startDaemon(
+		options: { gateSweepMs?: number; failPrompts?: number; bootBackup?: DaemonOptions["bootBackup"] } = {},
+	): Promise<void> {
 		const sessions = new FakeSessionStore();
 		const failPrompts = options.failPrompts ?? 0;
 		daemon = new Daemon({
@@ -920,6 +934,11 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
+			bootBackup:
+				options.bootBackup ??
+				(() => {
+					throw new BackupError("vacuum_failed", "boot backup off in this test");
+				}),
 			...(options.gateSweepMs === undefined ? {} : { gateSweepMs: options.gateSweepMs }),
 			driverFactory: (_origin, sessionDir) => {
 				const driver = new OpsDriver({ sessionDir, store: sessions });
@@ -948,6 +967,27 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		clock.advance(6_000);
 		await daemon.sweep();
 		expect(transport.posts((text) => text.includes("게이트 backup_age 열림"))).toHaveLength(1);
+	});
+
+	// doc/plans/first-install-defaults.md AC-2: a first start makes the first backup before the first gate check.
+	test("boot without a stamp: the daemon backs up before the first gate check, so backup_age never opens", async () => {
+		expect(readStamp(join(home.dir, "backups"))).toBeUndefined();
+		await startDaemon({ gateSweepMs: 5_000, bootBackup: runBackup });
+		expect(readStamp(join(home.dir, "backups"))).toBeDefined();
+		await daemon.sweep();
+		expect(gateIncidentStatus("backup_age")).toBeUndefined();
+		expect(daemon.status().openGates.map((gate) => gate.name)).not.toContain("backup_age");
+		expect(transport.posts((text) => text.includes("backup_age"))).toHaveLength(0);
+		expect(lines.some((line) => line.includes("event=boot_backup_done"))).toBe(true);
+	});
+
+	test("a failed boot backup is logged and backup_age still opens and DMs the owner", async () => {
+		await startDaemon({ gateSweepMs: 5_000 }); // the helper's boot backup fails
+		expect(lines.some((line) => line.includes("event=boot_backup_failed"))).toBe(true);
+		const opened = transport.waitForPosts((text) => text.includes("게이트 backup_age 열림"));
+		await daemon.sweep();
+		await opened;
+		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 	});
 
 	test("a socket down for 10+ minutes DMs the owner once (self-report, fake clock)", async () => {
@@ -1332,7 +1372,10 @@ describe("ompbot doctor omp runtime check", () => {
 		);
 		const lines: string[] = [];
 		await runDoctor(dir, (line) => lines.push(line));
-		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(`fail omp runtime: ${folder} unreadable (`);
+		// checkOmpRuntime reports the directory as a problem (the same code the gate and the RPC driver give).
+		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(
+			`fail omp runtime: omp_launcher_unreadable ${folder} cannot be read`,
+		);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
 	});
 
@@ -1349,9 +1392,7 @@ describe("ompbot doctor omp runtime check", () => {
 		expect(lines).toContain(`fail secret slack-app-token: mode=0644 expected=0600 (fix: chmod 600 ${app})`);
 		expect(lines).toContain("fail slack auth.test: skipped: fix the secret lines above first");
 		expect(lines.some((line) => /^(ok|fail) omp: /.test(line))).toBe(true);
-		expect(
-			lines.some((line) => line.startsWith("fail backup bundle: stamp=missing (expected on a first install")),
-		).toBe(true);
+		expect(lines).toContain(FIRST_INSTALL_LINE);
 
 		writeFileSync(bot, "xapp-WRONG-0\n", { mode: 0o600 });
 		chmodSync(app, 0o600);
@@ -1395,7 +1436,33 @@ describe("ompbot doctor backup bundle check", () => {
 		mkdirSync(join(dir, "sessions"), { recursive: true });
 		expect(await bundleLine()).toBe("fail backup bundle: bundle=none (run ompbot backup again)");
 	});
+
+	// doc/plans/first-install-defaults.md AC-1: before the daemon's first start there is no DB to back up.
+	test("first install (no ompbot.db, no stamp): a warning that never counts as a failure", async () => {
+		const lines: string[] = [];
+		let failures = 0;
+		checkBackupBundle(
+			dir,
+			(ok, name, detail) => {
+				if (!ok) failures += 1;
+				lines.push(`${ok ? "ok" : "fail"} ${name}: ${detail}`);
+			},
+			(name, detail) => lines.push(`warn ${name}: ${detail}`),
+		);
+		expect(failures).toBe(0);
+		expect(lines).toEqual([FIRST_INSTALL_LINE]);
+		expect(await bundleLine()).toBe(FIRST_INSTALL_LINE);
+	});
+
+	test("a DB without a stamp (the daemon ran, no backup succeeded) still fails", async () => {
+		new Database(join(dir, "ompbot.db")).close();
+		const line = await bundleLine();
+		expect(line).toStartWith("fail backup bundle: stamp=missing");
+	});
 });
+
+const FIRST_INSTALL_LINE =
+	"warn backup bundle: stamp=missing (first install: the daemon makes the first backup when it starts)";
 
 describe("ompbot doctor dispatch hosts", () => {
 	let home: TestHome;
@@ -1728,7 +1795,7 @@ describe("ompbot gc", () => {
 
 	beforeEach(() => {
 		home = makeHome("ompbot-ops-gc-");
-		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() });
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		store.ensureOrigin(ORIGIN, sessionOf(ORIGIN, 1));
 		store.newEpoch(ORIGIN, sessionOf(ORIGIN, 2));
 		store.newEpoch(ORIGIN, sessionOf(ORIGIN, 3));
@@ -1802,7 +1869,7 @@ describe("ompbot gc: thread-scoped sessions", () => {
 
 	beforeEach(() => {
 		home = makeHome("ompbot-ops-gc-thread-");
-		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() });
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		store.ensureOrigin("slack/ch/C1", sessionOf("slack/ch/C1"));
 		store.ensureOrigin("slack/ch/C1/t/100.1", sessionOf("slack/ch/C1/t/100.1")); // fresh thread: kept
 		store.ensureOrigin("slack/ch/C1/t/50.9", sessionOf("slack/ch/C1/t/50.9")); // expired thread: removed
@@ -1832,13 +1899,69 @@ describe("ompbot gc: thread-scoped sessions", () => {
 		expect(existsSync(sessionOf("slack/ch/C1"))).toBe(true);
 		expect(existsSync(sessionOf("slack/dm/D1"))).toBe(true);
 		// The ledger row is gone; a later message simply opens a fresh origin.
-		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() });
+		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		try {
 			expect(check.getOrigin("slack/ch/C1/t/50.9")).toBeUndefined();
 			expect(check.getOrigin("slack/ch/C1/t/100.1")).toBeDefined();
 		} finally {
 			check.close();
 		}
+	});
+
+	const hasOrigin = (key: string): boolean => {
+		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		try {
+			return check.getOrigin(key) !== undefined;
+		} finally {
+			check.close();
+		}
+	};
+
+	test("an origin directory swapped for a symlink is skipped: nothing outside sessions/ is deleted (J-9)", () => {
+		// slack/dm/D1 moves to epoch 2, and its origin directory becomes a link to a tree whose e1 is old.
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.newEpoch("slack/dm/D1", sessionOf("slack/dm/D1", 2));
+		store.close();
+		const outside = join(home.dir, "outside");
+		makeSession(join(outside, "e1"), 60);
+		rmSync(dirname(sessionOf("slack/dm/D1")), { recursive: true });
+		symlinkSync(outside, dirname(sessionOf("slack/dm/D1")));
+		// The expired thread origin's directory is a link too (backdated, so it reads as expired).
+		const threadOutside = join(home.dir, "thread-outside");
+		makeSession(join(threadOutside, "e1"), 60);
+		const threadDir = dirname(sessionOf("slack/ch/C1/t/50.9"));
+		rmSync(threadDir, { recursive: true });
+		symlinkSync(threadOutside, threadDir);
+		const old = new Date(Date.now() - 60 * DAY_MS);
+		lutimesSync(threadDir, old, old);
+
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
+		expect(existsSync(join(outside, "e1", "session.jsonl"))).toBe(true);
+		expect(result.removed).toEqual([]);
+		expect(existsSync(join(threadOutside, "e1", "session.jsonl"))).toBe(true);
+		expect(result.threadOriginsRemoved).not.toContain("slack/ch/C1/t/50.9");
+		expect(hasOrigin("slack/ch/C1/t/50.9")).toBe(true);
+	});
+
+	test("a thread origin with no directory yet is kept while its ledger row is fresh (J-10)", () => {
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.ensureOrigin("slack/ch/C1/t/200.1", sessionOf("slack/ch/C1/t/200.1")); // row now, no directory yet
+		store.close();
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
+		expect(result.threadOriginsRemoved).toEqual(["slack/ch/C1/t/50.9"]);
+		expect(hasOrigin("slack/ch/C1/t/200.1")).toBe(true);
+	});
+
+	test("an expired thread origin with pending inbound is kept whole (J-11)", () => {
+		const db = new Database(join(home.dir, "ompbot.db"), { strict: true });
+		db.run(
+			"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at) VALUES ('m1', 'slack/ch/C1/t/50.9', 1, 'x', 'pending', 0)",
+		);
+		db.close();
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
+		expect(result.threadOriginsRemoved).toEqual([]);
+		expect(existsSync(sessionOf("slack/ch/C1/t/50.9"))).toBe(true);
+		expect(hasOrigin("slack/ch/C1/t/50.9")).toBe(true);
 	});
 });
 
@@ -1857,7 +1980,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 	}
 
 	function originRow(key: string): boolean {
-		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() });
+		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		try {
 			return check.getOrigin(key) !== undefined;
 		} finally {
@@ -1867,7 +1990,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 
 	beforeEach(() => {
 		home = makeHome("ompbot-ops-gc-monitor-");
-		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() });
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		for (const key of ["monitor/mold", "monitor/mnew", "monitor/mlive", "slack/ch/C1/t/50.9"]) {
 			store.ensureOrigin(key, sessionOf(key));
 		}

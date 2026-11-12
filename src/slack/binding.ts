@@ -24,6 +24,9 @@ export class SlackBinding implements ChannelBinding {
 
 	createAdapter(deps: AdapterDeps): ChannelAdapter {
 		const { config, store } = deps;
+		const slackOwner = config.channels.slack?.ownerUserId;
+		// Bound only when `channels.slack` is set (daemon/run.ts `channelBindings`).
+		if (slackOwner === undefined) throw new Error("SlackBinding needs channels.slack");
 		const transport = this.port.transport;
 		// Missed-message backfill: once at startup (the daemon's `recover()`), then on every socket reconnect. The
 		// adapter's live ingest failures trigger it too: they never advance the watermark, so without this a
@@ -37,7 +40,7 @@ export class SlackBinding implements ChannelBinding {
 			return {
 				transport,
 				ingest: (event) => live.ingestRecovered(event),
-				notifier: (channel, text) => live.postNotice(channel, text),
+				notifier: (channel, text, threadTs) => live.postNotice(channel, text, threadTs),
 				cursors: store,
 				log: deps.log,
 				now: Date.now(),
@@ -69,7 +72,7 @@ export class SlackBinding implements ChannelBinding {
 			transport,
 			core: deps.core,
 			deliveries: deps.deliveries,
-			ownerUserId: config.channels.slack.ownerUserId,
+			ownerUserId: slackOwner,
 			clock: deps.clock,
 			log: deps.log,
 			mediaRoot: join(config.homeDir, "media"),

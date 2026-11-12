@@ -89,9 +89,10 @@ beforeAll(() => {
 	if (!runnable) return;
 	llm = startMockLlm();
 	env = createOmpMockEnv(llm.baseUrl);
-	store = openBotStore(join(env.root, "ompbot.db"), { now: () => now });
+	store = openBotStore(join(env.root, "ompbot.db"), { now: () => now }, "Asia/Seoul");
 	const slash = MOCK_MODEL.indexOf("/");
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock: { now: () => now },
 		sessionsRoot: env.sessionsRoot,

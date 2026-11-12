@@ -38,12 +38,13 @@ let counter = 0;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-btw-"));
-	store = openBotStore(join(dir, "ompbot.db"), clock);
+	store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 	drivers = [];
 	driverOptions = { holdTurns: true };
 	supportsBtw = true;
 	const sessionStore = new FakeSessionStore();
 	router = new OriginRouter({
+		timezone: "Asia/Seoul",
 		store,
 		clock,
 		sessionsRoot: join(dir, "sessions"),
