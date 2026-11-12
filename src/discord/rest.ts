@@ -227,6 +227,11 @@ export class DiscordRest {
 		return { id: body.id, username: typeof body.username === "string" ? body.username : undefined };
 	}
 
+	/** `PATCH /users/@me`: the global display name (DMs and nickname-less servers show it; a username is ASCII only). */
+	async patchCurrentUser(args: { displayName: string }): Promise<void> {
+		await this.#request("PATCH", "/users/@me", { json: { display_name: args.displayName } });
+	}
+
 	async createMessage(args: CreateMessageArgs): Promise<{ id: string }> {
 		checkContent(args.content);
 		const body = await this.#request("POST", `/channels/${args.channelId}/messages`, {
@@ -352,6 +357,11 @@ export class DiscordRest {
 
 	async deleteInteractionResponse(args: { token: string }): Promise<void> {
 		await this.#request("DELETE", `/webhooks/${this.#appId()}/${args.token}/messages/@original`);
+	}
+
+	/** `POST /channels/{id}/typing` (no body): the typing indicator for about 10 s. */
+	async triggerTyping(channelId: string): Promise<void> {
+		await this.#request("POST", `/channels/${channelId}/typing`);
 	}
 
 	/** `PUT /applications/{app}[/guilds/{guild}]/commands`: overwrites the whole set, so a repeat is harmless. */

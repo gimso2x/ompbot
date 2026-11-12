@@ -1,6 +1,7 @@
 // `ompbot inject` into a Discord conversation (doc/plans/discord-parity.md stage 1, AC-3): the marker goes up on the
 // Discord port and the owner message is taken through the Discord adapter's own message path.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { OmpbotConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
@@ -140,5 +141,46 @@ describe("inject into Discord", () => {
 			message_reference: { message_id: card, channel_id: DISCORD_DM },
 		});
 		expect(await result).toBe("replied: 진행");
+	});
+});
+
+// T-20261112-36 AC-1: the inject guard asks for the origin's own adapter, not for Slack.
+describe("inject with one platform configured", () => {
+	function startWith(binding: SlackBinding | DiscordBinding, config: OmpbotConfig = home.config): Promise<Daemon> {
+		const sessions = new FakeSessionStore();
+		const only = new Daemon({
+			config,
+			channels: [binding],
+			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		return only.start().then(() => only);
+	}
+
+	test("a Discord-only daemon takes an inject into discord/dm/<id>", async () => {
+		await daemon.stop();
+		const onlyDiscord = new WaitingDiscordTransport();
+		daemon = await startWith(
+			new DiscordBinding(new DiscordChannel(onlyDiscord, { ownerUserId: DISCORD_OWNER })),
+			withDiscord(home),
+		);
+		const { nonce, threadRef } = await daemon.inject({ origin: DM_ORIGIN, asOwner: true, text: "디스코드만" });
+		const marker = onlyDiscord.posts((text) => text.startsWith(`🧪 inject ${nonce}`))[0];
+		expect(marker?.channelId).toBe(DISCORD_DM);
+		expect(threadRef).toBe(`${DISCORD_DM}:${marker?.id}`);
+		expect(daemon.store.getInbound(threadRef)?.originKey).toBe(DM_ORIGIN);
+		await onlyDiscord.waitForPosts((text) => text.includes("ECHO 디스코드만"));
+	});
+
+	test("a Slack-only daemon refuses discord/... with `discord is not configured`", async () => {
+		await daemon.stop();
+		const onlySlack = new WaitingTransport();
+		daemon = await startWith(new SlackBinding(new SlackChannel(onlySlack)));
+		await expect(daemon.inject({ origin: DM_ORIGIN, asOwner: true, text: "x" })).rejects.toThrow(
+			"discord is not configured",
+		);
+		expect(onlySlack.posts()).toHaveLength(0);
 	});
 });

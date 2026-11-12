@@ -35,9 +35,15 @@ export interface DiscordMessageEvent {
 	type: number;
 	mentions?: ReadonlyArray<DiscordUser> | undefined;
 	message_reference?: { message_id?: string; channel_id?: string; guild_id?: string } | undefined;
+	/** The message a reply (type 19) answers; `null` when it was deleted. Its author or text can be missing. */
+	referenced_message?: { id: string; author?: DiscordUser | null; content?: string } | null | undefined;
 	attachments?: ReadonlyArray<DiscordAttachment> | undefined;
 	/** Rich embeds of the message (a peer bot's card); only their text is read. */
 	embeds?: ReadonlyArray<{ title?: string | undefined; description?: string | undefined }> | undefined;
+	/** A forwarded message (`message_reference.type` 1): its own `content` is empty, the original is in here. */
+	message_snapshots?:
+		| ReadonlyArray<{ message?: { content?: string; attachments?: ReadonlyArray<DiscordAttachment> } | undefined }>
+		| undefined;
 	timestamp?: string | undefined;
 }
 
@@ -221,6 +227,8 @@ export interface DiscordTransport {
 	editInteractionResponse(args: EditInteractionResponseArgs): Promise<void>;
 	deleteInteractionResponse(args: { token: string }): Promise<void>;
 	registerCommands(args: RegisterCommandsArgs): Promise<void>;
+	/** `POST /channels/{id}/typing`: Discord shows "typing…" in that channel for about 10 s. */
+	triggerTyping(channelId: string): Promise<void>;
 }
 
 /** HTTP 429 or a route whose bucket is spent; `retryAfterMs` is when the route opens again. */

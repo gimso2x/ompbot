@@ -111,6 +111,72 @@ describe("completion copies to the log channel", () => {
 	});
 });
 
+describe("completion copies per platform: the Discord log channel (channels.discord.logChannelId)", () => {
+	const DLOG = "678901234567890123";
+	const DDM = "123456789012345678";
+	const DCH = "111111111111111111";
+	const DTHREAD = "711111111111111111";
+	const discordCopies = () =>
+		store
+			.listDeliveries()
+			.filter((row) => row.threadRef === `${DLOG}:-`)
+			.map((row) => row.body);
+	/** Reopens the shared store with `logChannel`. */
+	const reopen = (logChannel: { slack?: string; discord?: string }) => {
+		store.close();
+		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "two.db"), clock, redact, logChannel });
+	};
+
+	test("a Discord DM's completion goes to the Discord log channel once, labelled DM, with its thread link", () => {
+		reopen({ slack: LOG, discord: DLOG });
+		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000001`, "✅ 완료: 디스코드\n세부");
+		expect(discordCopies()).toEqual([
+			`📒 완료 보고 사본 · DM{{thread-link:${DDM}:700000000000000001}}\n✅ 완료: 디스코드\n세부`,
+		]);
+		expect(copies()).toEqual([]);
+		// A replay of the same answer adds nothing.
+		store.recordAnswer({
+			originKey: `discord/dm/${DDM}`,
+			opRef: "op1",
+			threadRef: `${DDM}:700000000000000001`,
+			parts: ["✅ 완료: 디스코드\n세부"],
+		});
+		expect(discordCopies()).toHaveLength(1);
+	});
+
+	test("a Discord server thread is labelled <#channel>; a Slack chat still goes to the Slack #log only", () => {
+		reopen({ slack: LOG, discord: DLOG });
+		answer(`discord/ch/${DCH}/t/${DTHREAD}`, `${DCH}:${DTHREAD}`, "✅ 완료 서버");
+		expect(discordCopies()).toEqual([`📒 완료 보고 사본 · <#${DCH}>{{thread-link:${DCH}:${DTHREAD}}}\n✅ 완료 서버`]);
+		answer("slack/ch/C0WORK00001", "C0WORK00001:1700.000001", "✅ 완료 슬랙", "op2");
+		expect(copies()).toEqual([
+			"📒 완료 보고 사본 · <#C0WORK00001>{{thread-link:C0WORK00001:1700.000001}}\n✅ 완료 슬랙",
+		]);
+		expect(discordCopies()).toHaveLength(1);
+	});
+
+	test("a lane copies to its thread's platform: a Discord lane thread to the Discord log channel", () => {
+		reopen({ slack: LOG, discord: DLOG });
+		answer("ompbot/work/demo", `${DCH}:${DTHREAD}`, "✅ 완료: 레인");
+		expect(discordCopies()).toEqual([
+			`📒 완료 보고 사본 · 작업 레인 demo{{thread-link:${DCH}:${DTHREAD}}}\n✅ 완료: 레인`,
+		]);
+		answer("ompbot/work/slack-lane", "D1:1700.000002", "✅ 완료: 슬랙 레인", "op2");
+		expect(copies()).toHaveLength(1);
+	});
+
+	test("no Discord log channel: a Discord completion is copied nowhere (never to the Slack #log)", () => {
+		reopen({ slack: LOG });
+		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000001`, "✅ 완료");
+		expect(store.listDeliveries().filter((row) => row.body.startsWith("📒"))).toEqual([]);
+		store.setLogChannel({ discord: DLOG });
+		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000002`, "✅ 완료 둘", "op2");
+		answer("slack/dm/D1", "D1:1700.000003", "✅ 완료 슬랙", "op3");
+		expect(discordCopies()).toHaveLength(1);
+		expect(copies()).toEqual([]);
+	});
+});
+
 function makeAdapter(transport: FakeSlackTransport, recorded: string[]): SlackAdapter {
 	const adapter = new SlackAdapter({
 		transport,

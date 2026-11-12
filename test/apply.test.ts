@@ -11,18 +11,22 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { homeDeps } from "../src/cli/apply";
+import { APPLY_USAGE, applyCommand, homeDeps } from "../src/cli/apply";
+import { waitForDrain } from "../src/cli/drain";
+import { RESTART_CUT_FILE } from "../src/daemon/recovery";
 import {
 	type ApplyDeps,
 	type ApplyOptions,
 	type ApplyReceipt,
 	createApplyLock,
 	findDaemonUnits,
+	isReportOrigin,
 	type PeerApply,
 	parseApplyLock,
 	type RunResult,
 	reclaimStaleApplyLock,
 	releaseApplyLock,
+	reportThreadPattern,
 	revertCommandFor,
 	runApply,
 } from "../src/ops/apply";
@@ -61,6 +65,9 @@ interface World {
 	restartRc: number;
 	activeRc: number;
 	drainCancels: number;
+	/** `drain_cut` requests the daemon got; each one writes the cut record as the daemon would. */
+	drainCuts: unknown[];
+	drainCutResponse: unknown;
 	/** Whether a restart yields a freshly started daemon (lock startedAt after the restart). */
 	restartMakesFreshDaemon: boolean;
 	lockStartedAt: number | undefined;
@@ -89,6 +96,8 @@ function makeWorld(): World {
 		restartRc: 0,
 		activeRc: 0,
 		drainCancels: 0,
+		drainCuts: [],
+		drainCutResponse: { ok: true, opRefs: 1, approvals: 1 },
 		restartMakesFreshDaemon: true,
 		lockStartedAt: T0 - 3_600_000,
 		commands: [],
@@ -155,6 +164,11 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 				return world.injectResponse;
 			}
 			if (op === "drain_cancel") world.drainCancels += 1;
+			if (op === "drain_cut") {
+				world.drainCuts.push(request);
+				writeFileSync(join(home, RESTART_CUT_FILE), '{"at":0,"applyStamp":"x","opRefs":[]}', { mode: 0o600 });
+				return world.drainCutResponse;
+			}
 			return { ok: true, status: {} };
 		},
 		drain: async () => {
@@ -1018,5 +1032,178 @@ describe("runApply report inject retry", () => {
 			expect(readReceipt(receipt).report?.detail).toBe("inject failed attempts=6: Failed to connect");
 			expect(exitCode).toBe(drainOk ? 0 : 1); // the same exit as an apply without a report
 		}
+	});
+});
+
+// T-20261112-36 AC-2: the apply report also goes to a Discord DM or channel, with a Discord message id as its thread.
+describe("apply report origin on Discord", () => {
+	const DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
+	const CH = "111111111111111111"; // gitleaks:allow (fake snowflake)
+	const MESSAGE = "700000000000000001"; // gitleaks:allow (fake snowflake)
+
+	test("isReportOrigin takes Slack and Discord DM/channel origins, never a thread origin", () => {
+		expect(isReportOrigin(`discord/dm/${DM}`)).toBe(true);
+		expect(isReportOrigin(`discord/ch/${CH}`)).toBe(true);
+		expect(isReportOrigin(`discord/ch/${CH}/t/222222222222222222`)).toBe(false);
+		expect(isReportOrigin("slack/ch/C0123456789")).toBe(true);
+		expect(isReportOrigin("slack/dm/D0123456789")).toBe(true);
+		expect(isReportOrigin("slack/ch/C1/t/100.1")).toBe(false);
+		expect(isReportOrigin("telegram/dm/1")).toBe(false);
+	});
+
+	test("the report thread is a snowflake for a Discord origin and a ts for a Slack one", () => {
+		expect(reportThreadPattern(`discord/dm/${DM}`).test(MESSAGE)).toBe(true);
+		expect(reportThreadPattern(`discord/dm/${DM}`).test("1793318305.840629")).toBe(false);
+		expect(reportThreadPattern("slack/ch/C0123456789").test("1793318305.840629")).toBe(true);
+		expect(reportThreadPattern("slack/ch/C0123456789").test(MESSAGE)).toBe(false);
+	});
+
+	test("the CLI refuses a thread of the other platform's form with a usage error naming both forms", async () => {
+		const written: string[] = [];
+		const write = process.stderr.write;
+		process.stderr.write = ((chunk: string) => {
+			written.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			const home = mkdtempSync(join(tmpdir(), "ompbot-apply-cli-"));
+			const codes = [
+				await applyCommand(["--report-origin", `discord/dm/${DM}`, "--report-thread", "1793318305.840629"], home),
+				await applyCommand(["--report-origin", "slack/ch/C0123456789", "--report-thread", MESSAGE], home),
+				await applyCommand(["--report-origin", `discord/ch/${CH}/t/${MESSAGE}`], home),
+			];
+			rmSync(home, { recursive: true, force: true });
+			expect(codes).toEqual([2, 2, 2]);
+		} finally {
+			process.stderr.write = write;
+		}
+		const text = written.join("");
+		expect(text).toContain(
+			"--report-origin must be slack/ch/<channel id>, slack/dm/<dm id>, discord/ch/<channel id> or discord/dm/<dm id>",
+		);
+		expect(text).toContain(
+			"--report-thread needs --report-origin and a Slack ts like 1793318305.840629 (slack/...) or a Discord message id (discord/...)",
+		);
+	});
+
+	test("APPLY_USAGE and docs/guide.md show the Discord report form", () => {
+		expect(APPLY_USAGE).toContain("--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>>");
+		const guide = readFileSync(join(import.meta.dir, "..", "docs", "guide.md"), "utf8");
+		expect(guide).toContain("--report-origin discord/dm/<DM ID> --report-thread <메시지 ID>");
+	});
+
+	test("the report inject carries the Discord origin and thread as given", async () => {
+		const world = makeWorld();
+		await runApply({ ...base, reportOrigin: `discord/dm/${DM}`, reportThread: MESSAGE }, makeDeps(world));
+		expect(world.injects).toHaveLength(1);
+		expect(world.injects[0]).toMatchObject({ origin: `discord/dm/${DM}`, thread: MESSAGE, asOwner: true });
+	});
+});
+
+describe("runApply drain cut (--cut-after)", () => {
+	const BUSY = { ok: true as const, draining: true, turns: 1, hostTools: 0, approvals: 1 };
+
+	/** The real drain wait against a daemon that never goes idle, on the world's clock. */
+	function busyDrain(world: World): Partial<ApplyDeps> {
+		return {
+			drain: (timeoutMin, cutAfterMin) => {
+				world.drains += 1;
+				return waitForDrain({
+					call: async (op) => {
+						if (op === "drain_cancel") {
+							world.drainCancels += 1;
+							return { ...BUSY, draining: false };
+						}
+						return BUSY;
+					},
+					timeoutMin,
+					...(cutAfterMin === undefined ? {} : { cutAfterMin }),
+					now: () => world.clock,
+					sleep: async (ms) => {
+						world.clock += ms;
+					},
+				});
+			},
+		};
+	}
+
+	test("--cut-after 1 with a turn left: drain ok with cut=true, one drain_cut, the restart goes ahead, the record is removed", async () => {
+		const world = makeWorld();
+		let recordAtRestart = false;
+		world.onRestart = () => {
+			recordAtRestart = existsSync(join(home, RESTART_CUT_FILE));
+		};
+		const { exitCode, receipt } = await runApply({ ...base, cutAfterMin: 1 }, makeDeps(world, busyDrain(world)));
+		expect(exitCode).toBe(0);
+		const drain = readReceipt(receipt).steps.find((s) => s.name === "drain");
+		expect(drain).toMatchObject({ ok: true, detail: "cut=true turns=1 hostTools=0 approvals=1" });
+		expect(world.drainCuts).toEqual([{ op: "drain_cut", applyStamp: base.stamp }]);
+		expect(world.drainCancels).toBe(0);
+		expect(restartCommands(world)).toHaveLength(1);
+		expect(recordAtRestart).toBe(true);
+		expect(existsSync(join(home, RESTART_CUT_FILE))).toBe(false);
+		// The cut comes at its limit, not at the drain timeout.
+		expect(drain?.ms).toBe(60_000);
+	});
+
+	test("--cut-after 0 keeps the old behaviour: the timeout cancels the drain and nothing restarts", async () => {
+		const world = makeWorld();
+		const { exitCode, receipt } = await runApply({ ...base, cutAfterMin: 0 }, makeDeps(world, busyDrain(world)));
+		expect(exitCode).toBe(1);
+		expect(receipt.steps.at(-1)).toMatchObject({
+			name: "drain",
+			ok: false,
+			detail: "timeout after 5 min (drain cancelled)",
+		});
+		expect(world.drainCuts).toEqual([]);
+		expect(world.drainCancels).toBe(1);
+		expect(restartCommands(world)).toHaveLength(0);
+	});
+
+	test("a drain_cut the daemon does not confirm ends like a timeout: drain cancelled, no restart", async () => {
+		const world = makeWorld();
+		world.drainCutResponse = { ok: false, error: "EISDIR" };
+		const { exitCode, receipt } = await runApply({ ...base, cutAfterMin: 1 }, makeDeps(world, busyDrain(world)));
+		expect(exitCode).toBe(1);
+		const drain = receipt.steps.at(-1);
+		expect(drain).toMatchObject({ name: "drain", ok: false });
+		expect(drain?.detail).toContain("drain_cut refused");
+		expect(drain?.detail).toContain("drain cancelled");
+		expect(world.drainCancels).toBe(1);
+		expect(restartCommands(world)).toHaveLength(0);
+	});
+
+	test("a rollback restart still sees the record; the failed apply removes it at its end (AC-8)", async () => {
+		const world = makeWorld();
+		world.restartMakesFreshDaemon = false;
+		const seen: boolean[] = [];
+		world.onRestart = (n) => {
+			seen.push(existsSync(join(home, RESTART_CUT_FILE)));
+			if (n === 2) world.restartMakesFreshDaemon = true;
+		};
+		const { exitCode, receipt } = await runApply({ ...base, cutAfterMin: 1 }, makeDeps(world, busyDrain(world)));
+		expect(exitCode).toBe(1);
+		expect(receipt.steps.map((s) => [s.name, s.ok])).toEqual([
+			["preflight", true],
+			["backup", true],
+			["drain", true],
+			["restart", true],
+			["ready", false],
+			["rollback", true],
+		]);
+		expect(seen).toEqual([true, true]);
+		expect(existsSync(join(home, RESTART_CUT_FILE))).toBe(false);
+	});
+
+	test("an apply that did not cut leaves a record it did not write alone", async () => {
+		const world = makeWorld();
+		writeFileSync(join(home, RESTART_CUT_FILE), "{}");
+		expect((await runApply(base, makeDeps(world))).exitCode).toBe(0);
+		expect(existsSync(join(home, RESTART_CUT_FILE))).toBe(true);
+	});
+
+	test("the CLI rejects a --cut-after that is not a number of minutes", async () => {
+		expect(await applyCommand(["--cut-after", "five"], home)).toBe(2);
+		expect(APPLY_USAGE).toContain("--cut-after <min>");
 	});
 });

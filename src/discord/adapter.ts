@@ -82,6 +82,12 @@ const EPHEMERAL = 64;
 const SEEN_INTERACTIONS_MAX = 1000;
 /** Messages whose refused-thread notice was posted; the set is emptied past this. */
 const THREAD_NOTICE_MEMORY = 1000;
+/** Discord shows "typing…" for about 10 s per call: one call every 8 s keeps it on without a gap. */
+const TYPING_INTERVAL_MS = 8_000;
+/** Typing stops this long after the message; a longer turn shows its progress in the status message. */
+const TYPING_MAX_MS = 330_000;
+/** Characters of the replied-to post put in the prompt's context line. */
+const REPLY_CONTEXT_MAX = 300;
 
 /** What each slash command does, as its picker shows it (Slack's manifest wording; Discord allows 1–100 characters). */
 const COMMAND_DESCRIPTIONS: Record<CommandKind, string> = {
@@ -133,6 +139,8 @@ export interface DiscordAdapterOptions {
 	guildIds?: readonly string[] | undefined;
 	/** Channel ids where the owner's message counts as addressed without a mention. */
 	mentionFreeChannels?: readonly string[] | undefined;
+	/** The Discord #log ledger channel (`channels.discord.logChannelId`): inbound there or in its threads never becomes a turn. */
+	logChannel?: string | undefined;
 	/** In a server channel only a mention addresses the bot. */
 	requireMention?: boolean | undefined;
 	/** Peer bots whose server channel messages that mention this bot are taken (`channels.discord.peerBots`). */
@@ -151,6 +159,27 @@ export interface DiscordAdapterOptions {
 	/** Directory for downloaded inbound attachments (`<home>/media`); without it attachments are skipped with a note. */
 	mediaRoot?: string | undefined;
 	statusIntervalMs?: number | undefined;
+	/** The typing indicator's interval timer (tests fire it by hand). Default `setInterval`/`clearInterval`, unref'd. */
+	typingTimers?: TypingTimers | undefined;
+}
+
+export interface TypingTimers {
+	set(fn: () => unknown, ms: number): unknown;
+	clear(handle: unknown): void;
+}
+
+const INTERVAL_TIMERS: TypingTimers = {
+	set: (fn, ms) => setInterval(fn, ms).unref(),
+	clear: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+};
+
+/** One thread's typing indicator, from the owner message until the first answer, the turn's end or the cap. */
+interface TypingEntry {
+	/** Where "typing…" shows: the thread channel, or the DM. Unknown until the lookup settles. */
+	channelId: string | undefined;
+	startedAt: number;
+	handle: unknown;
+	stopped: boolean;
 }
 
 /** Where one owner message is: the channel it was posted in and its id (👀 goes there). */
@@ -179,7 +208,7 @@ interface StatusEntry {
 }
 
 /** One adapter-level block per kind of call: a 429 on posting must not stop status edits, and the other way round. */
-type Route = "post" | "edit" | "delete" | "react";
+type Route = "post" | "edit" | "delete" | "react" | "typing";
 
 function errorText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
@@ -196,14 +225,18 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #log: Logger;
 	readonly #guildIds: ReadonlySet<string> | undefined;
 	#mentionFree: ReadonlySet<string>;
+	readonly #logChannel: string | undefined;
 	#requireMention: boolean;
 	readonly #peerBots: PeerBotList;
-	readonly #peerHopLimit: { turns: number; windowMinutes: number };
+	#peerHopLimit: { turns: number; windowMinutes: number };
 	readonly #isTaskRoot: ((threadRef: string) => boolean) | undefined;
 	readonly #onInboundFailure: (() => void) | undefined;
 	readonly #mediaRoot: string | undefined;
 	readonly #statusIntervalMs: number;
 	readonly #statuses = new Map<string, StatusEntry>();
+	/** Typing per thread ref; a stopped entry stays until finishStatus so the same turn is not typed again. */
+	readonly #typing = new Map<string, TypingEntry>();
+	readonly #typingTimers: TypingTimers;
 	readonly #blockedUntil = new Map<Route, number>();
 	readonly #pump: DeliveryPump;
 	readonly #recovery: DiscordBackfill | undefined;
@@ -211,6 +244,8 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #seenInteractions = new Set<string>();
 	/** Messages whose refused thread start already left the channel notice (`#startThread`). */
 	readonly #threadNoticeSent = new Set<string>();
+	/** Recovered server roots that opened their thread, until their scan's notice picks one (`#recoveryNotice`). */
+	readonly #recoveredThreads = new Set<string>();
 	#ready: Promise<string | undefined> = Promise.resolve(undefined);
 	/** The start-time slash command registration; settles (never rejects) once every scope was tried. */
 	#commands: Promise<void> = Promise.resolve();
@@ -228,6 +263,7 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#log = options.log;
 		this.#guildIds = options.guildIds === undefined ? undefined : new Set(options.guildIds);
 		this.#mentionFree = new Set(options.mentionFreeChannels ?? []);
+		this.#logChannel = options.logChannel;
 		this.#requireMention = options.requireMention === true;
 		this.#peerBots = options.peerBots ?? [];
 		this.#peerHopLimit = options.peerHopLimit ?? DEFAULT_PEER_HOP_LIMIT;
@@ -235,6 +271,7 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#onInboundFailure = options.onInboundFailure;
 		this.#mediaRoot = options.mediaRoot;
 		this.#statusIntervalMs = options.statusIntervalMs ?? STATUS_MIN_INTERVAL_MS;
+		this.#typingTimers = options.typingTimers ?? INTERVAL_TIMERS;
 		this.#pump = new DeliveryPump({
 			source: options.deliveries,
 			sender: this.#sender(),
@@ -259,7 +296,15 @@ export class DiscordAdapter implements ChannelAdapter {
 							if (info.guildId === undefined) return { dm: true };
 							return { dm: false, guildId: info.guildId };
 						},
-						ingest: (event) => this.#processMessage(event, []),
+						ingest: async (event) => {
+							let opened = false;
+							const outcome = await this.#processMessage(event, [], false, () => {
+								opened = true;
+							});
+							if (opened && outcome === "recorded") this.#recoveredThreads.add(event.id);
+							return outcome;
+						},
+						notify: (target) => this.#recoveryNotice(target),
 					});
 	}
 
@@ -323,6 +368,8 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	async stop(): Promise<void> {
+		for (const typing of this.#typing.values()) this.#haltTyping(typing);
+		this.#typing.clear();
 		await this.#transport.stop();
 	}
 
@@ -340,8 +387,13 @@ export class DiscordAdapter implements ChannelAdapter {
 		return this.#recovery?.waitForIdle() ?? Promise.resolve();
 	}
 
-	/** Discord's policy keys live under `channels.discord`, which needs a restart; the top-level Slack keys do not apply. */
-	setChannelPolicy(_policy: ChannelPolicy): void {}
+	/**
+	 * Config reload. Discord's own policy keys live under `channels.discord`, which needs a restart; of the top-level
+	 * keys only `peerHopLimit` is shared by both platforms, so only it is taken here.
+	 */
+	setChannelPolicy(policy: ChannelPolicy): void {
+		this.#peerHopLimit = policy.peerHopLimit ?? DEFAULT_PEER_HOP_LIMIT;
+	}
 
 	/** An owner message the daemon puts in, fed through the live path as the owner's own message. */
 	async ingestOwner(input: OwnerIngest): Promise<IngestOutcome> {
@@ -405,6 +457,26 @@ export class DiscordAdapter implements ChannelAdapter {
 		} catch (err) {
 			this.#log.warn(event, { channel: conversationId, error: errorText(err) });
 		}
+	}
+
+	/**
+	 * Slack's recovery notice where the recovered answers show: a reply to the oldest recovered DM message, or in the
+	 * thread of the oldest recovered server root that opened one. A thread channel gets none (its answers are in it),
+	 * nor does a channel whose recovered messages opened no thread (commands): the channel body stays clean.
+	 */
+	async #recoveryNotice(target: { channelId: string; dm: boolean; recovered: readonly string[] }): Promise<void> {
+		const opened = target.recovered.filter((id) => this.#recoveredThreads.delete(id));
+		const anchor = (target.dm ? target.recovered : opened).reduce<string | undefined>(
+			(min, id) => (min === undefined || BigInt(id) < BigInt(min) ? id : min),
+			undefined,
+		);
+		if (anchor === undefined) return;
+		await this.#postText(
+			target.channelId,
+			anchor,
+			`⏬ 봇이 응답하지 못한 동안 도착한 메시지 ${target.recovered.length}건을 처리합니다`,
+			"backfill_notice_failed",
+		);
 	}
 
 	/** Best-effort notice at the channel's top level, or under `threadId` (a thread, or the message it answers). */
@@ -609,11 +681,34 @@ export class DiscordAdapter implements ChannelAdapter {
 		return "dropped";
 	}
 
-	/** `injected`: an `ompbot inject` message (`OwnerIngest.injected`), which may not answer a card. */
+	/**
+	 * The prompt's context line for a reply: `답장 대상(<author>): <first 300 characters>`, fenced with the other quoted
+	 * material. Only a post of this bot, the owner or a peer bot is quoted; a deleted post, one without its author or
+	 * text, and anyone else's post give none. No extra Discord call: what the event carries is all there is.
+	 */
+	#replyContext(ref: DiscordMessageEvent["referenced_message"], botUserId: string): string | undefined {
+		const author = ref?.author?.id;
+		const content = ref?.content?.replace(/\s+/g, " ").trim() ?? "";
+		if (author === undefined || content === "") return undefined;
+		const label =
+			author === botUserId
+				? "이 봇"
+				: isOwner(author, this.#owner)
+					? "오너"
+					: this.#peerBots.find((p) => p.userId === author)?.name;
+		if (label === undefined) return undefined;
+		return `답장 대상(${label}): ${cutCodePointSafe(content, REPLY_CONTEXT_MAX)}`;
+	}
+
+	/**
+	 * `injected`: an `ompbot inject` message (`OwnerIngest.injected`), which may not answer a card. `onThread`: told when
+	 * the message opened its own thread (recovery picks its notice's place by it).
+	 */
 	async #processMessage(
 		event: DiscordMessageEvent,
 		quoted: readonly string[],
 		injected = false,
+		onThread?: () => void,
 	): Promise<IngestOutcome> {
 		if (!READ_TYPES.has(event.type)) return this.#drop(event, "subtype");
 		const botUserId = await this.#ready;
@@ -641,6 +736,8 @@ export class DiscordAdapter implements ChannelAdapter {
 				conversationId = info.parentId;
 				threadId = event.channel_id;
 			}
+			// The log channel is a ledger, not a conversation: nothing said there or in its threads reaches omp.
+			if (conversationId === this.#logChannel) return this.#drop(event, "log_channel");
 		}
 		const spot: MessageSpot = { channelId: event.channel_id, messageId: event.id };
 		let text = event.content;
@@ -649,9 +746,11 @@ export class DiscordAdapter implements ChannelAdapter {
 			| undefined;
 		if (!dm) {
 			const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`];
+			const repliesToBot = event.referenced_message?.author?.id === botUserId;
+			// A pinging reply lists its target under `mentions`: for a reply to this bot only a mention in the text counts.
 			const mentioned =
 				tokens.some((token) => text.includes(token)) ||
-				(event.mentions?.some((user) => user.id === botUserId) ?? false);
+				(!repliesToBot && (event.mentions?.some((user) => user.id === botUserId) ?? false));
 			for (const token of tokens) text = text.split(token).join(" ");
 			text = text.trim();
 			const cardReply = await this.#processCardReply(event, conversationId, threadId, text, spot, injected);
@@ -660,25 +759,45 @@ export class DiscordAdapter implements ChannelAdapter {
 			const muteRef = threadRefOf(conversationId, threadId ?? event.id);
 			const muted = this.#core.isThreadMuted?.(muteRef) === true;
 			const command = parseThreadMuteCommand(text);
+			// A message that mentions a peer bot but not this bot is meant for the peer, whatever the channel policy says.
+			const forPeer =
+				!mentioned &&
+				this.#peerBots.some(
+					(p) =>
+						text.includes(`<@${p.userId}>`) ||
+						text.includes(`<@!${p.userId}>`) ||
+						(event.mentions?.some((user) => user.id === p.userId) ?? false),
+				);
+			// A reply to this bot's post addresses it like a mention (requireMention and the mute release included),
+			// unless its text mentions only a peer: then `forPeer` wins.
+			const addressed = mentioned || (repliesToBot && !forPeer);
 			const audible = this.#requireMention
-				? mentioned
+				? addressed
 				: this.#mentionFree.has(conversationId) ||
-					mentioned ||
+					addressed ||
 					(threadRef !== undefined && this.#core.knowsThread?.(threadRef) === true);
-			if (!audible || !(mentioned || command !== undefined || !muted)) {
+			if (!audible || forPeer || !(addressed || command !== undefined || !muted)) {
 				return this.#drop(event, muted ? "thread_muted" : "not_addressed");
 			}
-			muteContext = { ref: muteRef, mentioned, muted, command };
+			muteContext = { ref: muteRef, mentioned: addressed, muted, command };
 		} else {
 			const cardReply = await this.#processCardReply(event, conversationId, undefined, text, spot, injected);
 			if (cardReply !== undefined) return cardReply;
 		}
+		const replyContext = this.#replyContext(event.referenced_message, botUserId);
+		// A forward's text is the snapshots', fenced like Slack's shared messages; their files are not fetched.
+		const snapshots = event.message_snapshots ?? [];
+		const forwarded = snapshots
+			.map((snapshot) => snapshot.message?.content ?? "")
+			.filter((content) => content.trim() !== "");
+		const forwardedFiles = snapshots.reduce((sum, snapshot) => sum + (snapshot.message?.attachments?.length ?? 0), 0);
+		const forwardNote = forwardedFiles === 0 ? [] : [`[전달된 첨부 ${forwardedFiles}개는 받지 않았습니다]`];
 		const args = {
 			userId: event.author.id,
 			botUserId,
 			ownerUserId: this.#owner,
 			text,
-			quoted,
+			quoted: [...quoted, ...forwarded, ...(replyContext === undefined ? [] : [replyContext])],
 			channel: conversationId,
 			ts: event.id,
 			threadTs: threadId,
@@ -688,7 +807,12 @@ export class DiscordAdapter implements ChannelAdapter {
 		// The owner gate and addressing are settled above, before any download; the placeholder only stands in for the
 		// notes the download adds to an empty text.
 		const files = event.attachments ?? [];
-		const gate = normalizeInbound({ ...args, text: files.length > 0 && text.trim() === "" ? "[file]" : text });
+		const gate = normalizeInbound({
+			...args,
+			text: [files.length > 0 && text.trim() === "" ? "[file]" : text, ...forwardNote]
+				.filter((line) => line.trim() !== "")
+				.join("\n"),
+		});
 		if (!gate.accept) return this.#drop(event, gate.reason);
 		const muteCommand = muteContext?.command ?? (dm ? parseThreadMuteCommand(text) : undefined);
 		if (muteCommand !== undefined) {
@@ -708,10 +832,14 @@ export class DiscordAdapter implements ChannelAdapter {
 		// A server root that is no command opens its own thread, the way a Slack root opens its own origin.
 		let inbound = gate.inbound;
 		const opensThread = !dm && threadId === undefined && parseChatOrigin(inbound.originKey)?.threadId !== undefined;
-		if (opensThread) await this.#startThread(conversationId, event, text);
+		if (opensThread) {
+			// A forward has no text of its own: its thread is named after the original.
+			await this.#startThread(conversationId, event, text.trim() === "" ? (forwarded[0] ?? "") : text);
+			onThread?.();
+		}
 		if (opensThread || files.length > 0) {
 			const notes = files.length === 0 ? [] : await this.#collectAttachments(event, files);
-			const body = [text.trim(), ...notes].filter((line) => line !== "").join("\n");
+			const body = [text.trim(), ...forwardNote, ...notes].filter((line) => line !== "").join("\n");
 			const final = normalizeInbound({ ...args, text: body, ...(opensThread ? { threadTs: event.id } : {}) });
 			if (!final.accept) return this.#drop(event, final.reason);
 			inbound = final.inbound;
@@ -724,8 +852,10 @@ export class DiscordAdapter implements ChannelAdapter {
 		const parsed = parseThreadRef(inbound.threadRef);
 		if (parsed !== undefined) {
 			const command = parseCommand(inbound.text);
+			const showStatus = command === undefined || command.kind === "followup";
 			await this.#beginStatus(inbound.threadRef, parsed.channel, parsed.threadTs, spot, inbound.originKey, {
-				showStatus: command === undefined || command.kind === "followup",
+				showStatus,
+				typing: showStatus,
 			});
 		}
 		return "recorded";
@@ -761,6 +891,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			conversationId = info.parentId;
 			threadId = event.channel_id;
 		}
+		if (conversationId === this.#logChannel) return drop("log_channel");
 		// A root's keys are those of the thread the owner path would open from it (Discord: thread id = message id).
 		const root = threadId ?? event.id;
 		const threadRef = threadRefOf(conversationId, root);
@@ -917,7 +1048,10 @@ export class DiscordAdapter implements ChannelAdapter {
 				this.#log.info("inbound_duplicate", { id: platformMessageId });
 				return "duplicate";
 			}
-			await this.#beginStatus(threadRef, conversationId, card, spot, result.originKey, { showStatus: true });
+			await this.#beginStatus(threadRef, conversationId, card, spot, result.originKey, {
+				showStatus: true,
+				typing: true,
+			});
 			return "recorded";
 		}
 		return undefined;
@@ -963,21 +1097,25 @@ export class DiscordAdapter implements ChannelAdapter {
 		}
 	}
 
-	/** Registers the thread before any await, so a delivery finishing it meanwhile waits for `setup`. */
+	/**
+	 * Registers the thread before any await, so a delivery finishing it meanwhile waits for `setup`. `typing`: an owner
+	 * message whose turn shows its status also gets the typing indicator (a peer's never does).
+	 */
 	#beginStatus(
 		threadRef: string,
 		conversationId: string,
 		root: string,
 		spot: MessageSpot,
 		originKey: string,
-		options: { showStatus: boolean },
+		options: { showStatus: boolean; typing?: boolean },
 	): Promise<void> {
+		const typing = options.typing === true ? this.#startTyping(threadRef, conversationId, root) : undefined;
 		const ack = this.#acknowledge(spot, originKey);
 		const existing = this.#statuses.get(threadRef);
 		if (existing !== undefined && existing.final === undefined) {
 			existing.reactions.set(spot.messageId, spot.channelId);
 			existing.setup = Promise.all([existing.setup, ack]).then(() => undefined);
-			return existing.setup;
+			return Promise.all([existing.setup, typing]).then(() => undefined);
 		}
 		const now = this.#clock.now();
 		const entry: StatusEntry = {
@@ -1000,7 +1138,68 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#statuses.set(threadRef, entry);
 		const created = options.showStatus ? this.#createStatus(threadRef, entry) : Promise.resolve();
 		entry.setup = Promise.all([ack, created]).then(() => undefined);
-		return entry.setup;
+		return Promise.all([entry.setup, typing]).then(() => undefined);
+	}
+
+	// ---- typing indicator ----
+
+	/**
+	 * Types once at once, then every `TYPING_INTERVAL_MS` on the adapter's own timer, until the first answer, the turn's
+	 * end, `TYPING_MAX_MS` or a failed call. One entry per thread: a second message of the same turn adds nothing. A
+	 * restart drain types nothing (the message waits for the next process).
+	 */
+	async #startTyping(threadRef: string, conversationId: string, root: string): Promise<void> {
+		if (this.#typing.has(threadRef) || this.#core.isDraining?.() === true) return;
+		const typing: TypingEntry = {
+			channelId: undefined,
+			startedAt: this.#clock.now(),
+			handle: undefined,
+			stopped: false,
+		};
+		this.#typing.set(threadRef, typing);
+		try {
+			typing.channelId = (await this.#port.destination(conversationId, root)).channelId;
+		} catch (err) {
+			this.#log.warn("discord_typing_failed", { thread: threadRef, error: errorText(err) });
+			this.#haltTyping(typing);
+			return;
+		}
+		if (typing.stopped) return;
+		typing.handle = this.#typingTimers.set(() => this.#sendTyping(threadRef, typing), TYPING_INTERVAL_MS);
+		await this.#sendTyping(threadRef, typing);
+	}
+
+	/** One typing call; a failure (429 included) is logged once and stops this thread's typing, nothing else. */
+	async #sendTyping(threadRef: string, typing: TypingEntry): Promise<void> {
+		const channelId = typing.channelId;
+		if (typing.stopped || channelId === undefined) return;
+		if (this.#clock.now() - typing.startedAt > TYPING_MAX_MS) {
+			this.#haltTyping(typing);
+			return;
+		}
+		// Another thread's 429 blocked the route: skip this beat without a call.
+		if (this.#isBlocked("typing")) return;
+		try {
+			await this.#call("typing", () => this.#transport.triggerTyping(channelId));
+		} catch (err) {
+			if (typing.stopped) return;
+			this.#log.warn("discord_typing_failed", { thread: threadRef, error: errorText(err) });
+			this.#haltTyping(typing);
+		}
+	}
+
+	#haltTyping(typing: TypingEntry): void {
+		typing.stopped = true;
+		if (typing.handle !== undefined) this.#typingTimers.clear(typing.handle);
+		typing.handle = undefined;
+	}
+
+	/** Stops the thread's typing; `forget`: the turn is over, so the thread's next turn types again. */
+	#stopTyping(threadRef: string, forget: boolean): void {
+		const typing = this.#typing.get(threadRef);
+		if (typing === undefined) return;
+		this.#haltTyping(typing);
+		if (forget) this.#typing.delete(threadRef);
 	}
 
 	async #createStatus(threadRef: string, entry: StatusEntry): Promise<void> {
@@ -1074,6 +1273,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	 * ✅/⚠️ (`update`), 👀 is removed and the result mark added. Retried by tick() under a rate limit.
 	 */
 	async finishStatus(threadRef: string, outcome: FinalOutcome, action: "delete" | "update" = "update"): Promise<void> {
+		this.#stopTyping(threadRef, true);
 		let entry = this.#statuses.get(threadRef);
 		if (entry === undefined) {
 			const parsed = parseThreadRef(threadRef);
@@ -1278,6 +1478,7 @@ export class DiscordAdapter implements ChannelAdapter {
 					}),
 				);
 				if (topLevel) replyTo ??= posted.id;
+				this.#stopTyping(delivery.threadRef, false);
 				await this.#recordPost({ channel: channelId, ts: posted.id, deliveryId: delivery.deliveryId, part: sent });
 				sent += 1;
 			}

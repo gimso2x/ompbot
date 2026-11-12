@@ -1,5 +1,6 @@
 // Teams' plug into the daemon: its port (Bot Connector), and its adapter serving the Bot Framework endpoint, built
 // from `channels.teams`. Teams resends nothing the daemon missed, so there is no recovery and no thread reader.
+import { join } from "node:path";
 import type { AdapterDeps, ChannelAdapter, ChannelBinding } from "../channel/adapter";
 import { parseLoopbackListen } from "../config";
 import { TeamsAdapter } from "./adapter";
@@ -13,6 +14,8 @@ export interface TeamsBindingOptions {
 	listen?: { hostname: string; port: number };
 	/** Turn length before the `⏳ 작업 중` line. */
 	longTurnMs?: number;
+	/** Fetch for inbound attachment downloads (tests point it at a fake Microsoft). */
+	attachmentFetch?: typeof fetch;
 }
 
 export class TeamsBinding implements ChannelBinding {
@@ -48,6 +51,8 @@ export class TeamsBinding implements ChannelBinding {
 				auth: this.#options.auth ?? new TeamsAuth({ appId: teams.appId, tenantId: teams.tenantId }),
 			},
 			longTurnMs: this.#options.longTurnMs,
+			mediaRoot: join(deps.config.homeDir, "media"),
+			attachmentFetch: this.#options.attachmentFetch,
 		});
 		return this.adapter;
 	}

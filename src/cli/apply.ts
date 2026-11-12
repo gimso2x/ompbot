@@ -7,6 +7,7 @@ import { callDaemon } from "../daemon/ipc";
 import {
 	type ApplyDeps,
 	applyPathEnv,
+	DEFAULT_DRAIN_CUT_MIN,
 	DEFAULT_DRAIN_TIMEOUT_MIN,
 	findBun,
 	findDaemonUnits,
@@ -14,9 +15,9 @@ import {
 	isReportOrigin,
 	type PeerApply,
 	pidAlive,
-	REPORT_THREAD_PATTERN,
 	readLockStartedAt,
 	receiptPathFor,
+	reportThreadPattern,
 	runApply,
 	STAMP_PATTERN,
 	SYSTEMD_UNIT,
@@ -27,11 +28,14 @@ import { collectGates } from "../ops/gates";
 import { socketDrainCall, waitForDrain } from "./drain";
 import { runProfileSync } from "./omp";
 
-export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D> --report-thread <ts>] [--json]
+export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>> --report-thread <ts|message id>] [--json]
                                  precheck (main, HEAD==main, clean src, bun) → backup + config copy → with config ompProfile,
                                  ompbot omp sync (a failure stops here) → drain --wait (default 60 min) → systemctl --user
                                  restart <this home's unit> → wait for a fresh daemon (2 min) → gates/doctor summary; on
                                  failure restores config and restarts once (code is not reverted).
+                                 --cut-after <min> (default 5): a drain still busy then restarts anyway; the daemon records
+                                 the cut turns (<home>/restart-cut.json) and the next process resumes each once in its
+                                 session. --cut-after 0: no cut, a --timeout cancels the drain and nothing restarts.
                                  Then the same apply runs for every other active install on this checkout (ompbot-<instance>,
                                  own home and receipt); a failed one makes the exit 1. Receipt:
                                  <home>/logs/apply-<stamp>.json. --detach re-launches it as a systemd-run unit and returns.
@@ -70,6 +74,13 @@ export async function applyCommand(
 	if (values.timeout !== undefined && (!/^\d+(\.\d+)?$/.test(values.timeout) || !Number.isFinite(timeoutMin))) {
 		return usageError("--timeout must be a non-negative number of minutes");
 	}
+	const cutAfterMin = values["cut-after"] === undefined ? DEFAULT_DRAIN_CUT_MIN : Number(values["cut-after"]);
+	if (
+		values["cut-after"] !== undefined &&
+		(!/^\d+(\.\d+)?$/.test(values["cut-after"]) || !Number.isFinite(cutAfterMin))
+	) {
+		return usageError("--cut-after must be a non-negative number of minutes");
+	}
 	let mergedAt: Date | undefined;
 	if (values["merged-at"] !== undefined) {
 		mergedAt = new Date(values["merged-at"]);
@@ -78,10 +89,17 @@ export async function applyCommand(
 	const reportOrigin = values["report-origin"];
 	const reportThread = values["report-thread"];
 	if (reportOrigin !== undefined && !isReportOrigin(reportOrigin)) {
-		return usageError("--report-origin must be slack/ch/<channel id> or slack/dm/<dm id>");
+		return usageError(
+			"--report-origin must be slack/ch/<channel id>, slack/dm/<dm id>, discord/ch/<channel id> or discord/dm/<dm id>",
+		);
 	}
-	if (reportThread !== undefined && (reportOrigin === undefined || !REPORT_THREAD_PATTERN.test(reportThread))) {
-		return usageError("--report-thread <ts> needs --report-origin and a Slack ts like 1793318305.840629");
+	if (
+		reportThread !== undefined &&
+		(reportOrigin === undefined || !reportThreadPattern(reportOrigin).test(reportThread))
+	) {
+		return usageError(
+			"--report-thread needs --report-origin and a Slack ts like 1793318305.840629 (slack/...) or a Discord message id (discord/...)",
+		);
 	}
 	if (values.stamp !== undefined && !STAMP_PATTERN.test(values.stamp))
 		return usageError("--stamp must be YYYYMMDD-HHMMSS");
@@ -92,6 +110,7 @@ export async function applyCommand(
 
 	const options = {
 		timeoutMin,
+		cutAfterMin,
 		stamp,
 		...(mergedAt === undefined ? {} : { mergedAt }),
 	};
@@ -143,7 +162,12 @@ export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyD
 		sleep: (ms) => Bun.sleep(ms),
 		run: spawnRunner,
 		callDaemon: (request, timeoutMs) => callDaemon(socketPath, request, timeoutMs),
-		drain: (min) => waitForDrain({ call: socketDrainCall(socketPath), timeoutMin: min }),
+		drain: (min, cutAfterMin) =>
+			waitForDrain({
+				call: socketDrainCall(socketPath),
+				timeoutMin: min,
+				...(cutAfterMin === undefined ? {} : { cutAfterMin }),
+			}),
 		backup: () =>
 			runBackup({
 				homeDir,
@@ -192,6 +216,7 @@ function parseValues(args: string[]) {
 		options: {
 			detach: { type: "boolean" },
 			timeout: { type: "string" },
+			"cut-after": { type: "string" },
 			"merged-at": { type: "string" },
 			"report-origin": { type: "string" },
 			"report-thread": { type: "string" },
@@ -219,7 +244,7 @@ async function detach(input: {
 	}
 	const unit = `ompbot-apply-${stamp}`;
 	const childArgs = ["apply", "--stamp", stamp];
-	for (const key of ["timeout", "merged-at", "report-origin", "report-thread"] as const) {
+	for (const key of ["timeout", "cut-after", "merged-at", "report-origin", "report-thread"] as const) {
 		const value = values[key];
 		if (value !== undefined) childArgs.push(`--${key}`, value);
 	}

@@ -1705,3 +1705,183 @@ describe("merge and discard by the owner (AC-6)", () => {
 		});
 	});
 });
+
+describe("a not-done lane merged into the base branch outside the lane (doc/plans/lane-rebase-external-land.md)", () => {
+	/** A worktree lane whose claim of `b.txt` failed its check (`a.txt`): not-done with the real claim sha. */
+	async function notDoneLane(h: LaneHarness, repo: string): Promise<{ lane: LaneRow; sha: string; base: string }> {
+		const base = baseOf(repo);
+		const started = await h.manager.start({ title: "outside", cwd: repo, channel: "D1", acceptance: [CHECK_A] });
+		await h.settle();
+		const sha = commitIn(started.cwd, "b.txt");
+		const text = await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: sha, summary: "b.txt" });
+		await h.settle();
+		expect(text).toContain("[not-done]");
+		const lane = requireLane(h, started.name);
+		expect(lane.status).toBe("not-done");
+		return { lane, sha, base };
+	}
+
+	function expectLandedOutside(h: LaneHarness, lane: LaneRow, sha: string): void {
+		const row = requireLane(h, lane.name);
+		expect(row.status).toBe("closed");
+		expect(row.meta.land?.state).toBe("landed");
+		expect(row.meta.land?.cleanup).toBeUndefined();
+		expect(row.meta.sha).toBe(sha);
+		expect(row.history.at(-1)).toMatchObject({
+			event: "landed",
+			sha,
+			detail: `레인 밖에서 머지됨 · claim ${sha.slice(0, 12)}`,
+		});
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(false);
+		expect(git(lane.meta.repo ?? "", "branch", "--list", lane.meta.branch ?? "")).toBe("");
+		expect(rootUpdates(h.transport, lane).at(-1)).toBe("✅ outside");
+	}
+
+	function expectUntouched(h: LaneHarness, lane: LaneRow, status: LaneRow["status"]): void {
+		const row = requireLane(h, lane.name);
+		expect(row.status).toBe(status);
+		expect(row.meta.land).toBeUndefined();
+		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
+		expect(git(lane.meta.repo ?? "", "branch", "--list", lane.meta.branch ?? "")).not.toBe("");
+	}
+
+	async function tick(h: LaneHarness): Promise<void> {
+		await h.manager.tick();
+		await h.settle();
+	}
+
+	test("the verdict hands the lane's base branch to verify", async () => {
+		const repo = makeRepo(repos);
+		const seen: (string | undefined)[] = [];
+		const h = laneHarness(home.dir, {
+			verify: async (_evidence, _cwd, _baseSha, baseBranch) => {
+				seen.push(baseBranch);
+				return { ok: false, reasons: ["x"] };
+			},
+		});
+		const started = await h.manager.start({ title: "outside", cwd: repo, channel: "D1" });
+		await h.settle();
+		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "s" });
+		await h.settle();
+		expect(seen).toEqual([baseOf(repo)]);
+		h.close();
+	});
+
+	test("(A) fast-forward merge of the claim: the next tick closes it landed, worktree and branch gone", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await notDoneLane(h, repo);
+		git(repo, "merge", "-q", "--ff-only", lane.meta.branch ?? "");
+		await tick(h);
+		expectLandedOutside(h, lane, sha);
+		// origin was not pushed to: nothing recorded as pushed, and nothing pushed by the core.
+		expect(requireLane(h, lane.name).meta.land?.pushed).toBeUndefined();
+		expect(headOf(bare, `refs/heads/${base}`)).not.toBe(sha);
+		h.close();
+	});
+
+	test("(A) the claim rebased with the same patch onto a moved base branch: closed landed; origin having it is recorded as pushed", async () => {
+		const { repo, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await notDoneLane(h, repo);
+		commitIn(repo, "c.txt");
+		git(repo, "cherry-pick", sha);
+		expect(headOf(repo)).not.toBe(sha);
+		git(repo, "push", "-q", "origin", base);
+		git(repo, "fetch", "-q", "origin");
+		await tick(h);
+		expectLandedOutside(h, lane, sha);
+		expect(requireLane(h, lane.name).meta.land?.pushed).toBe(`origin/${base}`);
+		h.close();
+	});
+
+	test("(B) 11-12: the branch rebased with the claim's patch changed, then its tip fast-forward merged: closed landed", async () => {
+		const repo = makeRepo(repos);
+		const h = laneHarness(home.dir);
+		const { lane, sha, base } = await notDoneLane(h, repo);
+		const worktree = lane.meta.worktree ?? "";
+		commitIn(repo, "c.txt");
+		// Another session rebases the lane branch, resolving it into a different patch, and commits on top.
+		git(worktree, "rebase", "-q", base);
+		writeFileSync(join(worktree, "b.txt"), "b.txt resolved\n");
+		git(worktree, "commit", "-q", "-a", "--amend", "--no-edit");
+		const tip = commitIn(worktree, "d.txt");
+		expect(git(repo, "cherry", base, sha)).toStartWith("+ ");
+		git(repo, "merge", "-q", "--ff-only", tip);
+		await tick(h);
+		expectLandedOutside(h, lane, sha);
+		h.close();
+	});
+
+	test("working and paused lanes, and a not-done lane without a claim, stay as they are", async () => {
+		const repo = makeRepo(repos);
+		const h = laneHarness(home.dir);
+		const { lane } = await notDoneLane(h, repo);
+		git(repo, "merge", "-q", "--ff-only", lane.meta.branch ?? "");
+		h.store.transitionLane(lane.name, "working", { event: "x" });
+		await tick(h);
+		expectUntouched(h, lane, "working");
+		h.store.transitionLane(lane.name, "paused", { event: "x" }, { pausedFrom: "not-done" });
+		await tick(h);
+		expectUntouched(h, lane, "paused");
+		h.store.transitionLane(lane.name, "done-claimed", { event: "x" });
+		h.store.transitionLane(lane.name, "not-done", { event: "x" }, { claim: undefined });
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		h.close();
+	});
+
+	test("reset --hard to the base branch after the refused claim: stays not-done", async () => {
+		const repo = makeRepo(repos);
+		const h = laneHarness(home.dir);
+		const { lane, base } = await notDoneLane(h, repo);
+		commitIn(repo, "c.txt");
+		git(lane.meta.worktree ?? "", "reset", "-q", "--hard", base);
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		h.close();
+	});
+
+	test("a dirty worktree, then a running turn, keep the lane; once clean and idle it closes", async () => {
+		const repo = makeRepo(repos);
+		let busy = false;
+		const h = laneHarness(home.dir, { laneBusy: () => busy });
+		const { lane, sha } = await notDoneLane(h, repo);
+		git(repo, "merge", "-q", "--ff-only", lane.meta.branch ?? "");
+		const scratchFile = join(lane.meta.worktree ?? "", "scratch.txt");
+		writeFileSync(scratchFile, "x\n");
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		rmSync(scratchFile);
+		busy = true;
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		busy = false;
+		await tick(h);
+		expectLandedOutside(h, lane, sha);
+		h.close();
+	});
+
+	test("a commit after the claim that the base branch lacks keeps the lane", async () => {
+		const repo = makeRepo(repos);
+		const h = laneHarness(home.dir);
+		const { lane } = await notDoneLane(h, repo);
+		git(repo, "merge", "-q", "--ff-only", lane.meta.branch ?? "");
+		commitIn(lane.meta.worktree ?? "", "e.txt");
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		h.close();
+	});
+
+	test("a git call that fails changes nothing and logs lane_external_land_check_failed", async () => {
+		const repo = makeRepo(repos);
+		const h = laneHarness(home.dir);
+		const { lane } = await notDoneLane(h, repo);
+		git(repo, "merge", "-q", "--ff-only", lane.meta.branch ?? "");
+		h.store.patchLane(lane.name, undefined, { baseBranch: "no-such-branch" });
+		await tick(h);
+		expectUntouched(h, lane, "not-done");
+		expect(h.logs.some((line) => line.includes("lane_external_land_check_failed"))).toBe(true);
+		h.close();
+	});
+});

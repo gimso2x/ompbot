@@ -126,6 +126,13 @@ const decisionLine = (askable: boolean): string =>
 	`- 오너 결정이 필요하면 결정 카드로 묻는다 — \`\`\`card에 루트 \`tone\`(되돌리기 쉬움 ok, 주의 warn, 되돌리기 어려움·외부 반영 danger), 제목=질문 한 문장, Fields=\`✅ 추천\`(하나, 짧은 이유 포함)·\`선택지\`(번호 목록). 영향·되돌리기 설명·긴 설명은 카드에 넣지 않는다.${askable ? " 같은 답에서 `ask`로 선택지 버튼을 띄운다(추천을 recommended로)." : ""} 골격: ${CARD_SKELETONS[3]}. Ask an owner decision as a decision card: root \`tone\` (ok easy to undo, warn careful, danger hard to undo or outward-facing), title = the question, Fields = one \`✅ 추천\` with a short reason and the numbered \`선택지\`; no impact, undo steps or long explanation in the card.${askable ? " In the same answer, put the options up as buttons with `ask` (the recommendation as `recommended`)." : ""}`;
 
 /**
+ * Layout for a human reader on a phone: short lines, bold only on section heads, long material as a file. Discord draws
+ * a line-leading `-# ` as small subtext, which takes the evidence; Slack shows it literally, so its line says otherwise.
+ */
+const readabilityLine = (discord: boolean): string =>
+	`- 휴대폰에서 훑어 읽히게 쓴다: 항목은 한 줄에 하나, 문단은 3줄 이내. 굵은 라벨은 섹션 머리에만 쓰고 모든 줄에 붙이지 않는다. 본문이 15줄을 넘을 분석·긴 표는 파일로 만들어 올리고 본문에는 결론과 핵심만 둔다. 결정이 필요하면 "다시 ~라고 해 주시면 진행" 같은 글 대신 아래 결정 카드로 묻는다.${discord ? " 경로·커밋·영수증·명령 출력 같은 근거는 그 항목 아래 줄 맨 앞 `-# ` 작은 글씨 한 줄로 내린다." : " 근거(경로·커밋·명령 출력)는 항목 끝에 짧게 붙이고 `-#` 작은 글씨 문법은 쓰지 않는다(슬랙은 글자 그대로 보인다)."} Write for a phone skim: one point per line, short paragraphs, bold only on section heads, long analysis as an uploaded file, decisions as the decision card below.${discord ? " Put evidence (paths, commits, receipts, command output) on its own line under the point, starting with `-# ` (Discord subtext)." : " Keep evidence short at the end of the point; no `-#` subtext (Slack shows it literally)."}`;
+
+/**
  * Answer-format discipline for Slack chat sessions (owner DM, channels, threads), after the gajae-way hub and Hermes
  * report rules. Monitor sessions must keep machine-parsed answers (`NO_REPORT` / `[SILENT]` are matched on the exact
  * first/last line) and lane sessions report their own way, so those origins never see this section.
@@ -136,6 +143,7 @@ const formatSection = (herdr: boolean, discord: boolean, askable: boolean): stri
 		"- 첫 줄은 결론 한 문장: 무엇이 됐는지/안 됐는지부터 쓴다. 여는 말·맺음말·요청 되풀이 없이. First line is the conclusion; no preamble, no restating the request.",
 		"- 길이는 질문 무게에 맞춘다. 한 줄 질문에는 한 줄로. 끝난 일은 `바뀐 것`·`확인한 것`·`남은 것`만 쓰고 과정을 다시 늘어놓지 않는다. Match length to the ask; finished work is what changed, what is verified, what is left — never a replay of the process.",
 		"- 확인했다고 주장할 때는 실행한 명령과 결과를 함께 붙인다. 확인하지 못한 것은 확인 못 했다고 따로 적는다. A verification claim shows the command and its output; say plainly what is unverified.",
+		readabilityLine(discord),
 		decisionLine(askable),
 		...(herdr ? [HERDR_INTAKE_LINE] : []),
 		cardLine(discord),

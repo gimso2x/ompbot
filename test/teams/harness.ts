@@ -154,6 +154,7 @@ export async function startTeamsDaemon(
 		guestRun?: ProcessRunner;
 		guestEnv?: Record<string, string | undefined>;
 		teamsGraphEndpoints?: { loginBase: string; graphBase: string };
+		attachmentFetch?: typeof fetch;
 	} = {},
 ): Promise<{ daemon: Daemon; binding: TeamsBinding; port: number }> {
 	const clientSecretFile = join(home.dir, "secrets", "teams-client-secret");
@@ -186,7 +187,11 @@ export async function startTeamsDaemon(
 		botFrameworkOpenIdUrl: ms.botFrameworkOpenIdUrl,
 		entraOpenIdUrl: ms.entraOpenIdUrl,
 	});
-	const binding = new TeamsBinding(new TeamsChannel(connector), { auth, listen: { hostname: "127.0.0.1", port: 0 } });
+	const binding = new TeamsBinding(new TeamsChannel(connector), {
+		auth,
+		listen: { hostname: "127.0.0.1", port: 0 },
+		...(options.attachmentFetch === undefined ? {} : { attachmentFetch: options.attachmentFetch }),
+	});
 	const sessions = new FakeSessionStore();
 	const daemon = new Daemon({
 		config,

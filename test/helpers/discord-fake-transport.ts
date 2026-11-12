@@ -44,7 +44,9 @@ export type FakeDiscordCall =
  */
 export class FakeDiscordTransport implements DiscordTransport {
 	readonly calls: FakeDiscordCall[] = [];
-	readonly failNext: Partial<Record<FakeDiscordCall["method"] | "registerCommands", Error[]>> = {};
+	readonly failNext: Partial<Record<FakeDiscordCall["method"] | "registerCommands" | "triggerTyping", Error[]>> = {};
+	/** Channels `triggerTyping` was called for, in order; kept apart from `calls`, which log the message path. */
+	readonly typing: string[] = [];
 	/** Slash command sets registered at start; kept apart from `calls`, which log the message path. */
 	readonly commandSets: RegisterCommandsArgs[] = [];
 	/** Canned channel history for `listMessages`: `history[<channel>]`, any order (served oldest-first). */
@@ -87,7 +89,7 @@ export class FakeDiscordTransport implements DiscordTransport {
 		return String(FAKE_ID_BASE + this.#seq);
 	}
 
-	#maybeFail(method: FakeDiscordCall["method"] | "registerCommands"): void {
+	#maybeFail(method: FakeDiscordCall["method"] | "registerCommands" | "triggerTyping"): void {
 		const err = this.failNext[method]?.shift();
 		if (err) throw err;
 	}
@@ -191,6 +193,11 @@ export class FakeDiscordTransport implements DiscordTransport {
 	async registerCommands(args: RegisterCommandsArgs): Promise<void> {
 		this.commandSets.push(args);
 		this.#maybeFail("registerCommands");
+	}
+
+	async triggerTyping(channelId: string): Promise<void> {
+		this.typing.push(channelId);
+		this.#maybeFail("triggerTyping");
 	}
 
 	/** A gateway Ready (`resumed: false`, a new session) or Resumed after `start`. */

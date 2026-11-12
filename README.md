@@ -195,7 +195,7 @@ Slack으로 설치한 봇에 Discord를 더할 때:
 
 ```sh
 ompbot status | doctor | gates      # 상태 · 설치 점검(herdr omp 통합 포함) · 건강 판정(열리면 exit 1)
-ompbot apply                        # 검증 → 백업 → drain → 재시작 → 준비 확인 → 영수증
+ompbot apply                        # 검증 → 백업 → drain(--cut-after 기본 5분 넘으면 끊고 재시작, 끊긴 턴은 한 번 자동 이어가기) → 재시작 → 준비 확인 → 영수증
 ompbot reload                       # 재시작 없이 config.json 다시 읽기(바로 반영되는 키만)
 ompbot omp install|use|rollback|status|prune|sync   # 봇 전용 omp 버전 고정·프로필 동기화(config ompProfile)
 ompbot backup | restore | offsite   # 백업 · 복구 · 오프사이트 복제

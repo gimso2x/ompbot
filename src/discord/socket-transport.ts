@@ -32,6 +32,8 @@ export interface DiscordSocketTransportOptions {
 	/** REST base (tests point it at a local server); the gateway URL comes from its `GET /gateway/bot`. */
 	baseUrl?: string;
 	fetchImpl?: typeof fetch;
+	/** Applied once at start as the bot's global display name (`PATCH /users/@me`); a failure is logged, not fatal. */
+	displayName?: string;
 	/** Every Ready/Resumed; a new session (`resumed: false`) is where missed-message backfill starts. */
 	onReady?: (info: { resumed: boolean }) => void;
 	/** A non-retryable gateway close: Discord stops, the rest of the daemon keeps running. */
@@ -77,6 +79,14 @@ export class DiscordSocketTransport implements DiscordTransport {
 		});
 		const ids = await this.#gateway.start();
 		this.#rest.setApplicationId(ids.applicationId);
+		const displayName = this.#options.displayName;
+		if (displayName !== undefined) {
+			try {
+				await this.#rest.patchCurrentUser({ displayName });
+			} catch (err) {
+				console.error(redact(`[ompbot] discord display_name: ${(err as Error).message}`));
+			}
+		}
 		return ids;
 	}
 
@@ -151,5 +161,9 @@ export class DiscordSocketTransport implements DiscordTransport {
 
 	registerCommands(args: RegisterCommandsArgs): Promise<void> {
 		return this.#rest.registerCommands(args);
+	}
+
+	triggerTyping(channelId: string): Promise<void> {
+		return this.#rest.triggerTyping(channelId);
 	}
 }

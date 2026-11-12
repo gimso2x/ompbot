@@ -268,6 +268,103 @@ describe("recover()", () => {
 	});
 });
 
+// T-20261112-36 AC-3: Slack's `⏬ … N건을 처리합니다` recovery notice, placed where the answers show up.
+describe("recovery notice", () => {
+	const notices = () => calls("createMessage").filter((c) => c.content?.startsWith("⏬") === true);
+	const root = (id: string, content = `<@${BOT}> 질문 ${id}`): DiscordMessageEvent => ({
+		id,
+		channel_id: CH,
+		author: { id: DISCORD_OWNER },
+		content,
+		type: 0,
+	});
+
+	test("two DM messages recovered: one notice, a reply to the oldest of them, naming 2건", async () => {
+		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${DM}`, WATERMARK);
+		transport.history.set(DM, [dm("100000000000000005"), dm("100000000000000003")]);
+		const adapter = await boot();
+		await recover(adapter);
+		expect(notices()).toHaveLength(1);
+		expect(notices()[0]).toMatchObject({
+			channelId: DM,
+			content: "⏬ 봇이 응답하지 못한 동안 도착한 메시지 2건을 처리합니다",
+			messageReference: { messageId: "100000000000000003" },
+		});
+	});
+
+	test("a server root: the notice goes into the thread of the oldest recovered message that opened one", async () => {
+		store.ensureOrigin(`discord/ch/${CH}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${CH}`, WATERMARK);
+		// The oldest one is a command: it opens no thread, so the notice goes to the next one's thread.
+		transport.history.set(CH, [
+			root("100000000000000001", `<@${BOT}> !status`),
+			root("100000000000000002"),
+			root("100000000000000003"),
+		]);
+		const adapter = await boot();
+		await recover(adapter);
+		expect(calls("startThread").map((c) => c.messageId)).toEqual(["100000000000000002", "100000000000000003"]);
+		expect(notices()).toHaveLength(1);
+		expect(notices()[0]?.channelId).toBe("100000000000000002");
+		expect(notices()[0]?.content).toContain("3건");
+	});
+
+	test("commands only (no thread opened): no notice and no reply at the channel root", async () => {
+		store.ensureOrigin(`discord/ch/${CH}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${CH}`, WATERMARK);
+		transport.history.set(CH, [root("100000000000000001", `<@${BOT}> !status`)]);
+		const adapter = await boot();
+		await recover(adapter);
+		expect(inbound).toEqual([`${CH}:100000000000000001`]);
+		expect(notices()).toHaveLength(0);
+		expect(calls("createMessage").filter((c) => c.channelId === CH)).toHaveLength(0);
+	});
+
+	test("a thread channel target: no notice, the answers show in the thread itself", async () => {
+		const thread = "222222222222222222";
+		transport.setChannel({ id: thread, type: 11, parentId: CH, guildId: GUILD });
+		store.ensureOrigin(`discord/ch/${CH}/t/${thread}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${thread}`, WATERMARK);
+		transport.history.set(thread, [{ ...root("100000000000000001"), channel_id: thread }]);
+		const adapter = await boot();
+		await recover(adapter);
+		expect(inbound).toEqual([`${CH}:100000000000000001`]);
+		expect(notices()).toHaveLength(0);
+	});
+
+	test("nothing recovered and a rescan of the same messages: no notice beyond the first", async () => {
+		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${DM}`, WATERMARK);
+		const adapter = await boot();
+		await recover(adapter);
+		expect(notices()).toHaveLength(0);
+		transport.history.set(DM, [dm("100000000000000001")]);
+		await recover(adapter);
+		expect(notices()).toHaveLength(1);
+		store.setCursor(`dc:${DM}`, WATERMARK);
+		await recover(adapter);
+		expect(inbound).toHaveLength(1);
+		expect(notices()).toHaveLength(1);
+	});
+
+	test("a failed notice is a warning; the watermark still moves", async () => {
+		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${DM}`, WATERMARK);
+		transport.history.set(DM, [dm("100000000000000001")]);
+		const adapter = await boot();
+		const realCreate = transport.createMessage.bind(transport);
+		transport.createMessage = async (args) => {
+			if (args.content?.startsWith("⏬") === true) throw new DiscordCallError("definitive", "discord_http_403:50013");
+			return realCreate(args);
+		};
+		await recover(adapter);
+		expect(logs.some((line) => line.includes("event=backfill_notice_failed"))).toBe(true);
+		expect(store.getCursor(`dc:${DM}`)).toBe("100000000000000001");
+		expect(inbound).toEqual([`${DM}:100000000000000001`]);
+	});
+});
+
 describe("recovery triggers", () => {
 	beforeEach(() => {
 		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));

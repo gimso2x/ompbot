@@ -25,6 +25,11 @@ export interface DrainWaitOptions {
 	/** One daemon drain op; throws when the daemon is unreachable or answers something unexpected. */
 	call: (op: "drain" | "drain_status" | "drain_cancel") => Promise<DrainResponse>;
 	timeoutMin: number;
+	/**
+	 * Cut limit (min): still busy by then, the wait ends `{ ok: true, cut: true }` with the drain kept on (the caller
+	 * restarts anyway). Given, it replaces `timeoutMin`; absent, the timeout cancels the drain as before.
+	 */
+	cutAfterMin?: number;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	/** Called once after the drain is requested, before the wait loop. */
@@ -32,7 +37,7 @@ export interface DrainWaitOptions {
 }
 
 export type DrainWaitResult =
-	| { ok: true; counts: DrainCounts }
+	| { ok: true; cut?: true; counts: DrainCounts }
 	| { ok: false; reason: "cancelled_elsewhere" | "timeout"; counts: DrainCounts }
 	| { ok: false; reason: "unreachable"; error: string };
 
@@ -42,7 +47,8 @@ export async function waitForDrain(options: DrainWaitOptions): Promise<DrainWait
 	const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 	let accepted = false;
 	try {
-		const deadline = now() + options.timeoutMin * 60_000;
+		const cut = options.cutAfterMin !== undefined;
+		const deadline = now() + (options.cutAfterMin ?? options.timeoutMin) * 60_000;
 		let state = await options.call("drain");
 		accepted = true;
 		options.onStarted?.(state);
@@ -50,6 +56,7 @@ export async function waitForDrain(options: DrainWaitOptions): Promise<DrainWait
 			if (!state.draining) return { ok: false, reason: "cancelled_elsewhere", counts: state };
 			if (state.turns === 0 && state.hostTools === 0 && state.approvals === 0) return { ok: true, counts: state };
 			if (now() >= deadline) {
+				if (cut) return { ok: true, cut: true, counts: state };
 				await options.call("drain_cancel");
 				return { ok: false, reason: "timeout", counts: state };
 			}

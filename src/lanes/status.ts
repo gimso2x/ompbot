@@ -185,7 +185,8 @@ export interface LaneRow {
 const ALLOWED: Record<LaneStatus, readonly LaneStatus[]> = {
 	working: ["done-claimed", "paused"],
 	"done-claimed": ["closed", "not-done", "working", "paused"],
-	"not-done": ["done-claimed", "working", "paused"],
+	// `closed`: work merged into the base branch outside the lane (`#closeIfLandedOutside`).
+	"not-done": ["done-claimed", "working", "paused", "closed"],
 	paused: ["working", "done-claimed"],
 	closed: ["working"],
 };

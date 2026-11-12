@@ -182,9 +182,18 @@ export function progressLine(text: string): string {
  */
 export function runningStatusText(stalled: boolean, elapsedMs: number, progress: TurnProgress | undefined): string {
 	const tools = progress?.tools ?? 0;
+	const typical = progress?.typical;
+	let usual = "";
+	if (typical !== undefined) {
+		// A median-to-p90 range, so a turn already past the median does not read as late until it passes p90.
+		const low = Math.max(1, Math.ceil(typical.medianMs / 60_000));
+		const high = Math.max(low, Math.ceil(typical.p90Ms / 60_000));
+		const range = low === high ? `~${low}분` : `${low}~${high}분`;
+		usual = elapsedMs > typical.p90Ms ? ` · 평소보다 길어짐(보통 ${range})` : ` · 보통 ${range}`;
+	}
 	const head = stalled
 		? `${STALL_STATUS_TEXT} · ${formatElapsed(elapsedMs)}`
-		: `⏳ 작업 중 · ${formatElapsed(elapsedMs)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
+		: `⏳ 작업 중 · ${formatElapsed(elapsedMs)}${tools > 0 ? ` · 도구 ${tools}회` : ""}${usual}`;
 	if (progress === undefined) return head;
 	const lines = [head];
 	const { todo } = progress;

@@ -91,6 +91,11 @@ export class TeamsConnector {
 		return `28:${this.#options.appId}`;
 	}
 
+	/** The Bot Connector bearer token, for an inline image on the Activity's own connector host only (the caller checks). */
+	accessToken(): Promise<string> {
+		return this.#accessToken();
+	}
+
 	async #accessToken(): Promise<string> {
 		const cached = this.#token;
 		if (cached !== undefined && this.#now() < cached.renewAt) return cached.value;

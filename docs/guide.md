@@ -134,7 +134,7 @@ Slack을 쓰지 않으면 `slack-*` 두 줄을, Discord를 쓰지 않으면 `dis
 | --- | --- | --- |
 | `schemaVersion` | 예 | 항상 `1` |
 | `channels.slack.ownerUserId` | Slack을 쓸 때 | Slack 켜기. 없으면 Slack을 쓰지 않고 `channels.discord`(또는 `channels.teams`)만으로 돕니다(채널이 하나도 없으면 `config_invalid field=channels`). 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
-| `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
+| `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?, "logChannelId"?, "escalationChannelId"?, "displayName"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
 | `channels.teams` | 아니요 | Teams 켜기 `{"appId", "tenantId", "clientSecretFile", "ownerAadObjectId", "listen"?, "tokenTenant"?, "guestAadObjectIds"?, "ownerMode"?, "guestModel"?, "graph"?}`. 없으면 Teams 꺼짐. 키 설명은 [Teams](#teams선택) |
 | `channels.teams.graph` | 아니요 | Teams 오너 1:1에서 오너의 Teams 채팅을 읽는 도구 켜기 `{"tokenFile"?}`(기본 `secrets/teams-graph-token`). 없으면 지금과 같습니다. 켠 뒤 `ompbot teams login`으로 오너가 한 번 로그인합니다. [Teams 채팅 읽기](#teams-채팅-읽기선택-graph) 참고 |
 | `slack.botTokenFile`, `slack.appTokenFile` | Slack을 쓸 때 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
@@ -153,8 +153,8 @@ Slack을 쓰지 않으면 `slack-*` 두 줄을, Discord를 쓰지 않으면 `dis
 | `peerBots` | 아니요 | 이 봇을 멘션한 채널 글을 요청으로 받아 줄 다른 봇 목록 `[{"userId": "U…", "name": "떡"}]`(`userId`는 `U` 뒤 대문자·숫자 8자 이상이고 오너 id는 안 됨, `name`은 1~32자). 기본은 없음(모든 봇 글을 버림). [피어 봇](#피어-봇) 참고 |
 | `requireMention` | 아니요 | `true`면 채널에서는 이 봇을 멘션한 글만 받습니다(`mentionFreeChannels`·스레드 참여 무시, DM은 그대로). 기본 `false` |
 | `peerHopLimit` | 아니요 | 스레드마다 피어 입력 상한 `{"turns": 3, "windowMinutes": 30}`(기본값). `windowMinutes` 안에 `turns`개를 넘는 피어 글은 버립니다 |
-| `escalationChannel` | 아니요 | 승인 카드를 올릴 채널 id(`C…`/`G…`). [승인](#승인) 참고 |
-| `logChannel` | 아니요 | #log 장부 채널 id(`C…`/`G…`). 슬랙 대화나 작업 레인의 답 첫 줄이 `✅ 완료`(또는 `:white_check_mark: 완료`)로 시작하면 그 답의 사본이 `📒 완료 보고 사본 · <요청 위치 + 원 스레드 링크>` 머리말과 함께 이 채널 최상위에 한 번 올라갑니다(모니터 답·알림·승인 카드·명령 답은 제외). 이 채널의 메시지는 멘션이 있어도 턴이 되지 않습니다(`inbound_dropped reason=log_channel`) |
+| `escalationChannel` | 아니요 | Slack 요청의 승인 카드를 올릴 Slack 채널 id(`C…`/`G…`). Discord 요청은 `channels.discord.escalationChannelId`를 씁니다. [승인](#승인) 참고 |
+| `logChannel` | 아니요 | #log 장부 채널 id(`C…`/`G…`). 슬랙 대화나 작업 레인의 답 첫 줄이 `✅ 완료`(또는 `:white_check_mark: 완료`)로 시작하면 그 답의 사본이 `📒 완료 보고 사본 · <요청 위치 + 원 스레드 링크>` 머리말과 함께 이 채널 최상위에 한 번 올라갑니다(모니터 답·알림·승인 카드·명령 답은 제외). 이 채널의 메시지는 멘션이 있어도 턴이 되지 않습니다(`inbound_dropped reason=log_channel`). Discord 대화와 Discord 스레드의 작업 레인은 `channels.discord.logChannelId`로 같게 복사되고, 한 플랫폼의 사본이 다른 플랫폼 채널로 가지는 않습니다 |
 | `herdr` | 아니요 | herdr 켜기. `{}`이면 PATH의 `herdr`, `{"bin": "/절대경로/herdr"}`이면 그 파일을 로컬 herdr로 씁니다(`bin`이 절대경로가 아니면 `config_invalid field=herdr.bin`). 없으면 꺼짐: `ompbot_dispatch`는 simple만 보이고 `[TASK]` 스윕이 돌지 않습니다. 데몬 시작 때만 읽습니다. [herdr(선택)](#herdr선택) 참고 |
 | `dispatchHosts` | 아니요 | herdr 필요(`herdr` 없이 넣으면 `config_invalid field=herdr`). 원격 위임 대상. 예: `{"wsl": {"ssh": "wsl", "workDir": "/home/<user>/work", "herdrBin": "/home/<user>/.local/bin/herdr"}}`. `herdrBin`은 비대화형 ssh의 PATH에 herdr가 없을 때 절대경로로 지정합니다. `ompArgs`(문자열 배열, 예: `["--prewalk"]`)를 넣으면 그 호스트에 띄우는 herdr 워커 omp에 덧붙입니다(`herdr agent start … -- <인자>`). 인자는 그 호스트의 omp 설정으로 해석되므로(`--prewalk`면 그 호스트의 smol 모델로 넘어감) 그 호스트 smol을 먼저 맞추고 켭니다. `workerOmpArgs`를 물려받지 않습니다 |
 | `workerOmpArgs` | 아니요 | 로컬 herdr 워커 omp에 덧붙이는 인자(문자열 배열, 원소는 빈 문자열이면 안 됨). 예: `["--prewalk"]`이면 워커가 기본 모델로 계획을 세우고 첫 edit/write부터 smol 모델로 넘어갑니다. `ompbot_dispatch` taskSpec 신규 시작과 재개 때 죽은 에이전트 재기동에 붙고, `omp -p` 단순 위임·원격 호스트(`dispatchHosts.<h>.ompArgs`를 씀)·대화 세션에는 붙지 않습니다. 배열이 아니거나 빈 문자열이 있으면 `config_invalid field=workerOmpArgs` |
@@ -441,6 +441,9 @@ Discord에서 오너 한 명의 DM·서버 채널 대화를 받습니다. Slack 
   | `mentionFreeChannels` | 멘션 없이도 답할 채널 ID 목록(선택) |
   | `requireMention` | 서버 채널에서 멘션만 받음(선택, 기본 false) |
   | `laneChannelId` | Discord DM에서 요청한 작업 레인을 열 서버 텍스트 채널 ID(선택). 없으면 DM에서는 레인을 열지 않고 그 이유를 답합니다(서버 채널·스레드에서 요청한 레인은 그 채널에 열림) |
+  | `logChannelId` | Discord #log 장부로 쓸 서버 텍스트 채널 ID(선택). Discord 대화·레인의 `✅ 완료` 답 사본이 올라가고, 이 채널과 그 스레드의 글은 턴이 되지 않습니다. `escalationChannelId`·`laneChannelId`·`mentionFreeChannels`와 같으면 `config_invalid` |
+  | `escalationChannelId` | Discord 요청의 승인 카드를 받을 서버 텍스트 채널 ID(선택). 없으면 요청한 대화에 카드가 뜹니다 |
+  | `displayName` | 봇의 글로벌 표시 이름(선택, 1~32자). 기동 때 `PATCH /users/@me`로 반영되어 DM·별명 없는 서버의 메시지 위에 보입니다. Username은 ASCII만 되므로 한글 봇 이름은 이 키로 씁니다. 서버 별명이 있으면 그 별명이 우선하고, 반영이 실패하면 경고 로그만 남습니다 |
 
 - **인텐트**: Message Content Intent(`MESSAGE_CONTENT`)만 켭니다. 꺼져 있으면 Gateway가 4014로 끊고, 그때는 Discord만 멈추고 Slack을 같이 쓰면 Slack은 계속 답합니다.
 - **다시 붙기**: Gateway가 연결 뒤 30초 안에 HELLO를 보내지 않거나, READY에 세션·resume 주소가 빠졌거나, `/gateway/bot`·resume 주소가 URL이 아니면 로그에 남기고 백오프(1초부터 최대 60초) 뒤 다시 붙습니다. 이때 Discord 기동을 실패로 처리하지 않습니다.
@@ -454,7 +457,8 @@ Discord에서 오너 한 명의 DM·서버 채널 대화를 받습니다. Slack 
 - **모니터**: Discord DM 세션도 모니터 도구(`ompbot_monitor_add/list/remove`)를 받고 프롬프트에 그 안내가 실립니다. `channel`을 정하지 않은 모니터는 등록한 Discord DM ID를 `channel`로 저장해 결과가 그 DM에 새 글로 옵니다(Slack DM 등록은 지금처럼 비워 두어 Slack 오너 DM). `channel`·`copyChannel`은 Slack 채널 ID(`C…`/`G…`)나 Discord 채널 ID(숫자 17~20자리)를 받습니다. 서버 스레드 세션에는 모니터 도구가 없습니다(Slack과 같음).
 - **작업 레인**: 레인은 서버 텍스트 채널의 Discord 스레드에서 돕니다. 부모 채널에 `🔄 제목` 루트를 올리고 그 루트로 스레드를 만든 뒤(스레드 ID = 루트 ID, 레인 `threadRef`는 `<부모 채널>:<루트 ID>`) 상태 메시지(⏸ 버튼)와 Outcome 카드(머지·폐기)를 스레드 안에 올립니다. 스레드를 만들지 못하면 루트를 `❌ 제목`으로 고치고 worktree·브랜치를 지웁니다. 스레드 안 오너 글은 멘션 없이 레인으로 가고 `멈춰`·`계속`·`머지해`·`폐기해`·`!reopen`·버튼이 Slack 레인과 같게 동작합니다. 서버 채널·스레드에서 요청하면 그 채널에, DM에서 요청하면 `laneChannelId` 채널에 열고 요청한 곳에 레인 스레드 링크를 답합니다. `laneChannelId`가 없으면 DM 세션에는 `ompbot_work_start`가 없고 프롬프트와 `작업: …` 답이 이 설정을 안내합니다. 레인 세션은 `discord_send_file`로 레인 스레드에 파일을 올립니다.
 - **inject**: `ompbot inject --origin discord/dm/<ID>|discord/ch/<ID> --as-owner --text …`가 그 대화에 `🧪 inject` 마커를 올리고 오너 글로 접수합니다(DM의 `--thread <메시지 ID>`는 그 메시지에 대한 답장, DM 대화로 접수). Discord 세션도 긴 작업의 자동 후속(`[자동 후속]`)에 이것을 씁니다.
-- **Slack에만 있는 것**: 게이트·한도·재시작 같은 데몬 수준 알림, `logChannel` 사본, `escalationChannel`, 피어 봇, App Home은 Slack에만 있습니다.
+- **로그·승인 채널**: `logChannelId`를 넣으면 Discord 대화·레인의 `✅ 완료` 답 사본이 그 채널에 올라가고 그 채널(과 스레드)의 글은 턴이 되지 않습니다. `escalationChannelId`를 넣으면 Discord 요청의 승인 카드가 그 채널에 Discord 오너 멘션·`요청 위치` 링크와 함께 뜹니다. 둘 다 없으면 사본은 없고 카드는 요청한 대화에 뜹니다. 자세한 건 [Discord 봇 만들기](discord.md) 5절.
+- **Slack에만 있는 것**: 게이트·한도·재시작 같은 데몬 수준 알림, 피어 봇, App Home은 Slack에만 있습니다.
 - **현황판**: Discord DM은 `DM`, 서버 채널은 `Discord <채널 ID>`로 보이고, 시스템 보기에 Discord 게이트웨이 연결 카드가 생깁니다(Discord를 끈 설치에는 없음).
 
 ### Teams(선택)
@@ -477,8 +481,17 @@ Microsoft Teams(Bot Framework)에서 오너의 1:1·그룹 채팅 대화를 받�
   | `graph` | 오너 Teams 채팅 읽기 도구. [Teams 채팅 읽기](#teams-채팅-읽기선택-graph) 참고 |
 
 - **앱 패키지**: `ompbot teams package --out <zip>`이 봇 id·범위(`personal`, `groupChat`)·기본 아이콘 두 개를 담은 앱 패키지를 만듭니다. Teams의 "사용자 지정 앱 업로드"로 올립니다.
-- **대화**: 1:1은 모든 글을, 그룹 채팅은 봇을 멘션한 글만 받습니다. Teams에는 봇 반응·버튼이 없어 접수는 typing 표시로 알리고, 승인·질문 카드는 선택지를 글로 보여 주고 답장으로 받습니다. 파일 올리기는 지원하지 않습니다.
+- **대화**: 1:1은 모든 글을, 그룹 채팅은 봇을 멘션한 글만 받습니다. Teams에는 봇 반응·버튼이 없어 접수는 typing 표시로 알리고, 승인·질문 카드는 선택지를 글로 보여 주고 답장으로 받습니다. 오너 1:1에 올린 파일은 [Teams 1:1 파일 받기](#teams-11-파일-받기) 참고.
 - **알림 목적지**: Slack이 없으면 데몬 알림은 오너의 Teams 1:1로 갑니다(다른 사람이 있는 그룹 채팅은 고르지 않음). `!home`으로 바꿀 수 있습니다.
+
+### Teams 1:1 파일 받기
+
+오너가 봇과의 Teams 1:1 대화(`ownerMode: "full"`)에 파일을 올리거나 이미지를 붙여 넣으면 봇이 읽습니다. 남이 공유한 PPT·Excel도 오너가 받아 1:1에 다시 올리면 됩니다. Graph 권한이나 테넌트 관리자 동의는 필요 없습니다.
+
+- **앱 패키지 다시 올리기**: 파일 받기는 앱 manifest의 `supportsFiles`가 켜진 패키지(버전 1.0.1 이상)에서만 됩니다. `ompbot teams package --out ompbot-teams.zip`으로 새 zip을 만들어 Teams "앱 관리"에서 기존 앱을 업데이트(사용자 지정 앱 업로드)합니다. Teams는 같은 버전 재업로드를 거부합니다.
+- **받는 것**: 올린 파일(`file.download.info`)은 짧게 유효한 SharePoint/OneDrive 다운로드 주소로 인증 헤더 없이 받고(`*.sharepoint.com`·`*.sharepoint-df.com`·`*.files.1drv.com`·`*.livefilestore.com`의 https만, 리다이렉트도 같은 목록), 붙여 넣은 이미지는 그 메시지를 보낸 Bot Connector 호스트(또는 `*.botframework.com`)에서만 봇 토큰을 붙여 받습니다. 저장 위치는 `~/.ompbot/media/inbound/<대화 별칭>-<Activity id>/`(id의 `:` 같은 문자는 `_`로)이고, 메시지당 최대 6개·이미지 25MB·문서 20MB까지 Slack과 같은 `[첨부: 경로 (형식)]` 줄로 omp에게 전달됩니다. 글 없이 파일만 올려도 턴이 됩니다.
+- **실패**: 허용 목록 밖 주소·http·상한 초과·다운로드 실패는 `[첨부 실패: 이름 — 사유]` 줄로 남고 턴은 계속됩니다.
+- **받지 않는 곳**: 그룹 채팅, 손님, `ownerMode: "qa"`의 첨부는 받지 않고 로그 `teams_attachment_ignored reason=<group|guest|qa>` 한 줄만 남깁니다. 봇이 Teams로 파일을 보내는 기능은 없습니다.
 
 ### Teams 채팅 읽기(선택, Graph)
 
@@ -711,7 +724,7 @@ bun src/main.ts gc [--dry-run]    # 보존 기간이 지난 이전 대화 세션
 bun src/main.ts backup [--keep N] [--max-bundle-bytes N]
 bun src/main.ts drain [--wait] [--timeout <분>] # 재시작 전 대기(--wait 없으면 걸기만 하고 바로 끝남)
 bun src/main.ts drain --cancel
-bun src/main.ts apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <분>] [--merged-at <ISO>] [--report-origin slack/ch/<C>|slack/dm/<D> --report-thread <ts>] [--json]
+bun src/main.ts apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <분>] [--merged-at <ISO>] [--report-origin slack/ch/<C>|slack/dm/<D>|discord/ch/<ID>|discord/dm/<ID> --report-thread <ts|메시지 ID>] [--json]
                                   # 머지한 변경을 데몬에 반영(사전 검증→백업→drain→재시작→준비 대기→영수증)
 bun src/main.ts restore <백업 db 경로> [--yes]   # 데몬이 꺼진 상태에서 ompbot.db를 백업으로 교체
 bun src/main.ts freeze [--reason <이유>]  # 킬스위치: ~/.ompbot/FROZEN 작성
@@ -829,6 +842,8 @@ bun src/main.ts dashboard                      # config "dashboard": {"port": 73
 cd ~/work/ompbot && bun src/main.ts apply --merged-at <머지 시각 ISO> [--timeout 60]
 # 봇과 대화하는 세션(턴 안)에서는 턴이 끝나야 drain이 끝나므로 분리 실행합니다:
 bun src/main.ts apply --detach --merged-at <ISO> --report-origin slack/ch/<채널ID> --report-thread <요청 ts>
+# Discord에서 받은 요청이면 Discord origin과 메시지 ID(snowflake)를 줍니다:
+bun src/main.ts apply --detach --merged-at <ISO> --report-origin discord/dm/<DM ID> --report-thread <메시지 ID>
 ```
 
 순서와 판정:
@@ -841,7 +856,7 @@ bun src/main.ts apply --detach --merged-at <ISO> --report-origin slack/ch/<채�
 6. **기록** — `collectGates` 결과와 `doctor` 요약을 영수증에 적습니다. 열린 게이트·doctor 실패는 보고만 하며 반영을 되돌리지 않습니다.
 7. **실패 시 롤백** — 재시작 단계 이후 실패하면 `config.json.last-good`(데몬이 부팅해 `daemon_ready`를 찍은 직후, 재시작 필요 필드 없이 `reload`가 전부 적용된 직후, apply가 새 데몬 준비를 확인한 뒤에 원자적으로 남기는 0600 사본. 데몬은 자신이 검증한 내용만 기록합니다. 부팅 때는 `loadConfig` 직전에 읽은 텍스트를 기준으로 삼아, 그사이 파일이 바뀌었거나(`config_changed_since_boot`) 그 텍스트를 읽지 못했거나(`config_unreadable`) `restart_required`가 있으면 `last_good_config_skipped`만 남깁니다)에서 `config.json`을 복원하고 한 번 더 재시작합니다. last-good이 없으면 "복원할 정상 config 없음"을 영수증에 적고 config는 건드리지 않습니다. 새 데몬을 확인하지 못한 채 끝나는 경로(재시작 실패·롤백 재시작 실패)에서는 IPC `drain_cancel`을 시도하고 결과를 영수증에 남깁니다. **코드는 자동으로 되돌리지 않고**, 영수증에 이전 HEAD sha(reflog `HEAD@{1}`)와 되돌리기 명령(`git diff --cached --quiet && git read-tree -m -u HEAD <이전> && git commit` — merge 커밋이 있어도 트리째 복원하되 무관한 로컬 수정·미추적 파일은 보존하고, staged 변경이 있으면 실행하지 않음)을 적습니다. 종료 코드는 1입니다.
 8. **다른 설치본** — 이 설치본이 성공(이미 반영 포함)으로 끝나면, 같은 체크아웃으로 도는 다른 활성 설치본(`units render --instance`로 만든 `ompbot-<이름>`)마다 1~7단계를 그 홈·유닛으로 차례로 돌립니다(같은 `--timeout`·`--merged-at`·stamp, 보고 inject 없음, 영수증은 각 홈의 `logs/`). 결과는 이 영수증의 `peers` 단계에 `<유닛>=<상태>(<영수증>)`로 적히고, 하나라도 성공·이미 반영이 아니면 전체가 실패(1)입니다. 이 설치본이 SKIP·실패면 다른 설치본은 건드리지 않습니다.
-9. **영수증** — `~/.ompbot/logs/apply-<stamp>.json`에 단계별 `name`·`ok`·`detail`·`ms`, 게이트·doctor 요약, 이전 HEAD, 백업 경로를 남깁니다(0600). `--report-origin`(+`--report-thread`)을 주면 성공·실패·SKIP 모두 `[자동 후속] apply 결과 … 영수증 경로`를 그 스레드에 오너 메시지로 넣고, 그 inject 결과도 영수증 `report`에 기록합니다(inject가 실패해도 종료 코드는 바뀌지 않음). 데몬 소켓이 연결을 받지 않으면(`Failed to connect`·ECONNREFUSED·ENOENT — 다른 apply나 수동 재시작으로 잠깐 내려간 때) 5초 간격으로 최대 6번까지 시도하고, 데몬이 응답한 거절(`ok:false`)은 다시 시도하지 않습니다. `report.detail`에 시도 횟수(`attempts=N`)가 적힙니다.
+9. **영수증** — `~/.ompbot/logs/apply-<stamp>.json`에 단계별 `name`·`ok`·`detail`·`ms`, 게이트·doctor 요약, 이전 HEAD, 백업 경로를 남깁니다(0600). `--report-origin`(+`--report-thread`)을 주면 — origin은 `slack/ch/<C>`·`slack/dm/<D>`·`discord/ch/<ID>`·`discord/dm/<ID>`(스레드 origin은 안 됨), 스레드는 Slack origin이면 ts(`1793318305.840629`), Discord origin이면 메시지 ID(17~20자리 snowflake) — 성공·실패·SKIP 모두 `[자동 후속] apply 결과 … 영수증 경로`를 그 스레드에 오너 메시지로 넣고, 그 inject 결과도 영수증 `report`에 기록합니다(inject가 실패해도 종료 코드는 바뀌지 않음). 데몬 소켓이 연결을 받지 않으면(`Failed to connect`·ECONNREFUSED·ENOENT — 다른 apply나 수동 재시작으로 잠깐 내려간 때) 5초 간격으로 최대 6번까지 시도하고, 데몬이 응답한 거절(`ok:false`)은 다시 시도하지 않습니다. `report.detail`에 시도 횟수(`attempts=N`)가 적힙니다.
 
 - **한 번에 하나** — 같은 홈의 apply는 `<홈>/apply.lock`(`{pid, stamp, startedAt}`, 다 쓴 임시 파일을 `link`로 걸어 반쯤 쓴 락이 없음)을 잡고 1단계부터 돕니다. 다른 apply가 쥐고 있으면 `wait_apply` 단계로 기다리며 그동안 drain·재시작을 하지 않습니다(상한 `--timeout` 분 + 2분, 넘기면 아무것도 바꾸지 않고 `failed` `apply <stamp> still running after N min`). 락을 얻으면 1단계를 돈 뒤 기다린 apply의 영수증을 보고(`prior_apply` 단계), 그 영수증이 끝나 있고 상태가 성공·이미 반영이며 `head`가 지금 HEAD와 같으면 재시작·다른 설치본 없이 `already_applied`(`applied by apply-<stamp>`)로 끝냅니다. 그 apply가 실패(다른 설치본 실패 포함)했거나 HEAD가 다르거나 영수증을 읽지 못하면 2단계부터 전부 다시 돕니다. 락 주인 프로세스가 죽었거나 JSON이 깨진 락은 기다리지 않고 회수합니다(`stale lock <stamp> taken over`, 동시에 회수해도 주인은 하나). 락은 마지막 영수증(보고 inject 결과 포함)을 쓴 뒤에 풀므로, 기다리던 apply는 늘 완결된 영수증을 읽습니다. 다른 설치본은 각자 홈의 락을 씁니다.
 - `--detach`: 같은 인자로 `systemd-run --user --collect --unit=ompbot-apply-<stamp>`를 띄우고 유닛 이름과 영수증 예정 경로(`apply_detached unit=… receipt=…`)를 출력한 뒤 바로 끝납니다(PATH·`OMPBOT_HOME`을 유닛에 넘김). 영수증이 생기거나 `--report-origin` 보고가 오지 않으면 `journalctl --user -u ompbot-apply-<stamp>`를 보세요.

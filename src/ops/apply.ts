@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { DrainWaitResult } from "../cli/drain";
 import { parseChatOrigin } from "../core/origin-key";
+import { RESTART_CUT_FILE } from "../daemon/recovery";
 import { type BackupResult, backupStamp } from "./backup";
 import type { Gate } from "./gates";
 
@@ -22,17 +23,24 @@ import type { Gate } from "./gates";
 export const READY_TIMEOUT_MS = 120_000;
 const READY_POLL_MS = 1_000;
 export const DEFAULT_DRAIN_TIMEOUT_MIN = 60;
+/** `apply --cut-after` default: a drain still busy after this many minutes restarts anyway (the cut turns resume). */
+export const DEFAULT_DRAIN_CUT_MIN = 5;
 /** The `[자동 후속]` report inject is tried this many times while the daemon socket refuses connections. */
 export const REPORT_INJECT_ATTEMPTS = 6;
 export const REPORT_INJECT_RETRY_MS = 5_000;
 export const SYSTEMD_UNIT = "ompbot";
 
-/** The apply report goes to a Slack DM or channel origin (`slack/ch/<C>`, `slack/dm/<D>`), never a thread origin. */
+/**
+ * The apply report goes to a Slack or Discord DM or channel origin (`slack/ch/<C>`, `slack/dm/<D>`, `discord/ch/<id>`,
+ * `discord/dm/<id>`), never a thread origin.
+ */
 export const isReportOrigin = (originKey: string): boolean => {
 	const ref = parseChatOrigin(originKey);
-	return ref?.platform === "slack" && ref.threadId === undefined;
+	return (ref?.platform === "slack" || ref?.platform === "discord") && ref.threadId === undefined;
 };
-export const REPORT_THREAD_PATTERN = /^\d+\.\d+$/;
+/** `--report-thread` of a report origin: a Slack message ts, or a Discord message id (snowflake) — as `inject` checks. */
+export const reportThreadPattern = (originKey: string): RegExp =>
+	parseChatOrigin(originKey)?.platform === "discord" ? /^\d{17,20}$/ : /^\d+\.\d+$/;
 export const STAMP_PATTERN = /^\d{8}-\d{6}$/;
 /** The config copies `apply` itself makes (`config.json.bak-<stamp>-apply`); hand-made bak names never match. */
 const APPLY_CONFIG_COPY = /^config\.json\.bak-\d{8}-\d{6}-apply$/;
@@ -48,6 +56,11 @@ export type Runner = (cmd: string[], options?: { cwd?: string; env?: Record<stri
 
 export interface ApplyOptions {
 	timeoutMin: number;
+	/**
+	 * Drain cut limit (min): still busy by then, the daemon records its running turns (`drain_cut`) and the restart
+	 * goes ahead. Absent or 0: no cut, the drain waits `timeoutMin` and a timeout cancels it.
+	 */
+	cutAfterMin?: number;
 	/** Receipt/unit stamp; `--detach` fixes it up front so the receipt path can be announced. Default: start time. */
 	stamp?: string;
 	/** The change was merged at this instant; a daemon started after it already runs the new code. */
@@ -71,7 +84,8 @@ export interface ApplyDeps {
 	sleep: (ms: number) => Promise<void>;
 	run: Runner;
 	callDaemon: (request: unknown, timeoutMs: number) => Promise<unknown>;
-	drain: (timeoutMin: number) => Promise<DrainWaitResult>;
+	/** `cutAfterMin` is passed only when the apply cuts (see `ApplyOptions.cutAfterMin`). */
+	drain: (timeoutMin: number, cutAfterMin?: number) => Promise<DrainWaitResult>;
 	backup: () => BackupResult;
 	gates: () => Gate[];
 	doctor: () => Promise<{ code: number; lines: string[] }>;
@@ -485,7 +499,19 @@ async function applyUnderLock(
 	const git = async (...args: string[]): Promise<RunResult> =>
 		deps.run(["git", "-C", repoDir, ...args], { env: { PATH: deps.pathEnv } });
 
+	// Set once the daemon confirmed `drain_cut`: every end of this apply (ok, failed, rolled back) removes the file
+	// then, after the restarts it covers. A dead apply leaves it to the 3-hour expiry of recovery.
+	let cutRecorded = false;
 	const finish = async (status: ApplyStatus, exitCode: 0 | 1 | 3): Promise<ApplyOutcome> => {
+		if (cutRecorded) {
+			const cutPath = join(homeDir, RESTART_CUT_FILE);
+			try {
+				rmSync(cutPath, { force: true });
+				deps.log(`apply restart cut removed ${cutPath}`);
+			} catch (error) {
+				deps.log(`apply restart cut remove failed ${cutPath}: ${msg(error)}`);
+			}
+		}
 		receipt.status = status;
 		receipt.exitCode = exitCode;
 		writeReceipt();
@@ -729,13 +755,27 @@ async function applyUnderLock(
 
 	// 3. drain: a timeout cancels the drain itself, so nothing was changed and no restart follows. An unreachable
 	// daemon may still have taken the drain (a lost answer): cancel it too, best effort, so no restart leaves it held.
+	// With a cut limit, a drain still busy then restarts anyway once the daemon confirmed `drain_cut` (its running
+	// turns are on disk for the next process to resume); without that confirmation it ends like a timeout.
+	const cutAfterMin = options.cutAfterMin !== undefined && options.cutAfterMin > 0 ? options.cutAfterMin : undefined;
 	const drained = await step("drain", async () => {
-		const result = await deps.drain(options.timeoutMin);
-		if (result.ok)
-			return {
-				ok: true,
-				detail: `turns=${result.counts.turns} hostTools=${result.counts.hostTools} approvals=${result.counts.approvals}`,
-			};
+		const result = await deps.drain(options.timeoutMin, cutAfterMin);
+		if (result.ok) {
+			const counts = `turns=${result.counts.turns} hostTools=${result.counts.hostTools} approvals=${result.counts.approvals}`;
+			if (result.cut !== true) return { ok: true, detail: counts };
+			let refused: string;
+			try {
+				const response = await deps.callDaemon({ op: "drain_cut", applyStamp: stamp }, 30_000);
+				if (typeof response === "object" && response !== null && "ok" in response && response.ok === true) {
+					cutRecorded = true;
+					return { ok: true, detail: `cut=true ${counts}` };
+				}
+				refused = `drain_cut refused: ${JSON.stringify(response)}`;
+			} catch (error) {
+				refused = `drain_cut failed: ${msg(error)}`;
+			}
+			return { ok: false, detail: `timeout after ${cutAfterMin} min (${refused}; ${await cancelDrain()})` };
+		}
 		if (result.reason === "unreachable")
 			return { ok: false, detail: `daemon not reachable: ${result.error}; ${await cancelDrain()}` };
 		return { ok: false, detail: `${result.reason} after ${options.timeoutMin} min (drain cancelled)` };

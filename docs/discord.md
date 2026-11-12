@@ -33,7 +33,7 @@ ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slac
    - **Requires OAuth2 Code Grant**는 끈 채로 둡니다.
    - **Privileged Gateway Intents**에서 **Message Content Intent**를 켜고 **Save Changes**를 누릅니다. 이걸 끄면 서버 채널에서 멘션 없는 글(스레드 안 답장 등)의 본문을 받지 못하고, ompbot이 이 인텐트를 요청하므로 Gateway가 닫힘 코드 4014로 연결을 끊습니다. 서버 100개 미만의 봇은 심사 없이 켤 수 있습니다.
    - **Presence Intent**, **Server Members Intent**는 켜지 않습니다(쓰지 않습니다).
-   - Username과 아이콘은 여기서 바꿉니다. 메시지 위에 보이는 봇 이름이 됩니다.
+   - Username과 아이콘은 여기서 바꿉니다. Username은 소문자·숫자·`_`·`.`뿐이라 한글은 못 넣습니다. 메시지 위에 한글 봇 이름을 띄우려면 5절 설정의 `displayName`을 씁니다(기동 때 봇의 글로벌 표시 이름으로 반영되어 DM·별명 없는 서버에서 보입니다. 서버에서 지은 별명이 있으면 그 별명이 우선).
 
 ## 2. 봇 토큰을 파일로
 
@@ -98,14 +98,21 @@ Slack과 같이 쓰거나 서버·채널 키를 더할 때는 `~/.ompbot/config.
       "guildIds": ["<4절의 서버 ID>"],
       "mentionFreeChannels": [],
       "requireMention": false,
-      "laneChannelId": "<4절 5단계의 채널 ID>"
+      "laneChannelId": "<4절 5단계의 채널 ID>",
+      "logChannelId": "<#log로 쓸 서버 텍스트 채널 ID>",
+      "escalationChannelId": "<승인 카드를 받을 서버 텍스트 채널 ID>",
+      "displayName": "송박"
     }
   }
 }
 ```
 
 - `botTokenFile`은 ompbot 홈(`~/.ompbot`) 기준 상대경로입니다. 파일이 없으면 `secret_missing`, 권한이 0600이 아니면 `secret_permissions`로 기동하지 않습니다.
+- `displayName`은 선택입니다. 넣으면 기동 때 봇의 글로벌 표시 이름을 이 값으로 바꿉니다(`PATCH /users/@me`, 1~32자). DM·별명 없는 서버의 메시지 위에 이 이름이 보입니다. 바꾸기가 실패하면 경고 로그만 남고 기동은 계속됩니다.
 - `laneChannelId`는 선택입니다. 없으면 DM 세션에는 `ompbot_work_start`가 없고, DM의 `작업: …`에는 이 설정이 필요하다는 답이 옵니다. 서버 채널·스레드에서 요청한 레인은 설정 없이 그 채널에 열립니다.
+- `logChannelId`는 선택입니다. 넣으면 Discord 대화와 Discord 스레드의 작업 레인 답 첫 줄이 `✅ 완료`로 시작할 때 그 답의 사본이 `📒 완료 보고 사본 · <요청 위치 + 원 스레드 링크>` 머리말과 함께 이 채널에 한 번 올라갑니다. Slack 대화의 사본은 지금처럼 Slack `logChannel`로만 갑니다. 이 채널과 그 스레드의 글은 멘션이 있어도 턴이 되지 않습니다(`inbound_dropped reason=log_channel`). `escalationChannelId`·`laneChannelId`·`mentionFreeChannels`와 같은 채널이면 `config_invalid field=channels.discord.logChannelId`로 기동하지 않습니다.
+- `escalationChannelId`는 선택입니다. 넣으면 Discord 대화에서 올린 승인 카드가 이 채널에 뜹니다(Discord 오너 멘션, `요청 위치` 링크). 요청한 대화에 스레드가 있으면 그곳에 버튼 달린 사본 카드가 뜨고, 카드 스레드에 단 답글도 카드를 결정합니다. 없으면 지금처럼 요청한 대화에 카드가 뜹니다. Slack 요청은 Slack `escalationChannel`을 그대로 따릅니다.
+- 두 채널 모두 봇이 보고 글을 쓸 수 있어야 합니다(View Channel·Send Messages). `channels`는 재시작 키라 두 값도 재시작해야 반영됩니다.
 - `guildIds`·`mentionFreeChannels`·`requireMention`은 선택입니다. `guildIds`를 비우면 봇이 들어간 모든 서버의 글을 받습니다(오너 글만 처리하는 건 같습니다).
 - 기존 `ownerSlackUserId` 키는 계속 읽히지만 경고가 납니다. `channels.slack.ownerUserId`로 옮기면 경고가 사라집니다.
 - `channels`는 재시작이 필요한 키입니다. `reload`로는 반영되지 않습니다.
@@ -121,8 +128,11 @@ bun src/main.ts apply --detach  # 재시작
 ## 6. 동작 확인
 
 - 봇과의 DM에 아무 질문 → 👀 반응 → 진행 표시 → 답 → ✅.
+- 질문을 보내자마자 "입력 중…" 표시가 뜨고, 첫 답이 오거나 턴이 끝나면(길어도 5분 30초 뒤) 꺼집니다.
 - `!status`가 답합니다.
 - 서버 채널에서 봇을 멘션 → 스레드가 생기고 답이 스레드에 옵니다. 같은 스레드에 멘션 없이 답해도 이어집니다.
+- 봇 글에 Discord "답장"을 달면 멘션이 없어도 봇이 받고, 답장 대상 글의 앞부분을 참고합니다. 답장하면서 피어 봇만 멘션하면 피어 몫입니다.
+- 서버 멤버 목록에서 봇이 온라인(초록불)으로 보입니다.
 - 승인이 필요한 일을 시키면 버튼 카드가 오고, 누르면 결과 줄로 바뀝니다.
 - 같은 시간에 Slack DM도 정상으로 답합니다.
 - `/status-ompbot`이 나에게만 보이는 응답으로 답합니다.

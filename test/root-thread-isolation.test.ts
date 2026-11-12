@@ -398,7 +398,9 @@ describe("daemon: channel roots are isolated sessions", () => {
 		const recoveries = logs.count(/event=recovery_done /);
 		await boot(() => false, sessions);
 		await logs.waitFor(() => logs.count(/event=recovery_done /) > recoveries, "restart recovery");
-		expect(logs.lines.filter((line) => /event=recovery_done /.test(line)).at(-1)).toMatch(/ answered=0 interrupted=2$/);
+		expect(logs.lines.filter((line) => /event=recovery_done /.test(line)).at(-1)).toMatch(
+			/ answered=0 interrupted=2 continued=0$/,
+		);
 		await transport.waitForPosts((text) => text === INTERRUPTED_NOTICE, 2);
 		expect(
 			daemon.store
@@ -682,7 +684,7 @@ describe("router: taskSpec thread binding and restart recovery of two roots", ()
 			log,
 			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		});
-		expect(result).toEqual({ answered: 0, interrupted: 2 });
+		expect(result).toEqual({ answered: 0, interrupted: 2, continued: 0 });
 		const notices = store
 			.listDeliveries()
 			.filter((d) => d.body === INTERRUPTED_NOTICE)

@@ -95,6 +95,7 @@ import {
 	INTERIM_INFIX,
 	type InboundRow,
 	LOG_COPY_SUFFIX,
+	type LogChannels,
 	Store,
 } from "../store/db";
 import { notePrompt } from "../tasks/dispatch";
@@ -137,7 +138,7 @@ import {
 	formatTurnEscalationNotice,
 } from "./notices";
 import { NamespacedDriver } from "./opref";
-import { recoverDispatched } from "./recovery";
+import { type RestartCutEntry, recoverDispatched, writeRestartCut } from "./recovery";
 import { planReload, type ReloadResult } from "./reload";
 import {
 	pickRestartThreads,
@@ -329,7 +330,7 @@ class DaemonStore extends Store {
 		private readonly nudge: () => void,
 		log: Logger,
 		slackOwnerUserId: string | undefined,
-		logChannel: string | undefined,
+		logChannel: LogChannels,
 		timezone: string,
 	) {
 		super({
@@ -419,6 +420,8 @@ export class Daemon {
 	#taskSweeper: TaskSweeper | undefined;
 	/** `<task>:<reason>` of every overlap check a task was left out of, logged once each (memory only). */
 	readonly #overlapSkipped = new Set<string>();
+	/** Threads told "재시작 뒤에 처리" for an owner message held by the current drain: once per thread per drain. */
+	readonly #drainDeferNoticed = new Set<string>();
 	#lastTaskSweepAt = 0;
 	#taskSweeping = false;
 	/** Local `herdr status server` check on the task sweep cadence (herdr on only); feeds `herdr_unreachable`. */
@@ -805,7 +808,7 @@ export class Daemon {
 			() => this.#nudgePump(),
 			log,
 			config.channels.slack?.ownerUserId,
-			config.logChannel,
+			{ slack: config.logChannel, discord: config.channels.discord?.logChannelId },
 			config.timezone,
 		);
 		this.#store = store;
@@ -817,7 +820,7 @@ export class Daemon {
 				...(config.channels.discord === undefined ? {} : { discord: config.channels.discord.ownerUserId }),
 				...(config.channels.teams === undefined ? {} : { teams: config.channels.teams.ownerAadObjectId }),
 			},
-			escalationChannel: config.escalationChannel,
+			escalationChannel: { slack: config.escalationChannel, discord: config.channels.discord?.escalationChannelId },
 			log,
 			store,
 			clock: this.#clock,
@@ -841,8 +844,23 @@ export class Daemon {
 			store,
 			log,
 			driverFactory: (origin, dir) => this.#makeDriver(origin, dir),
+			homeDir: config.homeDir,
+			now: () => this.#clock.now(),
+			lockRepos: (originKey) => {
+				const repos = [...(config.turnSnapshot?.repos ?? [])];
+				try {
+					repos.push(this.cwdFor(originKey));
+				} catch {
+					// an open lane without its worktree: nothing there to hold a lock
+				}
+				return repos;
+			},
 		});
-		log.info("recovery_done", { answered: recovered.answered, interrupted: recovered.interrupted });
+		log.info("recovery_done", {
+			answered: recovered.answered,
+			interrupted: recovered.interrupted,
+			continued: recovered.continued,
+		});
 
 		const sessionsRoot = join(config.homeDir, "sessions");
 		mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
@@ -1040,8 +1058,14 @@ export class Daemon {
 					}
 				}
 				if (this.#router?.draining === true) {
-					// Restart drain: the row stays pending for the next process (or the cancel) to dispatch.
+					// Restart drain: the row stays pending for the next process (or the cancel) to dispatch. The owner hears
+					// so once per thread, or a held message looks ignored (independent of `restartNotice`). A slash command
+					// answers with the same text itself (onCommand).
 					log.info("drain_deferred", { origin: originKey, id: row.platformMessageId });
+					if (!row.platformMessageId.startsWith("slash:") && !this.#drainDeferNoticed.has(message.threadRef)) {
+						this.#drainDeferNoticed.add(message.threadRef);
+						this.#postThreadNotices([message.threadRef], DRAIN_DEFERRED_COMMAND_TEXT);
+					}
 					return {};
 				}
 				// Recorded durably first; dispatch (which may start omp) must not delay the 👀 acknowledgement.
@@ -1097,6 +1121,7 @@ export class Daemon {
 			},
 			knowsThread: (threadRef) => store.getLaneByThread(threadRef) !== undefined || store.hasInboundThread(threadRef),
 			isThreadMuted: (threadRef) => store.isThreadMuted(threadRef),
+			isDraining: () => this.#router?.draining === true,
 			setThreadMute: (threadRef, muted) => store.setThreadMute(threadRef, muted),
 			// Mute commands never become inbound rows, so handled ones are remembered in the ledger's KV store
 			// (namespaced like the backfill cursors) — a backfill replay of the same event is a duplicate,
@@ -2201,6 +2226,7 @@ export class Daemon {
 		const router = this.#router;
 		if (router === undefined || router.draining === on) return;
 		router.draining = on;
+		this.#drainDeferNoticed.clear();
 		this.#log.info(on ? "drain_started" : "drain_cancelled", { ...this.drainCounts() });
 		if (on) {
 			this.#announceDrain();
@@ -2210,6 +2236,44 @@ export class Daemon {
 		for (const originKey of new Set(this.store.listInbound({ state: "pending" }).map((row) => row.originKey))) {
 			this.#dispatchPending(originKey);
 		}
+	}
+
+	/**
+	 * `apply` past its drain cut limit, right before its restart: records the op_ref of every dispatched turn (with the
+	 * summary of the approval card its origin waits on) in `<home>/restart-cut.json` — the next process resumes those
+	 * turns instead of reporting them interrupted — then withdraws the pending approval cards. ok only once the file is
+	 * durably in place; a failed write answers an error and touches no card, and the apply then cancels the drain.
+	 */
+	async drainCut(
+		applyStamp: string,
+	): Promise<{ ok: true; opRefs: number; approvals: number } | { ok: false; error: string }> {
+		const router = this.#router;
+		const store = this.#store;
+		const broker = this.#broker;
+		if (router?.draining !== true || store === undefined || broker === undefined)
+			return { ok: false, error: "not draining" };
+		const approvals = new Map<string, string>();
+		for (const request of broker.pendingRequests()) {
+			if (request.originKey !== undefined && !approvals.has(request.originKey))
+				approvals.set(request.originKey, request.summary);
+		}
+		const opRefs: RestartCutEntry[] = [];
+		const seen = new Set<string>();
+		for (const row of store.listInbound({ state: "dispatched" })) {
+			if (row.opRef === null || seen.has(row.opRef)) continue;
+			seen.add(row.opRef);
+			const approval = approvals.get(row.originKey);
+			opRefs.push({ originKey: row.originKey, opRef: row.opRef, ...(approval === undefined ? {} : { approval }) });
+		}
+		try {
+			writeRestartCut(this.#options.config.homeDir, { at: this.#clock.now(), applyStamp, opRefs });
+		} catch (error) {
+			this.#log.warn("drain_cut_failed", { apply: applyStamp, error: String(error) });
+			return { ok: false, error: String(error) };
+		}
+		const cancelled = await broker.cancelForRestart();
+		this.#log.info("drain_cut", { apply: applyStamp, op_refs: opRefs.length, approvals_cancelled: cancelled });
+		return { ok: true, opRefs: opRefs.length, approvals: cancelled };
 	}
 
 	/**
@@ -2229,8 +2293,12 @@ export class Daemon {
 		}
 		const plan = planReload(current, fresh);
 		this.#options.config = plan.next;
-		this.#store?.setLogChannel(plan.next.logChannel);
-		this.#broker?.setEscalationChannel(plan.next.escalationChannel);
+		// `channels` is a restart key, so `plan.next` still carries the Discord values the daemon started with.
+		this.#store?.setLogChannel({ slack: plan.next.logChannel, discord: plan.next.channels.discord?.logChannelId });
+		this.#broker?.setEscalationChannel({
+			slack: plan.next.escalationChannel,
+			discord: plan.next.channels.discord?.escalationChannelId,
+		});
 		// The inbound policy keys are Slack's config fields.
 		this.#adapters.get("slack")?.setChannelPolicy({
 			...(plan.next.mentionFreeChannels === undefined ? {} : { mentionFreeChannels: plan.next.mentionFreeChannels }),
@@ -2239,6 +2307,10 @@ export class Daemon {
 			...(plan.next.requireMention === undefined ? {} : { requireMention: plan.next.requireMention }),
 			...(plan.next.peerHopLimit === undefined ? {} : { peerHopLimit: plan.next.peerHopLimit }),
 		});
+		// Of the top-level keys only the peer hop cap is Discord's too (its own policy is under `channels.discord`).
+		this.#adapters
+			.get("discord")
+			?.setChannelPolicy(plan.next.peerHopLimit === undefined ? {} : { peerHopLimit: plan.next.peerHopLimit });
 		this.#log.info("config_reloaded", {
 			trigger,
 			changed: plan.changed.join(",") || "-",
@@ -2340,7 +2412,7 @@ export class Daemon {
 	 * the owner message a reply of it.
 	 */
 	async inject(request: InjectRequest): Promise<InjectResult> {
-		if (!this.#adapters.has("slack")) throw new Error("daemon not started");
+		if (this.#adapters.size === 0) throw new Error("daemon not started");
 		if (request.asOwner !== true) throw new Error("inject requires --as-owner");
 		// Owner DM (`slack/dm/D…`, `discord/dm/<id>`) or a channel the bot is in (`slack/ch/C…`, `discord/ch/<id>`); no
 		// thread origins.
@@ -2659,6 +2731,10 @@ export class Daemon {
 		if (request.op === "drain" || request.op === "drain_status" || request.op === "drain_cancel") {
 			if (request.op !== "drain_status") this.setDraining(request.op === "drain");
 			return { ok: true, draining: this.#router?.draining ?? false, ...this.drainCounts() };
+		}
+		if (request.op === "drain_cut") {
+			const stamp = "applyStamp" in request && typeof request.applyStamp === "string" ? request.applyStamp : "";
+			return this.drainCut(stamp);
 		}
 		if (request.op === "inject") {
 			const text = "text" in request ? request.text : undefined;

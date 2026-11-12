@@ -46,6 +46,7 @@ import {
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
 import type { InboundRow, OriginRow, Store } from "../store/db";
+import { type TypicalDuration, typicalTurnDuration } from "../store/turn-duration";
 import { LiveTurn, type LiveView } from "./live-turn";
 import { parseThreadRef, TOP_LEVEL_TS, threadRefOfOrigin, wrapQuoted } from "./normalize";
 import { type ChatPlatform, parseChatOrigin } from "./origin-key";
@@ -321,6 +322,8 @@ export interface TurnProgress {
 	steers: number;
 	/** omp's model retry attempt (`auto_retry_start.attempt`); 0 without retries. */
 	retries: number;
+	/** How long this origin's turns usually take (chat origins with enough past turns only). */
+	typical?: TypicalDuration;
 }
 
 /** Tool lines a status message lists. */
@@ -1670,6 +1673,12 @@ export class OriginMailbox {
 		this.#eventPersistedAt = this.#lastEventAt;
 		this.#stalled = false;
 		log.info("turn_start", { origin: originKey, epoch: row.epoch, opRef });
+		// Reported at once: a turn without tool calls would otherwise never show what is usual.
+		const typical = typicalTurnDuration(store, originKey, log);
+		if (typical !== undefined) {
+			this.#turn.progress.typical = typical;
+			this.#reportProgress(this.#turn);
+		}
 	}
 
 	/**

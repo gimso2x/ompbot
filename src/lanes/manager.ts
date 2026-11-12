@@ -30,7 +30,7 @@ import {
 	LaneDiffUnavailable,
 	laneDiffUnavailableRefusal,
 } from "./integrity";
-import { createLaneLander, type LandLane, type LandResult, laneLandBlockers } from "./land";
+import { createLaneLander, externallyLanded, type LandLane, type LandResult, laneLandBlockers } from "./land";
 import { type LaneReviewDeps, reviewLane } from "./review";
 import {
 	INCONCLUSIVE_APPROVED,
@@ -47,7 +47,14 @@ import {
 	OWNER_PAUSE_HELD,
 } from "./status";
 import { buildLanePrompt, buildNotDonePrompt, buildRebasePrompt, classifyClosedLaneMessage } from "./trigger";
-import { type ClaimEvidence, type GitRunner, resolveBaseSha, type VerifyResult, verifyClaim } from "./verify";
+import {
+	type ClaimEvidence,
+	defaultGit,
+	type GitRunner,
+	resolveBaseSha,
+	type VerifyResult,
+	verifyClaim,
+} from "./verify";
 import {
 	laneBranchOf,
 	laneIdsOnBranches,
@@ -164,7 +171,7 @@ export interface LaneManagerDeps {
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state no lane starts. */
 	frozen?: () => FreezeState | undefined;
 	/** Test seam; default checks the real git repository. */
-	verify?: (evidence: ClaimEvidence, cwd: string, baseSha?: string) => Promise<VerifyResult>;
+	verify?: (evidence: ClaimEvidence, cwd: string, baseSha?: string, baseBranch?: string) => Promise<VerifyResult>;
 	/** Test seam; default reads the lane's `git diff` from the merge-base with its base branch (`collectLaneDiff`). */
 	collectDiff?: (laneCwd: string, range: LaneDiffRange, sha: string) => Promise<string>;
 	/** Test seam; default judges the claim's summary + diff (hermes completion_integrity). */
@@ -732,7 +739,7 @@ export class LaneManager {
 			if (lane?.status !== "done-claimed" || !claim) return { text: "no pending claim" };
 			let result: VerifyResult;
 			try {
-				result = await (this.#deps.verify ?? verifyClaim)(claim, lane.cwd, lane.meta.baseSha);
+				result = await (this.#deps.verify ?? verifyClaim)(claim, lane.cwd, lane.meta.baseSha, lane.meta.baseBranch);
 			} catch (error) {
 				log.warn("lane_verify_unavailable", { lane: name, error: String(error) });
 				store.patchLane(name, { event: "verify_unavailable", detail: String(error) }, {});
@@ -1644,6 +1651,7 @@ export class LaneManager {
 				}
 				await this.#sync(lane, "tick");
 				await this.#tickLanding(lane);
+				if (lane.status === "not-done") await this.#closeIfLandedOutside(lane.name);
 			} catch (error) {
 				this.#deps.log.error("lane_tick_failed", { lane: lane.name, error: String(error) });
 			}
@@ -1673,6 +1681,69 @@ export class LaneManager {
 		} finally {
 			this.#landing.delete(lane.name);
 		}
+	}
+
+	/**
+	 * A `not-done` worktree lane whose work someone merged into the base branch outside the lane (doc/plans/
+	 * lane-rebase-external-land.md 설계 2): closed as `landed`, its worktree and branch removed. Only a lane whose last
+	 * claim carries work made on the lane branch, whose work is in the base branch (`externallyLanded`), with a clean
+	 * worktree and no running turn. A git call that fails changes nothing and is logged.
+	 */
+	async #closeIfLandedOutside(name: string): Promise<void> {
+		const { store, log } = this.#deps;
+		const lane = store.getLane(name);
+		const claim = lane?.meta.claim;
+		const { repo, worktree, branch, baseBranch, baseSha } = lane?.meta ?? {};
+		if (
+			lane?.status !== "not-done" ||
+			claim === undefined ||
+			repo === undefined ||
+			worktree === undefined ||
+			branch === undefined ||
+			baseBranch === undefined ||
+			baseSha === undefined ||
+			this.#settling.has(name) ||
+			this.#landing.has(name) ||
+			this.#deps.laneBusy?.(lane.originKey) === true
+		) {
+			return;
+		}
+		let found: { sha: string; pushed: boolean } | undefined;
+		try {
+			found = await externallyLanded(defaultGit, { repo, worktree, branch, baseBranch, baseSha, claim: claim.commit });
+		} catch (error) {
+			log.warn("lane_external_land_check_failed", { lane: name, error: String(error).slice(0, 300) });
+			return;
+		}
+		if (found === undefined) return;
+		// Read again: the owner may have written in the thread (back to working) or the lane claimed again meanwhile.
+		const current = store.getLane(name);
+		if (current?.status !== "not-done" || current.meta.claim?.claimedAt !== claim.claimedAt) return;
+		if (this.#deps.laneBusy?.(lane.originKey) === true) return;
+		const { sha, pushed } = found;
+		const land: LaneLand = { state: "landed", attempts: 0, ...(pushed ? { pushed: `origin/${baseBranch}` } : {}) };
+		store.transitionLane(
+			name,
+			"closed",
+			{ event: "landed", sha, detail: `레인 밖에서 머지됨 · claim ${sha.slice(0, 12)}` },
+			{ sha, milestone: undefined, land },
+		);
+		log.info("lane_landed_outside", { lane: name, sha, pushed: pushed ? `origin/${baseBranch}` : "none" });
+		// An idle child of this lane still has the worktree as its cwd.
+		await this.#deps.stopWhenIdle(lane.originKey);
+		await this.#ops.removeWorktree({ repo, worktree, branch });
+		const left: string[] = [];
+		if (existsSync(worktree)) left.push(`worktree ${worktree}`);
+		if ((await defaultGit(["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0) {
+			left.push(`브랜치 ${branch}`);
+		}
+		const row =
+			left.length === 0
+				? store.getLane(name)
+				: this.#patchLand(name, { cleanup: `worktree·브랜치 정리 실패: ${left.join(", ")} — 손으로 지우세요` });
+		if (left.length > 0) log.warn("lane_external_land_cleanup_left", { lane: name, left: left.join(", ") });
+		this.#dropReviewFiles(row ?? lane);
+		if (row !== undefined) await this.#sync(row, "transition");
 	}
 
 	#requireLane(originKey: string): LaneRow {

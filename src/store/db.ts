@@ -56,6 +56,16 @@ export const TEAMS_QA_ORIGIN_PREFIX = "teams-qa/";
 const TURN_FAILED_HEAD = "[turn failed]";
 /** How far back recall candidates reach. */
 const RECALL_WINDOW_MS = 90 * 24 * 60 * 60_000;
+/** How far back turn-duration samples reach, and at most how many (newest first). */
+const TURN_SAMPLE_WINDOW_MS = 30 * 24 * 60 * 60_000;
+const TURN_SAMPLE_LIMIT = 200;
+/** Origin-key prefixes of every chat platform (`chatPlatformOf`): the turns typical durations are read from. */
+const CHAT_ORIGIN_PREFIXES = Object.keys({
+	slack: true,
+	telegram: true,
+	discord: true,
+	teams: true,
+} satisfies Record<ChatPlatform, true>).map((platform) => `${platform}/%`);
 /** First line of a chat answer that closes a task: only these are copied to the log channel. */
 const COMPLETION_MARKER = /^(?:✅|:white_check_mark:) 완료/;
 
@@ -84,6 +94,12 @@ export interface StoreClock {
 	now(): number;
 }
 
+/** The #log channel of each platform that has one (Slack: top-level `logChannel`, Discord: `channels.discord.logChannelId`). */
+export interface LogChannels {
+	slack?: string | undefined;
+	discord?: string | undefined;
+}
+
 export interface StoreOptions {
 	path: string;
 	clock: StoreClock;
@@ -93,8 +109,11 @@ export interface StoreOptions {
 	redact: (text: string) => string;
 	/** Fallback Slack channel for monitor output before any owner DM is known. */
 	slackOwnerUserId?: string;
-	/** Slack channel (the #log ledger) that gets a copy of every completion report; absent = no copies. */
-	logChannel?: string | undefined;
+	/**
+	 * The #log ledger channel of each platform: a completion report is copied to the one of its own platform; a platform
+	 * without one gets no copies. A string is the Slack channel alone.
+	 */
+	logChannel?: string | LogChannels | undefined;
 	hooks?: {
 		/** Runs inside the answer transaction after inbound rows became `answered`, before delivery rows exist. */
 		afterInboundAnswered?: () => void;
@@ -609,17 +628,17 @@ export class Store {
 	/** Posted delivery messages and the owner's 👍/👎 on them; shares this connection. */
 	readonly feedback: FeedbackLedger;
 	private readonly slackOwnerUserId: string | undefined;
-	private logChannel: string | undefined;
+	private logChannels: LogChannels = {};
 
-	/** Config reload: answers recorded from now on copy to the new #log channel (none when undefined). */
-	setLogChannel(channel: string | undefined): void {
-		this.logChannel = channel;
+	/** Config reload: answers recorded from now on copy to the new #log channels (a string: Slack's alone). */
+	setLogChannel(channel: string | LogChannels | undefined): void {
+		this.logChannels = typeof channel === "string" ? { slack: channel } : { ...channel };
 	}
 
 	constructor(options: StoreOptions) {
 		this.clock = options.clock;
 		this.slackOwnerUserId = options.slackOwnerUserId;
-		this.logChannel = options.logChannel;
+		this.setLogChannel(options.logChannel);
 		this.redact = options.redact;
 		this.hooks = options.hooks ?? {};
 		this.db = new Database(options.path, { create: true, strict: true });
@@ -1057,6 +1076,35 @@ export class Store {
 	}
 
 	/**
+	 * Durations (ms) of answered turns of the last 30 days, newest first, at most 200: the turn's first answer part
+	 * minus its earliest dispatch, one sample per turn however many messages were steered into it. Turns of
+	 * `originKey` only, or of every chat origin when it is omitted (monitor and lane turns never count).
+	 */
+	turnDurationSamples(originKey?: string): number[] {
+		const scope =
+			originKey === undefined
+				? `(${CHAT_ORIGIN_PREFIXES.map((_, i) => `i.origin_key LIKE $p${i}`).join(" OR ")})`
+				: "i.origin_key = $origin";
+		const rows = this.db
+			.query(
+				`SELECT d.created_at - MIN(i.dispatched_at) AS ms
+				 FROM inbound i JOIN deliveries d ON d.origin_key = i.origin_key AND d.op_ref = i.op_ref AND d.part = 0
+				 WHERE i.state = 'answered' AND i.dispatched_at IS NOT NULL AND ${scope}
+				 GROUP BY i.origin_key, i.op_ref
+				 HAVING MIN(i.dispatched_at) >= $since
+				 ORDER BY MIN(i.dispatched_at) DESC LIMIT $limit`,
+			)
+			.all({
+				...(originKey === undefined
+					? Object.fromEntries(CHAT_ORIGIN_PREFIXES.map((prefix, i) => [`$p${i}`, prefix]))
+					: { $origin: originKey }),
+				$since: this.clock.now() - TURN_SAMPLE_WINDOW_MS,
+				$limit: TURN_SAMPLE_LIMIT,
+			}) as Array<{ ms: number }>;
+		return rows.map((row) => row.ms);
+	}
+
+	/**
 	 * Recall candidates of one conversation space (its platform read from the id), newest first: owner messages and confirmed first-part bot
 	 * answers of the last 90 days whose origin AND thread both belong to `channel` (a DM origin's steer pointer into
 	 * a channel thread is excluded by the origin test), other than the `excludeThreadRef` thread and top-level posts.
@@ -1245,20 +1293,25 @@ export class Store {
 
 	/**
 	 * The single choke point where chat answers become deliveries also writes the log-channel copy of a completion
-	 * report: a Slack chat or work-lane answer (never commands) whose first non-empty line starts with `✅ 완료`.
-	 * The copy is one delivery on `<logChannel>:-` under `<opRef>:log-copy`, so a replayed answer inserts nothing new.
+	 * report: a Slack or Discord chat or work-lane answer (never commands) whose first non-empty line starts with
+	 * `✅ 완료`. It goes to the #log channel of the answer's own platform (a lane: its thread's), never another
+	 * platform's. The copy is one delivery on `<logChannel>:-` under `<opRef>:log-copy`, so a replayed answer inserts
+	 * nothing new.
 	 */
 	private copyCompletion(input: { originKey: string; opRef: string; threadRef: string }, body: string): void {
-		if (this.logChannel === undefined || COMMAND_OP_REF.test(input.opRef)) return;
-		// Slack chats only: the #log channel is a Slack channel.
-		if (chatPlatformOf(input.originKey) !== "slack" && !input.originKey.startsWith(LANE_ORIGIN_PREFIX)) return;
+		if (COMMAND_OP_REF.test(input.opRef)) return;
+		const lane = input.originKey.startsWith(LANE_ORIGIN_PREFIX);
+		const platform = lane ? platformOfThreadRef(input.threadRef) : chatPlatformOf(input.originKey);
+		const logChannel =
+			platform === "slack" ? this.logChannels.slack : platform === "discord" ? this.logChannels.discord : undefined;
+		if (logChannel === undefined) return;
 		const first = body.split("\n").find((line) => line.trim() !== "");
 		if (first === undefined || !COMPLETION_MARKER.test(first.trim())) return;
 		const requested = parseThreadRef(input.threadRef);
 		const channel = requested?.channel ?? "";
-		const where = input.originKey.startsWith(LANE_ORIGIN_PREFIX)
+		const where = lane
 			? `작업 레인 ${input.originKey.slice(LANE_ORIGIN_PREFIX.length)}`
-			: channel.startsWith("D")
+			: parseChatOrigin(input.originKey)?.kind === "dm"
 				? "DM"
 				: `<#${channel}>`;
 		const link =
@@ -1269,7 +1322,7 @@ export class Store {
 			{
 				originKey: input.originKey,
 				opRef: `${input.opRef}${LOG_COPY_SUFFIX}`,
-				threadRef: threadRefOf(this.logChannel, TOP_LEVEL_TS),
+				threadRef: threadRefOf(logChannel, TOP_LEVEL_TS),
 			},
 			0,
 			`📒 완료 보고 사본 · ${where}${link}\n${body}`,
@@ -1294,6 +1347,30 @@ export class Store {
 			const row = this.insertDelivery(input, 0, input.notice);
 			this.notifySteeredThreads(input, steered, input.notice);
 			return row;
+		})();
+	}
+
+	/**
+	 * One transaction: the resume row of a turn a planned restart cut (an owner row, `pending`, in the same thread;
+	 * idempotent on its `platformMessageId`) and the cut turn closed like `recordTurnFailure` with `notice`.
+	 */
+	recordContinuation(input: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		notice: string;
+		platformMessageId: string;
+		textRef: string;
+	}): { inserted: boolean } {
+		return this.db.transaction(() => {
+			const { inserted } = this.recordInbound({
+				originKey: input.originKey,
+				platformMessageId: input.platformMessageId,
+				textRef: input.textRef,
+				threadRef: input.threadRef,
+			});
+			this.recordTurnFailure(input);
+			return { inserted };
 		})();
 	}
 

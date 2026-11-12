@@ -48,6 +48,7 @@ export class DiscordBinding implements ChannelBinding {
 			log: deps.log,
 			guildIds: discord.guildIds,
 			mentionFreeChannels: discord.mentionFreeChannels,
+			logChannel: discord.logChannelId,
 			requireMention: discord.requireMention,
 			peerBots: discord.peerBots,
 			peerHopLimit: deps.config.peerHopLimit,

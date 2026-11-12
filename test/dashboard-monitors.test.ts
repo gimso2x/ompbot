@@ -112,7 +112,11 @@ function deps(): SnapshotDeps {
 		homeDir: home,
 		repoDir: "/srv/ompbot",
 		timezone: "Asia/Seoul",
-		config: { logChannel: "C0LOG", escalationChannel: "C0ESC" },
+		config: {
+			logChannel: "C0LOG",
+			escalationChannel: "C0ESC",
+			channels: { discord: { logChannelId: "678901234567890123", escalationChannelId: "789012345678901234" } },
+		},
 		now: () => NOW,
 		callDaemon: async () => {
 			throw new Error("no daemon");
@@ -235,6 +239,20 @@ describe("dashboard monitors snapshot", () => {
 		]) {
 			expect(json).not.toContain(leak);
 		}
+	});
+
+	test("the Discord log and escalation channels get the same names as Slack's", async () => {
+		addMonitors([
+			{
+				id: "discord",
+				name: "디스코드",
+				trigger: cron("0 23 * * *"),
+				channel: "678901234567890123",
+				copyChannel: "789012345678901234",
+			},
+		]);
+		const { items } = await monitorsOf();
+		expect(items.map((item) => [item.destination, item.copyTo])).toEqual([["로그 채널", "에스컬레이션 채널"]]);
 	});
 
 	test("AC-3: next-fire order, destination and copy names, bare file names", async () => {

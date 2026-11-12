@@ -106,6 +106,17 @@ describe("DiscordRest", () => {
 		});
 	});
 
+	test("patchCurrentUser PATCHes the global display name onto /users/@me", async () => {
+		server = startServer();
+		await rest(server.base).patchCurrentUser({ displayName: "송박" });
+		const req = server.seen[0];
+		if (req === undefined) throw new Error("no request");
+		expect(req.method).toBe("PATCH");
+		expect(req.path).toBe("/api/v10/users/@me");
+		expect(req.headers.get("authorization")).toBe(`Bot ${TOKEN}`);
+		expect(JSON.parse(req.body)).toEqual({ display_name: "송박" });
+	});
+
 	test("reaction emoji are URL-encoded into the path; edit, delete, threads and history hit their routes", async () => {
 		server = startServer((req) => {
 			if (req.method === "GET" && req.path.endsWith("/messages")) return Response.json([]);

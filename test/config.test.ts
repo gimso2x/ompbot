@@ -435,6 +435,7 @@ describe("channels.discord", () => {
 				mentionFreeChannels: ["456789012345678901"],
 				requireMention: true,
 				laneChannelId: "567890123456789012",
+				displayName: "송박",
 			}),
 		);
 		const cfg = loadConfig(home);
@@ -446,6 +447,7 @@ describe("channels.discord", () => {
 			mentionFreeChannels: ["456789012345678901"],
 			requireMention: true,
 			laneChannelId: "567890123456789012",
+			displayName: "송박",
 		});
 		expect(JSON.stringify(cfg)).not.toContain(TOKEN);
 		writeConfig(withDiscord());
@@ -454,6 +456,49 @@ describe("channels.discord", () => {
 			botTokenFile: join(home, "secrets/discord.token"),
 			applicationId: APP_ID,
 		});
+	});
+
+	test("logChannelId and escalationChannelId: snowflakes are taken; a top-level Slack logChannel stays as it was", () => {
+		writeConfig({
+			...withDiscord({ logChannelId: "678901234567890123", escalationChannelId: "789012345678901234" }),
+			logChannel: "C0LOGCHAN01",
+			escalationChannel: "C0ESCALATE1",
+		});
+		const cfg = loadConfig(home);
+		expect(cfg.channels.discord?.logChannelId).toBe("678901234567890123");
+		expect(cfg.channels.discord?.escalationChannelId).toBe("789012345678901234");
+		expect(cfg.logChannel).toBe("C0LOGCHAN01");
+		expect(cfg.escalationChannel).toBe("C0ESCALATE1");
+	});
+
+	test.each([
+		["a Slack-style logChannelId", { logChannelId: "C0LOGCHAN01" }, "channels.discord.logChannelId"],
+		["a numeric logChannelId", { logChannelId: 678901234567890 }, "channels.discord.logChannelId"],
+		[
+			"a Slack-style escalationChannelId",
+			{ escalationChannelId: "C0ESCALATE1" },
+			"channels.discord.escalationChannelId",
+		],
+		[
+			"logChannelId equal to escalationChannelId",
+			{ logChannelId: "678901234567890123", escalationChannelId: "678901234567890123" },
+			"channels.discord.logChannelId",
+		],
+		[
+			"logChannelId equal to laneChannelId",
+			{ logChannelId: "678901234567890123", laneChannelId: "678901234567890123" },
+			"channels.discord.logChannelId",
+		],
+		[
+			"logChannelId among mentionFreeChannels",
+			{ logChannelId: "678901234567890123", mentionFreeChannels: ["456789012345678901", "678901234567890123"] },
+			"channels.discord.logChannelId",
+		],
+	])("%s is config_invalid", (_name, overrides, field) => {
+		writeConfig(withDiscord(overrides));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(`field=${field}`);
 	});
 
 	test("readDiscordToken returns the one-line value", () => {
@@ -492,6 +537,9 @@ describe("channels.discord", () => {
 			withDiscord({ laneChannelId: 45678901234567890 }),
 			"field=channels.discord.laneChannelId",
 		],
+		["a numeric displayName", withDiscord({ displayName: 123 }), "field=channels.discord.displayName"],
+		["an empty displayName", withDiscord({ displayName: "" }), "field=channels.discord.displayName"],
+		["a 33-character displayName", withDiscord({ displayName: "가".repeat(33) }), "field=channels.discord.displayName"],
 		["an unknown key", withDiscord({ botToken: "x" }), "field=channels.discord.botToken"],
 		[
 			"discord not an object",
@@ -856,6 +904,24 @@ describe("Slack off: channels.slack absent (teams-channel TASK A)", () => {
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(`field=${field}`);
+	});
+
+	test("channels.discord.logChannelId and escalationChannelId load without Slack", () => {
+		const config = discordOnly();
+		writeConfig({
+			...config,
+			channels: {
+				discord: {
+					...config.channels.discord,
+					logChannelId: "678901234567890123",
+					escalationChannelId: "789012345678901234",
+				},
+			},
+		});
+		const loaded = loadConfig(home);
+		expect(loaded.channels.slack).toBeUndefined();
+		expect(loaded.channels.discord?.logChannelId).toBe("678901234567890123");
+		expect(loaded.channels.discord?.escalationChannelId).toBe("789012345678901234");
 	});
 
 	test("channels.discord.peerBots and peerHopLimit load without Slack", () => {

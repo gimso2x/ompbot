@@ -108,7 +108,7 @@ describe("restart recovery of a turn whose prompt the mailbox composed", () => {
 		);
 		expect(prompt.startsWith(`${RECALL_HEADER}\n`)).toBe(true);
 
-		expect(await recover()).toEqual({ answered: 1, interrupted: 0 });
+		expect(await recover()).toEqual({ answered: 1, interrupted: 0, continued: 0 });
 		expect(store.getInbound("C1:5000.2")?.state).toBe("answered");
 		expect(store.listDeliveries({ originKey: "slack/ch/C1/t/5000.1" }).map((d) => d.body)).toEqual(["끝난 답"]);
 	});
@@ -124,7 +124,7 @@ describe("restart recovery of a turn whose prompt the mailbox composed", () => {
 		const prompt = await finishedUnseen("slack/ch/C1/t/6000.1", "C1:6000.1", "C1:6000.2", "이어서 정리해줘");
 		expect(prompt.startsWith(THREAD_CONTEXT_HEADER)).toBe(true);
 
-		expect(await recover()).toEqual({ answered: 1, interrupted: 0 });
+		expect(await recover()).toEqual({ answered: 1, interrupted: 0, continued: 0 });
 		expect(store.listDeliveries({ originKey: "slack/ch/C1/t/6000.1" }).map((d) => d.body)).toEqual(["끝난 답"]);
 	});
 });

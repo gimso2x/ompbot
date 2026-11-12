@@ -36,7 +36,7 @@ let slack: WaitingTransport;
 let discord: WaitingDiscordTransport;
 let seq: bigint;
 
-async function boot(approvalTimeoutMs?: number): Promise<void> {
+async function boot(approvalTimeoutMs?: number, escalationChannelId?: string): Promise<void> {
 	slack = new WaitingTransport();
 	discord = new WaitingDiscordTransport();
 	discord.setChannel({ id: DM, type: 1 });
@@ -45,8 +45,18 @@ async function boot(approvalTimeoutMs?: number): Promise<void> {
 		new SlackBinding(new SlackChannel(slack)),
 		new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
 	];
+	const config = withDiscord(home);
+	const discordConfig = config.channels.discord;
+	if (discordConfig === undefined) throw new Error("no discord config");
 	daemon = new Daemon({
-		config: { ...withDiscord(home), escalationChannel: ESCALATION },
+		config: {
+			...config,
+			escalationChannel: ESCALATION,
+			channels: {
+				...config.channels,
+				discord: { ...discordConfig, ...(escalationChannelId === undefined ? {} : { escalationChannelId }) },
+			},
+		},
 		channels,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -165,6 +175,79 @@ describe("approval card on Discord", () => {
 		const card = await shownCard();
 		expect((await settledCard(card)).content).toContain("⌛ 시간 초과: 거부로 처리됨");
 		expectSlackUntouched();
+	});
+});
+
+describe("Discord escalation channel (channels.discord.escalationChannelId)", () => {
+	const DESC = "789012345678901234";
+	const GUILD = "300000000000000001";
+	const ASKED = "700000000000000100";
+
+	/** Boots with the Discord escalation channel and an owner message in the DM, so the request has a thread. */
+	async function bootEscalated(): Promise<void> {
+		await boot(undefined, DESC);
+		discord.setChannel({ id: DESC, type: 0, guildId: GUILD });
+		const store = daemon?.store;
+		if (store === undefined) throw new Error("not started");
+		store.ensureOrigin(ORIGIN, "sess/discord-dm");
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: `${DM}:${ASKED}`,
+			textRef: "푸시해",
+			threadRef: `${DM}:${ASKED}`,
+		});
+	}
+
+	test("a Discord request's card goes to the escalation channel with the Discord owner mention and the asking spot; a mirror lands in the asking thread", async () => {
+		await bootEscalated();
+		const result = ask();
+		const card = await shownCard();
+		const post = discord.posts((text) => text.includes("force push main"))[0];
+		expect(post?.channelId).toBe(DESC);
+		expect(post?.content).toContain(`<@${DISCORD_OWNER}>`);
+		expect(post?.content).toContain("요청 위치: DM");
+		expect(post?.content).toContain(`${DM}/${ASKED}`);
+		const shown = discord.calls.find((c) => isEdit(c) && buttonCount(c) > 0) as Edit;
+		expect(shown.channelId).toBe(DESC);
+		expect(JSON.stringify(shown.components)).toContain(approvalActionId("approve", DESC, card));
+		await discord.waitForPosts((text) => text.includes("force push main"), 2);
+		const mirror = discord.posts((text) => text.includes("force push main"))[1];
+		expect(mirror?.channelId).toBe(DM);
+		expect(mirror?.content).not.toContain(`<@${DISCORD_OWNER}>`);
+		await click(approvalActionId("approve", DESC, card), card);
+		expect(await result).toBe("approved");
+		expectSlackUntouched();
+	});
+
+	test("a reply in the escalation card's thread decides the card", async () => {
+		await bootEscalated();
+		const result = ask();
+		const card = await shownCard();
+		discord.setChannel({ id: card, type: 11, parentId: DESC, guildId: GUILD });
+		await discord.emitMessage({
+			id: "700000000000000201",
+			channel_id: card,
+			guild_id: GUILD,
+			author: { id: DISCORD_OWNER },
+			content: "그래 진행해",
+			type: 0,
+		});
+		expect(await result).toBe("replied: 그래 진행해");
+		expect((await settledCard(card)).content).toContain("💬 답장으로 처리됨");
+		expectSlackUntouched();
+	});
+
+	test("a Slack request still goes to the Slack escalation channel, never the Discord one", async () => {
+		await bootEscalated();
+		const tool = daemon?.hostToolsFor("slack/dm/D0OWNERDM1").find((t) => t.name === "ompbot_request_approval");
+		if (!tool) throw new Error("tool missing");
+		const abort = new AbortController();
+		const result = tool.execute({ summary: "slack force push" }, { signal: abort.signal });
+		await slack.waitForPosts((text) => text.includes("slack force push"));
+		expect(slack.posts((text) => text.includes("slack force push"))[0]?.channel).toBe(ESCALATION);
+		expect(discord.posts((text) => text.includes("slack force push"))).toHaveLength(0);
+		abort.abort();
+		await result;
 	});
 });
 

@@ -70,7 +70,7 @@ interface Harness {
 function harness(
 	options: {
 		maxLanes?: number;
-		verify?: (e: never, cwd: string) => Promise<VerifyResult>;
+		verify?: (e: never, cwd: string, baseSha?: string, baseBranch?: string) => Promise<VerifyResult>;
 		frozen?: () => { since: string; reason: string; by: string } | undefined;
 	} = {},
 ): Harness {
@@ -286,6 +286,59 @@ describe("verifyClaim (real git)", () => {
 		git(repo, "commit", "-q", "--allow-empty", "-m", "unrelated");
 		const unrelated = await verifyClaim({ repo, commit: "HEAD", summary: "s" }, repo, base);
 		expect(unrelated.ok === false && unrelated.reasons.join()).toContain("no_new_commit");
+	});
+
+	/** A repository on branch `lane` with claim commit `first` on it, while the base branch moved on by one commit. */
+	function reopenedLane(): { repo: string; base: string; first: string } {
+		const repo = makeRepo(repos);
+		const base = git(repo, "symbolic-ref", "--short", "HEAD");
+		git(repo, "checkout", "-q", "-b", "lane");
+		writeFileSync(join(repo, "lane.txt"), "lane\n");
+		git(repo, "add", "lane.txt");
+		git(repo, "commit", "-q", "-m", "lane work");
+		const first = git(repo, "rev-parse", "HEAD");
+		git(repo, "checkout", "-q", base);
+		writeFileSync(join(repo, "base.txt"), "base\n");
+		git(repo, "add", "base.txt");
+		git(repo, "commit", "-q", "-m", "base moved");
+		git(repo, "checkout", "-q", "lane");
+		return { repo, base, first };
+	}
+
+	test("AC-1: rebased onto the base branch after !reopen (no longer descends from the earlier claim): passes with work above the base, no_new_commit without", async () => {
+		const { repo, base, first } = reopenedLane();
+		git(repo, "rebase", "-q", base);
+		const rebased = git(repo, "rev-parse", "HEAD");
+		const claim = { repo, commit: "HEAD", summary: "s" };
+		expect(await verifyClaim(claim, repo, first, base)).toEqual({ ok: true, sha: rebased });
+		// Without the base branch the rule is as before.
+		const old = await verifyClaim(claim, repo, first);
+		expect(old.ok === false && old.reasons.join()).toContain("does not descend");
+		// The rebase dropped the work (the branch sits on the base): no new commit above it.
+		git(repo, "reset", "-q", "--hard", base);
+		const empty = await verifyClaim(claim, repo, first, base);
+		expect(empty.ok === false && empty.reasons.join()).toContain("no_new_commit");
+		// A base branch that cannot be read cannot judge the rebase: refused as before, and the reason says so.
+		git(repo, "reset", "-q", "--hard", rebased);
+		const unread = await verifyClaim(claim, repo, first, "no-such-branch");
+		expect(unread.ok === false && unread.reasons.join()).toContain("could not be read to judge a rebase");
+	});
+
+	test("AC-1b: a claim that is an ancestor of the base branch (the base merged in, no work) is no_new_commit though it descends from baseSha", async () => {
+		const { repo, base, first } = reopenedLane();
+		const start = git(repo, "rev-parse", `${first}~1`);
+		git(repo, "reset", "-q", "--hard", start);
+		git(repo, "merge", "-q", "--ff-only", base);
+		const claim = { repo, commit: "HEAD", summary: "s" };
+		const merged = await verifyClaim(claim, repo, start, base);
+		expect(merged.ok === false && merged.reasons.join()).toContain(
+			`no_new_commit: commit ${git(repo, "rev-parse", base)} is already in ${base}`,
+		);
+		// Without the base branch it would have passed: the merge descends from the starting commit.
+		expect((await verifyClaim(claim, repo, start)).ok).toBe(true);
+		// Work on top of the merged base passes.
+		commitMore(repo);
+		expect((await verifyClaim(claim, repo, start, base)).ok).toBe(true);
 	});
 });
 

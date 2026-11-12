@@ -21,6 +21,19 @@ export interface TeamsActivity {
 	entities?: TeamsMention[];
 	channelData?: { tenant?: { id?: string } };
 	replyToId?: string;
+	attachments?: TeamsAttachment[];
+}
+
+/**
+ * One Activity attachment: a file the user uploaded (`application/vnd.microsoft.teams.file.download.info`, `content`
+ * an object or its JSON string with `downloadUrl`), an inline image (`image/*` with a Bot Connector `contentUrl`), or a
+ * card/HTML rendering ompbot skips.
+ */
+export interface TeamsAttachment {
+	contentType?: string;
+	contentUrl?: string;
+	content?: unknown;
+	name?: string;
 }
 
 /**

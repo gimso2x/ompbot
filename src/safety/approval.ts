@@ -1,7 +1,7 @@
 import type { ActionButton, ChannelPort, MessageRef, OutboundMessage } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { cutCodePointSafe } from "../channel/text";
-import { type ChatPlatform, platformOfConversationId } from "../core/origin-key";
+import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import type { Logger } from "../log";
 import { redact } from "../redact";
 
@@ -229,14 +229,23 @@ export interface ApprovalStore {
 	}>;
 }
 
+/** The escalation channel of each platform that has one (Slack: `escalationChannel`, Discord: `channels.discord.escalationChannelId`). */
+export interface EscalationChannels {
+	slack?: string | undefined;
+	discord?: string | undefined;
+}
+
 export interface ApprovalBrokerOptions {
 	/** Each card goes out on the port of its conversation's platform. */
 	channels: ChannelRegistry;
 	ownerUserId: string;
 	/** The owner on each platform, for clicks on that platform's cards; a platform not listed uses `ownerUserId`. */
 	platformOwners?: Partial<Record<ChatPlatform, string>> | undefined;
-	/** Slack channel that receives the cards of requests that carry an origin (`ask` with `origin`); absent: the origin's own channel. */
-	escalationChannel?: string | undefined;
+	/**
+	 * The channel of each platform that receives the cards of that platform's requests that carry an origin (`ask` with
+	 * `origin`); a platform without one: the origin's own channel. A string is the Slack channel alone.
+	 */
+	escalationChannel?: string | EscalationChannels | undefined;
 	log: Logger;
 	/** Durable ledger for approvals: survives restarts, double-click safe, expired rows are swept into cards. */
 	store: ApprovalStore;
@@ -254,6 +263,12 @@ interface Pending {
 	isSettled: () => boolean;
 	/** False when the ledger row could not be created, so there is no durable row to arbitrate against. */
 	recorded: boolean;
+	/** The asking conversation, when the request came from one. */
+	originKey: string | undefined;
+	/** The request text as the card shows it. */
+	summary: string;
+	/** The card and its mirror in the asking thread (once posted). */
+	cards: () => MessageRef[];
 }
 
 /** A choice card (`ApprovalBroker.choose`): an omp dialog put to the owner in the asking conversation. */
@@ -322,6 +337,9 @@ const FINAL_TEXT: Record<ApprovalOutcome, string> = {
 	timeout: "⌛ 시간 초과: 거부로 처리됨",
 };
 
+/** A planned restart cut (`apply` past its drain limit) withdrew the pending card; the resumed turn may ask again. */
+export const RESTART_CUT_CARD_TEXT = "⏹ 재시작으로 취소됨 — 이어가기 턴이 필요하면 다시 요청합니다";
+
 /** The waiting tool call was aborted (daemon restart, stopped turn): nobody pressed anything, so it is not a denial. */
 const ABORTED_TEXT = "⌛ 기다리던 작업이 중단돼 만료됨(데몬 재시작 등) — 필요하면 다시 요청해 주세요";
 
@@ -341,9 +359,13 @@ export class ApprovalBroker {
 	readonly #deadline: Intl.DateTimeFormat;
 	readonly #pending = new Map<string, Pending>();
 	readonly #choices = new Map<string, ChoicePending>();
+	/** Requests withdrawn by `cancelForRestart`: their final card keeps the restart text, not the abort/timeout one. */
+	readonly #cut = new Set<string>();
+	#escalation: EscalationChannels = {};
 
 	constructor(options: ApprovalBrokerOptions) {
 		this.#options = options;
+		this.setEscalationChannel(options.escalationChannel);
 		this.#timers = options.timers ?? realTimers;
 		this.#clock = options.clock ?? { now: () => Date.now() };
 		this.#deadline = new Intl.DateTimeFormat("en-GB", {
@@ -358,9 +380,65 @@ export class ApprovalBroker {
 		return this.#pending.size;
 	}
 
-	/** Config reload: cards requested from now on go to the new escalation channel. */
-	setEscalationChannel(channel: string | undefined): void {
-		this.#options.escalationChannel = channel;
+	/** Approval requests still waiting for the owner: their key, asking conversation and shown summary. */
+	pendingRequests(): Array<{ approvalId: string; originKey: string | undefined; summary: string }> {
+		return [...this.#pending].map(([approvalId, p]) => ({ approvalId, originKey: p.originKey, summary: p.summary }));
+	}
+
+	/**
+	 * A planned restart cut: every pending request's ledger row is expired (a later click is ignored and the next boot
+	 * leaves its card alone) and its cards say {@link RESTART_CUT_CARD_TEXT} without buttons; a card that cannot be
+	 * edited gets the line as a reply in its thread instead. The waiting tool calls stay open — the restart ends them.
+	 * Returns how many requests were withdrawn.
+	 */
+	async cancelForRestart(): Promise<number> {
+		const { store, log } = this.#options;
+		const now = this.#clock.now();
+		const requests = [...this.#pending].filter(([, p]) => !p.isSettled());
+		for (const [approvalId, p] of requests) {
+			this.#cut.add(approvalId);
+			if (p.recorded) {
+				try {
+					store.decideApproval(approvalId, "expired", now);
+				} catch (error) {
+					log.warn("approval_cut_ledger_failed", { id: approvalId, error: String(error) });
+				}
+			}
+			const note = `${RESTART_CUT_CARD_TEXT} · ${this.#deadline.format(now)}`;
+			const message = {
+				text: `🔐 승인 요청\n${p.summary}\n${note}`,
+				title: "🔐 승인 요청",
+				body: p.summary,
+				buttons: [],
+				buttonsNote: note,
+			};
+			for (const ref of p.cards()) {
+				try {
+					await this.#port(ref.conversationId).edit(ref, message);
+				} catch (error) {
+					log.warn("approval_cut_card_failed", {
+						channel: ref.conversationId,
+						ts: ref.messageId,
+						error: String(error),
+					});
+					try {
+						await this.#port(ref.conversationId).post(
+							{ conversationId: ref.conversationId, threadId: ref.messageId },
+							{ text: RESTART_CUT_CARD_TEXT },
+						);
+					} catch (postError) {
+						log.warn("approval_cut_notice_failed", { channel: ref.conversationId, error: String(postError) });
+					}
+				}
+			}
+			log.info("approval_cut", { id: approvalId });
+		}
+		return requests.length;
+	}
+
+	/** Config reload: cards requested from now on go to the new escalation channels (a string: Slack's alone). */
+	setEscalationChannel(channel: string | EscalationChannels | undefined): void {
+		this.#escalation = typeof channel === "string" ? { slack: channel } : { ...channel };
 	}
 
 	/** Like `ask`, for callers with no use for a free-text reply (a reply counts as not approved). */
@@ -376,7 +454,9 @@ export class ApprovalBroker {
 
 	/** `채널·스레드 링크` text of the requesting conversation; without a thread link it is the channel alone. */
 	#whereOf(origin: ApprovalOrigin, threadUrl: string | undefined): string {
-		const label = origin.channel.startsWith("D") ? "DM" : `<#${origin.channel}>`;
+		// A Discord DM id is a snowflake, so only the origin's kind tells it; a Slack DM id starts with `D`.
+		const dm = parseChatOrigin(origin.originKey)?.kind === "dm" || origin.channel.startsWith("D");
+		const label = dm ? "DM" : `<#${origin.channel}>`;
 		return threadUrl === undefined ? label : `${label} · <${threadUrl}|스레드 보기>`;
 	}
 
@@ -406,13 +486,15 @@ export class ApprovalBroker {
 	): Promise<ApprovalResult> {
 		const { signal, detail, origin } = options;
 		const { log, store } = this.#options;
-		const escalation = this.#options.escalationChannel;
-		// The escalation channel is one platform's value: a request from another platform's conversation stays there.
+		// Each platform has its own escalation channel: a request never moves to another platform's.
+		const requestPlatform = platformOfConversationId(requestChannel);
+		const escalation =
+			requestPlatform === "slack" || requestPlatform === "discord" ? this.#escalation[requestPlatform] : undefined;
 		const escalated =
 			origin !== undefined &&
 			escalation !== undefined &&
 			escalation !== requestChannel &&
-			platformOfConversationId(escalation) === platformOfConversationId(requestChannel);
+			platformOfConversationId(escalation) === requestPlatform;
 		const channel = escalated ? escalation : requestChannel;
 		const port = this.#port(channel);
 		// Computed once: the card header and the ledger summary (and sections) must show the exact same text.
@@ -421,7 +503,7 @@ export class ApprovalBroker {
 		const originUrl =
 			origin?.threadTs === undefined ? undefined : await this.#permalink(origin.channel, origin.threadTs);
 		const escalationLine = escalated
-			? { ownerMention: port.mentionUser(this.#options.ownerUserId), where: this.#whereOf(origin, originUrl) }
+			? { ownerMention: port.mentionUser(this.#ownerOf(channel)), where: this.#whereOf(origin, originUrl) }
 			: undefined;
 		// `header` stays the notification/fallback text; the card itself shows the sections as fields, not as lines.
 		const header = renderCard(shown, sections, escalationLine);
@@ -484,7 +566,14 @@ export class ApprovalBroker {
 			if (settle("denied")) aborted = true;
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
-		this.#pending.set(key, { settle, isSettled: () => settled, recorded });
+		this.#pending.set(key, {
+			settle,
+			isSettled: () => settled,
+			recorded,
+			originKey: origin?.originKey,
+			summary: shown,
+			cards: () => (mirror === undefined ? [card] : [card, mirror]),
+		});
 		let result: ApprovalResult = "denied";
 		try {
 			// The action ids carry the message's own ts, which exists only after the post.
@@ -538,16 +627,21 @@ export class ApprovalBroker {
 				log.warn("approval_decide_failed", { channel, ts: card.messageId, error: String(error) });
 			}
 		}
-		const outcomeText = aborted
-			? ABORTED_TEXT
-			: typeof result === "string"
-				? FINAL_TEXT[result]
-				: `💬 답장으로 처리됨: ${replyLine(result.replied)}`;
+		const cut = this.#cut.delete(key);
+		const outcomeText = cut
+			? RESTART_CUT_CARD_TEXT
+			: aborted
+				? ABORTED_TEXT
+				: typeof result === "string"
+					? FINAL_TEXT[result]
+					: `💬 답장으로 처리됨: ${replyLine(result.replied)}`;
 		// The buttons give way to the result line; title and fields stay so the card still says what was decided.
 		const resultLine = `${outcomeText} · ${this.#deadline.format(this.#clock.now())}`;
 		// A timed-out request from a thread offers one `다시 요청` (the daemon asks that thread again); no other outcome does.
 		const buttons =
-			result === "timeout" && recorded && origin?.threadTs !== undefined ? [retryButton(channel, card.messageId)] : [];
+			!cut && result === "timeout" && recorded && origin?.threadTs !== undefined
+				? [retryButton(channel, card.messageId)]
+				: [];
 		try {
 			await port.edit(card, { text: `${header}\n${resultLine}`, ...cardShape, buttons, buttonsNote: resultLine });
 		} catch (error) {

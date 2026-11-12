@@ -131,12 +131,16 @@ export async function resolveBaseSha(laneCwd: string, git: GitRunner = defaultGi
  * foreign path) is refused as `repo_mismatch`. On that top level the working tree must be clean
  * (`status --porcelain` prints nothing) and `commit` must exist, be reachable from HEAD and be new since the lane
  * started (`baseSha`): the starting commit itself, or one that does not descend from it, is `no_new_commit`.
+ * With the lane's `baseBranch`, a commit already in that branch (no work on top of it) is `no_new_commit` too, and one
+ * that does not descend from `baseSha` still passes when it has commits above its merge-base with the branch (the lane
+ * rebased after `!reopen`, so the earlier claim it started from was rewritten).
  * Every failed check contributes one reason. Returns the full sha on success.
  */
 export async function verifyClaim(
 	evidence: ClaimEvidence,
 	laneCwd: string,
 	baseSha?: string,
+	baseBranch?: string,
 	git: GitRunner = defaultGit,
 ): Promise<VerifyResult> {
 	const claimed = checkRepoPath(evidence.repo);
@@ -181,10 +185,38 @@ export async function verifyClaim(
 	else if (baseSha !== undefined) {
 		if (sha === baseSha) {
 			reasons.push(`no_new_commit: commit ${sha} is the commit the lane started from; commit your work first`);
-		} else if ((await git(["-C", top, "merge-base", "--is-ancestor", baseSha, sha])).code === 1) {
-			reasons.push(`no_new_commit: commit ${sha} does not descend from the lane's starting commit ${baseSha}`);
+		} else {
+			const reason = await newWorkProblem(git, top, sha, baseSha, baseBranch);
+			if (reason !== undefined) reasons.push(reason);
 		}
 	}
 	if (reasons.length > 0) return { ok: false, reasons };
 	return { ok: true, sha };
+}
+
+/** Why `sha` (not `baseSha` itself) is not new work of the lane; `undefined` = it is. */
+async function newWorkProblem(
+	git: GitRunner,
+	top: string,
+	sha: string,
+	baseSha: string,
+	baseBranch: string | undefined,
+): Promise<string | undefined> {
+	const notDescending = `no_new_commit: commit ${sha} does not descend from the lane's starting commit ${baseSha}`;
+	if (baseBranch === undefined) {
+		return (await git(["-C", top, "merge-base", "--is-ancestor", baseSha, sha])).code === 1 ? notDescending : undefined;
+	}
+	const baseRef = `refs/heads/${baseBranch}`;
+	const base = await git(["-C", top, "rev-parse", "--verify", "-q", `${baseRef}^{commit}`]);
+	const baseRead = base.code === 0;
+	if (baseRead && (await git(["-C", top, "merge-base", "--is-ancestor", sha, baseRef])).code === 0) {
+		return `no_new_commit: commit ${sha} is already in ${baseBranch} (no new commit on top of it); commit your work first`;
+	}
+	if ((await git(["-C", top, "merge-base", "--is-ancestor", baseSha, sha])).code !== 1) return undefined;
+	if (!baseRead) return `${notDescending}, and ${baseBranch} could not be read to judge a rebase`;
+	const mergeBase = await git(["-C", top, "merge-base", baseRef, sha]);
+	if (mergeBase.code !== 0) return `${notDescending} nor shares history with ${baseBranch}`;
+	const count = await git(["-C", top, "rev-list", "--count", `${mergeBase.stdout.trim()}..${sha}`]);
+	if (count.code !== 0) return `${notDescending}, and its commits above ${baseBranch} could not be counted`;
+	return Number(count.stdout.trim()) >= 1 ? undefined : `${notDescending} and has no commit above ${baseBranch}`;
 }

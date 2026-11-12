@@ -2,13 +2,16 @@
 // the configured tenant only, a group chat only when the bot is mentioned, a 1:1 chat always. An accepted message
 // gets a typing indicator at once; a turn still running after `longTurnMs` gets one `⏳ 작업 중` line, edited to its
 // result at the end. Answers reply to the original Activity id through the shared delivery pump.
+import { join } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
+import { MAX_INBOUND_FILES, saveInboundAttachment } from "../channel/attachments";
 import { renderMentions } from "../channel/port";
 import { DeliveryPump, type DeliverySender, type DeliverySendResult } from "../channel/pump";
 import {
 	FINAL_MARKS,
 	type FinalOutcome,
 	formatElapsed,
+	oneLine,
 	runningStatusText,
 	STATUS_MIN_INTERVAL_MS,
 } from "../channel/text";
@@ -18,12 +21,22 @@ import { isOwner, normalizeInbound, parseThreadRef, TOP_LEVEL_TS } from "../core
 import { chatOriginKey } from "../core/origin-key";
 import type { Logger } from "../log";
 import type { TeamsConversation } from "../store/db";
+import {
+	activityDirName,
+	downloadTeamsAttachment,
+	FILE_TYPE_MIME,
+	fileDownloadInfo,
+	isInboundFile,
+	TEAMS_FILE_DOWNLOAD_INFO,
+	teamsFileHostAllowed,
+	teamsImageHostAllowed,
+} from "./attachments";
 import type { TeamsAuth } from "./auth";
 import type { TeamsChannel, TeamsConversations } from "./channel";
 import { renderTeamsParts, stripMentions } from "./format";
 import { TeamsServer } from "./server";
 import { TeamsCallError, type TeamsConnector, TeamsRateLimitedError } from "./transport";
-import { type TeamsActivity, teamsAlias } from "./types";
+import { type TeamsActivity, type TeamsAttachment, teamsAlias } from "./types";
 
 /** A turn running longer than this gets its `⏳ 작업 중` line. */
 export const LONG_TURN_MS = 60_000;
@@ -45,6 +58,10 @@ export interface TeamsAdapterOptions {
 	listen?: { hostname: string; port: number; auth: TeamsAuth } | undefined;
 	longTurnMs?: number | undefined;
 	statusIntervalMs?: number | undefined;
+	/** Directory for downloaded inbound attachments (`<home>/media`); without it attachments are skipped with a note. */
+	mediaRoot?: string | undefined;
+	/** Fetch for attachment downloads (tests point it at a fake Microsoft); default the global `fetch`. */
+	attachmentFetch?: typeof fetch | undefined;
 }
 
 interface StatusEntry {
@@ -64,6 +81,8 @@ interface OwnerMessage {
 	messageId: string;
 	text: string;
 	quoted: readonly string[];
+	/** Uploaded files and inline images of a live 1:1 Activity (`isInboundFile`). */
+	files?: readonly TeamsAttachment[];
 }
 
 function errorText(err: unknown): string {
@@ -86,6 +105,8 @@ export class TeamsAdapter implements ChannelAdapter {
 	readonly #listen: TeamsAdapterOptions["listen"];
 	readonly #longTurnMs: number;
 	readonly #statusIntervalMs: number;
+	readonly #mediaRoot: string | undefined;
+	readonly #attachmentFetch: typeof fetch | undefined;
 	readonly #statuses = new Map<string, StatusEntry>();
 	readonly #pump: DeliveryPump;
 	/** Typing indicators in flight (tests and shutdown wait for them). */
@@ -110,6 +131,8 @@ export class TeamsAdapter implements ChannelAdapter {
 		this.#listen = options.listen;
 		this.#longTurnMs = options.longTurnMs ?? LONG_TURN_MS;
 		this.#statusIntervalMs = options.statusIntervalMs ?? STATUS_MIN_INTERVAL_MS;
+		this.#mediaRoot = options.mediaRoot;
+		this.#attachmentFetch = options.attachmentFetch;
 		this.#pump = new DeliveryPump({
 			source: options.deliveries,
 			sender: this.#sender(),
@@ -226,9 +249,18 @@ export class TeamsAdapter implements ChannelAdapter {
 		// A Teams 1:1 the owner wrote in stays a notice-home candidate, whichever path the message takes.
 		if (owner) this.#conversations.markTeamsOwnerSpoke(conversation.alias);
 		const text = stripMentions(activity.text ?? "");
+		const files = (activity.attachments ?? []).filter(isInboundFile);
 		// The owner in a group chat or channel gets the qa run too: a full turn there would answer from the owner's
 		// session, memory and tools in front of everyone in the room.
 		if (guest || this.#ownerQa || kind === "ch") {
+			// The read-only run never gets files: only the owner's own 1:1 turn does.
+			if (files.length > 0) {
+				this.#log.info("teams_attachment_ignored", {
+					reason: guest ? "guest" : this.#ownerQa ? "qa" : "group",
+					id,
+					files: files.length,
+				});
+			}
 			return this.#acceptGuest({
 				conversation,
 				messageId: id,
@@ -237,7 +269,7 @@ export class TeamsAdapter implements ChannelAdapter {
 				owner,
 			});
 		}
-		return this.#accept({ conversation, messageId: id, text, quoted: [] });
+		return this.#accept({ conversation, messageId: id, text, quoted: [], files });
 	}
 
 	/** A guest's question (or the owner's under `qa`): the core answers it read-only; only a typing indicator here. */
@@ -272,7 +304,8 @@ export class TeamsAdapter implements ChannelAdapter {
 
 	async #accept(message: OwnerMessage): Promise<IngestOutcome> {
 		const { conversation, messageId } = message;
-		const gate = normalizeInbound({
+		const files = message.files ?? [];
+		const args = {
 			userId: this.#owner,
 			botUserId: this.botUserId,
 			ownerUserId: this.#owner,
@@ -282,8 +315,19 @@ export class TeamsAdapter implements ChannelAdapter {
 			ts: messageId,
 			channelType: conversation.kind === "dm" ? "im" : "channel",
 			platform: "teams",
+		} as const;
+		// The placeholder only stands in for the notes the download adds to an empty text (a file-only message).
+		let gate = normalizeInbound({
+			...args,
+			text: files.length > 0 && message.text.trim() === "" ? "[file]" : message.text,
 		});
 		if (!gate.accept) return this.#drop({ id: messageId }, gate.reason);
+		if (files.length > 0) {
+			const notes = await this.#collectAttachments(conversation, messageId, files);
+			const body = [message.text.trim(), ...notes].filter((line) => line !== "").join("\n");
+			gate = normalizeInbound({ ...args, text: body });
+			if (!gate.accept) return this.#drop({ id: messageId }, gate.reason);
+		}
 		// A group chat has no threads: the whole chat is one origin, its answers reply to each message.
 		const inbound = {
 			...gate.inbound,
@@ -297,6 +341,68 @@ export class TeamsAdapter implements ChannelAdapter {
 		this.#log.info("inbound_ack", { origin: inbound.originKey, id: messageId });
 		this.#beginStatus(inbound.threadRef, conversation, messageId);
 		return "recorded";
+	}
+
+	/**
+	 * Downloads a 1:1 owner message's files (at most `MAX_INBOUND_FILES`) into `<mediaRoot>/inbound/<alias>-<id>/` and
+	 * returns their prompt notes; a refused or failed file is a `[첨부 실패: …]` line and the turn goes on.
+	 */
+	async #collectAttachments(
+		conversation: TeamsConversation,
+		messageId: string,
+		files: readonly TeamsAttachment[],
+	): Promise<string[]> {
+		const mediaRoot = this.#mediaRoot;
+		if (mediaRoot === undefined) return [`[첨부 실패: ${files.length}개 — 미디어 저장이 구성되지 않았습니다]`];
+		const dir = join(mediaRoot, "inbound", activityDirName(conversation.alias, messageId));
+		const where = { alias: conversation.alias, id: messageId };
+		const fetchImpl = this.#attachmentFetch;
+		const notes = await Promise.all(
+			files.slice(0, MAX_INBOUND_FILES).map(async (file) => {
+				if (file.contentType === TEAMS_FILE_DOWNLOAD_INFO) {
+					const info = fileDownloadInfo(file.content);
+					if (info === undefined) {
+						this.#log.warn("attachment_download_failed", { ...where, error: "invalid_content" });
+						return `[첨부 실패: ${oneLine(file.name ?? "file", 120)} — content에 downloadUrl 없음]`;
+					}
+					// A pre-signed SharePoint/OneDrive URL: no header at all, SharePoint/OneDrive hosts only.
+					return saveInboundAttachment({
+						file: {
+							id: info.uniqueId,
+							name: file.name,
+							mimetype: info.fileType === undefined ? undefined : FILE_TYPE_MIME[info.fileType],
+							url: info.downloadUrl,
+						},
+						dir,
+						where,
+						log: this.#log,
+						download: (args) => downloadTeamsAttachment({ ...args, hostAllowed: teamsFileHostAllowed, fetchImpl }),
+					});
+				}
+				// An inline image on the Bot Connector: the token goes to the Activity's own service host only.
+				const hostAllowed = (url: URL): boolean => teamsImageHostAllowed(url, conversation.serviceUrl);
+				return saveInboundAttachment({
+					file: { name: file.name, mimetype: file.contentType, url: file.contentUrl },
+					dir,
+					where,
+					log: this.#log,
+					download: async (args) => {
+						if (!hostAllowed(new URL(args.url))) throw new Error("host_not_allowed");
+						const token = await this.#connector.accessToken();
+						await downloadTeamsAttachment({
+							...args,
+							hostAllowed,
+							headers: { authorization: `Bearer ${token}` },
+							fetchImpl,
+						});
+					},
+				});
+			}),
+		);
+		if (files.length > MAX_INBOUND_FILES) {
+			notes.push(`[첨부 생략: ${files.length - MAX_INBOUND_FILES}개 — 메시지당 최대 ${MAX_INBOUND_FILES}개]`);
+		}
+		return notes;
 	}
 
 	/** An owner message the daemon puts in (a button path, `inject`): taken like a live one in a known conversation. */

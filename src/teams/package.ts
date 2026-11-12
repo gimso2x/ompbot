@@ -19,7 +19,8 @@ export function buildTeamsManifest(input: TeamsManifestInput): Record<string, un
 	return {
 		$schema: TEAMS_MANIFEST_SCHEMA,
 		manifestVersion: TEAMS_MANIFEST_VERSION,
-		version: input.version ?? "1.0.0",
+		// Teams refuses a re-upload of the same version: bump it whenever the manifest changes.
+		version: input.version ?? "1.0.1",
 		id: input.appId,
 		developer: {
 			name: "ompbot",
@@ -34,7 +35,7 @@ export function buildTeamsManifest(input: TeamsManifestInput): Record<string, un
 		},
 		icons: { color: "color.png", outline: "outline.png" },
 		accentColor: "#2F6FDE",
-		bots: [{ botId: input.appId, scopes: [...TEAMS_BOT_SCOPES], supportsFiles: false, isNotificationOnly: false }],
+		bots: [{ botId: input.appId, scopes: [...TEAMS_BOT_SCOPES], supportsFiles: true, isNotificationOnly: false }],
 		permissions: ["identity", "messageTeamMembers"],
 		validDomains: [],
 	};

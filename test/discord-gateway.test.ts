@@ -269,6 +269,7 @@ describe("DiscordGateway", () => {
 		expect(identify.token).toBe(TOKEN);
 		expect(identify.intents).toBe(46593);
 		expect(identify.properties).toMatchObject({ browser: "ompbot", device: "ompbot" });
+		expect(identify.presence).toEqual({ status: "online", since: null, activities: [], afk: false });
 		expect(gw.session()).toEqual({
 			sessionId: "sess-1",
 			resumeUrl: `ws://localhost:${h.port}/resume`,
@@ -329,6 +330,7 @@ describe("DiscordGateway", () => {
 		await h.until(() => h.conns[0]?.closed === true && opsOf(h.conns[1]).includes(6));
 		expect(h.conns[1]?.path).toBe("/resume");
 		expect(h.conns[1]?.received.find((f) => f.op === 6)?.d).toEqual({ token: TOKEN, session_id: "sess-1", seq: 5 });
+		expect(h.conns[1]?.received.find((f) => f.op === 6)?.d).not.toHaveProperty("presence");
 		expect(opsOf(h.conns[1])).not.toContain(2);
 		await h.until(() => rec.ready.length === 2);
 		expect(rec.ready[1]).toEqual({ resumed: true });
@@ -693,6 +695,48 @@ describe("DiscordSocketTransport", () => {
 			});
 			await h.until(() => messages.length === 1);
 		} finally {
+			void api.stop(true);
+		}
+	});
+
+	test("applies the configured display name once at start; a refused patch is logged, not fatal", async () => {
+		const h = startHarness();
+		harness = h;
+		const patches: Array<{ name: string | undefined }> = [];
+		const api = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const url = new URL(req.url);
+				if (url.pathname.endsWith("/gateway/bot")) return Response.json({ url: `ws://localhost:${h.port}/gateway` });
+				if (req.method === "PATCH") {
+					patches.push({
+						name: (JSON.parse(await req.text()) as { display_name?: unknown }).display_name as string,
+					});
+					return Response.json({ message: "Invalid Form Body" }, { status: 400 });
+				}
+				return Response.json({ id: BOT });
+			},
+		});
+		const errors: string[] = [];
+		const original = console.error;
+		console.error = (line: string) => errors.push(String(line));
+		try {
+			transport = new DiscordSocketTransport(
+				{ botToken: TOKEN },
+				{ baseUrl: `http://localhost:${api.port}/api/v10`, displayName: "송박" },
+			);
+			const started = await transport.start({
+				message: async () => {},
+				reaction: async () => {},
+				interaction: async () => {},
+			});
+			expect(started).toEqual({ botUserId: BOT, applicationId: APP });
+			expect(transport.connectionState().state).toBe("up");
+			expect(patches).toEqual([{ name: "송박" }]);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toContain("discord display_name");
+		} finally {
+			console.error = original;
 			void api.stop(true);
 		}
 	});

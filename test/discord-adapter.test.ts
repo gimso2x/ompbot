@@ -8,6 +8,7 @@ import type {
 	PeerInboundMessage,
 	PeerInboundOutcome,
 } from "../src/channel/types";
+import { QUOTED_HEADER } from "../src/core/normalize";
 import { parseCommand } from "../src/core/types";
 import { DiscordAdapter, type DiscordAdapterOptions } from "../src/discord/adapter";
 import { DiscordChannel } from "../src/discord/channel";
@@ -465,6 +466,29 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		expect(parseCommand(peers[0]?.message.text ?? "")).toBeUndefined();
 	});
 
+	test("an owner message that mentions only the peer is the peer's, even in a mention-free channel or a known thread", async () => {
+		await peerAdapter(undefined, { mentionFreeChannels: [CH] });
+		const root = message(`<@${BOT}> 시작`);
+		await transport.emitMessage(root);
+		await transport.emitMessage(message(`<@${PEER}> 이거 봐줘`, { channel_id: root.id }));
+		await transport.emitMessage(message(`<@!${PEER}> 루트에서 봐줘`));
+		await transport.emitMessage(message(`<@${BOT}> <@${PEER}> 둘 다`, { channel_id: root.id }));
+		expect(inbound.map((m) => m.text)).toEqual(["시작", `<@${PEER}> 둘 다`]);
+		expect(logs.filter((line) => line.includes("reason=not_addressed"))).toHaveLength(2);
+	});
+
+	test("setChannelPolicy takes the shared peerHopLimit for the next peer message", async () => {
+		const made = await peerAdapter();
+		made.setChannelPolicy({ peerHopLimit: { turns: 5, windowMinutes: 10 }, requireMention: true });
+		await transport.emitMessage(peerMessage(`<@${BOT}> 한도`));
+		made.setChannelPolicy({});
+		await transport.emitMessage(peerMessage(`<@${BOT}> 기본`));
+		expect(peers.map((p) => p.hop)).toEqual([
+			{ turns: 5, windowMs: 10 * 60_000 },
+			{ turns: 3, windowMs: 30 * 60_000 },
+		]);
+	});
+
 	test("peer_hop_cap: the first drop alone posts PEER_HOP_NOTICE, as a reply to the root, without a bot mention", async () => {
 		let notice = true;
 		await peerAdapter(() => {
@@ -518,5 +542,391 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		expect(peers.map((p) => p.message.platformMessageId)).toEqual([`${CH}:${missed.id}`]);
 		expect(inbound).toHaveLength(0);
 		expect(logged("reason=bot_message")).toBe(true);
+	});
+});
+
+/** Typing timers the test fires by hand: no real interval ever runs. */
+class ManualTimers {
+	readonly handles = new Map<number, () => unknown>();
+	readonly delays: number[] = [];
+	#next = 0;
+	readonly set = (fn: () => unknown, ms: number): unknown => {
+		this.#next += 1;
+		this.handles.set(this.#next, fn);
+		this.delays.push(ms);
+		return this.#next;
+	};
+	readonly clear = (handle: unknown): void => {
+		this.handles.delete(handle as number);
+	};
+	/** Runs every live timer once and waits for its send. */
+	async fire(): Promise<void> {
+		for (const fn of [...this.handles.values()]) await fn();
+	}
+}
+
+describe("typing indicator (doc/plans/discord-typing-reply-presence.md A)", () => {
+	const START = 1_800_000_000_000;
+	const PEER = "200000000000000001";
+	let now: number;
+	let timers: ManualTimers;
+
+	beforeEach(() => {
+		now = START;
+		timers = new ManualTimers();
+	});
+
+	const typingAdapter = (options: Partial<DiscordAdapterOptions> = {}) =>
+		adapter({ clock: { now: () => now }, typingTimers: timers, ...options });
+
+	test("a DM is typed at once, again every 8 s on the adapter's own timer, and never after finishStatus", async () => {
+		const made = await typingAdapter();
+		const dm = message("안녕", { channel_id: DM, guild_id: undefined });
+		await transport.emitMessage(dm);
+		expect(transport.typing).toEqual([DM]);
+		expect(timers.delays).toEqual([8_000]);
+		now += 8_000;
+		await timers.fire();
+		now += 8_000;
+		await timers.fire();
+		expect(transport.typing).toEqual([DM, DM, DM]);
+		await made.finishStatus(`${DM}:${dm.id}`, "done", "update");
+		expect(timers.handles.size).toBe(0);
+		await timers.fire();
+		expect(transport.typing).toHaveLength(3);
+	});
+
+	test("a server message is typed in its thread channel; a second message in the thread keeps one timer", async () => {
+		await typingAdapter();
+		const root = message(`<@${BOT}> 시작`);
+		await transport.emitMessage(root);
+		expect(transport.typing).toEqual([root.id]);
+		await transport.emitMessage(message("이어서", { channel_id: root.id }));
+		expect(inbound).toHaveLength(2);
+		expect(timers.handles.size).toBe(1);
+		expect(transport.typing).toEqual([root.id]);
+		await timers.fire();
+		expect(transport.typing).toEqual([root.id, root.id]);
+	});
+
+	test("past 330 s the timer stops without another send", async () => {
+		await typingAdapter();
+		await transport.emitMessage(message("긴 작업", { channel_id: DM, guild_id: undefined }));
+		now += 328_000;
+		await timers.fire();
+		expect(transport.typing).toHaveLength(2);
+		now += 3_000;
+		await timers.fire();
+		expect(transport.typing).toHaveLength(2);
+		expect(timers.handles.size).toBe(0);
+	});
+
+	test("a peer message and a command (!status) are never typed", async () => {
+		await typingAdapter({
+			core: { ...core(), onPeerInbound: () => ({}) },
+			peerBots: [{ userId: PEER, name: "떡" }],
+		});
+		await transport.emitMessage(message(`<@${BOT}> 검토`, { author: { id: PEER, bot: true } }));
+		await transport.emitMessage(message("!status", { channel_id: DM, guild_id: undefined }));
+		expect(inbound.map((m) => m.text)).toEqual(["!status"]);
+		expect(calls("createMessage").some((c) => c.content?.startsWith("⏳"))).toBe(true);
+		expect(transport.typing).toHaveLength(0);
+		expect(timers.handles.size).toBe(0);
+	});
+
+	test("a failed send stops that thread's typing once; the turn's status and answer go on, other threads still type", async () => {
+		const delivery = {
+			deliveryId: 1,
+			originKey: `discord/dm/${DM}`,
+			threadRef: "",
+			body: "답입니다",
+			redelivered: false,
+		};
+		let due = false;
+		const made = await typingAdapter({
+			deliveries: {
+				...noDeliveries,
+				claimDue: () => {
+					if (!due) return [];
+					due = false;
+					return [delivery];
+				},
+			},
+		});
+		transport.failNext.triggerTyping = [new DiscordCallError("ambiguous", "discord request failed: TimeoutError")];
+		const dm = message("첫 질문", { channel_id: DM, guild_id: undefined });
+		await transport.emitMessage(dm);
+		expect(transport.typing).toEqual([DM]);
+		expect(timers.handles.size).toBe(0);
+		expect(logs.filter((line) => line.includes("event=discord_typing_failed"))).toHaveLength(1);
+		expect(inbound).toHaveLength(1);
+		expect(calls("createMessage").filter((c) => c.content?.startsWith("⏳"))).toHaveLength(1);
+		const root = message(`<@${BOT}> 다른 스레드`);
+		await transport.emitMessage(root);
+		expect(transport.typing).toEqual([DM, root.id]);
+		delivery.threadRef = `${DM}:${dm.id}`;
+		due = true;
+		await made.pumpDeliveries();
+		expect(calls("createMessage").some((c) => c.channelId === DM && c.content?.includes("답입니다"))).toBe(true);
+		await timers.fire();
+		expect(transport.typing).toEqual([DM, root.id, root.id]);
+		expect(logs.filter((line) => line.includes("event=discord_typing_failed"))).toHaveLength(1);
+	});
+
+	test("the first delivered answer stops the thread's typing, even while its status keeps running", async () => {
+		const dm = message("중간 보고 있음", { channel_id: DM, guild_id: undefined });
+		let due = false;
+		const made = await typingAdapter({
+			deliveries: {
+				...noDeliveries,
+				claimDue: () => {
+					if (!due) return [];
+					due = false;
+					return [
+						{
+							deliveryId: 1,
+							originKey: `discord/dm/${DM}`,
+							threadRef: `${DM}:${dm.id}`,
+							body: "중간 답",
+							redelivered: false,
+							keepStatus: true,
+						},
+					];
+				},
+			},
+		});
+		await transport.emitMessage(dm);
+		expect(timers.handles.size).toBe(1);
+		due = true;
+		await made.pumpDeliveries();
+		expect(calls("createMessage").some((c) => c.content?.includes("중간 답"))).toBe(true);
+		expect(timers.handles.size).toBe(0);
+		await timers.fire();
+		expect(transport.typing).toEqual([DM]);
+	});
+
+	test("a message taken during a restart drain is not typed", async () => {
+		await typingAdapter({ core: { ...core(), isDraining: () => true } });
+		await transport.emitMessage(message("드레인 중", { channel_id: DM, guild_id: undefined }));
+		expect(inbound).toHaveLength(1);
+		expect(transport.typing).toHaveLength(0);
+		expect(timers.handles.size).toBe(0);
+	});
+
+	test("stop() clears every typing timer", async () => {
+		const made = await typingAdapter();
+		await transport.emitMessage(message("하나", { channel_id: DM, guild_id: undefined }));
+		await transport.emitMessage(message(`<@${BOT}> 둘`));
+		expect(timers.handles.size).toBe(2);
+		await made.stop();
+		expect(timers.handles.size).toBe(0);
+	});
+});
+
+describe("replies to the bot's posts (doc/plans/discord-typing-reply-presence.md B)", () => {
+	const PEER = "200000000000000001";
+	type Referenced = { id: string; author: { id: string; bot?: boolean }; content: string };
+	const botPost = (content = "이전 답"): Referenced => ({ id: nextId(), author: { id: BOT, bot: true }, content });
+	/**
+	 * A Discord reply (type 19) to `ref` with the ping turned off: nothing in `mentions`. A pinging reply lists the
+	 * replied-to author there too.
+	 */
+	const replyTo = (ref: Referenced, content: string, overrides: Partial<DiscordMessageEvent> = {}) =>
+		message(content, {
+			type: 19,
+			message_reference: { message_id: ref.id },
+			referenced_message: ref,
+			mentions: [],
+			...overrides,
+		});
+
+	test("an unmentioned reply to the bot's post at a server root is taken and opens its thread", async () => {
+		await adapter();
+		const reply = replyTo(botPost(), "이거 다시 해줘");
+		await transport.emitMessage(reply);
+		expect(calls("startThread")).toHaveLength(1);
+		expect(inbound.map((m) => [m.originKey, m.text.split("\n")[0]])).toEqual([
+			[`discord/ch/${CH}/t/${reply.id}`, "이거 다시 해줘"],
+		]);
+	});
+
+	test("requireMention takes a reply to the bot's post as a mention", async () => {
+		await adapter({ requireMention: true });
+		await transport.emitMessage(replyTo(botPost(), "답장만"));
+		expect(inbound).toHaveLength(1);
+	});
+
+	test("in a muted thread a reply to the bot's post is taken and releases the mute", async () => {
+		await adapter();
+		const root = message(`<@${BOT}> 시작`);
+		await transport.emitMessage(root);
+		await transport.emitMessage(message("!shutup", { channel_id: root.id }));
+		expect(muted.has(`${CH}:${root.id}`)).toBe(true);
+		await transport.emitMessage(replyTo(botPost(), "답장으로 깨우기", { channel_id: root.id }));
+		expect(muted.has(`${CH}:${root.id}`)).toBe(false);
+		expect(inbound).toHaveLength(2);
+	});
+
+	test("a reply to someone else's post stays not_addressed", async () => {
+		await adapter();
+		await transport.emitMessage(replyTo({ id: nextId(), author: { id: STRANGER }, content: "남의 글" }, "그렇네"));
+		expect(inbound).toHaveLength(0);
+		expect(logged("reason=not_addressed")).toBe(true);
+	});
+
+	test("a reply to the bot's post that mentions only a peer in its text is the peer's", async () => {
+		await adapter({ core: { ...core(), onPeerInbound: () => ({}) }, peerBots: [{ userId: PEER, name: "떡" }] });
+		await transport.emitMessage(
+			replyTo(botPost(), `<@${PEER}> 봐줘`, {
+				mentions: [
+					{ id: BOT, bot: true },
+					{ id: PEER, bot: true },
+				],
+			}),
+		);
+		expect(inbound).toHaveLength(0);
+		expect(logged("reason=not_addressed")).toBe(true);
+	});
+
+	test("referenced_message null (a deleted post) or without an author is no reply", async () => {
+		await adapter();
+		await transport.emitMessage(message("삭제된 글에 답장", { type: 19, referenced_message: null }));
+		await transport.emitMessage(
+			message("작성자 없음", {
+				type: 19,
+				referenced_message: { id: nextId(), content: "?" } as unknown as DiscordMessageEvent["referenced_message"],
+			}),
+		);
+		expect(inbound).toHaveLength(0);
+		expect(logs.filter((line) => line.includes("reason=not_addressed"))).toHaveLength(2);
+	});
+
+	const quotedLine = (text: string) => text.split("\n").find((line) => line.startsWith("답장 대상("));
+	const inDm = { channel_id: DM, guild_id: undefined };
+
+	test("the context line quotes at most 300 code-point-safe characters of the bot's post, inside the fence", async () => {
+		await adapter();
+		await transport.emitMessage(replyTo(botPost(`${"가".repeat(299)}😀끝`), "이모지 경계", inDm));
+		await transport.emitMessage(replyTo(botPost(`${"나".repeat(300)}뒤`), "한글 경계", inDm));
+		const [first, second] = inbound.map((m) => m.text);
+		expect(quotedLine(first ?? "")).toBe(`답장 대상(이 봇): ${"가".repeat(299)}`);
+		expect(quotedLine(second ?? "")).toBe(`답장 대상(이 봇): ${"나".repeat(300)}`);
+		expect(first?.startsWith("이모지 경계\n")).toBe(true);
+		const lines = (first ?? "").split("\n");
+		const at = lines.findIndex((line) => line.startsWith("답장 대상("));
+		expect(lines[at - 1]).toMatch(/^<<<quoted-/);
+		expect(lines[at + 1]).toMatch(/^<<<end-quoted-/);
+	});
+
+	test("the context line names the owner and a peer, and is left out for anyone else", async () => {
+		await adapter({ peerBots: [{ userId: PEER, name: "떡" }] });
+		await transport.emitMessage(replyTo({ id: nextId(), author: { id: OWNER }, content: "내 메모" }, "이거", inDm));
+		await transport.emitMessage(
+			replyTo({ id: nextId(), author: { id: PEER, bot: true }, content: "떡 의견" }, "저거", inDm),
+		);
+		await transport.emitMessage(replyTo({ id: nextId(), author: { id: STRANGER }, content: "남 글" }, "그거", inDm));
+		expect(inbound.map((m) => quotedLine(m.text))).toEqual([
+			"답장 대상(오너): 내 메모",
+			"답장 대상(떡): 떡 의견",
+			undefined,
+		]);
+		expect(inbound[2]?.text).toBe("그거");
+	});
+});
+
+// T-20261112-36 AC-4: a forwarded message comes with an empty `content`; its text is in `message_snapshots`.
+describe("forwarded messages", () => {
+	const forward = (snapshot: { content?: string; attachments?: DiscordMessageEvent["attachments"] }) =>
+		message("", {
+			channel_id: DM,
+			guild_id: undefined,
+			message_reference: { message_id: "700000000000009999", channel_id: CH },
+			message_snapshots: [{ message: snapshot }],
+		});
+
+	test("an owner DM forward is one inbound with the original text fenced as quoted", async () => {
+		await adapter();
+		await transport.emitMessage(forward({ content: "전달한 원문 첫 줄\n둘째 줄" }));
+		expect(inbound).toHaveLength(1);
+		const text = inbound[0]?.text ?? "";
+		expect(text.startsWith(QUOTED_HEADER)).toBe(true);
+		expect(text).toMatch(/<<<quoted-[0-9a-f]+>>>\n전달한 원문 첫 줄\n둘째 줄\n<<<end-quoted-[0-9a-f]+>>>/);
+		expect(logged("inbound_dropped")).toBe(false);
+	});
+
+	test("a forward with neither snapshot text nor content is still dropped as empty", async () => {
+		await adapter();
+		await transport.emitMessage(forward({ content: "" }));
+		await transport.emitMessage(message("", { channel_id: DM, guild_id: undefined }));
+		expect(inbound).toHaveLength(0);
+		expect(logs.filter((line) => line.includes("event=inbound_dropped") && line.includes("reason=empty"))).toHaveLength(
+			2,
+		);
+	});
+
+	test("snapshot attachments are not taken: one line says how many", async () => {
+		await adapter();
+		const file = { id: "1", filename: "a.png", size: 10, url: "https://cdn.example/a.png", content_type: "image/png" };
+		await transport.emitMessage(forward({ content: "사진 봐줘", attachments: [file, { ...file, id: "2" }] }));
+		expect(inbound).toHaveLength(1);
+		expect(inbound[0]?.text.split("\n")[0]).toBe("[전달된 첨부 2개는 받지 않았습니다]");
+		expect(calls("downloadAttachment")).toHaveLength(0);
+	});
+
+	test("a server root forward (empty content) names its thread after the snapshot's first line", async () => {
+		await adapter({ mentionFreeChannels: [CH] });
+		const root = message("", { message_snapshots: [{ message: { content: "배포 로그 확인\n자세한 내용" } }] });
+		await transport.emitMessage(root);
+		expect(calls("startThread")).toEqual([
+			{ method: "startThread", channelId: CH, messageId: root.id, name: "배포 로그 확인", id: root.id },
+		]);
+		expect(inbound.map((m) => m.originKey)).toEqual([`discord/ch/${CH}/t/${root.id}`]);
+	});
+});
+
+// T-20261112-38 AC-4: the Discord log channel is a ledger, never a conversation; the escalation channel still is.
+describe("Discord log channel (channels.discord.logChannelId)", () => {
+	const LOG = "222222222222222222";
+	const LOG_THREAD = "722222222222222222";
+	const ESC = "333333333333333333";
+	const CARD = "733333333333333333";
+	const dropped = () =>
+		logs.filter((line) => line.includes("event=inbound_dropped") && line.includes("reason=log_channel"));
+
+	beforeEach(() => {
+		transport.setChannel({ id: LOG, type: 0, guildId: GUILD });
+		transport.setChannel({ id: LOG_THREAD, type: 11, parentId: LOG, guildId: GUILD });
+		transport.setChannel({ id: ESC, type: 0, guildId: GUILD });
+	});
+
+	test("an owner message in the log channel, even mentioning the bot, and one in its thread are dropped as log_channel", async () => {
+		await adapter({ logChannel: LOG, mentionFreeChannels: [CH] });
+		await transport.emitMessage(message(`<@${BOT}> 이거 해줘`, { channel_id: LOG }));
+		await transport.emitMessage(message("답글", { channel_id: LOG_THREAD }));
+		expect(inbound).toHaveLength(0);
+		expect(dropped()).toHaveLength(2);
+		expect(calls("startThread")).toHaveLength(0);
+		// Other channels are untouched.
+		await transport.emitMessage(message("여기는 대화", { channel_id: CH }));
+		expect(inbound).toHaveLength(1);
+	});
+
+	test("a reply in an escalation card's thread is still taken", async () => {
+		const replies: string[] = [];
+		transport.setChannel({ id: CARD, type: 11, parentId: ESC, guildId: GUILD });
+		await adapter({
+			logChannel: LOG,
+			core: {
+				...core(),
+				onCardReply: ({ threadRef, text }) => {
+					if (threadRef !== `${ESC}:${CARD}`) return undefined;
+					replies.push(text);
+					return { kind: "settled" };
+				},
+			},
+		});
+		await transport.emitMessage(message("그래 진행해", { channel_id: CARD }));
+		expect(replies).toEqual(["그래 진행해"]);
+		expect(dropped()).toHaveLength(0);
 	});
 });

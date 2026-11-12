@@ -97,6 +97,7 @@ function discordBindings(config: OmpbotConfig, env: Record<string, string | unde
 			: new DiscordSocketTransport(
 					{ botToken: readDiscordToken(config) },
 					{
+						...(discord.displayName === undefined ? {} : { displayName: discord.displayName }),
 						onLifecycle: (event) => {
 							if (event.type === "connected") log.info("discord_gateway_connected", { detail: event.detail });
 							else if (event.type === "reconnecting")

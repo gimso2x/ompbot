@@ -113,6 +113,8 @@ export interface CoreSink {
 	seenMuteCommand?(platformMessageId: string): boolean;
 	/** Durably marks a mute-command event handled after it ran, so replays resolve as duplicates. */
 	rememberMuteCommand?(platformMessageId: string): void;
+	/** True while a restart drain holds dispatch: a message taken now waits for the next process (no typing shown). */
+	isDraining?(): boolean;
 }
 
 export interface DeliveryItem {

@@ -56,6 +56,18 @@ export interface DiscordChannelConfig {
 	/** Server text channel where lanes asked for from the Discord DM open (a DM has no threads); absent: no DM lanes. */
 	laneChannelId?: string;
 	/**
+	 * Server text channel of the Discord #log ledger: completion reports of Discord conversations and lanes are copied
+	 * there and nothing said there (or in its threads) becomes a turn. Never a lane, escalation or mention-free channel.
+	 */
+	logChannelId?: string;
+	/** Server text channel that receives the approval cards of Discord requests; absent: the asking conversation. */
+	escalationChannelId?: string;
+	/**
+	 * Applied once at daemon start as the bot's global display name (`PATCH /users/@me`): what DMs and nickname-less
+	 * servers show instead of the ASCII username. 1-32 characters. A server nickname still wins over it.
+	 */
+	displayName?: string;
+	/**
 	 * Peer bots (other ompbot instances) whose server channel messages that mention this bot are taken as review
 	 * requests, the way the top-level Slack `peerBots` are. Changing it needs a restart (`channels` is a restart key).
 	 */
@@ -438,6 +450,9 @@ const DISCORD_KEYS: Record<string, true> = {
 	mentionFreeChannels: true,
 	requireMention: true,
 	laneChannelId: true,
+	logChannelId: true,
+	escalationChannelId: true,
+	displayName: true,
 	peerBots: true,
 };
 
@@ -469,9 +484,27 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 	const guildIds = snowflakes("guildIds");
 	const mentionFreeChannels = snowflakes("mentionFreeChannels");
 	const laneChannelId = record.laneChannelId === undefined ? undefined : snowflake("laneChannelId");
+	const logChannelId = record.logChannelId === undefined ? undefined : snowflake("logChannelId");
+	const escalationChannelId = record.escalationChannelId === undefined ? undefined : snowflake("escalationChannelId");
+	// Inbound in the log channel is dropped, so it cannot also be where cards are answered, lanes open or chats run.
+	if (
+		logChannelId !== undefined &&
+		(logChannelId === escalationChannelId ||
+			logChannelId === laneChannelId ||
+			mentionFreeChannels?.includes(logChannelId) === true)
+	) {
+		invalid(configPath, "channels.discord.logChannelId");
+	}
 	const requireMention = record.requireMention;
 	if (requireMention !== undefined && typeof requireMention !== "boolean") {
 		invalid(configPath, "channels.discord.requireMention");
+	}
+	const displayName = record.displayName;
+	if (
+		displayName !== undefined &&
+		(typeof displayName !== "string" || displayName.length < 1 || displayName.length > 32)
+	) {
+		invalid(configPath, "channels.discord.displayName");
 	}
 	const peerBotsRaw = record.peerBots;
 	let peerBots: Array<{ userId: string; name: string }> | undefined;
@@ -505,6 +538,9 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 		...(mentionFreeChannels === undefined ? {} : { mentionFreeChannels }),
 		...(requireMention === undefined ? {} : { requireMention }),
 		...(laneChannelId === undefined ? {} : { laneChannelId }),
+		...(logChannelId === undefined ? {} : { logChannelId }),
+		...(escalationChannelId === undefined ? {} : { escalationChannelId }),
+		...(displayName === undefined ? {} : { displayName }),
 		...(peerBots === undefined ? {} : { peerBots }),
 	};
 }

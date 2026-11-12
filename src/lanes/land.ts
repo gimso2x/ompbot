@@ -247,6 +247,69 @@ export async function landLane(request: LandRequest, deps: LanderDeps, hooks: La
 	return { state: "landed", preSha, ...(push === undefined ? {} : { pushed: push.pushed }), ...left };
 }
 
+/** Branch reflog subjects of a commit made on that branch (not a reset, merge, pull or the branch's creation). */
+const MADE_ON_BRANCH = /^(commit|commit \(amend\)|rebase( -i)? \(finish\)|cherry-pick):/;
+const CLAIM_SHA = /^[0-9a-f]{7,64}$/;
+
+export interface ExternalLandInput {
+	repo: string;
+	worktree: string;
+	branch: string;
+	baseBranch: string;
+	/** The commit the lane's current working period started from (`meta.baseSha`). */
+	baseSha: string;
+	/** The last claim's commit as the lane named it. */
+	claim: string;
+}
+
+/**
+ * Whether a lane's work reached its base branch outside the lane (doc/plans/lane-rebase-external-land.md 설계 2):
+ * the claim carries work (commits beyond `baseSha`, made on the lane branch per its reflog); the claim is in the base
+ * branch as it is or by an equal patch (A), or the branch tip, made on the branch, is in it (B — a rebase that changed
+ * the claim's patch, then the tip merged); and nothing on the branch is missing from the base branch, the worktree
+ * clean. Returns the full claim sha and whether `origin/<baseBranch>` (the local tracking ref) has the work too;
+ * `undefined` = not landed. Throws when git fails (nothing may change then).
+ */
+export async function externallyLanded(
+	git: GitRunner,
+	input: ExternalLandInput,
+): Promise<{ sha: string; pushed: boolean } | undefined> {
+	const { repo, worktree, branch, baseBranch, baseSha } = input;
+	const run = async (args: string[], ok: readonly number[] = [0]): Promise<GitResult> => {
+		const result = await git(["-C", repo, ...args]);
+		if (!ok.includes(result.code)) throw new Error(`git ${args.join(" ")}: ${failureLine(result)}`);
+		return result;
+	};
+	if (!CLAIM_SHA.test(input.claim)) return undefined;
+	const claimed = await run(["rev-parse", "--verify", "-q", `${input.claim}^{commit}`], [0, 1]);
+	if (claimed.code !== 0) return undefined;
+	const sha = claimed.stdout.trim();
+	const tip = (await run(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`])).stdout.trim();
+	const reflog = (await run(["reflog", "show", "--format=%H %gs", `refs/heads/${branch}`])).stdout.split("\n");
+	const madeOnBranch = (commit: string): boolean => {
+		const latest = reflog.find((line) => line.startsWith(`${commit} `));
+		return latest !== undefined && MADE_ON_BRANCH.test(latest.slice(commit.length + 1));
+	};
+	if (!madeOnBranch(sha)) return undefined;
+	if (Number((await run(["rev-list", "--count", `${baseSha}..${sha}`])).stdout.trim()) < 1) return undefined;
+	const isAncestor = async (commit: string, ref: string) =>
+		(await run(["merge-base", "--is-ancestor", commit, ref], [0, 1])).code === 0;
+	const allIn = async (ref: string, commit: string) =>
+		!(await run(["cherry", ref, commit])).stdout.split("\n").some((line) => line.startsWith("+"));
+	const landedIn = async (ref: string): Promise<boolean> =>
+		((await isAncestor(sha, ref)) || (await allIn(ref, sha)) || ((await isAncestor(tip, ref)) && madeOnBranch(tip))) &&
+		(await allIn(ref, tip));
+	if (!(await landedIn(`refs/heads/${baseBranch}`))) return undefined;
+	if (existsSync(worktree)) {
+		const status = await statusOf(git, worktree);
+		if ("failed" in status) throw new Error(status.failed);
+		if (status.dirty.length > 0) return undefined;
+	}
+	const origin = `refs/remotes/origin/${baseBranch}`;
+	const tracked = (await run(["rev-parse", "--verify", "-q", `${origin}^{commit}`], [0, 1])).code === 0;
+	return { sha, pushed: tracked && (await landedIn(origin)) };
+}
+
 /** `landLane` with the landings of one repository run one after the other (two lanes never race for a base branch). */
 export function createLaneLander(deps: LanderDeps): LandLane {
 	const tails = new Map<string, Promise<void>>();

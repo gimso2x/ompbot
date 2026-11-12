@@ -554,11 +554,13 @@ function monitorFiles(row: MonitorRow): MonitorFile[] {
 	return files.slice(0, MONITOR_FILES);
 }
 
-/** A Slack channel as the owner knows it: the DM, the config's log or escalation channel, else its id. */
+/** A channel as the owner knows it: the DM, the config's Slack or Discord log or escalation channel, else its id. */
 function channelName(channel: string | null, config: DashboardConfig | undefined): string {
 	if (channel === null) return "오너 DM";
-	if (channel === config?.logChannel) return "로그 채널";
-	if (channel === config?.escalationChannel) return "에스컬레이션 채널";
+	if (channel === config?.logChannel || channel === config?.channels?.discord?.logChannelId) return "로그 채널";
+	if (channel === config?.escalationChannel || channel === config?.channels?.discord?.escalationChannelId) {
+		return "에스컬레이션 채널";
+	}
 	return `채널 ${channel}`;
 }
 
@@ -717,12 +719,18 @@ export type DashboardConfig = Partial<
 		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
 		slack?: { teamId?: string };
 		/**
-		 * Only the server ids are read, for the Discord links of the turn panels, and the Discord peer bots, for the flow's
-		 * review node; `slack` only for whether Slack is on.
+		 * Only the server ids are read, for the Discord links of the turn panels, the Discord peer bots, for the flow's
+		 * review node, and the Discord log and escalation channels, for the monitor channel labels; `slack` only for
+		 * whether Slack is on.
 		 */
 		channels?: {
 			slack?: { ownerUserId: string };
-			discord?: { guildIds?: string[]; peerBots?: Array<{ userId: string; name: string }> };
+			discord?: {
+				guildIds?: string[];
+				peerBots?: Array<{ userId: string; name: string }>;
+				logChannelId?: string;
+				escalationChannelId?: string;
+			};
 		};
 	};
 

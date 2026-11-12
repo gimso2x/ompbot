@@ -121,4 +121,8 @@ export class FileFakeDiscordTransport implements DiscordTransport {
 	async registerCommands(args: RegisterCommandsArgs): Promise<void> {
 		this.#log({ method: "registerCommands", ...args });
 	}
+
+	async triggerTyping(channelId: string): Promise<void> {
+		this.#log({ method: "triggerTyping", channelId });
+	}
 }
