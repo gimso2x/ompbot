@@ -536,6 +536,41 @@ describe("channels.discord", () => {
 	test("channels needs a restart on reload", () => {
 		expect(RESTART_FIELDS as readonly string[]).toContain("channels");
 	});
+
+	test("peerBots: snowflake ids with a name load as written", () => {
+		writeConfig(withDiscord({ peerBots: [{ userId: "678901234567890123", name: "떡" }] }));
+		expect(loadConfig(home).channels.discord?.peerBots).toEqual([{ userId: "678901234567890123", name: "떡" }]);
+		writeConfig(withDiscord());
+		expect(loadConfig(home).channels.discord?.peerBots).toBeUndefined();
+	});
+
+	test.each([
+		["peerBots not an array", { peerBots: { userId: "678901234567890123", name: "떡" } }, "channels.discord.peerBots"],
+		["a Slack peer id", { peerBots: [{ userId: "UPEER00001", name: "떡" }] }, "channels.discord.peerBots.0.userId"],
+		["a numeric peer id", { peerBots: [{ userId: 12345678901234, name: "떡" }] }, "channels.discord.peerBots.0.userId"],
+		["the owner as peer", { peerBots: [{ userId: OWNER_ID, name: "떡" }] }, "channels.discord.peerBots.0.userId"],
+		["an empty name", { peerBots: [{ userId: "678901234567890123", name: "" }] }, "channels.discord.peerBots.0.name"],
+		[
+			"a 33-character name",
+			{ peerBots: [{ userId: "678901234567890123", name: "x".repeat(33) }] },
+			"channels.discord.peerBots.0.name",
+		],
+		[
+			"another key",
+			{
+				peerBots: [
+					{ userId: "678901234567890123", name: "a" },
+					{ userId: "789012345678901234", name: "b", token: "x" },
+				],
+			},
+			"channels.discord.peerBots.1.token",
+		],
+	])("peerBots: %s is config_invalid", (_name, overrides, field) => {
+		writeConfig(withDiscord(overrides));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(`field=${field})`);
+	});
 });
 
 describe("offsite", () => {
@@ -821,6 +856,21 @@ describe("Slack off: channels.slack absent (teams-channel TASK A)", () => {
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(`field=${field}`);
+	});
+
+	test("channels.discord.peerBots and peerHopLimit load without Slack", () => {
+		const config = discordOnly({ peerHopLimit: { turns: 2, windowMinutes: 10 } });
+		writeConfig({
+			...config,
+			channels: {
+				discord: { ...config.channels.discord, peerBots: [{ userId: "678901234567890123", name: "떡" }] },
+			},
+		});
+		const loaded = loadConfig(home);
+		expect(loaded.channels.slack).toBeUndefined();
+		expect(loaded.channels.discord?.peerBots).toEqual([{ userId: "678901234567890123", name: "떡" }]);
+		expect(loaded.peerHopLimit).toEqual({ turns: 2, windowMinutes: 10 });
+		expect(loaded.peerBots).toBeUndefined();
 	});
 
 	test("a Slack token block without a Slack owner is still config_invalid under channels.slack.ownerUserId", () => {

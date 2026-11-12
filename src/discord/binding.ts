@@ -49,6 +49,8 @@ export class DiscordBinding implements ChannelBinding {
 			guildIds: discord.guildIds,
 			mentionFreeChannels: discord.mentionFreeChannels,
 			requireMention: discord.requireMention,
+			peerBots: discord.peerBots,
+			peerHopLimit: deps.config.peerHopLimit,
 			isTaskRoot: (threadRef) => store.tasks.isTaskRoot(threadRef),
 			onInboundFailure: () => adapter.recover(),
 			mediaRoot: join(deps.config.homeDir, "media"),

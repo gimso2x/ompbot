@@ -106,7 +106,9 @@ function discordBindings(config: OmpbotConfig, env: Record<string, string | unde
 						onFatal: (error) => log.error("discord_gateway_fatal", { code: error.code, error: error.message }),
 					},
 				);
-	return [new DiscordBinding(new DiscordChannel(transport, { ownerUserId: discord.ownerUserId }))];
+	return [
+		new DiscordBinding(new DiscordChannel(transport, { ownerUserId: discord.ownerUserId, peerBots: discord.peerBots })),
+	];
 }
 
 /**

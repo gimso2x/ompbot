@@ -232,12 +232,23 @@ describe("ownerMode (AC-C2)", () => {
 		expect(daemon?.store.listOrigins("teams")).toEqual([]);
 	});
 
-	test("no ownerMode: the owner keeps the TASK B session path", async () => {
+	test("no ownerMode: the owner's 1:1 keeps the TASK B session path", async () => {
 		const port = await boot();
-		await say(port, { id: "o-1", text: "안녕" });
+		await say(port, { id: "o-1", text: "안녕", personal: true });
 		await ms.waitFor((call) => String(call.body.text).includes("ECHO 안녕"));
-		expect(daemon?.store.listInbound().map((row) => row.originKey)).toEqual([`teams/ch/${teamsAlias(GROUP_CHAT)}`]);
+		expect(daemon?.store.listInbound().map((row) => row.originKey)).toEqual([`teams/dm/${teamsAlias(PERSONAL_CHAT)}`]);
 		expect(calls).toEqual([]);
+	});
+
+	test("no ownerMode: the owner's group chat mention takes the read-only run, never the owner session", async () => {
+		const port = await boot();
+		await say(port, { id: "o-2", text: "그룹에서 안녕" });
+		await answerTo("o-2", "답변1");
+		const [call] = calls;
+		if (call === undefined) throw new Error("no guest run");
+		expectReadOnlyArgv(call);
+		expect(daemon?.store.listInbound()).toEqual([]);
+		expect(daemon?.store.listOrigins("teams")).toEqual([]);
 	});
 });
 
@@ -282,7 +293,7 @@ describe("owner notices stay out of group chats (AC-C4)", () => {
 	test("group chat only → unroutable; after a Teams 1:1 the notice goes to that 1:1", async () => {
 		const port = await boot({}, { costCap: { dailyUsd: 10 } });
 		await say(port, { id: "o-1", text: "그룹에서만" });
-		await ms.waitFor((call) => String(call.body.text).includes("ECHO 그룹에서만"));
+		await answerTo("o-1", "답변1");
 		await capNotice();
 		expect(unroutable().some((line) => line.includes("notice=cost_cap_daily"))).toBe(true);
 		expect(capPosts()).toEqual([]);

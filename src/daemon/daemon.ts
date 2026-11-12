@@ -558,7 +558,8 @@ export class Daemon {
 
 	/**
 	 * What the floors prompt of `originKey` must know beyond the key: a lane session's thread platform (its upload
-	 * tool), and whether a Discord DM is without lanes for want of `channels.discord.laneChannelId`.
+	 * tool), whether a Discord DM is without lanes for want of `channels.discord.laneChannelId`, and the peer bots of a
+	 * chat origin's platform with their mention tokens.
 	 */
 	floorsSurfaceFor(originKey: string): FloorsSurface {
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
@@ -580,7 +581,21 @@ export class Daemon {
 			isPersonaOrigin(originKey) &&
 			this.#laneChannelOf(originKey, ref.conversationId) === undefined &&
 			!this.peerTouched(originKey);
-		return noLaneChannel ? { noLaneChannel, ...timezone } : timezone;
+		// The peer bots of the conversation's platform, in that platform's mention syntax: Slack's are the top-level
+		// `peerBots`, Discord's `channels.discord.peerBots`; other platforms have none.
+		const { config } = this.#options;
+		const peerBots =
+			ref?.platform === "slack"
+				? config.peerBots
+				: ref?.platform === "discord"
+					? config.channels.discord?.peerBots
+					: undefined;
+		const port = this.#options.channels.find((binding) => binding.port.platform === ref?.platform)?.port;
+		const peers =
+			peerBots === undefined || peerBots.length === 0 || port === undefined
+				? {}
+				: { peers: peerBots.map((peer) => ({ name: peer.name, mention: port.mentionUser(peer.userId) })) };
+		return noLaneChannel ? { noLaneChannel, ...timezone, ...peers } : { ...timezone, ...peers };
 	}
 
 	/** Host tools for the omp child of `originKey`: file upload, owner approval, and the lane tools of its kind. */

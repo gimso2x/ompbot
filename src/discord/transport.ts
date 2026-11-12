@@ -36,6 +36,8 @@ export interface DiscordMessageEvent {
 	mentions?: ReadonlyArray<DiscordUser> | undefined;
 	message_reference?: { message_id?: string; channel_id?: string; guild_id?: string } | undefined;
 	attachments?: ReadonlyArray<DiscordAttachment> | undefined;
+	/** Rich embeds of the message (a peer bot's card); only their text is read. */
+	embeds?: ReadonlyArray<{ title?: string | undefined; description?: string | undefined }> | undefined;
 	timestamp?: string | undefined;
 }
 

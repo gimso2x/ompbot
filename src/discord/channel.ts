@@ -117,15 +117,21 @@ export class DiscordChannel implements ChannelPort {
 	readonly capabilities = { permalink: true, reactions: true };
 	readonly transport: DiscordTransport;
 	readonly #ownerUserId: string;
+	/** Peer bots (`channels.discord.peerBots`): they listen for mentions only, so a mention of one must notify. */
+	readonly #peerUserIds: readonly string[];
 	/** `null`: Discord said there is no such channel (a message id taken for a thread). */
 	readonly #channels = new Map<string, DiscordChannelInfo | null>();
 	/** Channel each message is in, from posts and clicks: a message id alone does not say which thread holds it. */
 	readonly #messageChannels = new Map<string, string>();
 	#buttonValues: ButtonValueLedger | undefined;
 
-	constructor(transport: DiscordTransport, options: { ownerUserId: string }) {
+	constructor(
+		transport: DiscordTransport,
+		options: { ownerUserId: string; peerBots?: ReadonlyArray<{ userId: string }> | undefined },
+	) {
 		this.transport = transport;
 		this.#ownerUserId = options.ownerUserId;
+		this.#peerUserIds = (options.peerBots ?? []).map((peer) => peer.userId);
 	}
 
 	/** Keeps button values in `ledger` from now on (the binding passes the store). */
@@ -203,12 +209,12 @@ export class DiscordChannel implements ChannelPort {
 		return (await this.destination(ref.conversationId, ref.threadId)).channelId;
 	}
 
-	/** No `@everyone`, role or user pings from content; only a mention of the owner notifies (the owner). */
+	/** No `@everyone`, role or user pings from content; only a mention of the owner or a peer bot notifies that user. */
 	allowedMentions(content: string): AllowedMentions {
-		const owner = this.#ownerUserId;
-		return content.includes(`<@${owner}>`) || content.includes(`<@!${owner}>`)
-			? { parse: [], users: [owner] }
-			: { parse: [] };
+		const users = [this.#ownerUserId, ...this.#peerUserIds].filter(
+			(id) => content.includes(`<@${id}>`) || content.includes(`<@!${id}>`),
+		);
+		return users.length > 0 ? { parse: [], users } : { parse: [] };
 	}
 
 	async post(target: PostTarget, msg: OutboundMessage): Promise<MessageRef> {

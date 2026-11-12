@@ -48,11 +48,17 @@ afterEach(async () => {
 });
 
 describe("Teams owner path (AC-B1)", () => {
-	test("an owner mention in a group chat is recorded under teams/ch/t… and answered as a reply to its Activity", async () => {
-		const port = await boot();
+	test("an owner mention in a group chat takes the read-only run (no owner session) and replies to its Activity", async () => {
+		const runs: string[][] = [];
+		const started = await startTeamsDaemon(home, ms, logs, {
+			guestRun: async (cmd) => {
+				runs.push(cmd);
+				return { code: 0, stdout: "그룹 답", timedOut: false };
+			},
+		});
+		daemon = started.daemon;
+		const port = started.port;
 		expect(logs.some((line) => line.includes("event=daemon_ready") && line.includes("teams=on"))).toBe(true);
-		const alias = teamsAlias(GROUP_CHAT);
-		expect(alias).toMatch(/^t[0-9a-f]{16}$/);
 
 		const activityId = "1794445875395";
 		const response = await postActivity(
@@ -62,27 +68,17 @@ describe("Teams owner path (AC-B1)", () => {
 		);
 		expect(response.status).toBe(200);
 
-		// Recorded at once (before the 200), under the group chat's origin, mention tag gone.
-		const rows = daemon?.store.listInbound() ?? [];
-		expect(rows.map((row) => [row.originKey, row.threadRef, row.platformMessageId])).toEqual([
-			[`teams/ch/${alias}`, `${alias}:${activityId}`, `${alias}:${activityId}`],
-		]);
-
-		// The typing indicator, then the answer replying to the original Activity id.
 		const encoded = encodeURIComponent(GROUP_CHAT);
-		await ms.waitFor((call) => call.body.type === "typing");
 		const answer = await ms.waitFor(
-			(call) => call.body.type === "message" && String(call.body.text).includes("ECHO 안녕 팀즈"),
+			(call) => call.body.type === "message" && String(call.body.text).includes("그룹 답"),
 		);
-		expect(answer.method).toBe("POST");
 		expect(answer.path).toBe(`/v3/conversations/${encoded}/activities/${activityId}`);
 		expect(answer.body.replyToId).toBe(activityId);
-		expect(answer.body.textFormat).toBe("markdown");
 		expect(answer.authorization).toBe("Bearer fake-access-token");
-
-		await daemon?.pump();
-		const delivered = daemon?.store.listDeliveries().map((row) => [row.originKey, row.threadRef, row.state]);
-		expect(delivered).toContainEqual([`teams/ch/${alias}`, `${alias}:${activityId}`, "confirmed"]);
+		expect(runs).toHaveLength(1);
+		// The owner session never sees a group chat: nothing in the owner ledger, no teams origin.
+		expect(daemon.store.listInbound()).toEqual([]);
+		expect(daemon.store.listOrigins("teams")).toEqual([]);
 	});
 
 	test("a 1:1 chat takes the owner without a mention, under teams/dm/t…", async () => {

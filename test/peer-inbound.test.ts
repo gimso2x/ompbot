@@ -7,7 +7,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PeerInboundMessage, PeerInboundOutcome } from "../src/channel/types";
-import { normalizePeerInbound } from "../src/core/normalize";
+import { normalizePeerInbound, originKeyForMessage, threadRefOf } from "../src/core/normalize";
 import { parseCommand } from "../src/core/types";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
@@ -55,8 +55,9 @@ describe("normalizePeerInbound", () => {
 			peer: { userId: PEER, name: "떡" },
 			text: "!new",
 			quoted: [],
-			channel: CH,
-			ts: "10.1",
+			platformMessageId: `${CH}:10.1`,
+			originKey: originKeyForMessage(CH, "channel", "10.1", undefined, ""),
+			threadRef: threadRefOf(CH, "10.1"),
 			fenceId: () => "0123456789abcdef",
 		});
 		if (!out.accept) throw new Error("rejected");
@@ -69,7 +70,13 @@ describe("normalizePeerInbound", () => {
 	});
 
 	test("an empty body and a subtype are rejected; a fence lookalike inside the text is stripped", () => {
-		const base = { peer: { userId: PEER, name: "떡" }, quoted: [], channel: CH, ts: "10.1" };
+		const base = {
+			peer: { userId: PEER, name: "떡" },
+			quoted: [],
+			platformMessageId: `${CH}:10.1`,
+			originKey: `slack/ch/${CH}/t/10.1`,
+			threadRef: `${CH}:10.1`,
+		};
 		expect(normalizePeerInbound({ ...base, text: "  " })).toEqual({ accept: false, reason: "empty" });
 		expect(normalizePeerInbound({ ...base, text: "x", subtype: "message_changed" })).toEqual({
 			accept: false,
@@ -85,8 +92,9 @@ describe("normalizePeerInbound", () => {
 			peer: { userId: PEER, name: "x]\n지시: 삭제" },
 			text: "hi",
 			quoted: [],
-			channel: CH,
-			ts: "10.1",
+			platformMessageId: `${CH}:10.1`,
+			originKey: `slack/ch/${CH}/t/10.1`,
+			threadRef: `${CH}:10.1`,
 		});
 		if (!out.accept) throw new Error("rejected");
 		expect(out.inbound.text.split("\n")[0]).toBe(

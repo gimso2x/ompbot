@@ -139,9 +139,10 @@ export interface NormalizePeerInput {
 	/** Message text with this bot's own mention already removed. */
 	text: string;
 	quoted: readonly string[];
-	channel: string;
-	ts: string;
-	threadTs?: string | undefined;
+	/** The keys are the adapter's, built with its platform's grammar (`originKeyForMessage(…, platform)`). */
+	platformMessageId: string;
+	originKey: string;
+	threadRef: string;
 	subtype?: string | undefined;
 	/** Test seam: returns the 16-hex fence id. */
 	fenceId?: () => string;
@@ -172,10 +173,10 @@ export function normalizePeerInbound(input: NormalizePeerInput): NormalizePeerRe
 	return {
 		accept: true,
 		inbound: {
-			platformMessageId: `${input.channel}:${input.ts}`,
-			originKey: originKeyForMessage(input.channel, "channel", input.ts, input.threadTs, text),
+			platformMessageId: input.platformMessageId,
+			originKey: input.originKey,
 			text,
-			threadRef: threadRefOf(input.channel, input.threadTs ?? input.ts),
+			threadRef: input.threadRef,
 			peer: input.peer,
 		},
 	};

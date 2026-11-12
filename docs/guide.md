@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | 대화 | DM·채널·채널 스레드별 독립 대화, 일하는 중 끼워 넣기(steer)·`!followup`, 끝맺은 답의 턴 중간 전달, 첨부 받기·파일 올리기, Slack `markdown` 블록 답과 `card` 펜스(네이티브 카드·표·차트), 진행 상태 메시지, 같은 도구 반복 감지, 같은 대화 공간의 지난 대화 자동 회상, 전달·첨부 자료의 인젝션 경고 | [대화](#대화) |
 | Discord(선택) | 오너 한 명의 Discord DM·서버 채널 대화(멘션하면 스레드), `!` 명령·슬래시 명령·진행 표시·승인·질문·TASK 카드 버튼·카드(embed)·파일·👍/👎·놓친 메시지 백필·`doctor` 점검, DM 모니터, 서버 채널 스레드의 작업 레인 | [Discord](#discord선택) |
+| Teams(선택) | Microsoft Teams 1:1·그룹 채팅(멘션) 대화, 손님·`qa` 읽기 전용 답변, 앱 패키지(`teams package`), 오너 채팅 읽기(Graph) | [Teams](#teams선택) |
 | 대화 에이전트 | omp(기본) 대신 Claude Code CLI(`"agent": "claude"`)나 Antigravity CLI(`"agent": "agy"`)로 대화를 구동 | [claude 에이전트](#claude-에이전트) · [agy 에이전트](#agy-에이전트) |
 | 채팅 명령 | 모델·thinking 전환, 컨텍스트 압축, 옛 세션 이어가기, 대기열 보기·취소, 새 대화, 스레드 뮤트, 토큰·비용 사용량, 오늘 비용과 상한(`!budget`), 턴 되돌리기(`!undo`) | [명령](#명령) · [턴 되돌리기](#턴-되돌리기undo) |
 | 비용 상한 | 턴 상한(마무리 지시 → 1.5배에서 중단)·하루 상한(모니터 정지·하루 1회 알림·`cost_cap` 게이트) | [설정](#5-설정-파일-ompbotconfigjson) `costCap` |
@@ -72,7 +73,7 @@ bun test          # 전부 통과해야 합니다(실제 omp E2E는 기본으로
 Slack과 Discord 중 쓸 것을 고릅니다. 하나만 써도 되고 둘 다 써도 됩니다. Discord만 쓰면 이 절을 건너뛰고 [Discord 봇 만들기](discord.md)로 봇·토큰·초대를 준비합니다.
 
 1. https://api.slack.com/apps → **Create New App** → **From a manifest** → 워크스페이스를 고릅니다.
-2. **JSON** 탭에 [`packaging/slack-manifest.json`](../packaging/slack-manifest.json) 내용을 그대로 붙여넣고 **Create**를 누릅니다. 검토 화면에서 권한 15개, 이벤트 6개(메시지 4개 + 반응 `reaction_added`·`reaction_removed`), 슬래시 명령 11개가 보여야 합니다. 반응 구독(`reactions:read`와 두 반응 이벤트)이 들어가기 전에 만든 앱은 앱 설정에서 이 셋을 더하고 다시 설치해야 [답 피드백](#답-피드백)이 들어옵니다(토큰이 바뀌면 `secrets/`의 봇 토큰도 바꿉니다). 이미 만든 앱에서 권한을 뺀 매니페스트는 앱을 워크스페이스에 다시 설치(reinstall)해야 실제 앱에 반영됩니다.
+2. **JSON** 탭에 [`packaging/slack-manifest.json`](../packaging/slack-manifest.json) 내용을 그대로 붙여넣고 **Create**를 누릅니다. 검토 화면에서 권한 15개, 이벤트 6개(메시지 4개 + 반응 `reaction_added`·`reaction_removed`), 슬래시 명령 12개가 보여야 합니다. 반응 구독(`reactions:read`와 두 반응 이벤트)이 들어가기 전에 만든 앱은 앱 설정에서 이 셋을 더하고 다시 설치해야 [답 피드백](#답-피드백)이 들어옵니다(토큰이 바뀌면 `secrets/`의 봇 토큰도 바꿉니다). 이미 만든 앱에서 권한을 뺀 매니페스트는 앱을 워크스페이스에 다시 설치(reinstall)해야 실제 앱에 반영됩니다.
 3. **Install App** → **Install to <워크스페이스>** → 허용을 누르면 `xoxb-` 봇 토큰이 나옵니다.
 4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**에서 범위 `connections:write`를 넣어 `xapp-` 토큰을 만듭니다.
 
@@ -134,6 +135,7 @@ Slack을 쓰지 않으면 `slack-*` 두 줄을, Discord를 쓰지 않으면 `dis
 | `schemaVersion` | 예 | 항상 `1` |
 | `channels.slack.ownerUserId` | Slack을 쓸 때 | Slack 켜기. 없으면 Slack을 쓰지 않고 `channels.discord`(또는 `channels.teams`)만으로 돕니다(채널이 하나도 없으면 `config_invalid field=channels`). 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
 | `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
+| `channels.teams` | 아니요 | Teams 켜기 `{"appId", "tenantId", "clientSecretFile", "ownerAadObjectId", "listen"?, "tokenTenant"?, "guestAadObjectIds"?, "ownerMode"?, "guestModel"?, "graph"?}`. 없으면 Teams 꺼짐. 키 설명은 [Teams](#teams선택) |
 | `channels.teams.graph` | 아니요 | Teams 오너 1:1에서 오너의 Teams 채팅을 읽는 도구 켜기 `{"tokenFile"?}`(기본 `secrets/teams-graph-token`). 없으면 지금과 같습니다. 켠 뒤 `ompbot teams login`으로 오너가 한 번 로그인합니다. [Teams 채팅 읽기](#teams-채팅-읽기선택-graph) 참고 |
 | `slack.botTokenFile`, `slack.appTokenFile` | Slack을 쓸 때 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
 | `ompExecutable` | 예 | 절대경로(`command -v omp`). 봇 전용 고정 버전을 쓰면 `~/.ompbot/omp/current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`([봇 전용 omp](#봇-전용-omp-버전-고정과-프로필) 참고) |
@@ -178,7 +180,7 @@ config.json의 모르는 최상위 키, 제어문자가 든 `dispatchHosts` 이�
 bun src/main.ts doctor
 ```
 
-홈 권한 0700, 토큰 파일 0600과 접두사, omp·bun 경로와 버전(`bun` 줄은 PATH의 bun 경로와 그 bun의 `--version`을 보이고, 실행 중인 bun과 다르면 `(running <버전>)`을 붙임), omp 런타임(`omp runtime`: 패키지 launcher인지, bun이 omp의 `engines.bun`을 만족하는지 — 데몬이 omp를 띄우기 전마다 하는 검사와 같습니다), omp가 쓸 수 있는 모델 수(`omp models`: 봇이 omp에 주는 환경으로 `omp models --json`을 돌려 `available=0`이면 실패 — 로그인도 API 키도 없으면 모든 턴이 `No default model selected`로 실패하고 슬랙에는 `[turn failed] omp_no_model …` 안내가 갑니다), Slack `auth.test`, 백업 번들 존재·나이(36시간)를 확인하며(데몬이 한 번도 뜨지 않아 `ompbot.db`가 없는 첫 설치에서는 백업 줄이 `warn backup bundle: stamp=missing …`이고 종료 코드에 들어가지 않습니다 — 데몬이 처음 뜰 때 첫 백업을 만듭니다), 토큰 값은 출력하지 않습니다. 토큰 파일·omp 경로 실패 줄에는 고치는 명령(`chmod 600 …`, `command -v omp`로 `ompExecutable` 고치기 등)이 붙고, 토큰 파일에 문제가 있어도 나머지 점검은 이어서 돕니다(그때 `slack auth.test`는 `skipped`). `config.json` 문법 오류는 파서가 기대한 것과 흔한 원인(끝 쉼표·빠진 쉼표·따옴표 없는 키)을 알려 줍니다. config에 `herdr`가 있으면 로컬 `<herdr.bin 또는 herdr> --version`을 돌려 `ok herdr: <경로> <버전>` 또는 `fail herdr: <경로> <사유>`를 내고, 실패면 종료 코드가 1이 됩니다. config에 `dispatchHosts`가 있으면 이어서 호스트마다 `ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh> true`를 돌려 `ok dispatch host <이름>: ssh <별칭>` 또는 `fail dispatch host <이름>: <ssh stderr 첫 줄> (warning only)`를 한 줄씩 냅니다. 꺼 둔 호스트일 수 있어 이 줄은 경고일 뿐 종료 코드를 바꾸지 않습니다. 처음 설치할 때는 백업이 아직 없어 `backup bundle` 줄만 `stamp=missing`으로 실패합니다. 나머지 줄이 모두 `ok`면 다음 단계로 갑니다. `ompbot.db`는 데몬이 처음 뜰 때 만들어지므로 그 전의 `backup`은 `db_missing`으로 실패합니다. 서비스를 띄운 뒤 `bun src/main.ts backup`을 한 번 돌리거나 [백업](#백업) 타이머가 돌면 이 줄도 `ok`가 됩니다.
+홈 권한 0700, 토큰 파일 0600과 접두사, omp·bun 경로와 버전(`bun` 줄은 PATH의 bun 경로와 그 bun의 `--version`을 보이고, 실행 중인 bun과 다르면 `(running <버전>)`을 붙임), omp 런타임(`omp runtime`: 패키지 launcher인지, bun이 omp의 `engines.bun`을 만족하는지 — 데몬이 omp를 띄우기 전마다 하는 검사와 같습니다), omp가 쓸 수 있는 모델 수(`omp models`: 봇이 omp에 주는 환경으로 `omp models --json`을 돌려 `available=0`이면 실패 — 로그인도 API 키도 없으면 모든 턴이 `No default model selected`로 실패하고 슬랙에는 `[turn failed] omp_no_model …` 안내가 갑니다), Slack `auth.test`(Slack을 쓰지 않으면 `ok slack: off (channels.slack not set)` 한 줄), Discord를 쓰면 토큰 파일과 `discord users/@me`·`discord gateway/bot`, 백업 번들 존재·나이(36시간)를 확인하며(데몬이 한 번도 뜨지 않아 `ompbot.db`가 없는 첫 설치에서는 백업 줄이 `warn backup bundle: stamp=missing …`이고 종료 코드에 들어가지 않습니다 — 데몬이 처음 뜰 때 첫 백업을 만듭니다), 토큰 값은 출력하지 않습니다. 토큰 파일·omp 경로 실패 줄에는 고치는 명령(`chmod 600 …`, `command -v omp`로 `ompExecutable` 고치기 등)이 붙고, 토큰 파일에 문제가 있어도 나머지 점검은 이어서 돕니다(그때 `slack auth.test`는 `skipped`). `config.json` 문법 오류는 파서가 기대한 것과 흔한 원인(끝 쉼표·빠진 쉼표·따옴표 없는 키)을 알려 줍니다. config에 `herdr`가 있으면 로컬 `<herdr.bin 또는 herdr> --version`을 돌려 `ok herdr: <경로> <버전>` 또는 `fail herdr: <경로> <사유>`를 내고, 실패면 종료 코드가 1이 됩니다. config에 `dispatchHosts`가 있으면 이어서 호스트마다 `ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh> true`를 돌려 `ok dispatch host <이름>: ssh <별칭>` 또는 `fail dispatch host <이름>: <ssh stderr 첫 줄> (warning only)`를 한 줄씩 냅니다. 꺼 둔 호스트일 수 있어 이 줄은 경고일 뿐 종료 코드를 바꾸지 않습니다. 첫 설치의 `warn backup bundle` 말고 나머지 줄이 모두 `ok`면 다음 단계로 갑니다. `ompbot.db`는 데몬이 처음 뜰 때 만들어지므로 그 전에 `bun src/main.ts backup`을 직접 돌리면 `db_missing`으로 실패합니다. 서비스를 띄우면 데몬이 첫 백업을 만들어 이 줄도 `ok`가 됩니다.
 
 ### 7. 서비스 등록
 
@@ -284,7 +286,9 @@ Install this repository (ompbot) into the systemd user session on this Linux mac
 | `!btw <질문>` | 곁질문. 같은 대화방의 진행 중인 작업에 끼워 넣지 않고 그 질문에만 바로 답합니다. 답은 지금까지의 대화 맥락으로 한 번 만들어 `💬 곁질문:`으로 시작하는 별도 글로 그 메시지 스레드에 오고, 진행 중인 작업과 대화 기록은 바뀌지 않습니다. 곁질문은 한 번에 하나만 돌고(도는 중에 또 보내면 실패 알림), 120초 안에 답이 없으면 취소하고 실패 알림을 남깁니다. 작업 중이 아니면 `!btw`를 뗀 질문이 일반 메시지로 처리되고, `agent: "claude"`처럼 곁질문을 지원하지 않는 에이전트면 안내만 합니다. 슬랙 앱에 슬래시 명령으로는 등록하지 않았으니(`/btw-ompbot`은 매니페스트에 없음) 메시지로 보냅니다 |
 | `!home` | 보낸 대화를 데몬 알림(턴 실패·제공자 한도·게이트·정체 경고)과 채널 없는 모니터 결과를 받을 곳으로 정합니다. 정하지 않으면 Slack이 있을 때 Slack 오너 DM, 없으면 오너의 가장 최근 1:1 대화, 그것도 없으면 오너가 마지막으로 말한 대화입니다. 오너가 아직 아무 데도 말하지 않았으면 알림은 로그 `owner_notice_unroutable`만 남기고 모니터는 다음 주기로 미룹니다 |
 | `!shutup` · `!unshutup` | 채널·채널 스레드 전용. `!shutup`을 보낸 스레드는 오너 메시지에도 반응하지 않고, `!unshutup`이나 봇 멘션으로 풀립니다. 최상위에서 보내면 그 메시지의 스레드가 뮤트됩니다. 뮤트는 재시작에도 유지되고 DM에서는 안내만 합니다 |
+| `/brief-ompbot` · `!brief` (`!브리핑`) | 지금 상태(주의·진행·모니터·백업)를 한 장 PNG로 그려 이 스레드에 올립니다(모델 호출 없음, 작업 중에도 사용 가능). 그림은 config `briefing.chromium`으로 그립니다 |
 | `작업: <제목> @<절대경로>` | 그 경로에서 작업 레인을 엽니다([작업 레인](#작업-레인)) |
+| `멈춰` · `계속` (`!pause` · `!unpause`) | 작업 레인 스레드나 `[TASK]` 스레드 전용. 메시지 전체가 `멈춰`·`잠깐`·`그만`·`stop`·`pause` 같은 말이면 그 레인(또는 그 스레드의 진행 중인 TASK)을 멈추고, `계속`·`재개`·`continue`면 다시 돌립니다. 레인은 ⏸·▶ 버튼으로도 됩니다. TASK는 CLI `ompbot tasks pause|resume <ID>`도 같습니다 |
 | `!reopen` · `!reopen <지시>` | 작업 레인 스레드 전용. 닫히고 아직 머지·폐기되지 않은 레인을 같은 세션으로 다시 엽니다(🔄). 다른 메시지는 레인을 닫힌 채로 두고 답만 받습니다 |
 
 모델·thinking 선택은 대화방마다 저장되어 프로세스를 내렸다 다시 띄워도, 데몬을 재시작해도, `/new-ompbot` 뒤에도 유지됩니다. 세션 모델이 provider에서 사라졌으면 대화방에서 고른 모델, 그것도 없으면 config `model`로 바꿉니다(config `model`이 비어 있거나 없는 모델이면 바꾸지 못하고 `model_stale_no_fallback`만 남깁니다). 고른 값은 지우지 않으므로 모델이 돌아오면 다시 적용됩니다. omp 설정 파일(`~/.omp/agent`)은 바꾸지 않습니다.
@@ -370,6 +374,7 @@ omp가 오너에게 묻는 창(select·confirm·input·editor·`ask`)을 띄우�
 - **주소 규칙(오너 글)**: 채널에서 오너가 피어 봇만 멘션하고 이 봇은 멘션하지 않으면 이 봇에게 온 글이 아니라 `not_addressed`로 버립니다. 둘 다 멘션하면 받습니다.
 - **재시작 없이 반영**: `peerBots`·`requireMention`·`peerHopLimit`는 `ompbot reload`로 다음 메시지부터 바뀝니다. 목록에서 뺀 봇의 지난 피어 글이 만든 "권한 없음" 표시는 장부에 남아 그 스레드에서 계속 적용됩니다.
 - **백필의 한계**: [놓친 메시지 백필](#놓친-메시지-백필)은 봇 글을 건너뛰므로, 소켓이 끊긴 동안 온 피어 호출은 복구되지 않습니다. 피어가 다시 멘션해야 합니다.
+- **Discord**: Discord 서버 채널·스레드에서도 같은 규칙으로 동작합니다. 목록은 `channels.discord.peerBots`(snowflake, 재시작 필요)에 따로 두고, 상한은 같은 `peerHopLimit`을 씁니다. 대화 플랫폼의 피어 봇이 프롬프트에 `이 대화의 피어 봇: <name> = <멘션>` 줄로 들어갑니다. 설정은 [Discord 안내 7절](discord.md#7-피어-봇두-번째-ompbot)을 봅니다.
 
 ### claude 에이전트
 
@@ -452,6 +457,29 @@ Discord에서 오너 한 명의 DM·서버 채널 대화를 받습니다. Slack 
 - **Slack에만 있는 것**: 게이트·한도·재시작 같은 데몬 수준 알림, `logChannel` 사본, `escalationChannel`, 피어 봇, App Home은 Slack에만 있습니다.
 - **현황판**: Discord DM은 `DM`, 서버 채널은 `Discord <채널 ID>`로 보이고, 시스템 보기에 Discord 게이트웨이 연결 카드가 생깁니다(Discord를 끈 설치에는 없음).
 
+### Teams(선택)
+
+Microsoft Teams(Bot Framework)에서 오너의 1:1·그룹 채팅 대화를 받습니다. Slack·Discord 없이 Teams만 써도 되고(`init --platform teams --owner <오너 Entra object id> --app-id <봇 id> --tenant <테넌트 id>`), 다른 채널과 같이 써도 됩니다.
+
+- **켜기**: `config.json`의 `channels.teams`에 아래 키를 넣고 재시작합니다. 클라이언트 시크릿은 `umask 077; cat > ~/.ompbot/secrets/teams-client-secret`(0600, 한 줄)로 둡니다.
+
+  | `channels.teams` 키 | 뜻 |
+  | --- | --- |
+  | `appId` | 봇의 Microsoft App ID(Entra client id, GUID, 필수). 들어오는 토큰의 `aud`가 이 값이어야 합니다 |
+  | `tenantId` | 오너의 Entra 테넌트 ID(GUID, 필수). 다른 테넌트의 Activity·토큰은 버립니다 |
+  | `clientSecretFile` | 클라이언트 시크릿 파일, 홈 기준 상대경로(필수, 예: `secrets/teams-client-secret`) |
+  | `ownerAadObjectId` | 오너의 Entra object id(GUID, 필수). 이 사용자의 글만 오너 명령으로 받습니다 |
+  | `listen` | Bot Framework 엔드포인트(`POST /api/messages`)를 받을 loopback 주소(선택, 기본 `127.0.0.1:3978`, `127.0.0.1`·`localhost`·`[::1]`만). 공개 HTTPS는 데몬 밖 터널(cloudflared 등)이 이 주소로 넘겨 줍니다 |
+  | `tokenTenant` | 보내는 쪽 Bot Connector 토큰을 받을 테넌트(선택, 기본 `tenantId`, 멀티 테넌트 봇이면 `botframework.com`) |
+  | `guestAadObjectIds` | 손님 Entra object id 목록(선택). 손님이 봇을 멘션하면 웹 검색만 쓰는 읽기 전용 일회성 실행으로 답하고, 오너 세션·승인·레인·위임에는 닿지 않습니다 |
+  | `ownerMode` | `"full"`(기본) 또는 `"qa"`. `"qa"`면 오너 글도 손님과 같은 읽기 전용 일회성 실행으로 답합니다 |
+  | `guestModel` | 손님·`qa` 실행에 쓸 `--model`(선택, 없으면 omp 기본) |
+  | `graph` | 오너 Teams 채팅 읽기 도구. [Teams 채팅 읽기](#teams-채팅-읽기선택-graph) 참고 |
+
+- **앱 패키지**: `ompbot teams package --out <zip>`이 봇 id·범위(`personal`, `groupChat`)·기본 아이콘 두 개를 담은 앱 패키지를 만듭니다. Teams의 "사용자 지정 앱 업로드"로 올립니다.
+- **대화**: 1:1은 모든 글을, 그룹 채팅은 봇을 멘션한 글만 받습니다. Teams에는 봇 반응·버튼이 없어 접수는 typing 표시로 알리고, 승인·질문 카드는 선택지를 글로 보여 주고 답장으로 받습니다. 파일 올리기는 지원하지 않습니다.
+- **알림 목적지**: Slack이 없으면 데몬 알림은 오너의 Teams 1:1로 갑니다(다른 사람이 있는 그룹 채팅은 고르지 않음). `!home`으로 바꿀 수 있습니다.
+
 ### Teams 채팅 읽기(선택, Graph)
 
 Teams 봇은 그룹 채팅에서 자기를 멘션한 글만 받습니다. `channels.teams.graph`를 켜면 오너의 Teams 1:1 대화(`ownerMode: "full"`)에서 봇이 Microsoft Graph 위임 권한 `Chat.Read`로 오너가 속한 채팅의 목록과 메시지를 읽을 수 있습니다.
@@ -460,7 +488,7 @@ Teams 봇은 그룹 채팅에서 자기를 멘션한 글만 받습니다. `chann
 - **켜기**: `config.json`의 `channels.teams`에 `"graph": {}`(토큰 파일을 바꾸려면 `{"tokenFile": "secrets/teams-graph-token"}`)를 넣고 재시작합니다.
 - **로그인**: `ompbot teams login`이 `teams_login code=<코드> url=https://microsoft.com/devicelogin`을 찍습니다. 브라우저에서 그 주소를 열고 코드를 넣은 뒤 **오너 계정**으로 로그인하면 refresh 토큰이 `tokenFile`(0600)에 저장됩니다. 로그인한 계정이 `ownerAadObjectId`와 다르면 저장하지 않고 `teams_graph_wrong_account`로 끝납니다. `ompbot teams logout`은 토큰 파일을 지웁니다. 토큰을 출력하는 조회 명령은 없습니다.
 - **도구**: `teams_list_chats(query?, limit?)`는 최근 채팅(id·종류·제목 또는 참여자 이름·마지막 시각)을, `teams_read_chat(chatId, since?, limit?)`는 메시지(보낸 사람·시각·본문, 기본 50개·최대 200개, HTML은 텍스트로)를 돌려줍니다. 본문은 비밀값을 가린 뒤 인용 펜스로 감싸 데이터로만 넘깁니다.
-- **어디에 있나**: 피어 봇 글이 들어오지 않은 오너 Teams 1:1 세션에만 있습니다. Teams 그룹 채팅·손님·`ownerMode: "qa"`·Slack·Discord 세션에는 없고, `qa`면 시작 때 `teams_graph_disabled reason=ownerMode_qa` 경고 한 줄을 남깁니다. graph를 켠 설치본의 Teams 그룹 채팅 세션은 기억(`memory`)을 끈 채 돌아, 1:1에서 읽은 남의 대화가 그룹 답에 회상되지 않습니다.
+- **어디에 있나**: 피어 봇 글이 들어오지 않은 오너 Teams 1:1 세션에만 있습니다. Teams 그룹 채팅·손님·`ownerMode: "qa"`·Slack·Discord 세션에는 없고, `qa`면 시작 때 `teams_graph_disabled reason=ownerMode_qa` 경고 한 줄을 남깁니다. 오너가 Teams 그룹 채팅에서 봇을 부르면 `ownerMode`와 상관없이 손님과 같은 읽기 전용 일회성 실행으로 답합니다(오너 세션·기억·도구가 방 사람들 앞에 나오지 않게). `ownerMode: "full"`은 오너 1:1에만 적용됩니다.
 - **관리자 동의가 필요할 때**: 테넌트가 사용자 동의를 막았으면 로그인이 `teams_login_failed … aadsts=65001`(관리자 동의 필요)로 끝납니다. 테넌트 관리자가 API 권한에서 "관리자 동의 허용"을 눌러야 합니다. `aadsts=7000218`이나 `invalid_client`면 public client flow가 꺼져 있는 것입니다.
 - **만료**: refresh 토큰이 만료·취소되면 도구가 "`ompbot teams login`을 다시 해야 합니다"를 돌려주고 오너 알림이 하루 한 번 갑니다.
 - **주의**: 읽은 회사 메시지는 봇이 쓰는 모델 제공자에게 넘어갑니다.
@@ -524,6 +552,8 @@ bun src/main.ts tasks list [--json]
 bun src/main.ts tasks show <T-…>                        # 레지스트리 행 + 상태 전이 기록(history) + 지금 판정
 bun src/main.ts tasks check <T-…>                       # 지금 판정; 실행 중인 데몬이 스윕과 같은 게시·반응을 합니다
 bun src/main.ts tasks close <T-…> --as done|cancelled   # 사람 전용. 반응을 ✅/❌로 바꾸고 스윕 대상에서 뺍니다
+bun src/main.ts tasks pause <T-…>                       # 오너 멈춤: 스윕의 재촉·stale 알림·자동 머지를 보류하고 워커에 Esc를 보냅니다(스레드의 `멈춰`와 같음)
+bun src/main.ts tasks resume <T-…>                      # 멈춤을 풉니다(스윕 보류만 풀고 워커에 재개 프롬프트는 보내지 않음)
 bun src/main.ts tasks flow --out <디렉터리> [--watch <초>] # 읽기 전용 DB로 흐름 뷰어 html + status.json을 씁니다(--watch면 status.json을 주기적으로 다시 씀, 1~2147483초. 감시 중 DB를 못 읽으면 'tasks flow: status.json not rewritten: …' 한 줄과 종료 코드 1)
 ```
 

@@ -34,11 +34,12 @@ function dispatchHostsOf(homeDir: string): Record<string, { ssh: string }> | und
 	}
 }
 
-/** Whether the flow has the spec review node: config `peerBots` names at least one peer bot. */
+/** Whether the flow has the spec review node: `peerBots` or `channels.discord.peerBots` names at least one peer bot. */
 function hasPeerReview(homeDir: string): boolean {
 	if (!existsSync(join(homeDir, "config.json"))) return false;
 	try {
-		return (loadConfig(homeDir, { checkTokens: false }).peerBots?.length ?? 0) > 0;
+		const config = loadConfig(homeDir, { checkTokens: false });
+		return (config.peerBots?.length ?? 0) > 0 || (config.channels.discord?.peerBots?.length ?? 0) > 0;
 	} catch (error) {
 		process.stderr.write(`tasks flow: config unreadable, review node left out: ${String(error)}\n`);
 		return false;

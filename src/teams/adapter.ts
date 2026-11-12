@@ -226,7 +226,9 @@ export class TeamsAdapter implements ChannelAdapter {
 		// A Teams 1:1 the owner wrote in stays a notice-home candidate, whichever path the message takes.
 		if (owner) this.#conversations.markTeamsOwnerSpoke(conversation.alias);
 		const text = stripMentions(activity.text ?? "");
-		if (guest || this.#ownerQa) {
+		// The owner in a group chat or channel gets the qa run too: a full turn there would answer from the owner's
+		// session, memory and tools in front of everyone in the room.
+		if (guest || this.#ownerQa || kind === "ch") {
 			return this.#acceptGuest({
 				conversation,
 				messageId: id,

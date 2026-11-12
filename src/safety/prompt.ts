@@ -154,6 +154,8 @@ export interface FloorsSurface {
 	noLaneChannel?: boolean;
 	/** The bot's zone (`config.timezone`) and its offset now: the persona monitor line tells `at` times in them. */
 	timezone?: { name: string; offset: string };
+	/** The peer bots of the conversation's platform, each with its mention token there (`port.mentionUser`). */
+	peers?: ReadonlyArray<{ name: string; mention: string }>;
 }
 
 /** Floor 6: when to raise an owner approval card. */
@@ -195,12 +197,12 @@ export function buildFloorsPrompt(
 }
 
 /** Floors lines that can change between two spawns of the same origin without a code change. */
-export type FloorsDynamicLine = "noLaneChannel" | "peerTouched" | "resume";
+export type FloorsDynamicLine = "noLaneChannel" | "peerTouched" | "peers" | "resume";
 
 /** One floors line; a runtime-dependent one carries its name so the spawn log can tell it apart. */
 type FloorsLine = string | { dynamic: FloorsDynamicLine; text: string };
 
-/** `buildFloorsPrompt` as lines, its runtime-dependent lines tagged (the bun path, the peer taint, a missing lane channel). */
+/** `buildFloorsPrompt` as lines, its runtime-dependent lines tagged (the bun path, the peer taint, the peer bots, a missing lane channel). */
 function floorsLines(
 	secretsDir: string,
 	originKey: string | undefined,
@@ -251,7 +253,16 @@ function floorsLines(
 		"## 도구 / Host tools",
 		...(hostTools ? hostToolLines : [NO_HOST_TOOLS_LINE]),
 		"- 작업 디렉터리는 ompbot workspace다. 그 밖의 파일은 필요할 때만 건드린다. Your cwd is the ompbot workspace; touch files elsewhere only when needed.",
+		"- 너를 돌리는 ompbot 데몬을 직접 끄지 않는다(kill·Ctrl-C·`tmux send-keys`). 그러면 이 대화와 재실행 예약이 함께 사라진다. 재시작은 `ompbot apply --detach`로만 하고, 그게 안 되는 호스트(systemd 없음)면 재시작이 필요하다고 오너에게 알린다. Never stop your own ompbot daemon (kill, Ctrl-C, tmux send-keys); restart only through `ompbot apply --detach`, else tell the owner a restart is needed.",
 		...(chat ? [discord ? DISCORD_THREAD_LOOKUP_LINE : THREAD_LOOKUP_LINE, WAIT_INTERIM_LINE] : []),
+		...(surface.peers === undefined || surface.peers.length === 0
+			? []
+			: [
+					{
+						dynamic: "peers" as const,
+						text: `- 이 대화의 피어 봇: ${surface.peers.map((peer) => `${peer.name} = ${peer.mention}`).join("·")}`,
+					},
+				]),
 		...(resumeLine === undefined ? [] : [{ dynamic: "resume" as const, text: resumeLine }]),
 		...(chat ? ["", formatSection(herdr && hostTools, discord, askable)] : []),
 	];

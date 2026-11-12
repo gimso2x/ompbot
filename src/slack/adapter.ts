@@ -17,6 +17,7 @@ import {
 	isOwner,
 	normalizeInbound,
 	normalizePeerInbound,
+	originKeyForMessage,
 	parseThreadRef,
 	THREAD_LINK_PREFIX,
 	TOP_LEVEL_TS,
@@ -475,9 +476,10 @@ export class SlackAdapter implements ChannelAdapter {
 			peer,
 			text: raw.split(mention).join(" ").trim(),
 			quoted,
-			channel: event.channel,
-			ts: event.ts,
-			threadTs: event.thread_ts,
+			platformMessageId: `${event.channel}:${event.ts}`,
+			// A peer's text is fenced, never a command: its origin is always the thread's.
+			originKey: originKeyForMessage(event.channel, "channel", event.ts, event.thread_ts, ""),
+			threadRef: threadRefOf(event.channel, event.thread_ts ?? event.ts),
 			subtype: event.subtype,
 		});
 		if (!result.accept) return drop(result.reason);

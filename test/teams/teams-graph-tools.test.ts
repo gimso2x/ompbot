@@ -122,8 +122,6 @@ describe("graph + ownerMode full (AC-2)", () => {
 	test("피어 미개입 오너 1:1에만 두 도구가 있다", async () => {
 		const port = await boot({ graph: { tokenFile: tokenFile() } });
 		await say(port, { id: "dm-1", conversationId: PERSONAL_CHAT, personal: true });
-		await say(port, { id: "ch-1", conversationId: GROUP_CHAT, personal: false });
-		await ms.waitFor((call) => String(call.body.text).includes("ECHO 질문 ch-1"));
 		await ms.waitFor((call) => String(call.body.text).includes("ECHO 질문 dm-1"));
 
 		expect(names(ownerDm)).toEqual([...TEAMS_DM_TOOLS.slice(0, 1), ...GRAPH_TOOLS, ...TEAMS_DM_TOOLS.slice(1)]);

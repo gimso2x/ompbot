@@ -26,6 +26,8 @@ import type { TurnProgress } from "../core/mailbox";
 import {
 	isOwner,
 	normalizeInbound,
+	normalizePeerInbound,
+	originKeyForMessage,
 	parseThreadRef,
 	THREAD_LINK_PREFIX,
 	TOP_LEVEL_TS,
@@ -41,6 +43,7 @@ import {
 	type ThreadMuteCommand,
 } from "../core/types";
 import type { Logger } from "../log";
+import { DEFAULT_PEER_HOP_LIMIT, PEER_HOP_NOTICE, type PeerBotList } from "../slack/adapter";
 import { type BackfillCursors, type BackfillTarget, DiscordBackfill } from "./backfill";
 import { type Destination, type DiscordChannel, PUBLIC_THREAD, THREAD_EXISTS, THREAD_NAME_MAX } from "./channel";
 import { fromDiscordEmoji, toDiscordEmoji } from "./emoji";
@@ -132,6 +135,10 @@ export interface DiscordAdapterOptions {
 	mentionFreeChannels?: readonly string[] | undefined;
 	/** In a server channel only a mention addresses the bot. */
 	requireMention?: boolean | undefined;
+	/** Peer bots whose server channel messages that mention this bot are taken (`channels.discord.peerBots`). */
+	peerBots?: PeerBotList | undefined;
+	/** Peer input cap per thread (top-level `peerHopLimit`). Default `DEFAULT_PEER_HOP_LIMIT`. */
+	peerHopLimit?: { turns: number; windowMinutes: number } | undefined;
 	/** Whether a thread root is a registered [TASK]: its status reaction belongs to the task sweep. */
 	isTaskRoot?: ((threadRef: string) => boolean) | undefined;
 	/** Called after a live message failed as `inbound_failed` (the missed-message recovery trigger). */
@@ -190,6 +197,8 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #guildIds: ReadonlySet<string> | undefined;
 	#mentionFree: ReadonlySet<string>;
 	#requireMention: boolean;
+	readonly #peerBots: PeerBotList;
+	readonly #peerHopLimit: { turns: number; windowMinutes: number };
 	readonly #isTaskRoot: ((threadRef: string) => boolean) | undefined;
 	readonly #onInboundFailure: (() => void) | undefined;
 	readonly #mediaRoot: string | undefined;
@@ -220,6 +229,8 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#guildIds = options.guildIds === undefined ? undefined : new Set(options.guildIds);
 		this.#mentionFree = new Set(options.mentionFreeChannels ?? []);
 		this.#requireMention = options.requireMention === true;
+		this.#peerBots = options.peerBots ?? [];
+		this.#peerHopLimit = options.peerHopLimit ?? DEFAULT_PEER_HOP_LIMIT;
 		this.#isTaskRoot = options.isTaskRoot;
 		this.#onInboundFailure = options.onInboundFailure;
 		this.#mediaRoot = options.mediaRoot;
@@ -607,7 +618,11 @@ export class DiscordAdapter implements ChannelAdapter {
 		if (!READ_TYPES.has(event.type)) return this.#drop(event, "subtype");
 		const botUserId = await this.#ready;
 		if (botUserId === undefined) return "dropped";
-		if (event.author.bot === true || event.author.id === botUserId) return this.#drop(event, "bot_message");
+		if (event.author.id === botUserId) return this.#drop(event, "bot_message");
+		// A peer is told by its id, whatever the bot flag says.
+		const peer = this.#peerBots.find((p) => p.userId === event.author.id);
+		if (peer !== undefined) return this.#processPeerMessage(event, botUserId, peer);
+		if (event.author.bot === true) return this.#drop(event, "bot_message");
 		// The owner gate comes before any lookup, so a stranger's message costs no API call.
 		if (!isOwner(event.author.id, this.#owner)) return this.#drop(event, "not_owner");
 		const dm = event.guild_id === undefined;
@@ -717,6 +732,87 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	/**
+	 * A message of an allowlisted peer bot, Slack's rules on Discord's shapes: a server channel or thread only, a read
+	 * type, this bot mentioned (whatever the channel policy), no muted thread. It never takes an owner path — no card
+	 * reply, no attachment download, no command parsing (the text goes to the core fenced) — and is capped per thread
+	 * by the core. A channel root's thread is opened only once the core recorded the message, so a dropped peer
+	 * message leaves no empty thread.
+	 */
+	async #processPeerMessage(
+		event: DiscordMessageEvent,
+		botUserId: string,
+		peer: { userId: string; name: string },
+	): Promise<IngestOutcome> {
+		const drop = (reason: string): IngestOutcome => {
+			this.#log.info("inbound_dropped", { reason, channel: event.channel_id, id: event.id, peer: peer.userId });
+			return "dropped";
+		};
+		if (event.guild_id === undefined) return drop("peer_dm");
+		if (this.#guildIds !== undefined && !this.#guildIds.has(event.guild_id)) return drop("guild_not_allowed");
+		const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`];
+		if (!tokens.some((token) => event.content.includes(token))) return drop("peer_not_mentioned");
+		const onPeerInbound = this.#core.onPeerInbound;
+		if (onPeerInbound === undefined) return drop("peer_unsupported");
+		let conversationId = event.channel_id;
+		let threadId: string | undefined;
+		const info = await this.#port.channelInfo(event.channel_id);
+		if (info === undefined) throw new Error(`unknown channel ${event.channel_id}`);
+		if (info.parentId !== undefined && info.type !== 0) {
+			conversationId = info.parentId;
+			threadId = event.channel_id;
+		}
+		// A root's keys are those of the thread the owner path would open from it (Discord: thread id = message id).
+		const root = threadId ?? event.id;
+		const threadRef = threadRefOf(conversationId, root);
+		// An owner-muted thread stays quiet for peers too, and a peer mention never releases the mute.
+		if (this.#core.isThreadMuted?.(threadRef) === true) return drop("thread_muted");
+		let text = event.content;
+		for (const token of tokens) text = text.split(token).join(" ");
+		text = text.trim();
+		const quoted = (event.embeds ?? [])
+			.flatMap((embed) => [embed.title, embed.description])
+			.filter((part): part is string => typeof part === "string" && part !== "");
+		const opensThread = threadId === undefined && this.#core.knowsThread?.(threadRef) !== true;
+		const result = normalizePeerInbound({
+			peer,
+			text,
+			quoted,
+			platformMessageId: threadRefOf(conversationId, event.id),
+			// A peer's text is fenced, never a command: its origin is always the thread's.
+			originKey: originKeyForMessage(conversationId, "channel", event.id, threadId, "", "discord"),
+			threadRef,
+		});
+		if (!result.accept) return drop(result.reason);
+		const { inbound } = result;
+		const outcome = onPeerInbound(inbound, {
+			turns: this.#peerHopLimit.turns,
+			windowMs: this.#peerHopLimit.windowMinutes * 60_000,
+		});
+		if (outcome.duplicate) {
+			this.#log.info("inbound_duplicate", { id: inbound.platformMessageId });
+			return "duplicate";
+		}
+		if (outcome.dropped !== undefined) {
+			drop(outcome.dropped);
+			if (outcome.dropped === "peer_hop_cap" && outcome.notice === true) {
+				// No bot mention in the notice: it must not invite another peer reply. A root gets it as a reply, no thread.
+				await this.postNotice(conversationId, PEER_HOP_NOTICE, root);
+			}
+			return "dropped";
+		}
+		if (opensThread) await this.#startThread(conversationId, event, text, false);
+		await this.#beginStatus(
+			threadRef,
+			conversationId,
+			root,
+			{ channelId: event.channel_id, messageId: event.id },
+			inbound.originKey,
+			{ showStatus: true },
+		);
+		return "recorded";
+	}
+
+	/**
 	 * Downloads an owner message's attachments (at most `MAX_INBOUND_FILES`) into `<mediaRoot>/inbound/<message id>/`
 	 * and returns their prompt notes. A file whose declared size is over its cap is refused without a download.
 	 */
@@ -748,10 +844,17 @@ export class DiscordAdapter implements ChannelAdapter {
 		return notes;
 	}
 
-	/** Starts the message's thread (or finds it started); a refusal leaves a notice and fails the message. */
-	async #startThread(conversationId: string, event: DiscordMessageEvent, text: string): Promise<void> {
-		const ref = threadRefOf(conversationId, event.id);
-		if (this.#core.knowsThread?.(ref) !== true) {
+	/**
+	 * Starts the message's thread (or finds it started); a refusal leaves a notice and fails the message. `known`: the
+	 * thread is there already (a caller that recorded the message first asks before recording).
+	 */
+	async #startThread(
+		conversationId: string,
+		event: DiscordMessageEvent,
+		text: string,
+		known = this.#core.knowsThread?.(threadRefOf(conversationId, event.id)) === true,
+	): Promise<void> {
+		if (!known) {
 			const line = progressLine(text.split("\n")[0] ?? "");
 			const name = (line === "" ? "ompbot" : line).slice(0, THREAD_NAME_MAX);
 			try {

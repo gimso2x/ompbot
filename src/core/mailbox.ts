@@ -651,6 +651,14 @@ const PEER_CONTEXT_MAX_BYTES = 16 * 1024;
 const PEER_CONTEXT_MESSAGE_CHARS = 4000;
 
 /**
+ * Whether message `a` was posted before `b`: two integer strings (Discord snowflakes, past 2^53) compare exactly as
+ * BigInt; Slack `<sec>.<usec>` ts compare as numbers.
+ */
+function tsBefore(a: string, b: string): boolean {
+	return /^[0-9]+$/.test(a) && /^[0-9]+$/.test(b) ? BigInt(a) < BigInt(b) : Number(a) < Number(b);
+}
+
+/**
  * Thread context for a peer bot's request: the thread root plus every other message after this bot's last post in
  * the thread (this bot's own posts are left out, the request itself too), at most 30 messages and 16KB with the
  * oldest cut first. Every message sits in a quoted fence (data, not instructions) and is redacted. Null when the
@@ -667,10 +675,10 @@ export function peerThreadContextBlock(
 	if (root === undefined || root.ts === currentTs) return null;
 	let lastSelf = -1;
 	messages.forEach((m, i) => {
-		if (m.user === selfUserId && Number(m.ts) < Number(currentTs)) lastSelf = i;
+		if (m.user === selfUserId && tsBefore(m.ts, currentTs)) lastSelf = i;
 	});
 	const picked = [root, ...messages.slice(Math.max(lastSelf + 1, 1))].filter(
-		(m, i) => i === 0 || (m.user !== selfUserId && Number(m.ts) < Number(currentTs)),
+		(m, i) => i === 0 || (m.user !== selfUserId && tsBefore(m.ts, currentTs)),
 	);
 	const render = (m: SlackThreadMessage): string => {
 		const who = m.user === selfUserId ? "이 봇" : (m.user ?? m.botId ?? "알 수 없음").replace(/[^A-Za-z0-9_]/g, "");

@@ -296,6 +296,28 @@ describe("tasks flow", () => {
 			const peers = await graphOf("peers");
 			expect(peers.graph.nodes.find((n: { id: string }) => n.id === "review")).toMatchObject({ name: "검토" });
 			expect(peers.status.map((s) => s.node)).toContain("review");
+
+			// A Discord-only bot with `channels.discord.peerBots` has the node too.
+			writeFileSync(
+				join(home, "config.json"),
+				JSON.stringify({
+					schemaVersion: 1,
+					channels: {
+						discord: {
+							ownerUserId: "123456789012345678",
+							botTokenFile: "secrets/discord-bot-token",
+							applicationId: "234567890123456789",
+							peerBots: [{ userId: "345678901234567890", name: "peer" }],
+						},
+					},
+					ompExecutable: process.execPath,
+					workspaceDir: "workspace",
+				}),
+				{ mode: 0o600 },
+			);
+			const discordPeers = await graphOf("discord-peers");
+			expect(discordPeers.graph.nodes.map((n: { id: string }) => n.id)).toContain("review");
+			expect(discordPeers.status.map((s) => s.node)).toContain("review");
 		} finally {
 			rmSync(home, { recursive: true, force: true });
 		}

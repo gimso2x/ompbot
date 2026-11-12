@@ -716,8 +716,14 @@ export type DashboardConfig = Partial<
 	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
 		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
 		slack?: { teamId?: string };
-		/** Only the server ids are read, for the Discord links of the turn panels; `slack` only for whether Slack is on. */
-		channels?: { slack?: { ownerUserId: string }; discord?: { guildIds?: string[] } };
+		/**
+		 * Only the server ids are read, for the Discord links of the turn panels, and the Discord peer bots, for the flow's
+		 * review node; `slack` only for whether Slack is on.
+		 */
+		channels?: {
+			slack?: { ownerUserId: string };
+			discord?: { guildIds?: string[]; peerBots?: Array<{ userId: string; name: string }> };
+		};
 	};
 
 export interface SnapshotDeps {
@@ -1765,7 +1771,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				FROM task_transitions WHERE task_id IN (SELECT task_id FROM tasks WHERE ${scope}) ORDER BY transition_id`,
 				since,
 			);
-			const statuses = taskFlowStatus(read, transitions, (config?.peerBots?.length ?? 0) > 0);
+			// The spec review node shows when either platform has a peer bot (Slack `peerBots`, `channels.discord.peerBots`).
+			const peerReview = (config?.peerBots?.length ?? 0) > 0 || (config?.channels?.discord?.peerBots?.length ?? 0) > 0;
+			const statuses = taskFlowStatus(read, transitions, peerReview);
 			const threads = new Map<string, TaskRow[]>();
 			for (const row of read) threads.set(row.threadRef, [...(threads.get(row.threadRef) ?? []), row]);
 			const chains = [...threads].map(([threadRef, list]) => {

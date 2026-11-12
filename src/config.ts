@@ -55,6 +55,11 @@ export interface DiscordChannelConfig {
 	requireMention?: boolean;
 	/** Server text channel where lanes asked for from the Discord DM open (a DM has no threads); absent: no DM lanes. */
 	laneChannelId?: string;
+	/**
+	 * Peer bots (other ompbot instances) whose server channel messages that mention this bot are taken as review
+	 * requests, the way the top-level Slack `peerBots` are. Changing it needs a restart (`channels` is a restart key).
+	 */
+	peerBots?: Array<{ userId: string; name: string }>;
 }
 
 /** `channels.teams`: present → the daemon also takes Bot Framework messages from Microsoft Teams (owner only). */
@@ -433,6 +438,7 @@ const DISCORD_KEYS: Record<string, true> = {
 	mentionFreeChannels: true,
 	requireMention: true,
 	laneChannelId: true,
+	peerBots: true,
 };
 
 function parseDiscordChannel(configPath: string, value: unknown, home: string): DiscordChannelConfig {
@@ -467,6 +473,30 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 	if (requireMention !== undefined && typeof requireMention !== "boolean") {
 		invalid(configPath, "channels.discord.requireMention");
 	}
+	const peerBotsRaw = record.peerBots;
+	let peerBots: Array<{ userId: string; name: string }> | undefined;
+	if (peerBotsRaw !== undefined) {
+		if (!Array.isArray(peerBotsRaw)) invalid(configPath, "channels.discord.peerBots");
+		peerBots = peerBotsRaw.map((entry, i) => {
+			const peer = asRecord(entry);
+			const field = `channels.discord.peerBots.${i}`;
+			// The owner is never a peer: a peer message carries no owner authority, so listing the owner would only shadow it.
+			if (
+				peer === undefined ||
+				typeof peer.userId !== "string" ||
+				!SNOWFLAKE.test(peer.userId) ||
+				peer.userId === ownerUserId
+			) {
+				invalid(configPath, `${field}.userId`);
+			}
+			if (typeof peer.name !== "string" || peer.name.length < 1 || peer.name.length > 32) {
+				invalid(configPath, `${field}.name`);
+			}
+			for (const key of Object.keys(peer))
+				if (key !== "userId" && key !== "name") invalid(configPath, `${field}.${key}`);
+			return { userId: peer.userId, name: peer.name };
+		});
+	}
 	return {
 		ownerUserId,
 		botTokenFile,
@@ -475,6 +505,7 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 		...(mentionFreeChannels === undefined ? {} : { mentionFreeChannels }),
 		...(requireMention === undefined ? {} : { requireMention }),
 		...(laneChannelId === undefined ? {} : { laneChannelId }),
+		...(peerBots === undefined ? {} : { peerBots }),
 	};
 }
 

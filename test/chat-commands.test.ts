@@ -447,8 +447,9 @@ describe("⑥ distill", () => {
 			peer: { userId: "UPEER00001", name: "떡" },
 			text: "!distill",
 			quoted: [],
-			channel: "C1",
-			ts: "1.1",
+			platformMessageId: "C1:1.1",
+			originKey: "slack/ch/C1/t/1.1",
+			threadRef: "C1:1.1",
 		});
 		if (!peer.accept) throw new Error("rejected");
 		expect(parseCommand(peer.inbound.text)).toBeUndefined();

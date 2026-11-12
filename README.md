@@ -12,7 +12,7 @@
 [![Workers](https://img.shields.io/badge/workers-herdr-bc8cff?style=flat-square&labelColor=black)](https://github.com/herdrdev/herdr)
 [![Slack](https://img.shields.io/badge/Slack-Socket%20Mode-4A154B?style=flat-square&labelColor=black&logo=slack)](https://api.slack.com/apis/socket-mode)
 [![Discord](https://img.shields.io/badge/Discord-Gateway-5865F2?style=flat-square&labelColor=black&logo=discord)](https://discord.com/developers/docs/events/gateway)
-![Tests](https://img.shields.io/badge/tests-2%2C500%2B%20passing-3fb950?style=flat-square&labelColor=black)
+![Tests](https://img.shields.io/badge/tests-3%2C000%2B%20passing-3fb950?style=flat-square&labelColor=black)
 
 [빠른 시작](#빠른-시작) · [핵심 기능](#핵심-기능) · [작동 방식](#작동-방식) · [명령](#명령-한눈에) · [사용 설명서](docs/guide.md)
 
@@ -71,7 +71,7 @@ bun link                  # (선택) 이후 'bun src/main.ts <명령>' 대신 'o
 
 **3. 채팅 앱 고르기** — Slack과 Discord 중 하나를 고릅니다(둘 다 쓰려면 Slack으로 설치한 뒤 [Discord](#discord선택)를 더합니다).
 
-- **Slack** — [api.slack.com/apps](https://api.slack.com/apps) → *Create New App* → *From a manifest* → [`packaging/slack-manifest.json`](packaging/slack-manifest.json) 붙여넣기(권한 15개·이벤트 6개·슬래시 명령 11개) → *Install App*에서 봇 토큰(`xoxb-`) → *Basic Information › App-Level Tokens*에서 `connections:write` 앱 토큰(`xapp-`). 화면별 순서는 [Slack 앱 만들기](docs/guide.md#2-slack-앱-만들기)에 있습니다.
+- **Slack** — [api.slack.com/apps](https://api.slack.com/apps) → *Create New App* → *From a manifest* → [`packaging/slack-manifest.json`](packaging/slack-manifest.json) 붙여넣기(권한 15개·이벤트 6개·슬래시 명령 12개) → *Install App*에서 봇 토큰(`xoxb-`) → *Basic Information › App-Level Tokens*에서 `connections:write` 앱 토큰(`xapp-`). 화면별 순서는 [Slack 앱 만들기](docs/guide.md#2-slack-앱-만들기)에 있습니다.
 - **Discord** — [Discord 봇 만들기](docs/discord.md)를 따라 봇을 만들고 **Message Content Intent**만 켠 뒤 서버에 초대합니다. 봇 토큰, Application ID, 내 사용자 ID(개발자 모드 → 프로필 → *사용자 ID 복사*)를 챙깁니다.
 
 **4. 홈과 토큰** — 3에서 고른 쪽 하나만 합니다.
@@ -158,6 +158,7 @@ flowchart LR
 - **[턴 되돌리기(`!undo`)](docs/guide.md#턴-되돌리기undo)** — `turnSnapshot.repos`: 대화 턴마다 작업 트리를 스냅샷해 그 턴이 바꾼 파일만 승인 카드 뒤에 되돌림
 - **[워커 omp 인자](docs/guide.md#5-설정-파일-ompbotconfigjson)** — `workerOmpArgs`·`dispatchHosts.<h>.ompArgs`: herdr 워커 omp에만 `--prewalk` 같은 인자를 붙임
 - **[비용 상한](docs/guide.md#5-설정-파일-ompbotconfigjson)** — `costCap`: 턴·하루 상한, `!budget`으로 확인
+- **[Teams 채널](docs/guide.md#teams선택)** — `channels.teams`: Microsoft Teams 1:1·그룹 채팅(멘션)에서 대화, 동료(손님)에게는 웹 검색만 쓰는 읽기 전용 답변(`guestAadObjectIds`)
 - **[Teams 채팅 읽기](docs/guide.md#teams-채팅-읽기선택-graph)** — `channels.teams.graph` + `ompbot teams login`: 오너 Teams 1:1에서 오너의 채팅 목록·메시지를 Graph 위임 `Chat.Read`로 읽음
 
 ## Discord(선택)
@@ -188,6 +189,7 @@ Slack으로 설치한 봇에 Discord를 더할 때:
 | `!brief` (`!브리핑`) | 지금 상태(주의·진행·모니터·백업)를 폭 1080px 한 장 PNG로 그려 이 스레드에 올립니다(모델 호출 없음, 작업 중에도 사용 가능) |
 | `!shutup` · `!unshutup` | 채널 스레드에서 봇을 뮤트하고 풉니다(오너 메시지에도 반응하지 않음, 멘션하면 풀림) |
 | `작업: <제목> @<경로>` | 그 저장소 옆 전용 worktree·브랜치(`lane/L-YYYYMMDD-NN`)에서 일하고 커밋으로 검증되는 작업 레인을 엽니다. 닫히면 `머지`·`폐기` 버튼 카드가 올라옵니다 |
+| `멈춰` · `계속` | 작업 레인·`[TASK]` 스레드에서 그 일을 멈추거나 다시 돌립니다(레인은 ⏸·▶ 버튼도 됨) |
 
 위 표의 `!` 명령은 `!btw`·`!distill`·`!shutup`·`!unshutup`을 빼고 `/new-ompbot` 같은 슬래시 명령으로도 쓸 수 있습니다.
 

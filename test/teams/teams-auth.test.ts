@@ -10,6 +10,7 @@ import {
 	makeKey,
 	messageActivity,
 	OTHER_TENANT,
+	PERSONAL_CHAT,
 	postActivity,
 	signJwt,
 	startTeamsDaemon,
@@ -44,7 +45,15 @@ async function send(token: string | undefined, tenant = TENANT): Promise<{ statu
 	const response = await postActivity(
 		port,
 		token,
-		messageActivity({ id, text: `질문 ${seq}`, serviceUrl: ms.serviceUrl, tenant }),
+		messageActivity({
+			id,
+			text: `질문 ${seq}`,
+			serviceUrl: ms.serviceUrl,
+			tenant,
+			conversationId: PERSONAL_CHAT,
+			conversationType: "personal",
+			mention: false,
+		}),
 	);
 	const rows = daemon.store.listInbound();
 	return {
