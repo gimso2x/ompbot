@@ -16,6 +16,7 @@ import {
 	type OmpOpenResult,
 	type OmpSessionDriver,
 	type OmpState,
+	type TodoPhase,
 } from "./driver";
 import { buildChildEnv } from "./env";
 import { checkOmpRuntime } from "./runtime-check";
@@ -69,6 +70,8 @@ interface RpcClientLike {
 	getAvailableThinkingLevels(): Promise<string[]>;
 	setThinkingLevel(level: string): Promise<void>;
 	compact(customInstructions?: string): Promise<{ summary: string; tokensBefore: number }>;
+	/** `set_todos`: replaces the session's task list; resolves with the phases omp stored. */
+	setTodos(phases: TodoPhase[]): Promise<unknown>;
 	/** Starts a side question; resolves with its `running` record. The outcome arrives through `onBtwRecord`. */
 	btw(question: string): Promise<BtwRecordLike>;
 	/** Cancels the running (or still starting) side question; with an id only when it is that record. */
@@ -668,6 +671,10 @@ export class RpcOmpDriver implements OmpSessionDriver {
 
 	setThinking(level: string): Promise<void> {
 		return this.#call((client) => client.setThinkingLevel(level));
+	}
+
+	async setTodos(phases: TodoPhase[]): Promise<void> {
+		await this.#call((client) => client.setTodos(phases));
 	}
 
 	async compact(instructions?: string): Promise<OmpCompactResult> {

@@ -63,14 +63,20 @@ export function buildLaneTools(manager: LaneManager, originKey: string): HostToo
 			name: "ompbot_lane_progress",
 			label: "Report lane milestone",
 			description:
-				"Report a milestone of this work lane in one line; it is shown in the lane's status message in its chat thread.",
+				"Report a milestone of this work lane in one line; it is shown in the lane's status message in its chat thread. With `needsOwner: true` the line is the question the owner must decide: end the turn after it (the core then sends no automatic nudge).",
 			parameters: {
 				type: "object",
-				properties: { text: { type: "string", description: "One-line milestone" } },
+				properties: {
+					text: { type: "string", description: "One-line milestone, or the owner's decision to make" },
+					needsOwner: {
+						type: "boolean",
+						description: "True when the lane waits for the owner's decision (the turn ends after this call)",
+					},
+				},
 				required: ["text"],
 				additionalProperties: false,
 			},
-			execute: async (params) => manager.progress(originKey, stringParam(params, "text")),
+			execute: async (params) => manager.progress(originKey, stringParam(params, "text"), params.needsOwner === true),
 		},
 		{
 			name: "ompbot_claim_done",

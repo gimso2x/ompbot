@@ -384,7 +384,8 @@ function gluedPath(value: string): string | undefined {
  * (`secre*`, `*`) match the secrets directory's own names — then again after symlinks resolve, and an existing hard
  * link by inode. A directory change it cannot resolve (`cd "$D"`, `cd $(…)`, `pushd +1`) makes the cwd unknown, and
  * any relative argument after it is refused (fail closed). A recursive search (`grep -r`, `rg`) rooted at the
- * secrets directory or one of its ancestors is refused too.
+ * secrets directory or one of its ancestors is refused too, and so is a copy or archive (`cp -a`, `tar`, `rsync`,
+ * `zip -r`) of one.
  * A mistake guard, not a sandbox: variables assembled at run time, script files and `eval` are not seen.
  */
 export function bashTouchesSecrets(command: string, secretsDir: string, context: BashPathContext): boolean {
@@ -418,10 +419,16 @@ export function bashTouchesSecrets(command: string, secretsDir: string, context:
 		} else {
 			const at = cwd;
 			if (operands.some((arg) => judge.reaches(arg, at))) return true;
-			if (name !== undefined && recursiveSearch(name, args)) {
-				// With one operand (the pattern) the search walks the cwd.
+			if (name !== undefined) {
 				const paths = args.filter((arg) => !arg.startsWith("-"));
-				const roots = paths.length <= 1 ? [...paths, "."] : paths;
+				// With one operand (the pattern) a search walks the cwd; a copy or archive walks only what it names.
+				const roots = recursiveSearch(name, args)
+					? paths.length <= 1
+						? [...paths, "."]
+						: paths
+					: recursiveCopy(name, args)
+						? paths
+						: [];
 				if (roots.some((arg) => judge.covers(arg, at))) return true;
 			}
 		}
@@ -494,6 +501,19 @@ function recursiveSearch(name: string, args: string[]): boolean {
 			arg === "--directories=recurse" ||
 			arg === "recurse",
 	);
+}
+
+/**
+ * A copy or archive that reads whole directories: `cp` / `scp` with `-r` / `-R` / `-a` / `--recursive` / `--archive`,
+ * `rsync`, `tar`, `zip -r` / `-R` / `--recurse-paths` and `7z`. Walks that only list (`find`, `du`, `ls -R`) are not
+ * copies: from home their `.` would cover the secrets directory and block everyday commands.
+ */
+function recursiveCopy(name: string, args: string[]): boolean {
+	if (name === "rsync" || name === "tar" || name === "7z") return true;
+	if (name === "cp" || name === "scp")
+		return args.some((arg) => /^-[A-Za-z]*[rRa]/.test(arg) || arg === "--recursive" || arg === "--archive");
+	if (name === "zip") return args.some((arg) => /^-[A-Za-z]*[rR]/.test(arg) || arg === "--recurse-paths");
+	return false;
 }
 
 /** Input keys that name a path in non-Bash tools (Read, Glob, Grep, LS, NotebookRead and the edit tools). */

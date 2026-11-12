@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 /** What `healSessionModelFile` changed: the patched file and the model swap it made. */
 export interface HealedSessionModel {
 	file: string;
-	/** The dead model the session's last `model_change` named. */
+	/** The dead model of the `model_change` omp restores from. */
 	from: string;
 	/** The live fallback the record was rewritten to. */
 	to: string;
@@ -55,11 +55,13 @@ function rewriteModel(line: string, from: string, to: string): string {
 }
 
 /**
- * Rewrites a session file's last `model_change` to `fallback`, so omp's restore — which resolves `model_change`
- * records newest-first and uses the first model it knows — succeeds again. Every other byte stays as it was:
- * the pristine original is copied to `<backupDir>/<UTC timestamp>.jsonl` first, and the corrected text lands
- * through a temp file + rename, leaving no new `*.jsonl` in the session dir. Returns `undefined` (touching
- * nothing) when the file has no `model_change` record or its last one already names `fallback`.
+ * Rewrites the `model_change` omp's restore reads to `fallback`, so the restore — which resolves those records
+ * newest-first and uses the first model it knows — succeeds again. The record is picked by omp's rule (a record's role
+ * is `role ?? "default"`): when the last `model_change` has role `"fallback"` (a retry hop) omp restores only the
+ * default model, so the last record whose role is default is rewritten; otherwise the last record is. Every other byte
+ * stays as it was: the pristine original is copied to `<backupDir>/<UTC timestamp>.jsonl` first, and the corrected
+ * text lands through a temp file + rename, leaving no new `*.jsonl` in the session dir. Returns `undefined` (touching
+ * nothing) when there is no such record or it already names `fallback`.
  */
 export function healSessionModelFile(
 	file: string,
@@ -68,25 +70,27 @@ export function healSessionModelFile(
 	now = new Date(),
 ): HealedSessionModel | undefined {
 	const lines = readFileSync(file, "utf8").split("\n");
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const line = lines[i] ?? ""; // split output is dense; "" also skips a missing slot
+	const changes: Array<{ index: number; model: string; role: string }> = [];
+	for (const [index, line] of lines.entries()) {
 		if (line === "") continue;
-		let record: { type?: unknown; model?: unknown };
+		let record: { type?: unknown; model?: unknown; role?: unknown };
 		try {
-			record = JSON.parse(line) as { type?: unknown; model?: unknown };
+			record = JSON.parse(line) as { type?: unknown; model?: unknown; role?: unknown };
 		} catch {
 			continue;
 		}
 		if (record?.type !== "model_change" || typeof record.model !== "string") continue;
-		if (record.model === fallback) return undefined;
-		const stamp = now.toISOString().replaceAll(":", "").replaceAll(".", "");
-		lines[i] = rewriteModel(line, record.model, fallback);
-		mkdirSync(backupDir, { recursive: true });
-		copyFileSync(file, join(backupDir, `${stamp}.jsonl`));
-		const temp = join(dirname(file), `.${stamp}.heal.tmp`);
-		writeFileSync(temp, lines.join("\n"));
-		renameSync(temp, file);
-		return { file, from: record.model, to: fallback };
+		changes.push({ index, model: record.model, role: typeof record.role === "string" ? record.role : "default" });
 	}
-	return undefined;
+	const target =
+		changes.at(-1)?.role === "fallback" ? changes.findLast((change) => change.role === "default") : changes.at(-1);
+	if (target === undefined || target.model === fallback) return undefined;
+	const stamp = now.toISOString().replaceAll(":", "").replaceAll(".", "");
+	lines[target.index] = rewriteModel(lines[target.index] ?? "", target.model, fallback);
+	mkdirSync(backupDir, { recursive: true });
+	copyFileSync(file, join(backupDir, `${stamp}.jsonl`));
+	const temp = join(dirname(file), `.${stamp}.heal.tmp`);
+	writeFileSync(temp, lines.join("\n"));
+	renameSync(temp, file);
+	return { file, from: target.model, to: fallback };
 }

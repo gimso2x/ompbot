@@ -15,12 +15,18 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { DrainWaitResult } from "../cli/drain";
 import { parseChatOrigin } from "../core/origin-key";
+import type { SweepHeartbeat } from "../daemon/heartbeat";
 import { RESTART_CUT_FILE } from "../daemon/recovery";
 import { type BackupResult, backupStamp } from "./backup";
 import type { Gate } from "./gates";
 
 /** How long the restarted daemon gets to answer IPC `status` from a fresh start. */
 export const READY_TIMEOUT_MS = 120_000;
+/**
+ * After `ready`, how long the new daemon gets to write a heartbeat (after the restart) with no chat transport down.
+ * Covers the Slack/Discord connect plus one sweep (15 s); a stamp the old daemon wrote never counts.
+ */
+export const TRANSPORTS_TIMEOUT_MS = 120_000;
 const READY_POLL_MS = 1_000;
 export const DEFAULT_DRAIN_TIMEOUT_MIN = 60;
 /** `apply --cut-after` default: a drain still busy after this many minutes restarts anyway (the cut turns resume). */
@@ -96,6 +102,8 @@ export interface ApplyDeps {
 	ompSync?: () => { changed: number };
 	/** `startedAt` (ms) of the process holding `ompbot.lock`; undefined when there is no readable lock. */
 	lockStartedAt: () => number | undefined;
+	/** `<home>/sweep-heartbeat` as the daemon last wrote it; undefined when absent or unreadable. */
+	heartbeat: () => SweepHeartbeat | undefined;
 	/** This process; recorded in `<home>/apply.lock`. */
 	pid: number;
 	/** Whether the process holding `<home>/apply.lock` still runs; a dead holder's lock is taken over. */
@@ -442,7 +450,7 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 
 /**
  * Applies a merged change to the running daemon in one auditable pass: precheck → backup (db + config copy) →
- * drain → restart → wait for a fresh daemon → record gates/doctor → roll back config and restart once on failure.
+ * drain → restart → wait for a fresh daemon and its chat transports → record gates/doctor → roll back config and restart once on failure.
  * Code is never reverted automatically; the receipt carries the previous HEAD and the revert command instead.
  */
 async function applyUnderLock(
@@ -823,13 +831,39 @@ async function applyUnderLock(
 		}
 	};
 
+	// Answering IPC is not taking messages: the new daemon's own heartbeat must show every chat transport it runs up.
+	const waitTransports = async (restartAt: number): Promise<StepResult> => {
+		const deadline = deps.now() + TRANSPORTS_TIMEOUT_MS;
+		let last = "no heartbeat";
+		for (;;) {
+			const beat = deps.heartbeat();
+			if (beat === undefined) last = "no heartbeat";
+			else if (beat.ts.getTime() <= restartAt) last = `heartbeat ${beat.ts.toISOString()} is from before the restart`;
+			else {
+				const down = [
+					beat.socket?.state === "down" ? "slack" : undefined,
+					beat.discord?.state === "down" ? "discord" : undefined,
+				].filter((name) => name !== undefined);
+				const states = `slack=${beat.socket?.state ?? "off"} discord=${beat.discord?.state ?? "off"}`;
+				if (down.length === 0) return { ok: true, detail: states };
+				last = `down: ${down.join(",")} (${states})`;
+			}
+			if (deps.now() >= deadline)
+				return { ok: false, detail: `transports not up within ${TRANSPORTS_TIMEOUT_MS / 1000}s: ${last}` };
+			await deps.sleep(READY_POLL_MS);
+		}
+	};
+
 	let restartAt = 0;
 	const restarted = await step("restart", async () => {
 		const r = await restartAndWait();
 		restartAt = r.restartAt;
 		return r;
 	});
-	const ready = restarted && (await step("ready", () => waitReady(restartAt)));
+	const ready =
+		restarted &&
+		(await step("ready", () => waitReady(restartAt))) &&
+		(await step("transports", () => waitTransports(restartAt)));
 
 	// 7. rollback on failure: last known-good config back, one more restart; the code stays and is described in the receipt.
 	if (!ready) {

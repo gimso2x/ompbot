@@ -3,11 +3,12 @@ import { isAbsolute, join } from "node:path";
 import type { ActionButton, MessageRef } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { escapeMrkdwn, formatElapsed } from "../channel/text";
-import type { PauseCheck } from "../core/mailbox";
+import type { PauseCheck, TurnSettledInfo } from "../core/mailbox";
 import { parseThreadRef, platformOfThreadRef } from "../core/normalize";
 import type { IdPlatform } from "../core/origin-key";
 import type { InboundRecord, MailboxClock } from "../core/types";
 import type { Logger } from "../log";
+import type { TodoPhase } from "../omp/driver";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { Store } from "../store/db";
@@ -35,6 +36,7 @@ import { type LaneReviewDeps, reviewLane } from "./review";
 import {
 	INCONCLUSIVE_APPROVED,
 	INTEGRITY_APPROVED,
+	isCoreSteerId,
 	type LaneChanges,
 	type LaneChecksInconclusive,
 	type LaneClaim,
@@ -46,7 +48,15 @@ import {
 	laneOriginKey,
 	OWNER_PAUSE_HELD,
 } from "./status";
-import { buildLanePrompt, buildNotDonePrompt, buildRebasePrompt, classifyClosedLaneMessage } from "./trigger";
+import {
+	buildLanePrompt,
+	buildLaneTodos,
+	buildNotDonePrompt,
+	buildNudgePrompt,
+	buildRebasePrompt,
+	classifyClosedLaneMessage,
+	type LaneWorktreeState,
+} from "./trigger";
 import {
 	type ClaimEvidence,
 	defaultGit,
@@ -77,6 +87,9 @@ export const INCONCLUSIVE_RUNS_MAX = 2;
 export const LAND_ATTEMPTS_MAX = 2;
 /** A landing that threw (git or the host unavailable) is run again by the tick; the third throw in a row is `blocked`. */
 export const LAND_ERRORS_MAX = 3;
+
+/** `lanes.completionNudges` when unset: nudges after claim-less turns per owner message. */
+export const DEFAULT_COMPLETION_NUDGES = 2;
 
 /** Root mark and status-message suffix of a closed lane, by where its landing stands. */
 const CLOSED_MARKS: Record<LaneLand["state"], readonly [mark: string, waiting: string]> = {
@@ -202,6 +215,11 @@ export interface LaneManagerDeps {
 	reviewer?: Omit<LaneReviewDeps, "headOf" | "now">;
 	/** Git for the Outcome card's change summary (test seam; default 10 seconds per call, `computeLaneChanges`). */
 	changesGit?: GitRunner;
+	/**
+	 * `lanes.completionNudges`, read at each turn end (a live setting): nudges after claim-less turns per owner message;
+	 * 0 turns them off. Absent → `DEFAULT_COMPLETION_NUDGES`.
+	 */
+	completionNudges?: () => number;
 }
 
 function slugify(title: string): string {
@@ -544,6 +562,7 @@ export class LaneManager {
 					land: undefined,
 					review: undefined,
 					changes: undefined,
+					nudges: undefined,
 				},
 			);
 			this.#deps.log.info("lane_reopened", { lane: lane.name });
@@ -556,7 +575,10 @@ export class LaneManager {
 				);
 			}
 		} else if (lane.status === "done-claimed") {
-			store.transitionLane(lane.name, "working", { event: "owner_reply" }, { claim: undefined });
+			store.transitionLane(lane.name, "working", { event: "owner_reply" }, { claim: undefined, nudges: undefined });
+		} else if (lane.meta.nudges !== undefined) {
+			// The owner wrote: the nudges since the last owner message start over.
+			store.patchLane(lane.name, undefined, { nudges: undefined });
 		}
 	}
 
@@ -640,7 +662,9 @@ export class LaneManager {
 		}
 		// An owner message held under the pause answers a pending claim exactly like one sent while it was pending
 		// (`onOwnerMessage`): the lane comes back working and the claim no longer closes it.
-		const answered = store.listInbound({ originKey: lane.originKey, state: "pending" }).length > 0;
+		const answered = store
+			.listInbound({ originKey: lane.originKey, state: "pending" })
+			.some((row) => !isCoreSteerId(row.platformMessageId));
 		const back: LaneStatus = lane.meta.pausedFrom === "done-claimed" && !answered ? "done-claimed" : "working";
 		const patch: Partial<LaneMeta> = { pausedFrom: undefined, pausedAt: undefined, pausedBy: undefined };
 		if (back === "done-claimed" && lane.meta.claim !== undefined) {
@@ -684,6 +708,103 @@ export class LaneManager {
 		});
 	}
 
+	/** The task list a fresh session of the lane starts with (its acceptance criteria, then the wrap-up). */
+	initialTodos(originKey: string): TodoPhase[] | undefined {
+		const lane = this.#deps.store.getLaneByOrigin(originKey);
+		return lane === undefined ? undefined : buildLaneTodos(lane.meta.acceptance ?? []);
+	}
+
+	/**
+	 * A lane turn ended. A `working`/`not-done` lane whose turn completed without a done claim, with no owner dialog
+	 * open, no `needsOwner` call, no question as its last line and no queued message, gets a nudge (an inbound from
+	 * the core, never counted as the owner's) — at most `completionNudges` per owner message; the cap posts one line in
+	 * the thread. Never throws: a failure is logged.
+	 */
+	onTurnSettled(info: TurnSettledInfo): void {
+		const { store, log } = this.#deps;
+		const lane = store.getLaneByOrigin(info.originKey);
+		if (lane === undefined) return;
+		try {
+			const nudges = lane.meta.nudges ?? { sent: 0 };
+			// `needsOwner` speaks for the turn that called it only.
+			if (nudges.ownerAsked) store.patchLane(lane.name, undefined, { nudges: { ...nudges, ownerAsked: undefined } });
+			const max = this.#deps.completionNudges?.() ?? DEFAULT_COMPLETION_NUDGES;
+			const skip = this.#nudgeSkip(lane, info, nudges.ownerAsked === true, max);
+			if (skip !== undefined) {
+				log.info("lane_nudge_skipped", { lane: lane.name, reason: skip });
+				return;
+			}
+			if (nudges.sent >= max) {
+				if (nudges.warned) {
+					log.info("lane_nudge_skipped", { lane: lane.name, reason: "cap" });
+					return;
+				}
+				store.patchLane(
+					lane.name,
+					{ event: "nudges_exhausted", detail: String(max) },
+					{ nudges: { sent: nudges.sent, warned: true } },
+				);
+				log.warn("lane_nudges_exhausted", { lane: lane.name, sent: nudges.sent });
+				this.#spawn(lane.name, () =>
+					this.#postInThread(lane, `⚠️ 자동 재촉 ${max}회 뒤에도 완료 주장이 없습니다. 확인이 필요합니다.`),
+				);
+				return;
+			}
+			const n = nudges.sent + 1;
+			// Counted before the git reads: a second turn end meanwhile sees this nudge.
+			store.patchLane(lane.name, { event: "nudge", detail: `${n}/${max}` }, { nudges: { sent: n } });
+			log.info("lane_nudge", { lane: lane.name, n, max });
+			this.#spawn(lane.name, async () => {
+				const worktree = await this.#worktreeState(lane);
+				const current = store.getLane(lane.name);
+				if (current?.status !== "working" && current?.status !== "not-done") {
+					log.info("lane_nudge_skipped", { lane: lane.name, reason: "status" });
+					return;
+				}
+				const notDone =
+					current.status === "not-done" ? current.history.findLast((e) => e.event === "not_done")?.detail : undefined;
+				this.#send(lane.name, "nudge", buildNudgePrompt({ n, max, worktree, notDone }));
+			});
+		} catch (error) {
+			log.error("lane_nudge_failed", { lane: lane.name, error: String(error) });
+		}
+	}
+
+	/** Why the turn that just ended gets no nudge (`undefined`: it may get one, subject to the cap). */
+	#nudgeSkip(lane: LaneRow, info: TurnSettledInfo, ownerAsked: boolean, max: number): string | undefined {
+		if (max <= 0) return "off";
+		if (lane.status !== "working" && lane.status !== "not-done") return "status";
+		// A failed, paused, stalled or stopped turn is handled by its own path (failure notice, pause line).
+		if (info.error !== undefined) return "turn_failed";
+		if (info.openDialogs > 0) return "open_dialog";
+		if (ownerAsked) return "needs_owner";
+		const last = info.text
+			.split("\n")
+			.map((line) => line.trim())
+			.findLast((line) => line !== "");
+		if (last !== undefined && /[?？]$/.test(last)) return "question_text";
+		// A queued message (the owner's, or the core's own) is the next turn already.
+		if (this.#deps.store.listInbound({ originKey: lane.originKey, state: "pending" }).length > 0) return "pending";
+		if (this.#deps.frozen?.() !== undefined) return "frozen";
+		return undefined;
+	}
+
+	/** Uncommitted paths and commits since the lane's start, read in its worktree; the reason when git could not. */
+	async #worktreeState(lane: LaneRow): Promise<LaneWorktreeState> {
+		try {
+			const status = await defaultGit(["-C", lane.cwd, "status", "--porcelain"]);
+			if (status.code !== 0) return { error: status.stderr.trim() || `git status exit ${status.code}` };
+			const uncommitted = status.stdout.split("\n").filter((line) => line !== "").length;
+			const base = lane.meta.baseSha;
+			if (base === undefined) return { error: "레인 시작 커밋(baseSha)이 없습니다" };
+			const count = await defaultGit(["-C", lane.cwd, "rev-list", "--count", `${base}..HEAD`]);
+			if (count.code !== 0) return { error: count.stderr.trim() || `git rev-list exit ${count.code}` };
+			return { uncommitted, commits: Number(count.stdout.trim()) };
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
 	/** One plain line in the lane's thread (warnings); a failure is logged, never thrown. */
 	async #postInThread(lane: LaneRow, text: string): Promise<void> {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
@@ -695,14 +816,24 @@ export class LaneManager {
 		}
 	}
 
-	/** Milestone report from the lane (`ompbot_lane_progress`): recorded and shown in the status message at once. */
-	async progress(originKey: string, text: string): Promise<string> {
+	/**
+	 * Milestone report from the lane (`ompbot_lane_progress`): recorded and shown in the status message at once.
+	 * `needsOwner`: the lane asks the owner to decide — the turn it ends is not nudged.
+	 */
+	async progress(originKey: string, text: string, needsOwner = false): Promise<string> {
 		const lane = this.#requireLane(originKey);
 		if (lane.status === "closed") return `lane ${lane.name} ${CLOSED_LANE_REPLY}`;
 		if (lane.status === "paused") return `lane ${lane.name} ${PAUSED_LANE_REPLY}`;
 		const milestone = redact(text.replace(/\s+/g, " ").trim()).slice(0, MAX_MILESTONE_CHARS);
 		if (milestone === "") throw new Error("text is required");
-		const patched = this.#deps.store.patchLane(lane.name, { event: "progress", detail: milestone }, { milestone });
+		const patched = this.#deps.store.patchLane(
+			lane.name,
+			{ event: needsOwner ? "needs_owner" : "progress", detail: milestone },
+			{
+				milestone,
+				...(needsOwner ? { nudges: { ...(lane.meta.nudges ?? { sent: 0 }), ownerAsked: true } } : {}),
+			},
+		);
 		await this.#sync(patched, "milestone");
 		return "progress recorded";
 	}

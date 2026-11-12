@@ -1,5 +1,6 @@
 import { readdirSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import type { TurnSettledInfo } from "../../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor } from "../../src/core/origin";
 import { LaneManager, type LaneManagerDeps } from "../../src/lanes/manager";
 import { createLogger } from "../../src/log";
@@ -36,6 +37,8 @@ export interface LaneHarness {
 	steers(originKey: string): string[];
 	/** `prompt:` calls the lane's omp child received. */
 	prompts(originKey: string): string[];
+	/** Resolves at the next turn end a mailbox reports, after the manager handled it (`onTurnSettled`). */
+	turnSettled(): Promise<TurnSettledInfo>;
 	close(): void;
 }
 
@@ -60,6 +63,7 @@ export type LaneHarnessExtra = Partial<
 		| "laneBusy"
 		| "reviewer"
 		| "changesGit"
+		| "completionNudges"
 	>
 > & { driver?: LaneDriverFactory };
 
@@ -75,6 +79,7 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 	const sessionsRoot = join(homeDir, "sessions");
 	const logs: string[] = [];
 	const log = createLogger({ sink: (line) => logs.push(line), clock, redact });
+	const settledWaiters: Array<(info: TurnSettledInfo) => void> = [];
 	// Assigned right below the router: the router tells it when a held lane's child starts working again.
 	let manager!: LaneManager;
 	const router = new OriginRouter({
@@ -87,6 +92,12 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 		// The registry is the single source of the hold (like the daemon): a restart keeps it.
 		isHeld: (originKey) => store.getLaneByOrigin(originKey)?.status === "paused",
 		onHeldWork: (info) => manager?.onHeldWork(info.originKey),
+		// Like the daemon: a new lane session gets its todos, a lane turn end may nudge (off unless a test sets it).
+		initialTodos: (originKey) => manager?.initialTodos(originKey),
+		onTurnSettled: (info) => {
+			manager?.onTurnSettled(info);
+			for (const resolve of settledWaiters.splice(0)) resolve(info);
+		},
 		driverFactory:
 			laneDriver ??
 			((origin, sessionDir) => {
@@ -124,6 +135,7 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 			return run;
 		},
 		sessionDirFor: (origin) => sessionDirFor(sessionsRoot, origin, 1),
+		completionNudges: () => 0,
 		...managerExtra,
 	});
 	const callsOf = (originKey: string, prefix: string) =>
@@ -148,6 +160,7 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 			}
 		},
 		steers: (originKey) => callsOf(originKey, "steer:"),
+		turnSettled: () => new Promise((resolve) => settledWaiters.push(resolve)),
 		prompts: (originKey) => callsOf(originKey, "prompt:"),
 		close: () => store.close(),
 	};

@@ -37,7 +37,7 @@ import {
 import { parseLaneActionId } from "../lanes/card";
 import { classifyLaneControl } from "../lanes/control";
 import type { LandLane } from "../lanes/land";
-import { LaneInputError, LaneManager } from "../lanes/manager";
+import { DEFAULT_COMPLETION_NUDGES, LaneInputError, LaneManager } from "../lanes/manager";
 import { isLaneOrigin, type LaneRow } from "../lanes/status";
 import { buildLaneTools, buildWorkStartTool } from "../lanes/tools";
 import {
@@ -919,6 +919,11 @@ export class Daemon {
 			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing.
 			isHeld: (originKey) => this.#store?.getLaneByOrigin(originKey)?.status === "paused",
 			onHeldWork: (info) => this.#lanes?.onHeldWork(info.originKey),
+			// A new lane session starts with its acceptance criteria as omp todos; a lane turn's end may nudge it.
+			initialTodos: (originKey) => (isLaneOrigin(originKey) ? this.#lanes?.initialTodos(originKey) : undefined),
+			onTurnSettled: (info) => {
+				if (isLaneOrigin(info.originKey)) this.#lanes?.onTurnSettled(info);
+			},
 			onStallEscalate: (info) => {
 				const owner = this.#ownerTarget("stall");
 				void owner?.adapter.postNotice(owner.channel, formatStallNotice(info));
@@ -951,6 +956,8 @@ export class Daemon {
 			ownerUserId: (platform) =>
 				platform === "discord" ? config.channels.discord?.ownerUserId : config.channels.slack?.ownerUserId,
 			laneBusy: (originKey) => this.#router?.mailbox(originKey).state.busy ?? false,
+			// A live setting: `ompbot reload` changes it for the next lane turn end.
+			completionNudges: () => this.#options.config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES,
 			// The independent review before a lane's auto-merge: a one-shot `omp -p` under the same safety floors.
 			reviewer: {
 				ompBin: config.ompExecutable,
@@ -2726,6 +2733,12 @@ export class Daemon {
 		if (request.op === "live") {
 			const origin = "origin" in request ? request.origin : undefined;
 			return { ok: true, live: typeof origin === "string" ? (this.#router?.liveView(origin) ?? null) : null };
+		}
+		if (request.op === "session_file") {
+			// `ompbot lanes watch`: the file the origin's running child has open; null when no child runs (read-only).
+			const origin = "origin" in request ? request.origin : undefined;
+			if (typeof origin !== "string") return { ok: false, error: "session_file needs an origin string" };
+			return { ok: true, sessionFile: (await this.#router?.openSessionFile(origin)) ?? null };
 		}
 		if (request.op === "reload") return this.reloadConfig("ipc");
 		if (request.op === "drain" || request.op === "drain_status" || request.op === "drain_cancel") {

@@ -9,7 +9,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { MonitorLedger, MonitorRow } from "./ledger";
 import { type MonitorSpec, MonitorSpecError, parseMonitorSpec, type SpecContext } from "./spec";
 
@@ -55,13 +55,22 @@ function rootsOf(ctx: PortableContext): PlaceholderRoot[] {
 	].sort((a, b) => b.root.length - a.root.length);
 }
 
-/** An absolute path inside a placeholder root as `{placeholder, rest}` (`rest` empty for the root itself). */
+/**
+ * An absolute path inside a placeholder root as `{placeholder, rest}` (`rest` empty for the root itself), judged after
+ * `..` and `.` are resolved: `<scripts>/../../x` is outside, whatever its spelling starts with.
+ */
 function underRoot(path: string, roots: readonly PlaceholderRoot[]): { placeholder: string; rest: string } | undefined {
+	const normal = resolve(path);
 	for (const { root, placeholder } of roots) {
-		if (path === root) return { placeholder, rest: "" };
-		if (path.startsWith(root + sep)) return { placeholder, rest: path.slice(root.length + 1) };
+		const rest = relative(root, normal);
+		if (!isOutside(rest)) return { placeholder, rest };
 	}
 	return undefined;
+}
+
+/** A `relative()` result that leaves its base: `..` first, or absolute (another drive). */
+function isOutside(rest: string): boolean {
+	return rest === ".." || rest.startsWith(`..${sep}`) || isAbsolute(rest);
 }
 
 /**
@@ -173,9 +182,14 @@ export function exportMonitors(
 		];
 		for (const path of referenced) {
 			const inside = isAbsolute(path) ? underRoot(path, roots) : undefined;
-			if (inside !== undefined && inside.rest !== "") {
-				copies.set(path, join(filesRoots[inside.placeholder] as string, inside.rest));
+			if (inside === undefined || inside.rest === "") continue;
+			const filesRoot = filesRoots[inside.placeholder] as string;
+			const target = join(filesRoot, inside.rest);
+			if (isOutside(relative(filesRoot, target))) {
+				warnings.push(`${row.name}: referenced file would land outside ${filesRoot}, not copied: ${path}`);
+				continue;
 			}
+			copies.set(path, target);
 		}
 	}
 	for (const [source, target] of copies) {

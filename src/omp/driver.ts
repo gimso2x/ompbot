@@ -166,6 +166,18 @@ export interface OmpOpenResult {
 	sessionId: string;
 }
 
+/** One task of an omp task list (omp wire `TodoItem`: `content` and `status` are both required). */
+export interface TodoItem {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+}
+
+/** One phase of an omp task list (omp wire `TodoPhase`, the `set_todos` RPC payload). */
+export interface TodoPhase {
+	name: string;
+	tasks: TodoItem[];
+}
+
 export interface OmpExitInfo {
 	code: number | null;
 	/** True when `stop()` was requested; false means the child died on its own. */
@@ -193,6 +205,11 @@ export interface OmpSessionDriver {
 	/** Thinking levels the active model accepts. */
 	thinkingLevels(): Promise<string[]>;
 	setThinking(level: string): Promise<void>;
+	/**
+	 * Replaces the session's task list (omp RPC `set_todos`). Drivers without omp todos (Claude, agy) resolve without
+	 * doing anything and log `set_todos_unsupported`; the caller never treats that as a failure.
+	 */
+	setTodos(phases: TodoPhase[]): Promise<void>;
 	/** Summarize older context while idle. */
 	compact(instructions?: string): Promise<OmpCompactResult>;
 	state(): Promise<OmpState>;

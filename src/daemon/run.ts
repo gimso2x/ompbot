@@ -363,6 +363,7 @@ export async function runDaemon(
 						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 						// No --append-system-prompt in agy: the driver prepends this to the first message of each child.
 						systemPrompt,
+						log,
 					})
 				: config.agent === "claude"
 					? new ClaudeOmpDriver({
@@ -374,6 +375,7 @@ export async function runDaemon(
 							secretsDir,
 							systemPrompt,
 							approval: daemon.requestApprovalFor(origin),
+							log,
 						})
 					: new DaemonRpcDriver({
 							ompExecutable: config.ompExecutable,

@@ -42,7 +42,52 @@ function splitFences(text: string): string[] {
 	return parts;
 }
 
-const CODE_SPAN = /`[^`\n]+`/g;
+/**
+ * `text` split at its inline code spans, CommonMark style: a run of N backticks opens a span that only the next run
+ * of exactly N backticks on the same line closes (`` ``a ` b`` `` is one span); a run with no closer is plain text.
+ * Odd indexes are the spans, backticks included. Body blocks, the mrkdwn fallback and the header share these bounds.
+ */
+function splitCodeSpans(text: string): string[] {
+	const parts: string[] = [];
+	let prose = 0;
+	let i = 0;
+	while (i < text.length) {
+		if (text[i] !== "`") {
+			i++;
+			continue;
+		}
+		const open = i;
+		while (text[i] === "`") i++;
+		const run = i - open;
+		let close = -1;
+		for (let k = i; k < text.length && text[k] !== "\n"; ) {
+			if (text[k] !== "`") {
+				k++;
+				continue;
+			}
+			const start = k;
+			while (text[k] === "`") k++;
+			if (k - start === run) {
+				close = k;
+				break;
+			}
+		}
+		if (close < 0) continue;
+		parts.push(text.slice(prose, open), text.slice(open, close));
+		prose = close;
+		i = close;
+	}
+	parts.push(text.slice(prose));
+	return parts;
+}
+
+/** A code span's inside: its backtick runs off, and one space off each end when both ends have one (CommonMark). */
+function codeSpanText(span: string): string {
+	const run = /^`+/.exec(span)?.[0].length ?? 0;
+	const inner = span.slice(run, span.length - run);
+	return inner.startsWith(" ") && inner.endsWith(" ") && inner.trim() !== "" ? inner.slice(1, -1) : inner;
+}
+
 const LINK = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
 /** `<@U…>`/`<#C…>`, optionally labelled (`<#C0123|general>`, `<@U0123|name>`). */
 const USER_MENTION = /<(?:@[UW]|#[CG])[A-Z0-9]+(?:\|[^<>\n]*)?>/g;
@@ -54,9 +99,9 @@ function convertProse(text: string): string {
 	const spans: string[] = [];
 	const links: string[] = [];
 	// The input's own sentinel characters would be read back as placeholders (dropping or swapping text): drop them.
-	const masked = text
-		.replace(/[\uE000\uE001]/g, "")
-		.replace(CODE_SPAN, (span) => `\uE001${spans.push(span) - 1}\uE001`)
+	const masked = splitCodeSpans(text.replace(/[\uE000\uE001]/g, ""))
+		.map((piece, i) => (i % 2 === 1 ? `\uE001${spans.push(piece) - 1}\uE001` : piece))
+		.join("")
 		.replace(LINK, (_m, label: string, url: string) => {
 			links.push(
 				`<${url.replace(/\|/g, "%7C").replace(/</g, "%3C").replace(/>/g, "%3E")}|${label.replace(/[<>|]/g, "")}>`,
@@ -386,8 +431,7 @@ function swapTokensOutsideCode(markdown: string, swap: (token: string) => string
 		.map((part, i) =>
 			i % 2 === 1
 				? part
-				: part
-						.split(/(`[^`\n]+`)/g)
+				: splitCodeSpans(part)
 						.map((piece, j) => (j % 2 === 1 ? piece : piece.replace(SLACK_TOKEN, swap)))
 						.join(""),
 		)
@@ -412,11 +456,13 @@ function bellLine(tokens: readonly string[]): string {
  * live tokens their readable name (`@오너`, `#label`, …); cut to the header limit.
  */
 export function plainHeaderText(line: string, names: MentionNames): string {
-	const plain = line
+	const unlinked = line
 		.replace(SLACK_TOKEN, (token) => readableToken(token, names))
 		.replace(/<[^<>|\n]+\|([^<>\n]+)>/g, "$1")
-		.replace(/<([^<>|\n]+)>/g, "$1")
-		.replace(/`([^`\n]+)`/g, "$1")
+		.replace(/<([^<>|\n]+)>/g, "$1");
+	const plain = splitCodeSpans(unlinked)
+		.map((piece, i) => (i % 2 === 1 ? codeSpanText(piece) : piece))
+		.join("")
 		.replace(/(^|[^\w*])\*{1,2}([^*\n]+?)\*{1,2}(?=$|[^\w*])/g, "$1$2")
 		.replace(/(^|[^\w_])_{1,2}([^_\n]+?)_{1,2}(?=$|[^\w_])/g, "$1$2")
 		.replace(/(^|[^\w~])~{1,2}([^~\n]+?)~{1,2}(?=$|[^\w~])/g, "$1$2")

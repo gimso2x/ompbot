@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { APPLY_USAGE, applyCommand, homeDeps } from "../src/cli/apply";
 import { waitForDrain } from "../src/cli/drain";
+import type { SweepHeartbeat } from "../src/daemon/heartbeat";
 import { RESTART_CUT_FILE } from "../src/daemon/recovery";
 import {
 	type ApplyDeps,
@@ -71,6 +72,8 @@ interface World {
 	/** Whether a restart yields a freshly started daemon (lock startedAt after the restart). */
 	restartMakesFreshDaemon: boolean;
 	lockStartedAt: number | undefined;
+	/** The heartbeat stamp; default: written by the daemon holding the lock, 0.5 s after its start, transports up. */
+	heartbeat: ((world: World) => SweepHeartbeat | undefined) | undefined;
 	commands: string[][];
 	envs: Array<Record<string, string> | undefined>;
 	drainResult: Awaited<ReturnType<ApplyDeps["drain"]>>;
@@ -100,6 +103,7 @@ function makeWorld(): World {
 		drainCutResponse: { ok: true, opRefs: 1, approvals: 1 },
 		restartMakesFreshDaemon: true,
 		lockStartedAt: T0 - 3_600_000,
+		heartbeat: undefined,
 		commands: [],
 		envs: [],
 		drainResult: { ok: true, counts: { turns: 0, hostTools: 0, approvals: 0 } },
@@ -182,6 +186,18 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 		gates: () => gates,
 		doctor: async () => ({ code: 1, lines: ["ok home: x", "fail omp: missing"] }),
 		lockStartedAt: () => world.lockStartedAt,
+		heartbeat: () => {
+			if (world.heartbeat !== undefined) return world.heartbeat(world);
+			if (world.lockStartedAt === undefined) return undefined;
+			const since = new Date(world.lockStartedAt);
+			return {
+				ts: new Date(world.lockStartedAt + 500),
+				loopMs: 1,
+				socket: { state: "up", since },
+				discord: { state: "up", since },
+				draining: false,
+			};
+		},
 		pid: nextPid++,
 		isAlive: () => true,
 		isExecutable: (path) => path === "/h/.local/bin/bun",
@@ -276,6 +292,7 @@ describe("runApply bot omp profile sync (omp-isolation AC-6)", () => {
 			"drain",
 			"restart",
 			"ready",
+			"transports",
 			"verify",
 			"last_good",
 		]);
@@ -332,9 +349,11 @@ describe("runApply execution", () => {
 			["drain", true],
 			["restart", true],
 			["ready", true],
+			["transports", true],
 			["verify", true],
 			["last_good", true],
 		]);
+		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("slack=up discord=up");
 		expect(readFileSync(join(home, "config.json.last-good"), "utf8")).toBe('{"v":"before"}');
 		expect(statSync(join(home, "config.json.last-good")).mode & 0o777).toBe(0o600);
 		expect(restartCommands(world)).toHaveLength(1);
@@ -348,6 +367,55 @@ describe("runApply execution", () => {
 		const configCopy = `${join(home, "config.json")}.bak-20261030-140000-apply`;
 		expect(readFileSync(configCopy, "utf8")).toBe('{"v":"before"}');
 		expect(statSync(configCopy).mode & 0o777).toBe(0o600);
+	});
+
+	test("transports: a stamp from before the restart never counts; a fresh one with a transport down rolls back", async () => {
+		const world = makeWorld();
+		writeFileSync(join(home, "config.json.last-good"), '{"v":"good"}', { mode: 0o600 });
+		const oldStamp = new Date(T0 - 1_000); // the old daemon's last beat: transports up, but before the restart
+		world.heartbeat = (w) =>
+			restartCommands(w).length === 1
+				? {
+						ts: oldStamp,
+						loopMs: 1,
+						socket: { state: "up", since: oldStamp },
+						discord: { state: "up", since: oldStamp },
+					}
+				: undefined;
+		const stale = await runApply(base, makeDeps(world));
+		expect(stale.exitCode).toBe(1);
+		expect(stale.receipt.steps.map((s) => [s.name, s.ok])).toEqual([
+			["preflight", true],
+			["backup", true],
+			["drain", true],
+			["restart", true],
+			["ready", true],
+			["transports", false],
+			["rollback", true],
+		]);
+		expect(stale.receipt.steps.find((s) => s.name === "transports")?.detail).toContain("from before the restart");
+		expect(restartCommands(world)).toHaveLength(2);
+		expect(readFileSync(join(home, "config.json"), "utf8")).toBe('{"v":"good"}');
+
+		rmSync(join(home, "logs"), { recursive: true, force: true });
+		const down = makeWorld();
+		down.heartbeat = (w) => {
+			const since = new Date(w.lockStartedAt ?? 0);
+			return { ts: new Date(w.clock), loopMs: 1, socket: { state: "up", since }, discord: { state: "down", since } };
+		};
+		const failed = await runApply({ ...base, stamp: "20261030-150000" }, makeDeps(down));
+		expect(failed.exitCode).toBe(1);
+		expect(failed.receipt.steps.find((s) => s.name === "transports")?.detail).toBe(
+			"transports not up within 120s: down: discord (slack=up discord=down)",
+		);
+	});
+
+	test("transports: a transport the daemon does not run (no field in the stamp) is not waited for", async () => {
+		const world = makeWorld();
+		world.heartbeat = (w) => ({ ts: new Date((w.lockStartedAt ?? 0) + 500), loopMs: 1 });
+		const { exitCode, receipt } = await runApply(base, makeDeps(world));
+		expect(exitCode).toBe(0);
+		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("slack=off discord=off");
 	});
 
 	test("a merge landing during drain: the receipt head is the commit the restart loads, preflight head kept", async () => {

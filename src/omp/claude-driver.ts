@@ -15,6 +15,7 @@ import {
 	type OmpOpenResult,
 	type OmpSessionDriver,
 	type OmpState,
+	type TodoPhase,
 } from "./driver";
 import { buildChildEnv } from "./env";
 import { isRecord } from "./type-guards";
@@ -102,7 +103,7 @@ export interface ClaudeOmpDriverOptions {
 	secretsDir?: string;
 	/** Owner approval bridge for dangerous Bash; absent → dangerous Bash is denied outright. */
 	approval?: ClaudeApprovalHook;
-	/** Where a failed permission decision is reported; absent → stderr. */
+	/** Where a failed permission decision (and an unsupported `setTodos`) is reported; absent → stderr. */
 	log?: Logger;
 	/** Parent environment source (tests); default `process.env`. */
 	baseEnv?: Record<string, string | undefined>;
@@ -307,6 +308,11 @@ export class ClaudeOmpDriver implements OmpSessionDriver {
 		}
 		await this.#ensureChild();
 		await this.#applyThinking(level);
+	}
+
+	/** Claude Code has no omp task list: nothing is planted (a lane's prompt still carries its acceptance criteria). */
+	async setTodos(phases: TodoPhase[]): Promise<void> {
+		this.#options.log?.info("set_todos_unsupported", { driver: "claude", phases: phases.length });
 	}
 
 	/** `/compact` as a slash-command turn; `tokensBefore` is the compact call's input tokens (best effort). */

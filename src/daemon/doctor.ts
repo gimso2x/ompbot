@@ -13,6 +13,7 @@ import {
 	SECRET_MODE,
 } from "../config";
 import { DiscordRest } from "../discord/rest";
+import { DEFAULT_COMPLETION_NUDGES } from "../lanes/manager";
 import { buildChildEnv, withOmpProfile } from "../omp/env";
 import { checkOmpRuntime } from "../omp/runtime-check";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
@@ -282,6 +283,9 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 					: `${bind}:${port} not listening (daemon down or webhook_bind_failed in the log)`,
 			);
 		}
+
+		const nudges = config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES;
+		report(true, "lane nudges", nudges === 0 ? "off (lanes.completionNudges=0)" : `completionNudges=${nudges}`);
 
 		// agent "claude": the CLI must exist, and auth must come from ~/.claude credentials or a key env
 		// (names only — values are never read here).

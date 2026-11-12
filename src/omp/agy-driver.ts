@@ -1,5 +1,6 @@
 import { accessSync, constants, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { Logger } from "../log";
 import {
 	type OmpCompactResult,
 	OmpDriverError,
@@ -12,6 +13,7 @@ import {
 	type OmpSessionDriver,
 	type OmpState,
 	type OmpUsage,
+	type TodoPhase,
 } from "./driver";
 import { buildChildEnv } from "./env";
 import { isRecord } from "./type-guards";
@@ -69,6 +71,8 @@ export interface AgyOmpDriverOptions {
 	baseEnv?: Record<string, string | undefined>;
 	/** How long a spawn waits for agy's `init` event. */
 	startupTimeoutMs?: number;
+	/** Where an unsupported `setTodos` is reported; absent → not reported. */
+	log?: Logger;
 }
 
 interface AgyChild {
@@ -289,6 +293,11 @@ export class AgyOmpDriver implements OmpSessionDriver {
 
 	thinkingLevels(): Promise<string[]> {
 		return Promise.resolve([...AGY_THINKING_LEVELS]);
+	}
+
+	/** agy has no omp task list: nothing is planted (a lane's prompt still carries its acceptance criteria). */
+	async setTodos(phases: TodoPhase[]): Promise<void> {
+		this.#options.log?.info("set_todos_unsupported", { driver: "agy", phases: phases.length });
 	}
 
 	async setThinking(level: string): Promise<void> {

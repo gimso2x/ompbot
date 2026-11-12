@@ -276,6 +276,11 @@ describe("loadConfig", () => {
 		["costCap.dailyUsd", baseConfig({ costCap: { dailyUsd: "300" } })],
 		["costCap.dailyUsd", baseConfig({ costCap: { dailyUsd: Number.POSITIVE_INFINITY } })],
 		["costCap.warnUsd", baseConfig({ costCap: { turnUsd: 20, dailyUsd: 300, warnUsd: 10 } })],
+		["lanes", baseConfig({ lanes: 2 })],
+		["lanes.completionNudges", baseConfig({ lanes: { completionNudges: -1 } })],
+		["lanes.completionNudges", baseConfig({ lanes: { completionNudges: 1.5 } })],
+		["lanes.completionNudges", baseConfig({ lanes: { completionNudges: "2" } })],
+		["lanes.maxNudges", baseConfig({ lanes: { maxNudges: 2 } })],
 	])("invalid field %s is reported by name", (field, cfg) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
@@ -328,6 +333,15 @@ describe("loadConfig", () => {
 		expect(loadConfig(home).costCap).toEqual({ turnUsd: 20 });
 		writeConfig(baseConfig({ costCap: { turnUsd: 20, dailyUsd: 300 } }));
 		expect(loadConfig(home).costCap).toEqual({ turnUsd: 20, dailyUsd: 300 });
+	});
+
+	test("lanes.completionNudges is optional, takes 0 (off), and reload treats it as live", () => {
+		expect(loadConfig(home).lanes).toBeUndefined();
+		writeConfig(baseConfig({ lanes: { completionNudges: 0 } }));
+		expect(loadConfig(home).lanes).toEqual({ completionNudges: 0 });
+		writeConfig(baseConfig({ lanes: { completionNudges: 3 } }));
+		expect(loadConfig(home).lanes).toEqual({ completionNudges: 3 });
+		expect(LIVE_FIELDS).toContain("lanes");
 	});
 
 	test("mentionFreeChannels is optional and accepts only channel ids", () => {

@@ -127,8 +127,17 @@ describe("owner messages in a closed lane's thread", () => {
 		await send("!reopen 테스트 하나 더", "1900000000.000500", rootTs);
 		await transport.waitForPosts((text) => text === "ECHO !reopen 테스트 하나 더");
 		expect(daemon.store.getLane("ask")?.status).toBe("working");
-		expect(laneEvents(daemon).at(-1)).toBe("reopened");
-		expect(lanePrompts().at(-1)).toBe("prompt:!reopen 테스트 하나 더");
+		// The reopened turn ends with no claim, so the core's automatic nudges may follow it in the history.
+		expect(
+			laneEvents(daemon)
+				.filter((event) => !event.startsWith("nudge"))
+				.at(-1),
+		).toBe("reopened");
+		expect(
+			lanePrompts()
+				.filter((call) => !call.includes("[자동 재촉"))
+				.at(-1),
+		).toBe("prompt:!reopen 테스트 하나 더");
 	});
 
 	test("a non-owner message in the thread is ignored: nothing recorded, the lane untouched", async () => {

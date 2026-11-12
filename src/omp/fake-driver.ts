@@ -9,6 +9,7 @@ import {
 	type OmpOpenResult,
 	type OmpSessionDriver,
 	type OmpState,
+	type TodoPhase,
 } from "./driver";
 
 /** A fresh real omp session already holds entries (model_change, thinking_level_change, ...), so its leafId is never null. */
@@ -51,6 +52,8 @@ export interface FakeOmpDriverOptions {
 	holdTurns?: boolean;
 	/** Make `start()` fail (e.g. `omp_executable_missing`). */
 	startError?: OmpDriverError;
+	/** Make `setTodos()` fail (an omp without `set_todos`, a broken pipe). */
+	setTodosError?: OmpDriverError;
 	/** Models `availableModels` reports and `setModel` accepts; the first is active at start. */
 	models?: readonly string[];
 	/** Active model at start, overriding `models[0]` — may be absent from `models`, like a session restored with a model the provider removed. */
@@ -117,8 +120,10 @@ export class FakeOmpDriver implements OmpSessionDriver {
 	readonly #eventListeners = new Set<(event: OmpEvent) => void>();
 	readonly #exitListeners = new Set<(info: OmpExitInfo) => void>();
 
-	/** Recorded calls, for mailbox tests: "prompt:<text>", "steer:<text>", "abort", "newSession", "openSession". */
+	/** Recorded calls, for mailbox tests: "prompt:<text>", "steer:<text>", "abort", "newSession", "openSession", "setTodos". */
 	readonly calls: string[] = [];
+	/** Every `setTodos` payload, in order (a failed call too). */
+	readonly todos: TodoPhase[][] = [];
 
 	constructor(options: FakeOmpDriverOptions = {}) {
 		this.#options = options;
@@ -332,6 +337,13 @@ export class FakeOmpDriver implements OmpSessionDriver {
 		this.calls.push(`setThinking:${level}`);
 		this.#thinking = level;
 		this.#append({ type: "thinking_level_change" });
+	}
+
+	async setTodos(phases: TodoPhase[]): Promise<void> {
+		this.#require();
+		this.calls.push("setTodos");
+		this.todos.push(phases);
+		if (this.#options.setTodosError) throw this.#options.setTodosError;
 	}
 
 	async compact(instructions?: string): Promise<OmpCompactResult> {

@@ -116,11 +116,12 @@ export async function tasksCommand(
 		const outDir = values.out;
 		const review = hasPeerReview(homeDir);
 		const timezone = timezoneOfHome(homeDir);
+		// A home without ompbot.db exports an empty flow, but a database that was there and went away ends the watch.
+		// Checked before the viewer line: a reader may remove the database as soon as it sees that line.
+		const hadDb = existsSync(dbPath);
 		exportFlow(dbPath, outDir, review, timezone);
 		process.stdout.write(`${join(outDir, "viewer.html")}\n`);
 		if (seconds === 0) return 0;
-		// A home without ompbot.db exports an empty flow, but a database that was there and went away ends the watch.
-		const hadDb = existsSync(dbPath);
 		const { promise, resolve } = Promise.withResolvers<number>();
 		const timer = setInterval(() => {
 			try {

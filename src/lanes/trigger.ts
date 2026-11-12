@@ -1,5 +1,7 @@
 import { parseCommand, promptTextOf } from "../core/types";
+import type { TodoPhase } from "../omp/driver";
 import type { AcceptanceItem } from "../tasks/docs";
+import { withoutCheckTail } from "../tasks/signals";
 import type { LaneLandState } from "./status";
 
 export interface LaneTrigger {
@@ -101,6 +103,7 @@ export function buildLanePrompt(input: {
 		"- 이 worktree 안에서만 고치고 커밋하세요. 원래 저장소 체크아웃은 건드리지 마세요.",
 		`- 머지·push·브랜치 전환은 하지 마세요. ${input.branch}를 ${input.baseBranch}에 합치는 일은 코어와 오너가 합니다.`,
 		"- 중요한 단계(마일스톤)를 끝낼 때마다 host tool `ompbot_lane_progress`({text})로 한 줄 보고하세요.",
+		"- 오너 결정이 필요하면 `ompbot_lane_progress`를 `needsOwner: true`와 함께 부르고 질문을 적은 뒤 턴을 끝내세요. 완료 주장 없이 끝난 턴에는 코어가 자동 재촉을 보내지만, 이 경우에는 보내지 않습니다.",
 		"- 작업을 마치면 변경을 모두 커밋한 뒤 host tool `ompbot_claim_done`({repo, commit, summary})을 호출하세요. repo는 위 프로젝트 디렉터리의 절대경로, commit은 커밋 sha(worktree HEAD)입니다.",
 		"- 완료는 이 도구로만 주장합니다. 코어가 `git status --porcelain`이 비어 있는지, 그 커밋이 존재하고 HEAD인지를 직접 확인하며, 커밋하지 않은 변경이 있으면 not-done입니다.",
 		"- 증거 없이 '완료'라고 말하지 마세요. not-done 사유가 오면 고친 뒤 다시 주장하세요.",
@@ -121,5 +124,50 @@ export function buildRebasePrompt(input: { branch: string; baseBranch: string })
 		`[ompbot] 머지하지 못했습니다: 그 사이 기준 브랜치 \`${input.baseBranch}\`가 앞서 나가 fast-forward가 안 됩니다. 레인을 다시 working으로 돌렸습니다.`,
 		`- 이 worktree에서 \`git rebase ${input.baseBranch}\`로 \`${input.branch}\`를 \`${input.baseBranch}\` 위로 rebase하고, 충돌이 나면 풀어 다시 커밋하세요.`,
 		"- 머지·push는 하지 마세요. 끝나면 `ompbot_claim_done`을 다시 호출하세요. 코어가 검사를 다시 돌린 뒤 머지합니다.",
+	].join("\n");
+}
+
+/**
+ * The task list a new lane session starts with (omp `set_todos`): one task per acceptance criterion (its `[check: …]`
+ * tail left out), then the wrap-up. Without criteria only the wrap-up phase. Every task starts `pending`.
+ */
+export function buildLaneTodos(acceptance: readonly AcceptanceItem[]): TodoPhase[] {
+	const wrapUp: TodoPhase = {
+		name: "마무리",
+		tasks: [
+			{ content: "변경 모두 커밋", status: "pending" },
+			{ content: "ompbot_claim_done 호출", status: "pending" },
+		],
+	};
+	if (acceptance.length === 0) return [wrapUp];
+	const criteria: TodoPhase = {
+		name: "수락기준",
+		tasks: acceptance.map((item) => ({ content: `${item.id}: ${withoutCheckTail(item.text)}`, status: "pending" })),
+	};
+	return [criteria, wrapUp];
+}
+
+/** What a nudge says about the lane's worktree: counts read with git, or why they could not be read. */
+export type LaneWorktreeState = { uncommitted: number; commits: number } | { error: string };
+
+/** The core's nudge into a lane whose turn ended with no done claim (`n` of `max` since the owner last wrote). */
+export function buildNudgePrompt(input: {
+	n: number;
+	max: number;
+	worktree: LaneWorktreeState;
+	/** The last not-done reasons, when the lane is `not-done`. */
+	notDone?: string | undefined;
+}): string {
+	const state =
+		"error" in input.worktree
+			? `worktree 상태 확인 실패: ${input.worktree.error}`
+			: `worktree 상태: 미커밋 경로 ${input.worktree.uncommitted}개, 레인 시작 이후 커밋 ${input.worktree.commits}개`;
+	return [
+		`[자동 재촉 ${input.n}/${input.max}] 턴이 완료 주장 없이 끝났습니다.`,
+		state,
+		...(input.notDone === undefined ? [] : [`마지막 거절 사유(not-done): ${input.notDone}`]),
+		"- 할 일 목록과 앞선 도구 호출을 보고 멈춘 곳부터 이어 가세요.",
+		"- 끝났으면 변경을 모두 커밋하고 `ompbot_claim_done`을 호출하세요.",
+		"- 오너 결정이 필요하면 `ompbot_lane_progress`를 `needsOwner: true`와 함께 불러 무엇이 필요한지 적고 턴을 끝내세요(이 경우 다음 턴 끝에서는 재촉하지 않습니다).",
 	].join("\n");
 }

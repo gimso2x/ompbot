@@ -34,7 +34,12 @@ afterAll(() => {
 });
 
 function py(args: string[]): { code: number; out: string; err: string } {
-	const run = Bun.spawnSync(["python3", ...args], { stdout: "pipe", stderr: "pipe" });
+	// 기대값이 KST라 봇 시간대를 고정한다(없으면 ~/.ompbot/config.json·시스템 시간대를 따라 CI(UTC)에서 깨진다).
+	const run = Bun.spawnSync(["python3", ...args], {
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, OMPBOT_TZ: "Asia/Seoul" },
+	});
 	return { code: run.exitCode, out: run.stdout.toString(), err: run.stderr.toString() };
 }
 

@@ -12,6 +12,7 @@ import {
 	type OmpExitInfo,
 	type OmpFinal,
 	type OmpSessionDriver,
+	type TodoPhase,
 } from "../omp/driver";
 import { type HealedSessionModel, healSessionModelFile, newestSessionFile } from "../omp/session-heal";
 import {
@@ -149,6 +150,20 @@ export interface TurnFailureEscalation {
 	modelHealed: boolean;
 }
 
+/** A turn that ended through the final path (`MailboxDeps.onTurnSettled`). */
+export interface TurnSettledInfo {
+	originKey: string;
+	/**
+	 * Why the turn did not end normally: omp's error, `lane_paused`, a stall/stuck/cost-cap stop reason, or the status
+	 * (`aborted`/`error`) when omp named none. Absent = the turn completed.
+	 */
+	error?: string;
+	/** The turn's final assistant text (`""` when there is none). */
+	text: string;
+	/** Owner dialogs (ask cards) of the origin still waiting when the turn ended. */
+	openDialogs: number;
+}
+
 /** A turn aborted because the same tool call kept returning the same result (`src/core/stuck.ts`). */
 export interface StuckLoopInfo {
 	originKey: string;
@@ -268,6 +283,16 @@ export interface MailboxDeps {
 	onStuckLoop?: (info: StuckLoopInfo) => void;
 	/** omp dialogs (select/confirm/input/editor/ask cards) waiting on the owner; absent: messages never answer one. */
 	dialogs?: OpenDialogs;
+	/**
+	 * Task-list phases planted with `set_todos` right before the first prompt of a freshly created session (never on a
+	 * continued session). Only the lane wiring sets it; `undefined` plants nothing. A failure is a warning only.
+	 */
+	initialTodos?: () => TodoPhase[] | undefined;
+	/**
+	 * Every turn that ended through the final path (completed, failed, paused, aborted), after its answer or failure
+	 * was recorded and before the next queued row starts. Called on the actor chain: it must never await.
+	 */
+	onTurnSettled?: (info: TurnSettledInfo) => void;
 	/** Turn snapshots and `!undo`; absent = no snapshot is taken and `!undo` says it is not wired. */
 	turnUndo?: TurnUndoDeps;
 	/**
@@ -1156,6 +1181,15 @@ export class OriginMailbox {
 		return this.#turn?.live.view() ?? null;
 	}
 
+	/**
+	 * The session file the running child reports as open (`ompbot lanes watch`); undefined without a child or when it
+	 * reports none. Only reads `state()`: never queued behind the running turn, never starts a child.
+	 */
+	async openSessionFile(): Promise<string | undefined> {
+		const driver = this.#driver;
+		return driver === undefined ? undefined : (await driver.state()).sessionFile;
+	}
+
 	#onDriverEvent(event: OmpEvent): void {
 		this.#turn?.live.feed(event);
 		if (this.#onRetryEvent(event)) return;
@@ -1637,6 +1671,8 @@ export class OriginMailbox {
 		}
 		const driver = await this.#ensureDriver(row.threadRef);
 		this.#warnColdCache(row.threadRef);
+		// Before `#firstTurnPrompt` clears the fresh flag: a continued session already has its todos.
+		if (this.#freshSession) await this.#plantTodos(driver);
 		// Read the cursor right before the prompt: extensions append entries after open.
 		const entryCursor = await driver.leafId();
 		// Before the prompt, not after: the first tool call would otherwise race the capture and land in no turn's diff.
@@ -1678,6 +1714,19 @@ export class OriginMailbox {
 		if (typical !== undefined) {
 			this.#turn.progress.typical = typical;
 			this.#reportProgress(this.#turn);
+		}
+	}
+
+	/** `initialTodos` into a fresh session; a driver that refuses them leaves the turn to go on without (warning only). */
+	async #plantTodos(driver: OmpSessionDriver): Promise<void> {
+		const { originKey, log } = this.#deps;
+		const phases = this.#deps.initialTodos?.();
+		if (phases === undefined) return;
+		try {
+			await driver.setTodos(phases);
+			log.info("lane_set_todos", { origin: originKey, phases: phases.length });
+		} catch (error) {
+			log.warn("lane_set_todos_failed", { origin: originKey, error: String(error) });
 		}
 	}
 
@@ -1797,7 +1846,8 @@ export class OriginMailbox {
 	/**
 	 * Session-file heal for a restore-model failure (no live driver — `#healStaleModel` cannot run): the file
 	 * omp resumes (`/resume-ompbot`'s pin, else the newest of the session dir — the rule `openOriginSession`
-	 * binds) has its last `model_change` rewritten to the fallback, the same chain `#healStaleModel` uses:
+	 * binds) has the `model_change` omp restores from (the last one; after a `role: "fallback"` retry hop, the last
+	 * one whose role is default) rewritten to the fallback, the same chain `#healStaleModel` uses:
 	 * `#effectiveSettings` → `defaultModel`. The original is backed up under the origin's backup dir first;
 	 * nothing is touched when there is no fallback, no file, or nothing to rewrite (already the fallback).
 	 */
@@ -2033,6 +2083,13 @@ export class OriginMailbox {
 			});
 			await this.#noteTurnFailure(turn.threadRef, final.error ?? final.status);
 		}
+		const error = final.error ?? (final.status === "completed" ? undefined : final.status);
+		this.#deps.onTurnSettled?.({
+			originKey,
+			text: final.text,
+			openDialogs: this.#deps.dialogs?.open(originKey) ?? 0,
+			...(error === undefined ? {} : { error }),
+		});
 		if (stopFirst) await this.#stopDriver();
 		// After the answer is stored and before the next row starts: the drain below may open the next turn, and its
 		// before-state must already include this turn's files.

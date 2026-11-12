@@ -30,6 +30,7 @@ import {
 	BLOCK_RETRY_HEAD,
 	BLOCK_RETRY_MAX,
 	BLOCK_RETRY_WAIT_MS,
+	BLOCKED_CHECKS_PASS_HEAD,
 	READ_FAILURE_NOTICE_AFTER,
 	REVIEW_REALERT_MS,
 	STALE_NOTICE_MS,
@@ -2366,6 +2367,54 @@ describe("TaskSweeper: one retry prompt before a blocked card", () => {
 			expect(added(r)).toEqual(["construction"]);
 			expect(texts(r)).toHaveLength(1);
 			expect(texts(r)[0]?.split("\n")).toContain("*사유*: 토큰 없음");
+		}
+	});
+});
+
+describe("TaskSweeper: checks pass while blocked, held during a freeze or an owner pause", () => {
+	const HEAD = "a".repeat(40);
+	const blockedPassing = (): TaskEvaluation => ({
+		ok: true,
+		judgement: judgement({
+			blocked: true,
+			status: "blocked",
+			blockedReason: "npm 없음",
+			current: "S2",
+			blockedChecksPassHead: HEAD,
+		}),
+	});
+	const passPrompts = (r: Rig) => r.reminders.filter((text) => text === BLOCKED_CHECKS_PASS_HEAD);
+	const passMarks = (r: Rig) =>
+		Object.keys(r.ledger.require(r.row.taskId).notices).filter((key) => key.startsWith("blockedcheckspass:"));
+
+	test("E-2: no prompt and no notice while frozen or paused; one prompt on the first sweep after", async () => {
+		const state: { value: { since: string; reason: string; by: string } | undefined } = {
+			value: { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" },
+		};
+		const frozen = rig({ frozen: () => state.value });
+		const paused = rig();
+		paused.ledger.pauseTask(paused.row.taskId);
+		for (const r of [frozen, paused]) {
+			r.clock.ms = T0 + 5 * MIN;
+			r.next.value = blockedPassing();
+			for (let i = 0; i < 3; i += 1) {
+				const [result] = await r.sweeper.sweep();
+				expect(result?.actions.some((action) => action.startsWith("checks pass while blocked, held"))).toBe(true);
+				r.clock.ms += 5 * MIN;
+			}
+			expect(passPrompts(r)).toEqual([]);
+			expect(passMarks(r)).toEqual([]);
+			expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		}
+		state.value = undefined;
+		paused.ledger.unpauseTask(paused.row.taskId);
+		for (const r of [frozen, paused]) {
+			const [result] = await r.sweeper.sweep();
+			expect(result?.actions).toContain("checks pass while blocked, told agent");
+			r.clock.ms += 5 * MIN;
+			await r.sweeper.sweep();
+			expect(passPrompts(r)).toHaveLength(1);
+			expect(passMarks(r)).toHaveLength(1);
 		}
 	});
 });

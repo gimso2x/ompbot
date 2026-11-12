@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import type { Logger } from "../log";
+import type { TodoPhase } from "../omp/driver";
 import { redact } from "../redact";
 import { openStore, type Store } from "../store/db";
 import type { LiveView } from "./live-turn";
@@ -84,6 +85,10 @@ export interface OriginRouterDeps {
 	isHeld?: (originKey: string) => boolean;
 	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */
 	onHeldWork?: MailboxDeps["onHeldWork"];
+	/** Task-list phases a fresh session of an origin starts with; passed per mailbox (`MailboxDeps.initialTodos`). */
+	initialTodos?: (originKey: string) => TodoPhase[] | undefined;
+	/** Every turn that ended through the final path; passed to every mailbox (`MailboxDeps.onTurnSettled`). */
+	onTurnSettled?: MailboxDeps["onTurnSettled"];
 }
 
 /** Owns one `OriginMailbox` per origin key. */
@@ -102,7 +107,7 @@ export class OriginRouter {
 	mailbox(originKey: string): OriginMailbox {
 		let mailbox = this.#mailboxes.get(originKey);
 		if (!mailbox) {
-			const { sessionsRoot, isHeld, onHeldWork, ...rest } = this.#deps;
+			const { sessionsRoot, isHeld, onHeldWork, initialTodos, ...rest } = this.#deps;
 			mailbox = new OriginMailbox({
 				...rest,
 				originKey,
@@ -110,6 +115,7 @@ export class OriginRouter {
 				isDraining: () => this.draining,
 				...(isHeld === undefined ? {} : { isHeld: () => isHeld(originKey) }),
 				...(onHeldWork === undefined ? {} : { onHeldWork }),
+				...(initialTodos === undefined ? {} : { initialTodos: () => initialTodos(originKey) }),
 			});
 			if (this.#dispatchStopped) mailbox.stopDispatching();
 			this.#mailboxes.set(originKey, mailbox);
@@ -152,6 +158,11 @@ export class OriginRouter {
 	/** What the origin's running turn is writing now; null for an origin with no mailbox (never creates one). */
 	liveView(originKey: string): LiveView | null {
 		return this.#mailboxes.get(originKey)?.liveView() ?? null;
+	}
+
+	/** The session file the origin's running child has open; undefined without a mailbox or child (never creates one). */
+	openSessionFile(originKey: string): Promise<string | undefined> {
+		return this.#mailboxes.get(originKey)?.openSessionFile() ?? Promise.resolve(undefined);
 	}
 
 	/** Origins with a running turn. */

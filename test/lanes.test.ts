@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import {
 	CLAIM_GRACE_MS,
+	DEFAULT_COMPLETION_NUDGES,
 	DEFAULT_MAX_LANES,
 	LaneCapError,
 	LaneInputError,
@@ -13,9 +14,12 @@ import {
 	PROGRESS_INTERVAL_MS,
 } from "../src/lanes/manager";
 import { buildLaneTools } from "../src/lanes/tools";
-import { buildLanePrompt, isReopenCommand, parseLaneTrigger } from "../src/lanes/trigger";
+import { buildLanePrompt, buildLaneTodos, isReopenCommand, parseLaneTrigger } from "../src/lanes/trigger";
 import { type VerifyResult, verifyClaim } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
+import { AgyOmpDriver } from "../src/omp/agy-driver";
+import { ClaudeOmpDriver } from "../src/omp/claude-driver";
+import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { collectGates } from "../src/ops/gates";
 import { redact } from "../src/redact";
@@ -25,7 +29,7 @@ import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
 import { git, makeRepo } from "./helpers/git-fixtures";
-import { removeRepoAndWorktrees } from "./helpers/lane-harness";
+import { type LaneHarness, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 const START = 1_800_000_000_000;
 const SHA = "a".repeat(40);
@@ -993,7 +997,9 @@ describe("lanes inside the daemon", () => {
 		expect(lane?.threadRef).toBe(`D1:${root?.ts}`);
 		// The lane's own omp session got the ulw prompt; the DM conversation's session never saw the trigger text.
 		await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore ulw debugging"));
-		expect(drivers.get("ompbot/work/demo")?.calls[1]).toContain("README에 한 줄 추가");
+		// The daemon plants the lane's todos right before that first prompt.
+		expect(drivers.get("ompbot/work/demo")?.calls[1]).toBe("setTodos");
+		expect(drivers.get("ompbot/work/demo")?.calls[2]).toContain("README에 한 줄 추가");
 		expect(drivers.has("slack/dm/D1")).toBe(false);
 		expect(daemon.cwdFor("ompbot/work/demo")).toBe(wt);
 		expect(daemon.cwdFor("slack/dm/D1")).toBe(home.config.workspaceDir);
@@ -1117,5 +1123,287 @@ describe("lanes inside the daemon", () => {
 		await ownerMessage("after restart", "1900000000.000300", root?.ts ?? "");
 		await transport.waitForPosts((text) => text === "ECHO after restart");
 		expect(second.store.getInbound("D1:1900000000.000300")?.originKey).toBe("ompbot/work/persist");
+	});
+});
+
+// doc/plans/lane-todos-nudge.md: a new lane session starts with its acceptance criteria as omp todos (A), and a lane
+// turn that ends with no done claim is nudged at most `lanes.completionNudges` times per owner message (B).
+
+const NUDGE_ACCEPTANCE = ['README 한 줄 [check: command ["bun","test"]]', "문서 갱신"];
+
+async function startLane(h: LaneHarness, title: string, acceptance?: string[]) {
+	const lane = await h.manager.start({
+		title,
+		cwd: makeRepo(repos),
+		channel: "D1",
+		...(acceptance === undefined ? {} : { acceptance }),
+	});
+	await h.settle();
+	return lane;
+}
+
+/** Ends the lane's held turn normally; resolves once the manager handled the end and whatever it routed. */
+async function endTurn(h: LaneHarness, driver: FakeOmpDriver | undefined) {
+	const settled = h.turnSettled();
+	driver?.release();
+	const info = await settled;
+	await h.settle();
+	return info;
+}
+
+const nudgePrompts = (h: LaneHarness, originKey: string) =>
+	h.prompts(originKey).filter((call) => call.includes("[자동 재촉"));
+
+describe("lane todos (set_todos)", () => {
+	test("AC-1/AC-4: the first turn of a new lane plants the criteria then the wrap-up, once, before its prompt", async () => {
+		const h = laneHarness(home.dir);
+		const lane = await startLane(h, "todos", NUDGE_ACCEPTANCE);
+		const driver = h.drivers.get(lane.originKey);
+		expect(driver?.calls.slice(0, 3)).toEqual(["openSession", "setTodos", expect.stringMatching(/^prompt:/)]);
+		expect(driver?.todos).toEqual([
+			[
+				{
+					name: "수락기준",
+					tasks: [
+						{ content: "AC-1: README 한 줄", status: "pending" },
+						{ content: "AC-2: 문서 갱신", status: "pending" },
+					],
+				},
+				{
+					name: "마무리",
+					tasks: [
+						{ content: "변경 모두 커밋", status: "pending" },
+						{ content: "ompbot_claim_done 호출", status: "pending" },
+					],
+				},
+			],
+		]);
+		// The prompt keeps the criteria text: the todos are added, never instead of it.
+		const prompt = h.prompts(lane.originKey)[0] ?? "";
+		expect(prompt).toContain("수락기준:");
+		expect(prompt).toContain("- AC-1: README 한 줄");
+		h.close();
+	});
+
+	test("AC-1: without criteria only the wrap-up phase; every task is pending", () => {
+		expect(buildLaneTodos([])).toEqual([
+			{
+				name: "마무리",
+				tasks: [
+					{ content: "변경 모두 커밋", status: "pending" },
+					{ content: "ompbot_claim_done 호출", status: "pending" },
+				],
+			},
+		]);
+		for (const phase of buildLaneTodos([{ id: "AC-1", text: "x [check: file a.txt]" }])) {
+			for (const task of phase.tasks) expect(task.status).toBe("pending");
+		}
+	});
+
+	test("AC-4: a refused set_todos is a warning only — the first prompt still goes out", async () => {
+		const drivers = new Map<string, FakeOmpDriver>();
+		const sessions = new FakeSessionStore();
+		const h = laneHarness(home.dir, {
+			driver: (origin, sessionDir) => {
+				const driver = new FakeOmpDriver({
+					sessionDir,
+					store: sessions,
+					holdTurns: true,
+					setTodosError: new OmpDriverError("rpc_error", "unknown command set_todos"),
+				});
+				drivers.set(origin, driver);
+				return driver;
+			},
+		});
+		const lane = await startLane(h, "plant-fail", NUDGE_ACCEPTANCE);
+		const driver = drivers.get(lane.originKey);
+		expect(driver?.calls.filter((call) => call === "setTodos")).toHaveLength(1);
+		expect(driver?.calls.some((call) => call.startsWith("prompt:") && call.includes("수락기준:"))).toBe(true);
+		expect(h.logs.some((line) => line.includes("lane_set_todos_failed"))).toBe(true);
+		h.close();
+	});
+
+	test("AC-4: Claude and agy drivers accept set_todos without doing anything and log it", async () => {
+		const logs: string[] = [];
+		const log = createLogger({ sink: (line) => logs.push(line), clock: { now: () => START }, redact });
+		const phases = buildLaneTodos([{ id: "AC-1", text: "x" }]);
+		const root = mkdtempSync(join(tmpdir(), "ompbot-plant-drivers-"));
+		repos.push(root);
+		await new ClaudeOmpDriver({
+			claudeExecutable: join(root, "no-claude"),
+			cwd: root,
+			sessionDir: join(root, "c"),
+			log,
+		}).setTodos(phases);
+		await new AgyOmpDriver({
+			agyExecutable: join(root, "no-agy"),
+			cwd: root,
+			sessionDir: join(root, "a"),
+			log,
+		}).setTodos(phases);
+		expect(logs.filter((line) => line.includes("set_todos_unsupported"))).toHaveLength(2);
+	});
+});
+
+describe("lane completion nudges", () => {
+	test("AC-2: claim-less turns get a nudge each, twice, then one warning line; a nudge never resets the count", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => DEFAULT_COMPLETION_NUDGES });
+		const lane = await startLane(h, "nudge", NUDGE_ACCEPTANCE);
+		const driver = h.drivers.get(lane.originKey);
+
+		await endTurn(h, driver);
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(1);
+		const first = nudgePrompts(h, lane.originKey)[0] ?? "";
+		expect(first).toContain("[자동 재촉 1/2] 턴이 완료 주장 없이 끝났습니다.");
+		expect(first).toContain("worktree 상태: 미커밋 경로 0개, 레인 시작 이후 커밋 0개");
+		expect(first).toContain("ompbot_claim_done");
+		expect(first).toContain("needsOwner: true");
+		// The nudge row is the core's, not the owner's: the count is still 1 after it was dispatched.
+		expect(h.store.getLane(lane.name)?.meta.nudges?.sent).toBe(1);
+		expect(h.store.getInbound(`lane:${lane.name}:nudge:2`)).toBeDefined();
+
+		await endTurn(h, driver);
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(2);
+		expect(nudgePrompts(h, lane.originKey)[1]).toContain("[자동 재촉 2/2]");
+		// Later turns of the same session plant no todos again.
+		expect(driver?.calls.filter((call) => call === "setTodos")).toHaveLength(1);
+
+		await endTurn(h, driver);
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(2);
+		const warning = "⚠️ 자동 재촉 2회 뒤에도 완료 주장이 없습니다. 확인이 필요합니다.";
+		expect(h.transport.posts((text) => text === warning)).toHaveLength(1);
+
+		// Another claim-less end in the same owner-message span: no nudge and no second warning.
+		await h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(2);
+		expect(h.transport.posts((text) => text === warning)).toHaveLength(1);
+
+		// The owner writes: the count starts over.
+		h.manager.onOwnerMessage(h.store.getLane(lane.name) ?? lane, "계속 해 줘");
+		expect(h.store.getLane(lane.name)?.meta.nudges).toBeUndefined();
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgePrompts(h, lane.originKey).at(-1)).toContain("[자동 재촉 1/2]");
+		h.close();
+	});
+
+	test("AC-2: `!reopen` resets the count", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => 2 });
+		const lane = await startLane(h, "reopen-reset");
+		h.store.transitionLane(lane.name, "done-claimed", { event: "claim" }, { nudges: { sent: 2, warned: true } });
+		const closed = h.store.transitionLane(lane.name, "closed", { event: "closed" }, { sha: lane.meta.baseSha });
+		h.manager.onOwnerMessage(closed, "!reopen 이어서");
+		const reopened = h.store.getLane(lane.name);
+		expect(reopened?.status).toBe("working");
+		expect(reopened?.meta.nudges).toBeUndefined();
+		// Its own status redraw ends before this awaited one (the reopen's redraw is not awaited by onOwnerMessage).
+		await h.manager.progress(lane.originKey, "다시 작업");
+		h.close();
+	});
+
+	test("AC-2: a not-done lane's nudge carries the last refusal; a git failure is named, the nudge still goes", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => 2 });
+		const lane = await startLane(h, "notdone-nudge");
+		const driver = h.drivers.get(lane.originKey);
+		h.store.transitionLane(lane.name, "done-claimed", { event: "claim" });
+		h.store.transitionLane(lane.name, "not-done", { event: "not_done", detail: "커밋하지 않은 변경 1개" });
+		await endTurn(h, driver);
+		expect(nudgePrompts(h, lane.originKey)[0]).toContain("마지막 거절 사유(not-done): 커밋하지 않은 변경 1개");
+
+		rmSync(lane.cwd, { recursive: true, force: true });
+		await endTurn(h, driver);
+		const second = nudgePrompts(h, lane.originKey)[1] ?? "";
+		expect(second).toContain("[자동 재촉 2/2]");
+		expect(second).toContain("worktree 상태 확인 실패:");
+		h.close();
+	});
+
+	test("AC-3: no nudge for paused/done-claimed/closed lanes, failed or paused turns, open dialogs, needsOwner, a question", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => 2 });
+		const lane = await startLane(h, "no-nudge");
+		const ended = (info: { error?: string; text?: string; openDialogs?: number }) => {
+			h.manager.onTurnSettled({
+				originKey: lane.originKey,
+				text: info.text ?? "",
+				openDialogs: info.openDialogs ?? 0,
+				...(info.error === undefined ? {} : { error: info.error }),
+			});
+		};
+		const skipped = (reason: string) =>
+			h.logs.filter((line) => line.includes("lane_nudge_skipped") && line.includes(`reason=${reason}`)).length;
+
+		ended({ error: "error" });
+		ended({ error: "lane_paused" });
+		ended({ error: "aborted" });
+		expect(skipped("turn_failed")).toBe(3);
+		ended({ openDialogs: 1 });
+		expect(skipped("open_dialog")).toBe(1);
+		ended({ text: "작업 중입니다.\n어느 쪽으로 할까요?\n\n" });
+		expect(skipped("question_text")).toBe(1);
+
+		// needsOwner speaks for the turn that called it only.
+		expect(await h.manager.progress(lane.originKey, "DB 스키마를 바꿔도 될지 결정 필요", true)).toBe(
+			"progress recorded",
+		);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.ownerAsked).toBe(true);
+		ended({});
+		expect(skipped("needs_owner")).toBe(1);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.ownerAsked).toBeUndefined();
+
+		for (const [to, entry] of [
+			["done-claimed", "claim"],
+			["paused", "paused"],
+		] as const) {
+			h.store.transitionLane(lane.name, to, { event: entry });
+			ended({});
+		}
+		h.store.transitionLane(lane.name, "done-claimed", { event: "resumed" });
+		h.store.transitionLane(lane.name, "closed", { event: "closed" });
+		ended({});
+		expect(skipped("status")).toBe(3);
+		await h.settle();
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(0);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.sent ?? 0).toBe(0);
+
+		// The first prompt tells the lane how to ask the owner.
+		expect(h.prompts(lane.originKey)[0]).toContain("`ompbot_lane_progress`를 `needsOwner: true`와 함께 부르고");
+		h.close();
+	});
+
+	test("AC-3: the lane progress tool passes needsOwner through", async () => {
+		const h = laneHarness(home.dir);
+		const lane = await startLane(h, "tool-needs-owner");
+		const tool = buildLaneTools(h.manager, lane.originKey).find((t) => t.name === "ompbot_lane_progress");
+		await tool?.execute({ text: "결정 필요", needsOwner: true }, { signal: new AbortController().signal });
+		expect(h.store.getLane(lane.name)?.meta.nudges?.ownerAsked).toBe(true);
+		h.close();
+	});
+
+	test("AC-5: completionNudges 0 sends no nudge", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => 0 });
+		const lane = await startLane(h, "nudge-off");
+		await endTurn(h, h.drivers.get(lane.originKey));
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(0);
+		expect(h.logs.some((line) => line.includes("lane_nudge_skipped") && line.includes("reason=off"))).toBe(true);
+		h.close();
+	});
+
+	test("AC-5: the count survives a restart (it lives in the lane row)", async () => {
+		const first = laneHarness(home.dir, { completionNudges: () => 2 });
+		const lane = await startLane(first, "nudge-restart");
+		await endTurn(first, first.drivers.get(lane.originKey));
+		expect(nudgePrompts(first, lane.originKey)[0]).toContain("[자동 재촉 1/2]");
+		first.close();
+
+		const second = laneHarness(home.dir, { completionNudges: () => 2 });
+		expect(second.store.getLane(lane.name)?.meta.nudges?.sent).toBe(1);
+		second.manager.onTurnSettled({ originKey: lane.originKey, text: "", openDialogs: 0 });
+		await second.settle();
+		expect(nudgePrompts(second, lane.originKey)[0]).toContain("[자동 재촉 2/2]");
+		second.manager.onTurnSettled({ originKey: lane.originKey, text: "", openDialogs: 0 });
+		await second.settle();
+		expect(nudgePrompts(second, lane.originKey)).toHaveLength(1);
+		second.close();
 	});
 });

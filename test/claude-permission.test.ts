@@ -430,3 +430,42 @@ describe("qa-d lane M regressions", () => {
 			expect({ command, touches: touches(command) }).toEqual({ command, touches: false });
 	});
 });
+
+describe("qa-e lane E regressions", () => {
+	// Lexical fake home (nothing on disk); the real ~/.ompbot/secrets is never touched.
+	const secretsDir = "/h/u/.ompbot/secrets";
+	const userHome = "/h/u";
+	const workspace = "/h/u/.ompbot/workspace";
+	const touches = (command: string, at = workspace) => bashTouchesSecrets(command, secretsDir, { cwd: at, userHome });
+
+	test("E-1 copying or archiving an ancestor of the secrets directory is blocked", () => {
+		const blocked: Array<[string, string?]> = [
+			["cp -a ~/.ompbot /tmp/x"],
+			["cp -r /h/u/.ompbot /tmp/x"],
+			["cp --archive ~ /tmp/x"],
+			["scp -r ~/.ompbot host:/tmp/x"],
+			["tar cf /tmp/b.tar ~/.ompbot"],
+			["tar -czf /tmp/b.tgz .ompbot", "/h/u"],
+			["rsync -a ~/.ompbot/ /tmp/y"],
+			["zip -r /tmp/z.zip .ompbot", "/h/u"],
+			["zip -qr /tmp/z.zip ~"],
+			["7z a /tmp/z.7z ~/.ompbot"],
+		];
+		for (const [command, at] of blocked)
+			expect({ command, at, hit: touches(command, at) }).toMatchObject({ hit: true });
+	});
+
+	test("E-1 common copy, archive and walk commands stay allowed, even from home", () => {
+		for (const at of ["/h/u", workspace])
+			for (const command of [
+				"cp -a src /tmp/x",
+				"tar czf /tmp/w.tgz workspace",
+				"zip -r /tmp/w.zip workspace",
+				"find . -name '*.ts'",
+				"du -sh .",
+				"cp a.txt b.txt",
+				"zip /tmp/w.zip ~/.ompbot/workspace/a.txt",
+			])
+				expect({ command, at, hit: touches(command, at) }).toMatchObject({ hit: false });
+	});
+});

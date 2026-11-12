@@ -22,6 +22,7 @@ import { DASHBOARD_USAGE, dashboardCommand } from "./dashboard";
 import { DRAIN_USAGE, drainCommand } from "./drain";
 import { FEEDBACK_USAGE, feedbackCommand } from "./feedback";
 import { INIT_USAGE, initCommand } from "./init";
+import { LANES_USAGE, lanesCommand } from "./lanes";
 import { MONITORS_USAGE, monitorsCommand } from "./monitors";
 import { OMP_USAGE, ompCommand } from "./omp";
 import { RESTORE_USAGE, restoreCommand } from "./restore";
@@ -62,7 +63,7 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}${TEAMS_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}${TEAMS_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -509,6 +510,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return await monitorsCommand(rest, homeDir);
 			case "tasks":
 				return await tasksCommand(rest, homeDir);
+			case "lanes":
+				return await lanesCommand(rest, homeDir);
 			case "skills":
 				return skillsCommand(rest, env);
 			case "dashboard":

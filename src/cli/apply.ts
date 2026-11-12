@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultHomeDir, loadConfig } from "../config";
 import { runDoctor } from "../daemon/doctor";
+import { readSweepHeartbeat } from "../daemon/heartbeat";
 import { callDaemon } from "../daemon/ipc";
 import {
 	type ApplyDeps,
@@ -31,7 +32,8 @@ import { runProfileSync } from "./omp";
 export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>> --report-thread <ts|message id>] [--json]
                                  precheck (main, HEAD==main, clean src, bun) → backup + config copy → with config ompProfile,
                                  ompbot omp sync (a failure stops here) → drain --wait (default 60 min) → systemctl --user
-                                 restart <this home's unit> → wait for a fresh daemon (2 min) → gates/doctor summary; on
+                                 restart <this home's unit> → wait for a fresh daemon (2 min) → wait for its heartbeat
+                                 after the restart with no Slack/Discord transport down (2 min) → gates/doctor summary; on
                                  failure restores config and restarts once (code is not reverted).
                                  --cut-after <min> (default 5): a drain still busy then restarts anyway; the daemon records
                                  the cut turns (<home>/restart-cut.json) and the next process resumes each once in its
@@ -203,6 +205,7 @@ export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyD
 					}),
 				}),
 		lockStartedAt: () => readLockStartedAt(homeDir),
+		heartbeat: () => readSweepHeartbeat(homeDir),
 		pid: process.pid,
 		isAlive: pidAlive,
 		isExecutable: isExecutableFile,

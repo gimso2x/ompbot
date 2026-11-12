@@ -20,6 +20,7 @@ import {
 	STEER_BEFORE_ANSWER_SEEN_NOTE,
 	type StuckLoopInfo,
 	type TurnFailureEscalation,
+	type TurnSettledInfo,
 } from "../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor, slackDmOrigin } from "../src/core/origin";
 import { IDLE_STOP_MS, type InboundRecord, MONITOR_IDLE_STOP_MS } from "../src/core/types";
@@ -34,6 +35,7 @@ import {
 	type OmpFinal,
 	type OmpOpenResult,
 	type OmpState,
+	type TodoPhase,
 } from "../src/omp/driver";
 import {
 	FakeOmpDriver,
@@ -41,6 +43,7 @@ import {
 	FakeSessionStore,
 	type FakeTurnMessage,
 } from "../src/omp/fake-driver";
+import { healSessionModelFile } from "../src/omp/session-heal";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 
@@ -2189,5 +2192,164 @@ describe("mailbox: prompt cache monitor", () => {
 		seedSession(origin, clock.now() - 120 * MIN, { cacheRead: 240_000, cacheWrite: 10_000 });
 		await turn("run", origin);
 		expect(coldCaches).toHaveLength(0);
+	});
+});
+
+describe("session file heal picks the record omp restores (role fallback)", () => {
+	const record = (id: string, model: string, role?: string) =>
+		JSON.stringify({
+			type: "model_change",
+			id,
+			timestamp: "2026-11-10T00:00:01.000Z",
+			model,
+			...(role ? { role } : {}),
+		});
+	const message = (id: string) =>
+		JSON.stringify({
+			type: "message",
+			id,
+			timestamp: "2026-11-10T00:01:00.000Z",
+			message: { role: "user", content: [] },
+		});
+	/** omp's restore candidate: after a `role: "fallback"` last record, the last record whose role is none or default. */
+	const restoreTarget = (file: string): string | undefined => {
+		const changes = readFileSync(file, "utf8")
+			.split("\n")
+			.filter((line) => line !== "")
+			.map((line) => JSON.parse(line) as { type?: string; model?: string; role?: string })
+			.filter((entry) => entry.type === "model_change");
+		const last = changes.at(-1);
+		if (last?.role !== "fallback") return last?.model;
+		return changes.findLast((entry) => (entry.role ?? "default") === "default")?.model;
+	};
+	const temps: string[] = [];
+	afterEach(() => {
+		for (const temp of temps.splice(0)) rmSync(temp, { recursive: true, force: true });
+	});
+	const sessionFile = (lines: string[]): string => {
+		const temp = mkdtempSync(join(tmpdir(), "ompbot-heal-"));
+		temps.push(temp);
+		const file = join(temp, "s.jsonl");
+		writeFileSync(file, `${lines.join("\n")}\n`);
+		return file;
+	};
+
+	test("E-5: a role fallback last record -> the last role-less/default record is healed; a second heal is undefined", () => {
+		const file = sessionFile([
+			JSON.stringify({ type: "session", version: 1, id: "s1", timestamp: "2026-11-10T00:00:00.000Z", cwd: "/w" }),
+			record("e1", "dead/primary"),
+			message("e2"),
+			record("e3", "dead/fallback", "fallback"),
+		]);
+		const backups = join(file, "..", "backups");
+		expect(healSessionModelFile(file, "live/new", backups)).toEqual({ file, from: "dead/primary", to: "live/new" });
+		expect(restoreTarget(file)).toBe("live/new");
+		expect(readFileSync(file, "utf8")).toContain('"model":"dead/fallback"');
+		expect(healSessionModelFile(file, "live/new", backups)).toBeUndefined();
+		expect(readdirSync(backups)).toHaveLength(1);
+	});
+
+	test("E-5: a single role-less record is healed as before", () => {
+		const file = sessionFile([record("e1", "dead/primary")]);
+		expect(healSessionModelFile(file, "live/new", join(file, "..", "backups"))?.from).toBe("dead/primary");
+		expect(restoreTarget(file)).toBe("live/new");
+	});
+});
+
+describe("mailbox: lane todos and turn-end report (doc/plans/lane-todos-nudge.md)", () => {
+	const LANE = laneOriginKey("plant-lane");
+	const PHASES: TodoPhase[] = [{ name: "마무리", tasks: [{ content: "변경 모두 커밋", status: "pending" }] }];
+	let settled: TurnSettledInfo[];
+	let opened: FakeOmpDriver[];
+	let openDialogs: number;
+
+	function laneMailbox(options: FakeOmpDriverOptions = {}): OriginMailbox {
+		return new OriginMailbox({
+			timezone: "Asia/Seoul",
+			originKey: LANE,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new FakeOmpDriver({ holdTurns: true, sessionDir, store: sessionStore, ...options });
+				opened.push(driver);
+				return driver;
+			},
+			initialTodos: () => PHASES,
+			onTurnSettled: (info) => settled.push(info),
+			dialogs: { open: () => openDialogs, answer: async () => false, ambiguous: () => undefined },
+		});
+	}
+
+	beforeEach(() => {
+		settled = [];
+		opened = [];
+		openDialogs = 0;
+	});
+
+	test("AC-1: a fresh session gets set_todos once, right before its first prompt; the next turn gets none", async () => {
+		const mailbox = laneMailbox();
+		try {
+			const first = msg("첫 턴", { originKey: LANE });
+			await mailbox.enqueue(first);
+			const driver = opened[0] as FakeOmpDriver;
+			expect(driver.calls).toEqual(["openSession", "setTodos", "prompt:첫 턴"]);
+			expect(driver.todos).toEqual([PHASES]);
+			await untilFinal(mailbox, driver, () => driver.release());
+			await mailbox.enqueue(msg("둘째 턴", { originKey: LANE, threadRef: first.threadRef }));
+			expect(driver.calls.filter((call) => call === "setTodos")).toHaveLength(1);
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("AC-1: a continued session (its session file exists) gets no set_todos", async () => {
+		const sessionDir = sessionDirFor(join(dir, "sessions"), LANE, 1);
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(sessionDir, "2026-11-13T00-00-00-000Z_0000aaaa.jsonl"), "");
+		const mailbox = laneMailbox();
+		try {
+			await mailbox.enqueue(msg("이어서", { originKey: LANE }));
+			expect(opened[0]?.calls).not.toContain("setTodos");
+			expect(opened[0]?.calls.some((call) => call.startsWith("prompt:"))).toBe(true);
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("AC-4: a refused set_todos is logged and the turn goes on", async () => {
+		const mailbox = laneMailbox({ setTodosError: new OmpDriverError("rpc_error", "no set_todos") });
+		try {
+			await mailbox.enqueue(msg("첫 턴", { originKey: LANE }));
+			expect(opened[0]?.calls).toEqual(["openSession", "setTodos", "prompt:첫 턴"]);
+			expect(logLines.some((line) => line.includes("lane_set_todos_failed"))).toBe(true);
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("AC-2/AC-3: every turn end reports its error (none when completed), final text and open dialogs", async () => {
+		const mailbox = laneMailbox({ respond: () => "끝났나요?" });
+		try {
+			const first = msg("첫 턴", { originKey: LANE });
+			await mailbox.enqueue(first);
+			const driver = opened[0] as FakeOmpDriver;
+			openDialogs = 1;
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(settled).toEqual([{ originKey: LANE, text: "끝났나요?", openDialogs: 1 }]);
+
+			openDialogs = 0;
+			await mailbox.enqueue(msg("둘째 턴", { originKey: LANE, threadRef: first.threadRef }));
+			await untilFinal(mailbox, driver, () => void driver.abort());
+			expect(settled[1]).toEqual({ originKey: LANE, text: "", openDialogs: 0, error: "aborted" });
+
+			await mailbox.enqueue(msg("셋째 턴", { originKey: LANE, threadRef: first.threadRef }));
+			await mailbox.pauseTurn();
+			expect(settled[2]?.error).toBe("lane_paused");
+		} finally {
+			await mailbox.close();
+		}
 	});
 });

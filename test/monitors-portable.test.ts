@@ -3,6 +3,7 @@ import { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, r
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openMonitorLedger } from "../src/monitors/ledger";
+import { exportMonitors } from "../src/monitors/portable";
 import { parseMonitorSpec } from "../src/monitors/spec";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
@@ -233,5 +234,44 @@ describe("ompbot monitors export/apply", () => {
 		expect((await monitors(a, "export", "--dir", dir)).code).toBe(0);
 		expect(Object.keys(jsonFiles(dir))).toEqual(["disk-check.json", "hook.json", "morning-brief.json"]);
 		expect(readFileSync(join(dir, "notes.txt"), "utf8")).toBe("kept\n");
+	});
+});
+
+describe("monitors export --with-files: arguments with ..", () => {
+	test("E-3: a script argument <scripts>/../../x writes nothing outside the export dir and warns", () => {
+		const base = tempDir("ompbot-e3-");
+		const scriptsRoot = join(base, "h", "a", "scripts");
+		const workspaceDir = join(base, "h", "a", "workspace");
+		mkdirSync(scriptsRoot, { recursive: true });
+		mkdirSync(workspaceDir, { recursive: true });
+		const script = join(scriptsRoot, "check.sh");
+		writeFileSync(script, "#!/bin/sh\nexit 0\n");
+		chmodSync(script, 0o755);
+		writeFileSync(join(scriptsRoot, "data.txt"), "data\n");
+		writeFileSync(join(base, "src.txt"), "planted\n");
+		const outside = join(base, "out", "src.txt");
+		mkdirSync(join(base, "out"));
+		writeFileSync(outside, "victim\n");
+		const ctx = { scriptsRoot, workspaceDir, defaultTimezone: "Asia/Seoul" };
+		const ledger = openMonitorLedger(join(base, "ompbot.db"));
+		cleanups.push(() => ledger.close());
+		const dotted = `${scriptsRoot}/../../../src.txt`;
+		ledger.addMonitor(
+			parseMonitorSpec(
+				{
+					name: "dotted",
+					trigger: { kind: "script", command: [script, dotted, join(scriptsRoot, "data.txt")], intervalMs: 300_000 },
+					instruction: "x",
+				},
+				ctx,
+			),
+		);
+		const dir = join(base, "out", "e");
+		const result = exportMonitors(ledger, dir, ctx, { withFiles: true });
+		expect(readFileSync(outside, "utf8")).toBe("victim\n");
+		expect(readdirSync(join(base, "out")).sort()).toEqual(["e", "src.txt"]);
+		expect(result.warnings.some((warning) => warning.includes(dotted))).toBe(true);
+		expect(readFileSync(join(dir, "files", "scripts", "data.txt"), "utf8")).toBe("data\n");
+		expect(readFileSync(join(dir, "files", "scripts", "check.sh"), "utf8")).toBe("#!/bin/sh\nexit 0\n");
 	});
 });

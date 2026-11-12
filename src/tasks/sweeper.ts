@@ -374,6 +374,18 @@ export class TaskSweeper {
 				actions.push("blocked notice");
 			}
 			const passHead = judgement.blockedChecksPassHead;
+			// A frozen bot or an owner-paused task sends the agent nothing and marks nothing: the prompt goes out once,
+			// on the first sweep after the unfreeze or the unpause.
+			const held =
+				this.#deps.frozen?.() !== undefined
+					? "frozen"
+					: ledger.isPaused(ledger.require(row.taskId))
+						? "paused"
+						: undefined;
+			if (passHead !== undefined && held !== undefined) {
+				actions.push(`checks pass while blocked, held (${held})`);
+				return this.#result(row, status, judgement, actions);
+			}
 			// Marked before it goes out, like the retry prompt: a failed send is not repeated for this block and HEAD.
 			if (passHead !== undefined && ledger.recordNotice(row.taskId, `blockedcheckspass:${since}:${passHead}`)) {
 				const sent = await this.#remind(row, BLOCKED_CHECKS_PASS_HEAD);

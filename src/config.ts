@@ -179,6 +179,7 @@ const ROOT_KEYS = new Set([
 	"webhook",
 	"dashboard",
 	"briefing",
+	"lanes",
 ]);
 
 /** One `dispatchHosts` entry: ssh target, remote work directory, remote herdr binary, worker omp extra arguments. */
@@ -290,6 +291,11 @@ export interface OmpbotConfig {
 	 * for that commit lets the lane merge unasked (`timeoutMs` default 600000, at most 1800000). Unset → no review.
 	 */
 	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk; review?: { model: string; timeoutMs?: number } };
+	/**
+	 * Work lanes. `completionNudges`: after a lane turn ends with no done claim the core nudges the lane this many
+	 * times per owner message (default 2; 0 turns nudges off).
+	 */
+	lanes?: { completionNudges?: number };
 	/** Slack channel id that receives approval cards (owner mention, link back to the asking thread). Default: the asking conversation. */
 	escalationChannel?: string;
 	/** Slack channel id of the #log ledger: completion reports are copied there and nothing said there becomes a turn. */
@@ -850,6 +856,17 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		}
 	}
 
+	const lanes = root.lanes;
+	if (lanes !== undefined) {
+		const record = asRecord(lanes);
+		if (record === undefined) invalid(configPath, "lanes");
+		for (const key of Object.keys(record)) {
+			if (key !== "completionNudges") invalid(configPath, `lanes.${key}`);
+			const value = record[key];
+			if (!Number.isSafeInteger(value) || (value as number) < 0) invalid(configPath, `lanes.${key}`);
+		}
+	}
+
 	const requireMention = root.requireMention;
 	if (requireMention !== undefined && typeof requireMention !== "boolean") invalid(configPath, "requireMention");
 	const peerHopLimit = root.peerHopLimit;
@@ -1144,6 +1161,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
 	if (taskAutoLand !== undefined) config.taskAutoLand = taskAutoLand;
+	if (lanes !== undefined) config.lanes = lanes as { completionNudges?: number };
 
 	if (options.checkTokens !== false) {
 		// Fail at startup on permissions/prefix/shape; values are discarded here.

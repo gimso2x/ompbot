@@ -166,7 +166,17 @@ export interface LaneMeta {
 	pausedAt?: number;
 	/** How the pause was asked: an owner message in the lane thread or the ⏸ button. */
 	pausedBy?: "owner-message" | "button";
+	/**
+	 * Automatic nudges after turns that ended with no done claim (`lanes.completionNudges`), counted since the owner
+	 * last wrote in the thread or `!reopen` (only those reset it — a nudge never does). `warned`: the cap's one thread
+	 * line was posted; `ownerAsked`: the running turn called `ompbot_lane_progress` with `needsOwner` (cleared when
+	 * that turn ends).
+	 */
+	nudges?: { sent: number; warned?: boolean; ownerAsked?: boolean };
 }
+
+/** Inbound ids of messages the core itself steers into a lane (first prompt, not-done, nudge): never the owner's. */
+export const isCoreSteerId = (platformMessageId: string): boolean => platformMessageId.startsWith("lane:");
 
 export interface LaneRow {
 	name: string;

@@ -93,6 +93,15 @@ export function checkSignalsOf(text: string): string[] {
 	return signals;
 }
 
+/** `text` without the `[check: …]` that ends it (the criterion's own words); trimmed `text` when none ends it. */
+export function withoutCheckTail(text: string): string {
+	const t = text.trim();
+	let open = t.lastIndexOf(CHECK_OPEN);
+	while (open !== -1 && closingBracket(t, open) !== t.length - 1)
+		open = open === 0 ? -1 : t.lastIndexOf(CHECK_OPEN, open - 1);
+	return open === -1 ? t : t.slice(0, open).trim();
+}
+
 /**
  * Registration rule (judgement keeps reading the trailing block only): one `[check: …]` per criterion, at its very end.
  * `[check:` inside a double-quoted string or inline code (a backtick run closed by a run of the same length) is a

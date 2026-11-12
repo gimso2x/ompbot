@@ -7,6 +7,7 @@ import type {
 	OmpOpenResult,
 	OmpSessionDriver,
 	OmpState,
+	TodoPhase,
 } from "../omp/driver";
 
 /**
@@ -72,6 +73,10 @@ export class NamespacedDriver implements OmpSessionDriver {
 
 	setThinking(level: string): Promise<void> {
 		return this.inner.setThinking(level);
+	}
+
+	setTodos(phases: TodoPhase[]): Promise<void> {
+		return this.inner.setTodos(phases);
 	}
 
 	compact(instructions?: string): Promise<OmpCompactResult> {

@@ -17,6 +17,7 @@ import { SlackAdapter, type SlackAdapterOptions } from "../src/slack/adapter";
 import {
 	MARKDOWN_CHUNK_LIMIT,
 	type MarkdownPart,
+	plainHeaderText,
 	renderMarkdownParts,
 	renderParts,
 	toMrkdwn,
@@ -1632,5 +1633,41 @@ describe("qa50b K-6: a file_share message without files", () => {
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.textRef).toContain("이 파일 봐");
 		expect(rows[0]?.textRef).toContain("[첨부 실패:");
+	});
+});
+
+describe("inline code opened with several backticks (CommonMark backtick runs)", () => {
+	const names = { ownerUserId: "U0OWNER", peerBots: [] };
+	const coded = ["``a`` `<!channel>` 끝", "`` a ` b `` `<!here>`"];
+
+	test("E-4: a token quoted in code after a multi-backtick span stays verbatim, with no 🔔 line; the fallback keeps it", () => {
+		for (const body of coded) {
+			const [part] = renderMarkdownParts(body, false, undefined, { names }) ?? [];
+			expect({ body, blocks: part?.blocks }).toEqual({ body, blocks: [{ type: "markdown", text: body }] });
+			expect({ body, text: part?.text }).toEqual({ body, text: body });
+			expect({ body, mrkdwn: toMrkdwn(body) }).toEqual({ body, mrkdwn: body });
+		}
+	});
+
+	test("E-4: a token outside the code is still read as a name and rings; an unclosed run is plain text", () => {
+		const [part] = renderMarkdownParts("``a`` <!channel> 끝", false, undefined, { names }) ?? [];
+		expect(part?.blocks).toEqual([
+			{ type: "markdown", text: "``a`` @channel 끝" },
+			{ type: "context", elements: [{ type: "mrkdwn", text: "🔔 <!channel>" }] },
+		]);
+		const [open] = renderMarkdownParts("``a `<!here>` 끝", false, undefined, { names }) ?? [];
+		expect(open?.blocks?.[0]).toEqual({ type: "markdown", text: "``a `<!here>` 끝" });
+		expect(open?.blocks).toHaveLength(1);
+	});
+
+	test("E-4: the monitor header uses the same span boundaries and its code tokens open no 🔔 line", () => {
+		expect(plainHeaderText("⏰ ``a`` `x` b", names)).toBe("⏰ a x b");
+		expect(plainHeaderText("⏰ `` a ` b `` 끝", names)).toBe("⏰ a ` b 끝");
+		const [part] =
+			renderMarkdownParts("⏰ ``a`` `<!channel>` 끝\n본문", false, undefined, { names, monitorHeader: true }) ?? [];
+		expect(part?.blocks).toEqual([
+			{ type: "header", text: { type: "plain_text", text: "⏰ a @channel 끝", emoji: true } },
+			{ type: "markdown", text: "본문" },
+		]);
 	});
 });
