@@ -6,6 +6,7 @@ import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "..
 import { buildDispatchTool, type DispatchToolDeps } from "../dispatch/tool";
 import type { Logger } from "../log";
 import { maskKnownFragments, redact, secretShapes } from "../redact";
+import { buildTeamsGraphTools, type TeamsGraphClient } from "../teams/graph";
 import type { ApprovalBroker, ApprovalDetail } from "./approval";
 import { isInside } from "./inside";
 import { sendFileToolName } from "./prompt";
@@ -126,6 +127,11 @@ export interface HostToolDeps {
 	frozen?: DispatchToolDeps["frozen"];
 	/** Config `herdr`: absent → the dispatch tool is simple-only. */
 	herdr?: DispatchToolDeps["herdr"];
+	/**
+	 * The owner's delegated Graph session (`channels.teams.graph`): `teams_list_chats` and `teams_read_chat` are added
+	 * for a `teams/dm/*` origin only. The caller passes it only for the owner's own 1:1 no peer bot has written in.
+	 */
+	teamsGraph?: TeamsGraphClient;
 }
 
 function realOrSelf(path: string): string {
@@ -229,8 +235,13 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 				}
 			: undefined;
 	const dispatch = dispatchDeps === undefined ? undefined : buildDispatchTool(dispatchDeps);
+	const teamsGraph =
+		deps.teamsGraph !== undefined && chatOrigin?.platform === "teams" && chatOrigin.kind === "dm"
+			? buildTeamsGraphTools(deps.teamsGraph)
+			: [];
 	return [
 		...(dispatch === undefined ? [] : [dispatch]),
+		...teamsGraph,
 		{
 			name: sendFileToolName(platform),
 			label: "Send file to owner",

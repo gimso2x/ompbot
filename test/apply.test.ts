@@ -336,6 +336,28 @@ describe("runApply execution", () => {
 		expect(statSync(configCopy).mode & 0o777).toBe(0o600);
 	});
 
+	test("a merge landing during drain: the receipt head is the commit the restart loads, preflight head kept", async () => {
+		const world = makeWorld();
+		const moved = "c".repeat(40);
+		const deps = makeDeps(world);
+		const { exitCode, receipt } = await runApply(base, {
+			...deps,
+			drain: async (timeoutMin) => {
+				const result = await deps.drain(timeoutMin);
+				world.headSha = moved;
+				world.mainSha = moved;
+				return result;
+			},
+		});
+		expect(exitCode).toBe(0);
+		expect(receipt.head).toBe(moved);
+		expect(receipt.headAtPreflight).toBe(HEAD);
+		expect(receipt.steps.find((s) => s.name === "restart")?.detail).toBe(
+			"restart requested (HEAD moved after preflight: aaaaaaa→ccccccc)",
+		);
+		expect(readReceipt(receipt).head).toBe(moved);
+	});
+
 	test("an old daemon still answering is not ready: waits, then rolls back config with one more restart", async () => {
 		const world = makeWorld();
 		world.restartMakesFreshDaemon = false; // restart returns 0 but no new process ever takes the lock

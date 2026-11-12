@@ -113,6 +113,7 @@ import {
 } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
 import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
+import { TeamsGraphClient } from "../teams/graph";
 import { localIso, offsetLabel } from "../time";
 import type { CrashPoint } from "./crash";
 import {
@@ -272,6 +273,11 @@ export interface DaemonOptions {
 	guestRun?: ProcessRunner;
 	/** Test seam: the env the guest/qa runs inherit (and find the real omp agent dir in); default `process.env`. */
 	guestEnv?: Record<string, string | undefined>;
+	/**
+	 * Test seam for the Teams Graph chat tools' endpoints (fake Entra and Graph servers); used only when
+	 * `channels.teams.graph` is set and `ownerMode` is not `qa`.
+	 */
+	teamsGraphEndpoints?: { loginBase: string; graphBase: string };
 }
 
 export interface InjectRequest {
@@ -441,6 +447,8 @@ export class Daemon {
 	readonly #retryClicks = new Set<string>();
 	/** Tasks whose auto-merge "머지해" is being put in right now (a concurrent second call is refused); removed when it settles. */
 	readonly #autoLanding = new Set<string>();
+	/** The owner's delegated Graph session for the Teams chat tools; set when `channels.teams.graph` is on in `full`. */
+	readonly #teamsGraph: TeamsGraphClient | undefined;
 
 	constructor(options: DaemonOptions) {
 		this.#options = options;
@@ -456,6 +464,25 @@ export class Daemon {
 		});
 		this.#log = options.log;
 		this.#frozen = createFreezeProbe(options.config.homeDir);
+		const teams = options.config.channels.teams;
+		if (teams?.graph !== undefined && teams.ownerMode === "qa") {
+			// The owner's Teams messages take the read-only guest path under `qa`: no session there to read chats in.
+			this.#log.warn("teams_graph_disabled", { reason: "ownerMode_qa" });
+		} else if (teams?.graph !== undefined) {
+			this.#teamsGraph = new TeamsGraphClient({
+				tenantId: teams.tenantId,
+				clientId: teams.appId,
+				tokenFile: teams.graph.tokenFile,
+				ownerAadObjectId: teams.ownerAadObjectId,
+				log: this.#log,
+				now: () => this.#clock.now(),
+				notifyOwner: (text) => {
+					const owner = this.#ownerTarget("teams_graph_relogin");
+					void owner?.adapter.postNotice(owner.channel, text);
+				},
+				...options.teamsGraphEndpoints,
+			});
+		}
 	}
 
 	/** The adapter of a thread ref's platform; none for an unbound platform or a malformed ref. */
@@ -565,6 +592,16 @@ export class Daemon {
 		// Once a peer bot spoke in this origin its child gets only file upload, approval and dispatch (no lane or
 		// monitor tools); dispatch there asks the owner only for a high_risk brief, like anywhere else.
 		const peerTouched = this.peerTouched(originKey);
+		// The Graph chat tools read other people's conversations: the owner's own Teams 1:1 only, never once a peer
+		// bot has written there (the ledger's alias row must say a 1:1 the owner wrote in).
+		const teamsGraph =
+			this.#teamsGraph !== undefined &&
+			chatOrigin?.platform === "teams" &&
+			chatOrigin.kind === "dm" &&
+			!peerTouched &&
+			this.#store?.isTeamsOwnerDm(chatOrigin.conversationId) === true
+				? this.#teamsGraph
+				: undefined;
 		const base = buildHostTools({
 			originKey,
 			channels: this.#channels,
@@ -579,6 +616,7 @@ export class Daemon {
 			...(config.workerOmpArgs === undefined ? {} : { workerOmpArgs: config.workerOmpArgs }),
 			...(config.herdrBoard === undefined ? {} : { herdrBoard: config.herdrBoard }),
 			...(config.herdr === undefined ? {} : { herdr: config.herdr }),
+			...(teamsGraph === undefined ? {} : { teamsGraph }),
 			frozen: this.#frozen,
 			...(this.#store === undefined
 				? {}

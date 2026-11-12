@@ -1435,6 +1435,15 @@ export class Store {
 		this.db.query("UPDATE teams_conversations SET owner_at = ? WHERE alias = ?").run(this.clock.now(), alias);
 	}
 
+	/** Whether `alias` is a Teams 1:1 the owner has written in (`kind = 'dm'`, `owner_at` set): the owner's own 1:1. */
+	isTeamsOwnerDm(alias: string): boolean {
+		return (
+			this.db
+				.query("SELECT 1 FROM teams_conversations WHERE alias = ? AND kind = 'dm' AND owner_at IS NOT NULL")
+				.get(alias) !== null
+		);
+	}
+
 	/** One guest/qa question of a Teams conversation (`teams_qa`, context copy only); returns its row id. */
 	recordTeamsQuestion(input: {
 		alias: string;

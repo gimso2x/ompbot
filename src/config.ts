@@ -77,7 +77,21 @@ export interface TeamsChannelConfig {
 	ownerMode?: "full" | "qa";
 	/** `--model` of the guest/qa runs; absent: omp's default. */
 	guestModel?: string;
+	/**
+	 * Present → the owner's Teams 1:1 (`ownerMode: full`) gets the Graph chat reading tools (delegated `Chat.Read`,
+	 * `ompbot teams login`). Absent: no tools, Teams behaves as before.
+	 */
+	graph?: TeamsGraphConfig;
 }
+
+/** `channels.teams.graph`. */
+export interface TeamsGraphConfig {
+	/** Absolute, resolved against the config directory; default `secrets/teams-graph-token`. Written by `teams login`. */
+	tokenFile: string;
+}
+
+/** `channels.teams.graph.tokenFile` when the key is left out (config directory relative). */
+export const TEAMS_GRAPH_DEFAULT_TOKEN_FILE = "secrets/teams-graph-token";
 
 /**
  * Per-platform chat settings: who the owner is on each platform the bot talks on. Each platform is optional, but at
@@ -476,6 +490,7 @@ const TEAMS_KEYS: Record<string, true> = {
 	guestAadObjectIds: true,
 	ownerMode: true,
 	guestModel: true,
+	graph: true,
 };
 export const TEAMS_DEFAULT_LISTEN = "127.0.0.1:3978";
 
@@ -521,6 +536,18 @@ function parseTeamsChannel(configPath: string, value: unknown, home: string): Te
 		invalid(configPath, "channels.teams.ownerMode");
 	}
 	const guestModel = optionalString(configPath, record, "guestModel", "channels.teams.guestModel");
+	let graph: TeamsGraphConfig | undefined;
+	if (record.graph !== undefined) {
+		const graphRecord = asRecord(record.graph);
+		if (graphRecord === undefined) invalid(configPath, "channels.teams.graph");
+		for (const key of Object.keys(graphRecord)) {
+			if (key !== "tokenFile") invalid(configPath, `channels.teams.graph.${key}`);
+		}
+		const tokenFile =
+			optionalString(configPath, graphRecord, "tokenFile", "channels.teams.graph.tokenFile") ??
+			TEAMS_GRAPH_DEFAULT_TOKEN_FILE;
+		graph = { tokenFile: resolve(home, tokenFile) };
+	}
 	return {
 		appId: guid("appId"),
 		tenantId: guid("tenantId"),
@@ -534,6 +561,7 @@ function parseTeamsChannel(configPath: string, value: unknown, home: string): Te
 		...(guestAadObjectIds === undefined ? {} : { guestAadObjectIds }),
 		...(ownerMode === undefined ? {} : { ownerMode }),
 		...(guestModel === undefined ? {} : { guestModel }),
+		...(graph === undefined ? {} : { graph }),
 	};
 }
 

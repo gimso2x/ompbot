@@ -178,7 +178,21 @@ function maskWrappedShapes(text: string): string {
 	return replaced + text.slice(copiedTo);
 }
 
-export const redact: Redactor = (text) => maskKnownFragments(maskWrappedShapes(text).replace(SECRET_PATTERN, REDACTED));
+/**
+ * OAuth bearer credentials (the Teams Graph delegated tokens): a JWT (Entra access tokens, so also any
+ * `Authorization: Bearer eyJ…` header), and the value of an `access_token` / `refresh_token` / `id_token` field in JSON
+ * or a form body. Chat masking only: the upload check keeps `secretShapes`.
+ */
+const JWT_PATTERN = /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+const TOKEN_FIELD_PATTERN = /(["']?\b(?:access|refresh|id)_token["']?\s*[:=]\s*["']?)[^"'&\s,}]{16,}/gi;
+
+export const redact: Redactor = (text) =>
+	maskKnownFragments(
+		maskWrappedShapes(text)
+			.replace(SECRET_PATTERN, REDACTED)
+			.replace(JWT_PATTERN, REDACTED)
+			.replace(TOKEN_FIELD_PATTERN, `$1${REDACTED}`),
+	);
 
 const encoder = new TextEncoder();
 

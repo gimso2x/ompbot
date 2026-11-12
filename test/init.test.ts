@@ -78,6 +78,38 @@ describe("ompbot init", () => {
 		expect(config.sessionRetentionDays).toBe(30);
 	});
 
+	test("--platform discord writes a Discord-only config that loads once the bot token file exists", () => {
+		const home = freshHome();
+		const owner = "100000000000000001"; // gitleaks:allow (fake snowflake)
+		const app = "100000000000000002"; // gitleaks:allow (fake snowflake)
+		const run = init(["--platform", "discord", "--owner", owner, "--app-id", app, "--omp", process.execPath], home);
+		expect(run.err).toBe("");
+		expect(run.code).toBe(0);
+		expect(run.out).toContain(join(home, "secrets", "discord-bot-token"));
+		const raw = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+		expect(raw.channels).toEqual({
+			discord: { ownerUserId: owner, botTokenFile: "secrets/discord-bot-token", applicationId: app },
+		});
+		expect(raw.slack).toBeUndefined();
+		writeFileSync(join(home, "secrets", "discord-bot-token"), "fake-discord-token\n", { mode: 0o600 });
+		const config = loadConfig(home);
+		expect(config.channels.slack).toBeUndefined();
+		expect(config.channels.discord?.ownerUserId).toBe(owner);
+	});
+
+	test("--platform discord without a Discord id for --owner or --app-id exits 2 and creates nothing", () => {
+		for (const args of [
+			["--owner", OWNER, "--app-id", "100000000000000002"], // gitleaks:allow (fake snowflake)
+			["--owner", "100000000000000001"], // gitleaks:allow (fake snowflake)
+		]) {
+			const home = freshHome();
+			const run = init(["--platform", "discord", ...args, "--omp", process.execPath], home);
+			expect(run.code).toBe(2);
+			expect(run.err).toContain("must be a Discord id");
+			expect(existsSync(home)).toBe(false);
+		}
+	});
+
 	test("AC-1: --workspace is used as an absolute workspaceDir; --omp falls back to omp on PATH", () => {
 		const home = freshHome();
 		const bin = tempDir("ompbot-init-bin-");

@@ -49,7 +49,7 @@
   단독 실행 파일(컴파일된 바이너리) 형태의 omp는 ompbot이 RPC 자식으로 쓸 수 없어 `omp_launcher_standalone`으로 거부합니다. `readlink` 결과가 `dist/cli.js`가 아니면 위 명령으로 다시 설치하세요.
 - (선택) 대화 에이전트를 Claude Code CLI로 쓰려면(`"agent": "claude"`) [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)가 설치돼 있고 로그인돼 있어야 합니다(`claude --version`, `claude` 한 번 실행해 `/login` 완료 — 자격은 `~/.claude/` 아래에만 둡니다). omp는 여전히 설치돼 있어야 합니다(dispatch 등 일부 도구가 씁니다). 자세한 차이는 [claude 에이전트](#claude-에이전트) 참고
 - (선택) 대화 에이전트를 Antigravity CLI로 쓰려면(`"agent": "agy"`) `agy --version`이 응답하고 `agy`를 한 번 실행해 Google 로그인을 마쳐야 합니다. omp는 여전히 설치돼 있어야 합니다. 자세한 차이는 [agy 에이전트](#agy-에이전트) 참고
-- Slack 워크스페이스 관리자 권한(앱 생성용)
+- 채팅 앱 하나 이상: Slack 워크스페이스에 앱을 만들 권한, 또는 Discord 봇을 만들고 서버에 초대할 권한. 둘 중 하나만 있어도 되고 둘 다 써도 됩니다
 - (선택) 장기 위임에는 herdr와 config `"herdr": {}`가, 원격 위임에는 대상 호스트로의 ssh(`BatchMode`)가 필요합니다. [herdr(선택)](#herdr선택) 참고.
 
 ## 코어와 설치본
@@ -69,6 +69,8 @@ bun test          # 전부 통과해야 합니다(실제 omp E2E는 기본으로
 
 ### 2. Slack 앱 만들기
 
+Slack과 Discord 중 쓸 것을 고릅니다. 하나만 써도 되고 둘 다 써도 됩니다. Discord만 쓰면 이 절을 건너뛰고 [Discord 봇 만들기](discord.md)로 봇·토큰·초대를 준비합니다.
+
 1. https://api.slack.com/apps → **Create New App** → **From a manifest** → 워크스페이스를 고릅니다.
 2. **JSON** 탭에 [`packaging/slack-manifest.json`](../packaging/slack-manifest.json) 내용을 그대로 붙여넣고 **Create**를 누릅니다. 검토 화면에서 권한 15개, 이벤트 6개(메시지 4개 + 반응 `reaction_added`·`reaction_removed`), 슬래시 명령 11개가 보여야 합니다. 반응 구독(`reactions:read`와 두 반응 이벤트)이 들어가기 전에 만든 앱은 앱 설정에서 이 셋을 더하고 다시 설치해야 [답 피드백](#답-피드백)이 들어옵니다(토큰이 바뀌면 `secrets/`의 봇 토큰도 바꿉니다). 이미 만든 앱에서 권한을 뺀 매니페스트는 앱을 워크스페이스에 다시 설치(reinstall)해야 실제 앱에 반영됩니다.
 3. **Install App** → **Install to <워크스페이스>** → 허용을 누르면 `xoxb-` 봇 토큰이 나옵니다.
@@ -76,18 +78,20 @@ bun test          # 전부 통과해야 합니다(실제 omp E2E는 기본으로
 
 같은 워크스페이스에 봇이 여러 개면, 슬래시 명령 이름이 겹치지 않도록 매니페스트의 `/…-ompbot` 명령 이름을 바꾸세요. 같은 이름이면 마지막에 설치한 앱의 명령만 동작합니다.
 
-Discord에서도 쓰려면(선택) [Discord 봇 만들기](discord.md)를 따라 봇·토큰·초대를 준비합니다.
+Slack과 함께 Discord도 쓰려면 [Discord 봇 만들기](discord.md)를 따라 봇·토큰·초대를 준비합니다.
 
 ### 3. 홈과 설정 만들기 (`init`)
 
 ```sh
-bun src/main.ts init --owner <Slack 멤버 ID> [--omp <omp 절대경로>] [--workspace <디렉터리>]
+bun src/main.ts init --owner <Slack 멤버 ID> [--omp <omp 절대경로>] [--workspace <디렉터리>]                                        # Slack
+bun src/main.ts init --platform discord --owner <Discord 사용자 ID> --app-id <Application ID> [--omp …] [--workspace …]   # Discord만
 ```
 
-- `--owner`: 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**(`U…`). 형식이 틀리면 아무것도 만들지 않고 종료 코드 2입니다.
+- `--owner`: 명령을 받아들일 유일한 사용자. Slack이면 Slack 프로필 → ⋮ → **멤버 ID 복사**(`U…`), Discord면 개발자 모드에서 내 프로필 → **사용자 ID 복사**(숫자 17~20자리)입니다. `--app-id`는 Discord Developer Portal의 Application ID입니다. 형식이 틀리면 아무것도 만들지 않고 종료 코드 2입니다.
+- Slack과 Discord를 같이 쓰려면 Slack으로 `init`한 뒤 `config.json`에 `channels.discord`를 더합니다([Discord(선택)](#discord선택)).
 - `--omp`를 비우면 PATH의 `omp`를 씁니다(못 찾으면 종료 코드 2). `--workspace`를 비우면 `<홈>/workspace`입니다.
 - 홈(`OMPBOT_HOME`, 기본 `~/.ompbot`, 0700), `secrets/`(0700), workspace 디렉터리, 아래 5절의 최소 키만 든 `config.json`(0600)을 만듭니다. `config.json`이 이미 있으면 아무것도 바꾸지 않고 종료 코드 2로 끝납니다(덮어쓰기 옵션은 없습니다).
-- 토큰은 묻지도 쓰지도 않습니다. 끝에 토큰 파일 두 개의 경로와 다음 단계를 출력합니다.
+- 토큰은 묻지도 쓰지도 않습니다. 끝에 토큰 파일 경로(Slack은 두 개, Discord는 `discord-bot-token` 하나)와 다음 단계를 출력합니다.
 
 다른 홈을 쓰려면 모든 명령 앞에 `OMPBOT_HOME=<경로>`를 붙입니다. `OMPBOT_HOME=`(빈 값)은 설정하지 않은 것과 같아 `~/.ompbot`을 씁니다. 홈·`secrets/`·workspace 자리(또는 그 상위)에 파일이 있으면 아무것도 만들지 않고 종료 코드 2입니다.
 
@@ -99,8 +103,11 @@ bun src/main.ts init --owner <Slack 멤버 ID> [--omp <omp 절대경로>] [--wor
 umask 077
 cat > ~/.ompbot/secrets/slack-bot-token   # xoxb-… 붙여넣고 Ctrl-D
 cat > ~/.ompbot/secrets/slack-app-token   # xapp-… 붙여넣고 Ctrl-D
+cat > ~/.ompbot/secrets/discord-bot-token # (Discord를 쓸 때) 봇 토큰 붙여넣고 Ctrl-D
 chmod 600 ~/.ompbot/secrets/*
 ```
+
+Slack을 쓰지 않으면 `slack-*` 두 줄을, Discord를 쓰지 않으면 `discord-bot-token` 줄을 건너뜁니다.
 
 ### 5. 설정 파일 `~/.ompbot/config.json`
 
@@ -125,141 +132,12 @@ chmod 600 ~/.ompbot/secrets/*
 | 키 | 필수 | 설명 |
 | --- | --- | --- |
 | `schemaVersion` | 예 | 항상 `1` |
-| `channels.slack.ownerUserId` | 예 | 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
+| `channels.slack.ownerUserId` | Slack을 쓸 때 | Slack 켜기. 없으면 Slack을 쓰지 않고 `channels.discord`(또는 `channels.teams`)만으로 돕니다(채널이 하나도 없으면 `config_invalid field=channels`). 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
 | `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
-| `slack.botTokenFile`, `slack.appTokenFile` | 예 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
+| `channels.teams.graph` | 아니요 | Teams 오너 1:1에서 오너의 Teams 채팅을 읽는 도구 켜기 `{"tokenFile"?}`(기본 `secrets/teams-graph-token`). 없으면 지금과 같습니다. 켠 뒤 `ompbot teams login`으로 오너가 한 번 로그인합니다. [Teams 채팅 읽기](#teams-채팅-읽기선택-graph) 참고 |
+| `slack.botTokenFile`, `slack.appTokenFile` | Slack을 쓸 때 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
 | `ompExecutable` | 예 | 절대경로(`command -v omp`). 봇 전용 고정 버전을 쓰면 `~/.ompbot/omp/current/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`([봇 전용 omp](#봇-전용-omp-버전-고정과-프로필) 참고) |
-| `ompProfile` | 아니요 | 봇 omp 자식(대화·레인·모니터 턴, 레인 리뷰, `ompbot_dispatch` 단순 위임, `doctor`의 모델 점검)에 줄 `OMP_PROFILE` 이름. 에이전트 폴더가 `~/.omp/profiles/<이름>/agent`로 바뀌고, 물려받은 `PI_CODING_AGENT_DIR`는 뺍니다. omp 규칙 `^[a-z0-9][a-z0-9._-]{0,63}# ompbot 사용 설명서
-
-[← README](../README.md)
-
-설치부터 운영까지 ompbot의 모든 동작을 정리한 레퍼런스입니다.
-
-- **시작하기:** [요구 사항](#요구-사항) · [코어와 설치본](#코어와-설치본) · [설치](#설치) · [설정 파일](#5-설정-파일-ompbotconfigjson) · [서비스 등록](#7-서비스-등록) · [AI 에이전트에게 설치 맡기기](#ai-에이전트에게-설치-맡기기)
-- **쓰기:** [대화](#대화) · [명령](#명령) · [턴 되돌리기](#턴-되돌리기undo) · [승인](#승인) · [질문 카드](#질문-카드) · [답 피드백](#답-피드백) · [페르소나와 답변 형식](#페르소나와-답변-형식) · [claude 에이전트](#claude-에이전트) · [agy 에이전트](#agy-에이전트) · [Discord](#discord선택)
-- **맡기기:** [작업 위임](#작업-위임) · [`[TASK]` 상태 문서](#task-상태-문서) · [`[TASK]` 자동 머지](#task-자동-머지) · [작업 레인](#작업-레인) · [모니터](#모니터)
-- **운영:** [CLI](#운영) · [현황판](#현황판) · [동결(킬스위치)](#동결킬스위치) · [재시작과 drain](#재시작과-drain) · [설정 반영](#재시작-없이-설정-반영) · [놓친 메시지 백필](#놓친-메시지-백필) · [건강 게이트](#건강-게이트와-자가-보고) · [캐시 감시·파일 겹침](#프롬프트-캐시-감시와-task-파일-겹침-알림) · [백업](#백업) · [스킬 리뷰](#스킬-리뷰)
-- **그 밖:** [보안 메모](#보안-메모) · [개발](#개발)
-
-## 기능 지도
-
-| 영역 | 기능 | 자세히 |
-| --- | --- | --- |
-| 대화 | DM·채널·채널 스레드별 독립 대화, 일하는 중 끼워 넣기(steer)·`!followup`, 끝맺은 답의 턴 중간 전달, 첨부 받기·파일 올리기, Slack `markdown` 블록 답과 `card` 펜스(네이티브 카드·표·차트), 진행 상태 메시지, 같은 도구 반복 감지, 같은 대화 공간의 지난 대화 자동 회상, 전달·첨부 자료의 인젝션 경고 | [대화](#대화) |
-| Discord(선택) | 오너 한 명의 Discord DM·서버 채널 대화(멘션하면 스레드), `!` 명령·슬래시 명령·진행 표시·승인·질문·TASK 카드 버튼·카드(embed)·파일·👍/👎·놓친 메시지 백필·`doctor` 점검, DM 모니터, 서버 채널 스레드의 작업 레인 | [Discord](#discord선택) |
-| 대화 에이전트 | omp(기본) 대신 Claude Code CLI(`"agent": "claude"`)나 Antigravity CLI(`"agent": "agy"`)로 대화를 구동 | [claude 에이전트](#claude-에이전트) · [agy 에이전트](#agy-에이전트) |
-| 채팅 명령 | 모델·thinking 전환, 컨텍스트 압축, 옛 세션 이어가기, 대기열 보기·취소, 새 대화, 스레드 뮤트, 토큰·비용 사용량, 오늘 비용과 상한(`!budget`), 턴 되돌리기(`!undo`) | [명령](#명령) · [턴 되돌리기](#턴-되돌리기undo) |
-| 비용 상한 | 턴 상한(마무리 지시 → 1.5배에서 중단)·하루 상한(모니터 정지·하루 1회 알림·`cost_cap` 게이트) | [설정](#5-설정-파일-ompbotconfigjson) `costCap` |
-| 승인 | 되돌릴 수 없거나 밖으로 나가는 작업 전 승인 버튼(구조화된 카드, 외부 공개 `🌐` 카드, 영속 장부, escalation 채널과 요청 스레드 사본, 다시 요청 버튼, 카드 스레드 답장) | [승인](#승인) |
-| 답 피드백 | 봇 답에 단 오너 👍/👎를 그 답을 낳은 턴에 기록, 현황판 배지·`feedback` CLI | [답 피드백](#답-피드백) |
-| 질문 카드 | omp의 질문 창(select·confirm·input·editor·`ask`)을 대화 스레드의 버튼·답장 카드로, 마감 시 omp와 같은 기본값 | [질문 카드](#질문-카드) |
-| 페르소나·답변 형식 | `workspace/`의 `soul.md`·`owner.md`·`persona.md`를 세션 시스템 프롬프트에 추가, 답변 형식 규율 | [페르소나와 답변 형식](#페르소나와-답변-형식) |
-| 완료 사본 | `✅ 완료`로 시작하는 답을 #log 채널에 사본으로 남김 | [설정](#5-설정-파일-ompbotconfigjson) `logChannel` |
-| 작업 위임 | `ompbot_dispatch` — 단발(`omp -p`)·장기(herdr)·원격 호스트, `[TASK]` 상태 문서와 5분 스윕, 머지·추천대로 버튼, 개인 저장소 자동 머지(`taskAutoLand`), 같은 저장소 TASK 파일 겹침 알림 | [작업 위임](#작업-위임) |
-| 작업 레인 | `작업: <제목> @<경로>`로 레인 스레드, 레인마다 전용 worktree·브랜치, 커밋과 `[check: …]` 재실행으로 검증되는 완료, Outcome 카드의 `머지`·`폐기` 버튼, 코어가 하는 ff 머지·push·정리, 개인 저장소 자동 머지(`taskAutoLand`) | [작업 레인](#작업-레인) |
-| 모니터 | cron·한 번·스크립트 조건·파일 변경(watcher)·webhook 트리거, 채널 게시·사본, 모델 고정, 절차 파일, 턴 없이 그대로 전달(verbatim), 실패 재시도·인시던트, 설치본 저장소로 내보내기·적용 | [모니터](#모니터) |
-| 현황판 | 루프백 전용 읽기 전용 웹 현황판: 인박스·턴 보드(대화·생성 중 글·트레이스)·TASK 흐름 고리·모니터·승인 대기·알림·시스템 | [현황판](#현황판) |
-| 신뢰성 | 재시작 뒤 대화 유지·답 복구, 놓친 메시지 백필, 멈춘 대기 메시지 재시도, 건강 게이트와 자가 보고, drain 재시작과 재시작 알림, 재시작 없는 설정 반영, 프롬프트 캐시 미스·식은 캐시 알림 | [운영](#운영) |
-| 백업 | 매일 DB 사본 + 세션·설정 번들, 성공 도장, 보존 | [백업](#백업) |
-| 학습 | N턴마다 또는 `!distill`로 스킬 제안(근거·검증 짝 채택 게이트) → 승인 설치 → 개정 롤백 | [스킬 리뷰](#스킬-리뷰) |
-| 보안 | 오너 게이트, 두 겹 비밀 마스킹, 자식 환경 정리, 업로드 차단 목록 | [보안 메모](#보안-메모) |
-
-## 요구 사항
-
-- Linux, systemd user 세션(재부팅 후 자동 시작을 원하면 `loginctl enable-linger $USER`). WSL2에서도 됩니다. `/etc/wsl.conf`의 `[boot]`에 `systemd=true`를 넣고 Windows에서 `wsl --shutdown`으로 다시 시작한 뒤 `systemctl --user status`가 응답하는지 확인하세요. WSL은 마지막 창을 닫으면 멈출 수 있으니 상시 운영은 Linux 서버가 낫습니다.
-- [Bun](https://bun.sh): 설치한 omp의 `engines.bun` 이상(omp 18.16 기준 1.4.4). 낮으면 `bun upgrade`. `doctor`의 `omp runtime` 줄이 이 조건을 확인합니다.
-- omp(oh-my-pi)를 **bun 패키지로** 설치하고 로그인해 둡니다. ompbot은 omp의 기존 `~/.omp/agent` 설정을 그대로 씁니다.
-
-  ```sh
-  bun install -g @oh-my-pi/pi-coding-agent
-  readlink -f "$(command -v omp)"   # …/@oh-my-pi/pi-coding-agent/dist/cli.js 여야 합니다
-  omp login                         # 모델 공급자 하나 이상 로그인(브라우저 OAuth 또는 API 키)
-  omp --version
-  ```
-
-  단독 실행 파일(컴파일된 바이너리) 형태의 omp는 ompbot이 RPC 자식으로 쓸 수 없어 `omp_launcher_standalone`으로 거부합니다. `readlink` 결과가 `dist/cli.js`가 아니면 위 명령으로 다시 설치하세요.
-- (선택) 대화 에이전트를 Claude Code CLI로 쓰려면(`"agent": "claude"`) [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)가 설치돼 있고 로그인돼 있어야 합니다(`claude --version`, `claude` 한 번 실행해 `/login` 완료 — 자격은 `~/.claude/` 아래에만 둡니다). omp는 여전히 설치돼 있어야 합니다(dispatch 등 일부 도구가 씁니다). 자세한 차이는 [claude 에이전트](#claude-에이전트) 참고
-- (선택) 대화 에이전트를 Antigravity CLI로 쓰려면(`"agent": "agy"`) `agy --version`이 응답하고 `agy`를 한 번 실행해 Google 로그인을 마쳐야 합니다. omp는 여전히 설치돼 있어야 합니다. 자세한 차이는 [agy 에이전트](#agy-에이전트) 참고
-- Slack 워크스페이스 관리자 권한(앱 생성용)
-- (선택) 장기 위임에는 herdr와 config `"herdr": {}`가, 원격 위임에는 대상 호스트로의 ssh(`BatchMode`)가 필요합니다. [herdr(선택)](#herdr선택) 참고.
-
-## 코어와 설치본
-
-이 저장소(코어)는 코드만 담습니다. 설치한 사람마다 다른 것은 모두 `OMPBOT_HOME`(기본 `~/.ompbot`) 아래의 설치본입니다 — `config.json`, `secrets/`(Slack 토큰), `workspace/persona.md`, 세션, `ompbot.db`(모니터 포함), 백업, 로그. 설치본은 git에 넣지 않습니다. systemd 유닛(`packaging/*.service`·`*.timer`)은 템플릿이고 `ompbot units render`가 자기 bun·체크아웃·홈 경로로 채웁니다. `examples/`는 그대로 쓰지 않고 자기 경로로 바꿔 쓰는 예시입니다.
-
-## 설치
-
-### 1. 소스 받기
-
-```sh
-git clone <이 저장소의 clone URL> ~/work/ompbot
-cd ~/work/ompbot
-bun install
-bun test          # 전부 통과해야 합니다(실제 omp E2E는 기본으로 건너뜀)
-```
-
-### 2. Slack 앱 만들기
-
-1. https://api.slack.com/apps → **Create New App** → **From a manifest** → 워크스페이스를 고릅니다.
-2. **JSON** 탭에 [`packaging/slack-manifest.json`](../packaging/slack-manifest.json) 내용을 그대로 붙여넣고 **Create**를 누릅니다. 검토 화면에서 권한 15개, 이벤트 6개(메시지 4개 + 반응 `reaction_added`·`reaction_removed`), 슬래시 명령 11개가 보여야 합니다. 반응 구독(`reactions:read`와 두 반응 이벤트)이 들어가기 전에 만든 앱은 앱 설정에서 이 셋을 더하고 다시 설치해야 [답 피드백](#답-피드백)이 들어옵니다(토큰이 바뀌면 `secrets/`의 봇 토큰도 바꿉니다). 이미 만든 앱에서 권한을 뺀 매니페스트는 앱을 워크스페이스에 다시 설치(reinstall)해야 실제 앱에 반영됩니다.
-3. **Install App** → **Install to <워크스페이스>** → 허용을 누르면 `xoxb-` 봇 토큰이 나옵니다.
-4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**에서 범위 `connections:write`를 넣어 `xapp-` 토큰을 만듭니다.
-
-같은 워크스페이스에 봇이 여러 개면, 슬래시 명령 이름이 겹치지 않도록 매니페스트의 `/…-ompbot` 명령 이름을 바꾸세요. 같은 이름이면 마지막에 설치한 앱의 명령만 동작합니다.
-
-Discord에서도 쓰려면(선택) [Discord 봇 만들기](discord.md)를 따라 봇·토큰·초대를 준비합니다.
-
-### 3. 홈과 설정 만들기 (`init`)
-
-```sh
-bun src/main.ts init --owner <Slack 멤버 ID> [--omp <omp 절대경로>] [--workspace <디렉터리>]
-```
-
-- `--owner`: 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**(`U…`). 형식이 틀리면 아무것도 만들지 않고 종료 코드 2입니다.
-- `--omp`를 비우면 PATH의 `omp`를 씁니다(못 찾으면 종료 코드 2). `--workspace`를 비우면 `<홈>/workspace`입니다.
-- 홈(`OMPBOT_HOME`, 기본 `~/.ompbot`, 0700), `secrets/`(0700), workspace 디렉터리, 아래 5절의 최소 키만 든 `config.json`(0600)을 만듭니다. `config.json`이 이미 있으면 아무것도 바꾸지 않고 종료 코드 2로 끝납니다(덮어쓰기 옵션은 없습니다).
-- 토큰은 묻지도 쓰지도 않습니다. 끝에 토큰 파일 두 개의 경로와 다음 단계를 출력합니다.
-
-다른 홈을 쓰려면 모든 명령 앞에 `OMPBOT_HOME=<경로>`를 붙입니다. `OMPBOT_HOME=`(빈 값)은 설정하지 않은 것과 같아 `~/.ompbot`을 씁니다. 홈·`secrets/`·workspace 자리(또는 그 상위)에 파일이 있으면 아무것도 만들지 않고 종료 코드 2입니다.
-
-### 4. 토큰 파일
-
-토큰은 파일로만 둡니다. 채팅이나 셸 기록에 남기지 마세요.
-
-```sh
-umask 077
-cat > ~/.ompbot/secrets/slack-bot-token   # xoxb-… 붙여넣고 Ctrl-D
-cat > ~/.ompbot/secrets/slack-app-token   # xapp-… 붙여넣고 Ctrl-D
-chmod 600 ~/.ompbot/secrets/*
-```
-
-### 5. 설정 파일 `~/.ompbot/config.json`
-
-`init`이 만든 파일은 다음과 같습니다. 선택 키는 아래 표를 보고 직접 더합니다.
-
-```json
-{
-  "schemaVersion": 1,
-  "channels": {
-    "slack": { "ownerUserId": "U0123456789" }
-  },
-  "slack": {
-    "botTokenFile": "secrets/slack-bot-token",
-    "appTokenFile": "secrets/slack-app-token"
-  },
-  "ompExecutable": "/home/<user>/.bun/bin/omp",
-  "workspaceDir": "/home/<user>/.ompbot/workspace",
-  "sessionRetentionDays": 30
-}
-```
-
-| 키 | 필수 | 설명 |
-| --- | --- | --- |
-| `schemaVersion` | 예 | 항상 `1` |
-| `channels.slack.ownerUserId` | 예 | 명령을 받아들일 유일한 사용자. Slack 프로필 → ⋮ → **멤버 ID 복사**. 옛 키 `ownerSlackUserId`도 읽지만(기동 때 `config_deprecated_key` 경고 한 번) 두 값이 다르면 기동하지 않습니다 |
-| `channels.discord` | 아니요 | Discord 켜기 `{"ownerUserId", "botTokenFile", "applicationId", "guildIds"?, "mentionFreeChannels"?, "requireMention"?, "laneChannelId"?}`. 없으면 Discord 꺼짐. 키 설명은 [Discord](#discord선택), 봇 만들기는 [Discord 봇 만들기](discord.md) |
-| `slack.botTokenFile`, `slack.appTokenFile` | 예 | 토큰 파일 경로(홈 기준 상대경로 가능). 각각 `xoxb-`, `xapp-`로 시작해야 합니다 |
-을 어기면 `config_invalid field=ompProfile`. 비우면 지금처럼 사람 omp와 같은 `~/.omp/agent`를 씁니다. 재시작해야 반영됩니다 |
+| `ompProfile` | 아니요 | 봇 omp 자식(대화·레인·모니터 턴, 레인 리뷰, `ompbot_dispatch` 단순 위임, `doctor`의 모델 점검)에 줄 `OMP_PROFILE` 이름. 에이전트 폴더가 `~/.omp/profiles/<이름>/agent`로 바뀌고, 물려받은 `PI_CODING_AGENT_DIR`는 뺍니다. omp 규칙 `^[a-z0-9][a-z0-9._-]{0,63}$`을 어기면 `config_invalid field=ompProfile`. 비우면 지금처럼 사람 omp와 같은 `~/.omp/agent`를 씁니다. 재시작해야 반영됩니다 |
 | `workspaceDir` | 예 | 일반 대화에서 omp가 작업하는 디렉터리 |
 | `timezone` | 아니요 | 봇 시간대(IANA 이름, 예 `"Asia/Seoul"`·`"America/New_York"`). 하루 비용 상한의 날짜 경계, TASKID·레인 ID 날짜, 브리핑·현황판·TASK 문서 시각, `timezone` 없이 등록한 cron과 오프셋 없는 `at`의 시간대가 모두 이 값을 따릅니다. 없으면 서버(호스트) 시간대, 틀린 이름이면 설정 오류로 시작하지 않습니다. 재시작해야 반영됩니다. cron 모니터는 등록할 때의 시간대를 저장하므로 나중에 이 값을 바꿔도 이미 등록한 cron은 그대로입니다 |
 | `agent` | 아니요 | 대화를 구동할 자식 에이전트: `"omp"`(기본), `"claude"`, `"agy"`. [claude 에이전트](#claude-에이전트), [agy 에이전트](#agy-에이전트) 참고 |
@@ -337,7 +215,7 @@ systemctl --user enable --now ompbot-<이름> ompbot-<이름>-backup.timer ompbo
 
 ### AI 에이전트에게 설치 맡기기
 
-사람이 해야 하는 일은 Slack 앱 만들기, 토큰 붙여넣기, `omp login`의 브라우저 인증뿐입니다. 나머지는 저장소를 읽고 셸을 실행할 수 있는 코딩 에이전트(Claude Code, Codex, omp 등)에게 맡길 수 있습니다. `init`·`doctor`·`units render`·`gates`는 결과를 종료 코드로 알려 주므로 에이전트가 성공 여부를 스스로 확인할 수 있습니다. 아래를 그대로 붙여넣으세요.
+사람이 해야 하는 일은 Slack 앱이나 Discord 봇 만들기, 토큰 붙여넣기, `omp login`의 브라우저 인증뿐입니다. 나머지는 저장소를 읽고 셸을 실행할 수 있는 코딩 에이전트(Claude Code, Codex, omp 등)에게 맡길 수 있습니다. `init`·`doctor`·`units render`·`gates`는 결과를 종료 코드로 알려 주므로 에이전트가 성공 여부를 스스로 확인할 수 있습니다. 아래를 그대로 붙여넣으세요.
 
 ```text
 Install this repository (ompbot) into the systemd user session on this Linux machine. Follow the "요구 사항" (Requirements) and "설치" (Installation) sections of docs/guide.md.
@@ -347,8 +225,8 @@ Install this repository (ompbot) into the systemd user session on this Linux mac
 3. If omp is missing, install it with `bun install -g @oh-my-pi/pi-coding-agent`. Do not use the standalone executable (install script or binary release); ompbot rejects it as omp_launcher_standalone. Confirm that `readlink -f "$(command -v omp)"` resolves to .../@oh-my-pi/pi-coding-agent/dist/cli.js.
 4. `omp login` is interactive, so I will run it myself. Just tell me the command; when I say I am done, verify with `omp --version`, then run `omp models --json` and confirm its `models` array is not empty. It exits 0 even when the array is empty, so judge by the content, not the exit code; an empty list means every bot turn will fail.
 5. Run `bun install && bun test && bun run check` and confirm 0 failures.
-6. Ask me for my Slack member ID (starts with U), then run `bun src/main.ts init --owner <ID>`.
-7. I will create the Slack app myself. Walk me through docs/guide.md "2. Slack 앱 만들기" (Create the Slack app) step by step. Never take tokens over chat. I will write them myself in a terminal with `umask 077; cat > ~/.ompbot/secrets/slack-bot-token` (bot token) and `cat > ~/.ompbot/secrets/slack-app-token` (app token). Only check that both files are mode 0600; never read or print their contents.
+6. Ask me whether I use Slack or Discord (one is enough). For Slack, ask for my Slack member ID (starts with U) and run `bun src/main.ts init --owner <ID>`. For Discord, ask for my Discord user ID and the bot's Application ID (17-20 digits each) and run `bun src/main.ts init --platform discord --owner <user ID> --app-id <Application ID>`.
+7. I will create the Slack app or Discord bot myself. Walk me through docs/guide.md "2. Slack 앱 만들기" (Create the Slack app) or docs/discord.md (Create the Discord bot) step by step. Never take tokens over chat. I will write them myself in a terminal with `umask 077; cat > ~/.ompbot/secrets/slack-bot-token` (bot token) and `cat > ~/.ompbot/secrets/slack-app-token` (app token) for Slack, or `umask 077; cat > ~/.ompbot/secrets/discord-bot-token` for Discord. Only check that the token files are mode 0600; never read or print their contents.
 8. Run `bun src/main.ts doctor` and confirm it exits 0. The `warn backup bundle: stamp=missing` line is expected here (the daemon makes the first backup when it first starts) and does not count. If any line fails, report that line and its cause, then stop.
 9. Run `bun src/main.ts units render`, then `systemctl --user daemon-reload`, then `systemctl --user enable --now ompbot ompbot-backup.timer ompbot-gc.timer`. Confirm daemon_ready appears in `journalctl --user -u ompbot -n 50`. Check `loginctl show-user "$USER" -p Linger`; if it says `Linger=no`, tell me that the bot stops when I log out and that `loginctl enable-linger "$USER"` keeps it running after logout and reboot.
 10. Confirm `boot_backup_done` appears in `journalctl --user -u ompbot -n 50`, then run `bun src/main.ts doctor` again. This time every line must be ok.
@@ -545,7 +423,7 @@ omp 에이전트와의 차이:
 
 ### Discord(선택)
 
-Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 받습니다. 같은 데몬이 두 어댑터를 같이 돌리고, Slack은 계속 필수입니다. 봇 만들기·토큰·초대·문제 해결은 [Discord 봇 만들기](discord.md)에 있습니다.
+Discord에서 오너 한 명의 DM·서버 채널 대화를 받습니다. Slack 없이 Discord만 써도 되고(`init --platform discord`, [설치 3절](#3-홈과-설정-만들기-init)), Slack과 같이 쓰면 같은 데몬이 두 어댑터를 함께 돌립니다. 데몬 알림(턴 실패·게이트 등)은 Slack이 있으면 Slack 오너 DM, 없으면 오너의 가장 최근 1:1 대화로 가고 `!home`으로 바꿀 수 있습니다. 봇 만들기·토큰·초대·문제 해결은 [Discord 봇 만들기](discord.md)에 있습니다.
 
 - **켜기**: `config.json`의 `channels.discord`에 아래 키를 넣고 재시작합니다(`channels`는 `reload`로 반영되지 않음). 토큰 파일이 없으면 `secret_missing`, 0600이 아니면 `secret_permissions`로 기동하지 않습니다.
 
@@ -559,7 +437,7 @@ Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 �
   | `requireMention` | 서버 채널에서 멘션만 받음(선택, 기본 false) |
   | `laneChannelId` | Discord DM에서 요청한 작업 레인을 열 서버 텍스트 채널 ID(선택). 없으면 DM에서는 레인을 열지 않고 그 이유를 답합니다(서버 채널·스레드에서 요청한 레인은 그 채널에 열림) |
 
-- **인텐트**: Message Content Intent(`MESSAGE_CONTENT`)만 켭니다. 꺼져 있으면 Gateway가 4014로 끊고, 그때는 Discord만 멈추고 Slack은 계속 답합니다.
+- **인텐트**: Message Content Intent(`MESSAGE_CONTENT`)만 켭니다. 꺼져 있으면 Gateway가 4014로 끊고, 그때는 Discord만 멈추고 Slack을 같이 쓰면 Slack은 계속 답합니다.
 - **다시 붙기**: Gateway가 연결 뒤 30초 안에 HELLO를 보내지 않거나, READY에 세션·resume 주소가 빠졌거나, `/gateway/bot`·resume 주소가 URL이 아니면 로그에 남기고 백오프(1초부터 최대 60초) 뒤 다시 붙습니다. 이때 Discord 기동을 실패로 처리하지 않습니다.
 - **대화**: DM은 하나의 대화입니다. 서버 채널에서 봇을 멘션하면 봇이 그 메시지로 스레드를 만들어 답하고, 같은 스레드는 멘션 없이 이어집니다. `!status` 같은 `!` 명령, 👀·⏳ 진행 표시, 2000자 분할, `!shutup` 뮤트가 Slack과 같게 동작합니다. 양끝 `|` 없는 GFM 표(`a | b` / `--- | ---`)도 코드블록으로 감싸고, 스레드를 만들지 못한 메시지의 `⚠️ 스레드를 만들지 못해…` 공지는 백필이 다시 시도해도 메시지당 한 번만 올라갑니다. ⏳ 상태 글의 갱신·마무리와 슬래시 명령 응답 수정은 멘션 알림을 보내지 않습니다(`allowed_mentions: { parse: [] }`).
 - **점검**: `ompbot doctor`가 `ok discord …` 줄로 토큰 권한·`users/@me`·`gateway/bot`을 확인하고, 데몬 `daemon_ready` 로그에 discord 상태가 함께 찍힙니다.
@@ -573,6 +451,19 @@ Slack과 함께 Discord에서도 오너 한 명의 DM·서버 채널 대화를 �
 - **inject**: `ompbot inject --origin discord/dm/<ID>|discord/ch/<ID> --as-owner --text …`가 그 대화에 `🧪 inject` 마커를 올리고 오너 글로 접수합니다(DM의 `--thread <메시지 ID>`는 그 메시지에 대한 답장, DM 대화로 접수). Discord 세션도 긴 작업의 자동 후속(`[자동 후속]`)에 이것을 씁니다.
 - **Slack에만 있는 것**: 게이트·한도·재시작 같은 데몬 수준 알림, `logChannel` 사본, `escalationChannel`, 피어 봇, App Home은 Slack에만 있습니다.
 - **현황판**: Discord DM은 `DM`, 서버 채널은 `Discord <채널 ID>`로 보이고, 시스템 보기에 Discord 게이트웨이 연결 카드가 생깁니다(Discord를 끈 설치에는 없음).
+
+### Teams 채팅 읽기(선택, Graph)
+
+Teams 봇은 그룹 채팅에서 자기를 멘션한 글만 받습니다. `channels.teams.graph`를 켜면 오너의 Teams 1:1 대화(`ownerMode: "full"`)에서 봇이 Microsoft Graph 위임 권한 `Chat.Read`로 오너가 속한 채팅의 목록과 메시지를 읽을 수 있습니다.
+
+- **Azure 앱 등록에서 할 일**(봇과 같은 앱 등록): **인증** → "Allow public client flows"를 **예**로 켭니다. **API 권한** → Microsoft Graph **위임된 권한** `Chat.Read`·`User.Read`·`offline_access`를 추가합니다.
+- **켜기**: `config.json`의 `channels.teams`에 `"graph": {}`(토큰 파일을 바꾸려면 `{"tokenFile": "secrets/teams-graph-token"}`)를 넣고 재시작합니다.
+- **로그인**: `ompbot teams login`이 `teams_login code=<코드> url=https://microsoft.com/devicelogin`을 찍습니다. 브라우저에서 그 주소를 열고 코드를 넣은 뒤 **오너 계정**으로 로그인하면 refresh 토큰이 `tokenFile`(0600)에 저장됩니다. 로그인한 계정이 `ownerAadObjectId`와 다르면 저장하지 않고 `teams_graph_wrong_account`로 끝납니다. `ompbot teams logout`은 토큰 파일을 지웁니다. 토큰을 출력하는 조회 명령은 없습니다.
+- **도구**: `teams_list_chats(query?, limit?)`는 최근 채팅(id·종류·제목 또는 참여자 이름·마지막 시각)을, `teams_read_chat(chatId, since?, limit?)`는 메시지(보낸 사람·시각·본문, 기본 50개·최대 200개, HTML은 텍스트로)를 돌려줍니다. 본문은 비밀값을 가린 뒤 인용 펜스로 감싸 데이터로만 넘깁니다.
+- **어디에 있나**: 피어 봇 글이 들어오지 않은 오너 Teams 1:1 세션에만 있습니다. Teams 그룹 채팅·손님·`ownerMode: "qa"`·Slack·Discord 세션에는 없고, `qa`면 시작 때 `teams_graph_disabled reason=ownerMode_qa` 경고 한 줄을 남깁니다. graph를 켠 설치본의 Teams 그룹 채팅 세션은 기억(`memory`)을 끈 채 돌아, 1:1에서 읽은 남의 대화가 그룹 답에 회상되지 않습니다.
+- **관리자 동의가 필요할 때**: 테넌트가 사용자 동의를 막았으면 로그인이 `teams_login_failed … aadsts=65001`(관리자 동의 필요)로 끝납니다. 테넌트 관리자가 API 권한에서 "관리자 동의 허용"을 눌러야 합니다. `aadsts=7000218`이나 `invalid_client`면 public client flow가 꺼져 있는 것입니다.
+- **만료**: refresh 토큰이 만료·취소되면 도구가 "`ompbot teams login`을 다시 해야 합니다"를 돌려주고 오너 알림이 하루 한 번 갑니다.
+- **주의**: 읽은 회사 메시지는 봇이 쓰는 모델 제공자에게 넘어갑니다.
 
 ## 작업 위임
 

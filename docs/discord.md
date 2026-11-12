@@ -78,7 +78,14 @@ https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.c
 
 ## 5. ompbot 설정 (`channels.discord`)
 
-`~/.ompbot/config.json`에 넣습니다. Slack 설정은 그대로 둡니다(Slack은 계속 필수입니다).
+Discord만 쓸 때는 홈을 만들 때 한 번에 넣습니다(Slack 설정 없이 Discord만으로 돕니다).
+
+```sh
+bun src/main.ts init --platform discord --owner <4절의 사용자 ID> --app-id <1절의 Application ID>
+umask 077; cat > ~/.ompbot/secrets/discord-bot-token   # 2절의 봇 토큰 붙여넣고 Ctrl-D
+```
+
+Slack과 같이 쓰거나 서버·채널 키를 더할 때는 `~/.ompbot/config.json`의 `channels`에 직접 넣습니다. Slack을 쓰면 Slack 설정은 그대로 둡니다(`"slack"` 줄은 Discord만 쓰면 빼도 됩니다).
 
 ```json
 {

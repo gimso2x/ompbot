@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { defaultHomeDir, HOME_MODE, SECRET_MODE } from "../config";
 
 export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>] | --help
+  init --platform discord --owner <Discord user id> --app-id <application id> [--omp …] [--workspace …]
   init --platform teams --owner <Entra object id> --app-id <bot id> --tenant <tenant id> [--omp …] [--workspace …]
                                  create the home (0700), secrets/ (0700), the workspace and a minimal config.json (0600);
                                  --omp defaults to omp on PATH, --workspace to <home>/workspace; never writes tokens and
@@ -11,6 +12,7 @@ export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [
 `;
 
 const OWNER_ID = /^U[A-Z0-9]{8,}$/;
+const SNOWFLAKE = /^[0-9]{17,20}$/;
 const ENTRA_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function fail(message: string): number {
@@ -50,9 +52,19 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 		return 0;
 	}
 	const platform = values.platform ?? "slack";
-	if (platform !== "slack" && platform !== "teams") return fail("--platform must be slack or teams");
+	if (platform !== "slack" && platform !== "discord" && platform !== "teams") {
+		return fail("--platform must be slack, discord or teams");
+	}
 	if (platform === "slack" && (values.owner === undefined || !OWNER_ID.test(values.owner))) {
 		return fail("--owner must be a Slack member id (U followed by 8+ uppercase letters or digits)");
+	}
+	if (platform === "discord") {
+		for (const [option, value] of [
+			["--owner", values.owner],
+			["--app-id", values["app-id"]],
+		] as const) {
+			if (value === undefined || !SNOWFLAKE.test(value)) return fail(`${option} must be a Discord id (17-20 digits)`);
+		}
 	}
 	if (platform === "teams") {
 		for (const [option, value] of [
@@ -109,10 +121,20 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 						},
 					},
 				}
-			: {
-					channels: { slack: { ownerUserId: values.owner } },
-					slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
-				};
+			: platform === "discord"
+				? {
+						channels: {
+							discord: {
+								ownerUserId: values.owner,
+								botTokenFile: "secrets/discord-bot-token",
+								applicationId: values["app-id"],
+							},
+						},
+					}
+				: {
+						channels: { slack: { ownerUserId: values.owner } },
+						slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+					};
 	const config = {
 		schemaVersion: 1,
 		...chat,
@@ -133,12 +155,18 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 						"  umask 077",
 						`  cat > ${join(secretsDir, "teams-client-secret")}   # paste the secret then Ctrl-D`,
 					]
-				: [
-						"next: put the two Slack tokens into files (never into chat or shell history), then run doctor:",
-						"  umask 077",
-						`  cat > ${join(secretsDir, "slack-bot-token")}   # paste xoxb-… then Ctrl-D`,
-						`  cat > ${join(secretsDir, "slack-app-token")}   # paste xapp-… then Ctrl-D`,
-					]),
+				: platform === "discord"
+					? [
+							"next: put the Discord bot token into a file (never into chat or shell history), then run doctor:",
+							"  umask 077",
+							`  cat > ${join(secretsDir, "discord-bot-token")}   # paste the bot token then Ctrl-D`,
+						]
+					: [
+							"next: put the two Slack tokens into files (never into chat or shell history), then run doctor:",
+							"  umask 077",
+							`  cat > ${join(secretsDir, "slack-bot-token")}   # paste xoxb-… then Ctrl-D`,
+							`  cat > ${join(secretsDir, "slack-app-token")}   # paste xapp-… then Ctrl-D`,
+						]),
 			`  ${homePrefix}bun src/main.ts doctor`,
 			"",
 		].join("\n"),

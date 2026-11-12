@@ -3,6 +3,7 @@ import type { OmpbotConfig } from "../config";
 import { readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
 import type { Logger } from "../log";
 import { indexSecretValue } from "../redact";
+import { readGraphTokenFile } from "../teams/graph";
 
 /**
  * Names that hold secret VALUES (upstream: SECRET_ENV_NAME). Pointer-style names (`*_FILE`, `*_PATH`, …) hold
@@ -94,6 +95,9 @@ export function indexRuntimeSecrets(
 		} catch {
 			// Same as above: doctor reports it.
 		}
+		// The Graph refresh token `teams login` saved (reading it indexes it); none yet is not a problem.
+		const graphTokenFile = config.channels.teams.graph?.tokenFile;
+		if (graphTokenFile !== undefined && readGraphTokenFile(graphTokenFile) !== undefined) known += 1;
 	}
 
 	known += indexEnvSecrets(env);

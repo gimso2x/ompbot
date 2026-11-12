@@ -64,6 +64,19 @@ describe("channels.teams", () => {
 		}
 	});
 
+	test("graph: absent stays absent, {} takes the default token file, an unknown sub-key is config_invalid", () => {
+		writeConfig(base);
+		expect(loadConfig(home).channels.teams?.graph).toBeUndefined();
+		writeConfig({ ...base, graph: {} });
+		expect(loadConfig(home).channels.teams?.graph).toEqual({ tokenFile: join(home, "secrets", "teams-graph-token") });
+		writeConfig({ ...base, graph: { tokenFile: "graph.json" } });
+		expect(loadConfig(home).channels.teams?.graph).toEqual({ tokenFile: join(home, "graph.json") });
+		writeConfig({ ...base, graph: { scope: "x" } });
+		expect(() => loadConfig(home)).toThrow("field=channels.teams.graph.scope");
+		writeConfig({ ...base, graph: true });
+		expect(() => loadConfig(home)).toThrow("field=channels.teams.graph");
+	});
+
 	test("a secret file readable by others is refused", () => {
 		writeConfig(base);
 		chmodSync(join(home, "teams-client-secret"), 0o644);

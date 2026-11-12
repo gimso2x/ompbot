@@ -157,7 +157,10 @@ export interface ApplyReceipt {
 	status: ApplyStatus;
 	exitCode: 0 | 1 | 3;
 	repoDir: string;
+	/** The commit the restarted daemon loads: read again right before the restart, since a merge can land during drain. */
 	head: string | undefined;
+	/** HEAD at preflight, set only when HEAD moved between preflight and the restart. */
+	headAtPreflight?: string;
 	/** Where HEAD pointed before the latest checkout/merge move (reflog), the code a revert would go back to. */
 	previousHead: string | undefined;
 	revertCommand: string | undefined;
@@ -741,11 +744,22 @@ async function applyUnderLock(
 
 	// 4+5. restart and wait for a daemon that started after the restart request.
 	const restartAndWait = async (): Promise<StepResult & { restartAt: number }> => {
+		// The daemon loads whatever the checkout holds at restart; a merge landing during drain moves HEAD past preflight.
+		const head = await git("rev-parse", "HEAD");
+		const current = head.code === 0 ? head.stdout.trim() : undefined;
+		const moved = current !== undefined && receipt.head !== undefined && current !== receipt.head;
+		if (moved) {
+			receipt.headAtPreflight ??= receipt.head;
+			receipt.head = current;
+		}
 		const restartAt = deps.now();
 		const restart = await deps.run(["systemctl", "--user", "restart", unit], { env: { PATH: deps.pathEnv } });
 		if (restart.code !== 0)
 			return { ok: false, detail: `systemctl restart rc=${restart.code}: ${restart.stderr.trim()}`, restartAt };
-		return { ok: true, detail: "restart requested", restartAt };
+		const note = moved
+			? ` (HEAD moved after preflight: ${receipt.headAtPreflight?.slice(0, 7)}→${current.slice(0, 7)})`
+			: "";
+		return { ok: true, detail: `restart requested${note}`, restartAt };
 	};
 	const waitReady = async (restartAt: number): Promise<StepResult> => {
 		const deadline = deps.now() + READY_TIMEOUT_MS;

@@ -153,6 +153,7 @@ export async function startTeamsDaemon(
 		extra?: Partial<OmpbotConfig>;
 		guestRun?: ProcessRunner;
 		guestEnv?: Record<string, string | undefined>;
+		teamsGraphEndpoints?: { loginBase: string; graphBase: string };
 	} = {},
 ): Promise<{ daemon: Daemon; binding: TeamsBinding; port: number }> {
 	const clientSecretFile = join(home.dir, "secrets", "teams-client-secret");
@@ -197,6 +198,7 @@ export async function startTeamsDaemon(
 		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		...(options.guestRun === undefined ? {} : { guestRun: options.guestRun }),
 		...(options.guestEnv === undefined ? {} : { guestEnv: options.guestEnv }),
+		...(options.teamsGraphEndpoints === undefined ? {} : { teamsGraphEndpoints: options.teamsGraphEndpoints }),
 	});
 	await daemon.start();
 	const port = binding.adapter?.listenPort;

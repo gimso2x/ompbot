@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelBinding } from "../channel/adapter";
 import { type OmpbotConfig, readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
+import { parseChatOrigin } from "../core/origin-key";
 import { DiscordBinding } from "../discord/binding";
 import { DiscordChannel } from "../discord/channel";
 import { DiscordSocketTransport } from "../discord/socket-transport";
@@ -50,6 +51,25 @@ export function botRpcEnv(
 ): { env: Record<string, string>; baseEnv?: Record<string, string | undefined> } {
 	const env = { OMP_WIKI_NOTE_DISABLE: "1" };
 	return ompProfile === undefined ? { env } : { env, baseEnv: withOmpProfile(base, ompProfile) };
+}
+
+/**
+ * The `--config` overlay of a Teams group chat's omp child while the Graph chat tools are on: memory off, so what the
+ * owner's 1:1 read out of other people's chats (kept in the shared memory) is never recalled into a group answer.
+ */
+export const TEAMS_GROUP_OVERLAY_YAML = 'memory:\n  backend: "off"\n';
+
+/** Where `runDaemon` writes {@link TEAMS_GROUP_OVERLAY_YAML}. */
+export const teamsGroupOverlayPath = (homeDir: string): string => join(homeDir, "teams-group.omp.yml");
+
+/**
+ * The overlay file of the RPC child of `origin`: {@link teamsGroupOverlayPath} for a `teams/ch/*` origin when
+ * `channels.teams.graph` is set, `undefined` for every other origin and config (no `--config` as before).
+ */
+export function rpcOverlayFor(config: OmpbotConfig, origin: string): string | undefined {
+	if (config.channels.teams?.graph === undefined) return undefined;
+	const ref = parseChatOrigin(origin);
+	return ref?.platform === "teams" && ref.kind === "ch" ? teamsGroupOverlayPath(config.homeDir) : undefined;
 }
 
 function pickTransport(config: OmpbotConfig, env: Record<string, string | undefined>, log: Logger): SlackTransport {
@@ -264,6 +284,9 @@ export async function runDaemon(
 		log.warn("persona_unreadable", { path, error: String(error) });
 	// Seed the known-secret value index before anything can answer: masking sits below the agent.
 	indexRuntimeSecrets(config, env, log);
+	if (config.channels.teams?.graph !== undefined) {
+		writeFileSync(teamsGroupOverlayPath(config.homeDir), TEAMS_GROUP_OVERLAY_YAML, { mode: 0o600 });
+	}
 	const exited = Promise.withResolvers<number>();
 	const shutdown = (signal: string) => {
 		log.info("signal", { signal });
@@ -310,6 +333,7 @@ export async function runDaemon(
 		driverFactory: (origin, sessionDir) => {
 			// Only the omp driver answers dialogs and narrows host tools for a peer-touched conversation.
 			const omp = config.agent !== "agy" && config.agent !== "claude";
+			const overlayConfig = rpcOverlayFor(config, origin);
 			const answerDialog = omp ? daemon.answerDialogsFor(origin) : undefined;
 			const systemPrompt = spawnSystemPrompt({
 				secretsDir,
@@ -355,6 +379,7 @@ export async function runDaemon(
 							...model,
 							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
 							...botRpcEnv(config.ompProfile),
+							...(overlayConfig === undefined ? {} : { overlayConfig }),
 							extraArgs: ["--append-system-prompt", systemPrompt],
 							hostTools: daemon.hostToolsFor(origin),
 							answerDialog,

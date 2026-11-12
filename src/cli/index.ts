@@ -516,7 +516,7 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 			case "briefing":
 				return await briefingCommand(rest, homeDir);
 			case "teams":
-				return teamsCommand(rest, homeDir);
+				return await teamsCommand(rest, homeDir);
 			case "feedback":
 				return feedbackCommand(rest, homeDir);
 			default:
