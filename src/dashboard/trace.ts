@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { newestSessionFile } from "../omp/session-heal";
-import { type FeedbackVerdict, readTurnVerdicts } from "../store/feedback";
 import { readTranscript } from "./trace-transcript";
 
 /**
@@ -42,8 +41,6 @@ export type TurnTrace =
 			now: number;
 			live: boolean;
 			truncated: boolean;
-			/** The owner's current 👍/👎 on the turn; absent without one. */
-			feedback?: FeedbackVerdict;
 			root: TraceSpan;
 	  }
 	| { ok: false; error: TraceError };
@@ -90,9 +87,6 @@ export function readTurnTrace(homeDir: string, inboundId: number, now: number): 
 		const failed = turn.state === "failed_notified";
 		// The session goes on past the turn (memory notes, the next request): a finished turn ends with its last span.
 		const lastEnd = Math.max(0, ...main.spans.map((span) => span.end ?? span.start));
-		const feedback = readTurnVerdicts(db, 0).find(
-			(verdict) => verdict.originKey === turn.origin_key && verdict.opRef === turn.op_ref,
-		)?.verdict;
 		return {
 			ok: true,
 			inboundId,
@@ -100,7 +94,6 @@ export function readTurnTrace(homeDir: string, inboundId: number, now: number): 
 			now,
 			live,
 			truncated: main.truncated,
-			...(feedback === undefined ? {} : { feedback }),
 			root: {
 				id: "turn",
 				name: "턴",

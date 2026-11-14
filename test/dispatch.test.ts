@@ -338,7 +338,7 @@ describe("remote dispatch (host qualifier)", () => {
 			options: { run: remoteRun },
 		});
 		expect(result.ok).toBe(true);
-		const ssh = "ssh -o BatchMode=yes -o ConnectTimeout=8 wsl --";
+		const ssh = "ssh -o BatchMode=yes -o ConnectTimeout=8 -- wsl";
 		expect(log.some((line) => line.startsWith(`${ssh} 'herdr' 'agent' 'list'`))).toBe(true);
 		expect(log.some((line) => line.includes("'workspace' 'create'") && line.includes("'--cwd' '/home/dev/work'"))).toBe(
 			true,
@@ -362,8 +362,8 @@ describe("remote dispatch (host qualifier)", () => {
 			"BatchMode=yes",
 			"-o",
 			"ConnectTimeout=8",
-			"wsl",
 			"--",
+			"wsl",
 			"'herdr'",
 			"'agent'",
 			"'prompt'",
@@ -390,7 +390,7 @@ describe("remote dispatch (host qualifier)", () => {
 		});
 		expect(result.ok).toBe(true);
 		expect(seen.length).toBeGreaterThan(0);
-		expect(seen.every((cmd) => cmd[cmd.indexOf("--") + 1] === `'${herdrBin}'`)).toBe(true);
+		expect(seen.every((cmd) => cmd[cmd.indexOf("--") + 2] === `'${herdrBin}'`)).toBe(true);
 	});
 
 	test("round trip: a POSIX shell given the ssh-joined words recovers the original argv", () => {
@@ -408,7 +408,7 @@ describe("remote dispatch (host qualifier)", () => {
 			"~/x",
 		];
 		const argv = herdrSshArgv("host", "herdr", args);
-		const remoteWords = argv.slice(argv.indexOf("--") + 1);
+		const remoteWords = argv.slice(argv.indexOf("--") + 2);
 		// ssh joins the remote argv with spaces and hands the line to the login shell.
 		const proc = Bun.spawnSync(["sh", "-c", `printf '%s\\0' ${remoteWords.join(" ")}`], {
 			env: { ...process.env, HOME: "/tmp/round-trip-home" },
@@ -531,7 +531,7 @@ describe("herdr remote start cleanup on a failed first prompt (B-4)", () => {
 	async function remoteWith(shared: boolean, closeOnPromptFailure?: boolean) {
 		const words: string[][] = [];
 		const run: ProcessRunner = async (cmd) => {
-			const args = cmd.slice(cmd.indexOf("--") + 2).map((word) => word.slice(1, -1));
+			const args = cmd.slice(cmd.indexOf("--") + 3).map((word) => word.slice(1, -1));
 			words.push(args);
 			const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), timedOut: false });
 			if (args[0] === "agent" && args[1] === "list") return ok({ agents: [] });
@@ -810,7 +810,7 @@ describe("herdrAgentStatus", () => {
 		});
 		expect(result).toEqual({ ok: true, status: "blocked" });
 		expect(seen).toEqual([herdrSshArgv("wsl", "/home/dev/.local/bin/herdr", ["agent", "list"])]);
-		expect(seen[0]?.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--"]);
+		expect(seen[0]?.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl"]);
 	});
 });
 
@@ -934,7 +934,7 @@ describe("worker omp arguments (agentArgs)", () => {
 		};
 		return { seen, run };
 	}
-	const SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--"];
+	const SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl"];
 	const LOCAL_START = ["herdr", "agent", "start", "w-1", "--kind", "omp", "--pane", "P1", "--timeout", "60000"];
 	const REMOTE_START = [...SSH, ...LOCAL_START.map(remoteShellQuote)];
 	const local = (agentArgs?: string[]) => {

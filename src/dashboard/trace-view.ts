@@ -219,10 +219,6 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 	for (let i = 0; i < sigText.length; i++) hash = ((hash << 5) + hash + sigText.charCodeAt(i)) | 0;
 
 	return `<div class="tw" data-trace data-sig="${(hash >>> 0).toString(36)}-${rows.length}"><div class="tw-head"><h3 class="h3">트레이스</h3><span class="tw-state ${stateTone}" role="status" aria-live="polite" data-part="html"><i class="tw-dot" aria-hidden="true"></i>${stateWord}</span>${
-		answer.feedback === undefined
-			? ""
-			: `<span class="badge" data-feedback="${answer.feedback}" title="오너 피드백">${answer.feedback === "up" ? "👍" : "👎"}</span>`
-	}${
 		foldable
 			? `<button type="button" class="button is-ghost is-sm tw-fold-all" data-trace-fold-all data-part="text">${anyOpen ? "모두 접기" : "모두 펼치기"}</button>`
 			: ""

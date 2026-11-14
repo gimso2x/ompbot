@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -13,6 +13,7 @@ export const UNITS_USAGE = `  units render [--out <dir>] [--dry-run] [--instance
                                  dashboard and names ending in -backup/-gc/-dashboard are taken by other units' names
 `;
 
+const CONTROL_CHARS = /\p{Cc}/u;
 const INSTANCE_NAME = /^[a-z][a-z0-9-]{0,23}$/;
 
 /** The checkout this file belongs to: src/cli/units.ts → repo root. */
@@ -44,11 +45,13 @@ function renderUnit(name: string, template: string, values: UnitValues): string 
 			"/bin",
 		]),
 	].join(":");
+	// systemd expands `%` specifiers in ExecStart= and Environment=; replacers are functions so `$&` in a path stays literal.
+	const fill = (value: string) => () => value.replaceAll("%", "%%");
 	let text = template
-		.replaceAll("@BUN@", values.bun)
-		.replaceAll("@REPO_DIR@", values.repoDir)
-		.replaceAll("@HOME@", values.home)
-		.replaceAll("@PATH@", path);
+		.replaceAll("@BUN@", fill(values.bun))
+		.replaceAll("@REPO_DIR@", fill(values.repoDir))
+		.replaceAll("@HOME@", fill(values.home))
+		.replaceAll("@PATH@", fill(path));
 	if (values.ompbotHome !== undefined && name.endsWith(".service")) {
 		// systemd splits an unquoted value at spaces and expands `%`; a plain path stays unquoted so installed units match.
 		const assignment = `OMPBOT_HOME=${values.ompbotHome}`;
@@ -88,6 +91,15 @@ function renderUnits(values: UnitValues, instance?: string): RenderedUnit[] {
 		});
 }
 
+/** A symlink whose target is missing: `existsSync` says false, yet a write through it creates the target. */
+function isDanglingLink(path: string): boolean {
+	try {
+		return lstatSync(path).isSymbolicLink() && !existsSync(path);
+	} catch {
+		return false;
+	}
+}
+
 function usage(message: string): number {
 	process.stderr.write(`units: ${message}\n${UNITS_USAGE}`);
 	return 2;
@@ -108,8 +120,8 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 	}
 	// An empty OMPBOT_HOME is unset, as in config.ts: the default ~/.ompbot, no Environment= line.
 	const ompbotHome = env.OMPBOT_HOME === undefined || env.OMPBOT_HOME === "" ? undefined : resolve(env.OMPBOT_HOME);
-	if (ompbotHome !== undefined && /[\n\r\0]/.test(ompbotHome))
-		return usage("OMPBOT_HOME contains a newline or NUL; a unit file cannot carry it");
+	if (ompbotHome !== undefined && CONTROL_CHARS.test(ompbotHome))
+		return usage("OMPBOT_HOME contains a control character; a unit file cannot carry it");
 	if (values.out === "") return usage("--out is empty; leave it out to use ~/.config/systemd/user");
 	const instance = values.instance;
 	if (instance !== undefined) {
@@ -123,7 +135,9 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 			return usage(`--instance ${instance} ends in -${suffix}, the name of another instance's ${suffix} units`);
 		if (ompbotHome === undefined) return usage("--instance needs OMPBOT_HOME (a second install needs its own home)");
 	}
-	const home = homedir();
+	// An empty HOME is unset (as OMPBOT_HOME above): a relative one would put PATH entries and --out under the cwd.
+	const home = env.HOME || homedir();
+	if (CONTROL_CHARS.test(home)) return usage("HOME contains a control character; a unit file cannot carry it");
 	const units = renderUnits(
 		{
 			bun: process.execPath,
@@ -140,11 +154,13 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 
 	const outDir = resolve(values.out ?? join(home, ".config", "systemd", "user"));
 	// The nearest existing ancestor must be a directory, or mkdir fails halfway with a raw EEXIST/ENOTDIR.
+	if (isDanglingLink(outDir)) return usage(`--out ${outDir} is a symlink to a missing path`);
 	let existing = outDir;
 	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
 	if (!statSync(existing).isDirectory()) return usage(`--out ${outDir}: ${existing} is not a directory`);
 	for (const unit of units) {
 		const path = join(outDir, unit.name);
+		if (isDanglingLink(path)) return usage(`--out ${outDir}: ${path} is a symlink to a missing path`);
 		if (existsSync(path) && !statSync(path).isFile()) return usage(`--out ${outDir}: ${path} is not a file`);
 	}
 	const plan = units.map((unit) => {

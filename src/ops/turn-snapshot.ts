@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, readdirSync, readlinkSync, realpathSync, rmSync, type Stats, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Logger } from "../log";
@@ -424,6 +424,29 @@ export function undoPlanNotes(plan: RepoPlan): string[] {
 }
 
 /**
+ * `lstat` of a path that may be gone, `undefined` then. ENOTDIR is gone too: a parent the undo already put back as a
+ * file (a turn that turned `pkg` into `pkg/inner.txt`) leaves no child to delete (qa-i #22).
+ */
+function lstatOrAbsent(full: string): Stats | undefined {
+	try {
+		return lstatSync(full);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+		throw error;
+	}
+}
+
+/** Whether every file under the directory `full` (repo-relative `path`) is one the plan deletes as turn-created. */
+function holdsOnlyPlanned(full: string, path: string, planned: ReadonlySet<string>): boolean {
+	return readdirSync(full, { withFileTypes: true }).every((entry) =>
+		entry.isDirectory()
+			? holdsOnlyPlanned(join(full, entry.name), `${path}/${entry.name}`, planned)
+			: planned.has(`${path}/${entry.name}`),
+	);
+}
+
+/**
  * Performs a plan's `revert` files: `git restore --source=<before-tree> --worktree` (mode and executable bit come from
  * the tree, the real index is untouched) or, for a file the turn created, a plain delete. Conflicts and overlaps are
  * left exactly as they are, and so is a directory where a created file was to be deleted: it is returned in
@@ -432,18 +455,24 @@ export function undoPlanNotes(plan: RepoPlan): string[] {
 export async function applyUndo(plan: RepoPlan, options: { run?: GitRunner } = {}): Promise<UndoApplied> {
 	const run = options.run ?? runGit;
 	const done: UndoApplied = { reverted: 0, conflicts: [] };
+	const planned = new Set(plan.files.filter((f) => f.kind === "revert" && f.mode === undefined).map((f) => f.path));
 	for (const file of plan.files) {
 		if (file.kind !== "revert") continue;
 		try {
+			const full = join(plan.repo, file.path);
+			const stat = lstatOrAbsent(full);
 			if (file.mode === undefined) {
-				const full = join(plan.repo, file.path);
-				const stat = lstatSync(full, { throwIfNoEntry: false });
 				if (stat !== undefined && !stat.isFile() && !stat.isSymbolicLink()) {
 					done.conflicts.push(file.path);
 					continue;
 				}
-				rmSync(full, { force: true });
+				if (stat !== undefined) rmSync(full);
 			} else {
+				// A directory in the way is replaced only when everything in it is a turn-created file this plan deletes.
+				if (stat?.isDirectory() && !holdsOnlyPlanned(full, file.path, planned)) {
+					done.conflicts.push(file.path);
+					continue;
+				}
 				await required(run, plan.repo, ["restore", `--source=${plan.source}`, "--worktree", "--", file.path]);
 			}
 		} catch (error) {

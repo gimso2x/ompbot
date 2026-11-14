@@ -32,6 +32,34 @@ describe("isDangerousBash", () => {
 		expect(isDangerousBash("ls -la; cat package.json")).toBe(false);
 		expect(isDangerousBash("curl -s https://example.com")).toBe(false);
 	});
+
+	// fable 감사 IMP-03: git global options, combined flags and `+refspec` slipped past the list.
+	test("catches git destructive forms behind global options and combined flags", () => {
+		for (const command of [
+			"git -C /srv/repo push --force origin main",
+			"git -C /srv/repo reset --hard HEAD~1",
+			"git push -fu origin main",
+			"git push origin +main",
+			"git push origin --delete feature/x",
+			"git stash drop",
+			"git stash clear",
+			"git checkout -- .",
+			"git restore .",
+			"gh pr merge 12 --squash",
+		]) {
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		}
+	});
+
+	// fable 감사 UX-17: service names are judged as the command run, not as any word.
+	test("judges sudo/systemctl/docker by the command name, through shell wrappers too", () => {
+		for (const command of ["sudo ls", "FOO=1 docker ps", "bash -c 'docker rm x'", "ssh host systemctl restart x"]) {
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		}
+		for (const command of ["rg -n service src", "cat docker-compose.yml", "git restore --staged ."]) {
+			expect([command, isDangerousBash(command)]).toEqual([command, false]);
+		}
+	});
 });
 
 describe("bashTouchesSecrets", () => {
@@ -295,7 +323,8 @@ describe("qa50b lane H regressions", () => {
 			["if cd ~/work; then git status; fi"],
 			['cd "$D"'],
 			['cd "$D" && cat /h/u/work/notes'],
-			['cd "$D" && cd /h/u/work && cat notes'],
+			// An absolute cd to a directory that exists gives a known cwd back (one it cannot see keeps the unknown one).
+			['cd "$D" && cd /tmp && cat notes'],
 		];
 		for (const [command, at] of allowed)
 			expect({ command, at, hit: touches(command, at) }).toMatchObject({ hit: false });
@@ -467,5 +496,225 @@ describe("qa-e lane E regressions", () => {
 				"zip /tmp/w.zip ~/.ompbot/workspace/a.txt",
 			])
 				expect({ command, at, hit: touches(command, at) }).toMatchObject({ hit: false });
+	});
+});
+
+describe("qa-h dangling and looping link regressions", () => {
+	// A temporary fake home on disk; the real ~/.ompbot and ~/.ssh are never touched.
+	const root = mkdtempSync(join(tmpdir(), "ompbot-claude-perm-h-"));
+	afterAll(() => rmSync(root, { recursive: true, force: true }));
+	const home = join(root, "home");
+	const secrets = join(home, ".ompbot", "secrets");
+	const ws = join(home, ".ompbot", "workspace");
+	mkdirSync(secrets, { recursive: true });
+	mkdirSync(join(ws, "src"), { recursive: true });
+	mkdirSync(join(home, ".ssh"), { recursive: true });
+	// n39·n84: the link targets do not exist yet, so a Write would create them outside through the link.
+	symlinkSync(join(home, ".ssh", "authorized_keys"), join(ws, "keys"));
+	symlinkSync("/nonexistent/x", join(ws, "l"));
+	// A relative chain: a -> b -> ../../.ssh/new_key (from the workspace, two levels up is `home`).
+	symlinkSync("b", join(ws, "a"));
+	symlinkSync("../../.ssh/new_key", join(ws, "b"));
+	// A dangling link into the secrets directory.
+	symlinkSync(join(secrets, "new-token"), join(ws, "tok"));
+	// A cycle: c1 -> c2 -> c1.
+	symlinkSync("c2", join(ws, "c1"));
+	symlinkSync("c1", join(ws, "c2"));
+	// Inside links: a dangling one to a new workspace file and one to an existing directory.
+	symlinkSync(join(ws, "src", "new.ts"), join(ws, "fresh"));
+	symlinkSync("src", join(ws, "srclink"));
+	const decide = (toolName: string, input: Record<string, unknown>) =>
+		classifyPermission({ toolName, input, cwd: ws, secretsDir: secrets, userHome: home });
+
+	test("Write/Edit through a dangling link to outside the workspace is not inside", async () => {
+		for (const file_path of ["keys", "l", "a", "b", `${ws}/keys`, "./src/../keys"]) {
+			expect({ file_path, inside: editsInside("Write", { file_path }, ws, home) }).toMatchObject({ inside: false });
+			expect({ file_path, inside: editsInside("Edit", { file_path }, ws, home) }).toMatchObject({ inside: false });
+			expect({ file_path, decision: await decide("Write", { file_path }) }).toMatchObject({
+				decision: { behavior: "deny" },
+			});
+		}
+	});
+
+	test("new files and links that stay inside keep their verdict", async () => {
+		for (const file_path of ["src/a.ts", "src/new/dir/x.ts", "fresh", "srclink/b.ts", "missing/../src/c.ts"])
+			expect({ file_path, inside: editsInside("Write", { file_path }, ws, home) }).toMatchObject({ inside: true });
+		expect(await decide("Write", { file_path: "src/new.ts" })).toMatchObject({ behavior: "allow" });
+	});
+
+	test("a dangling link into the secrets directory reaches it", async () => {
+		expect(bashTouchesSecrets("echo x > tok", secrets, { cwd: ws, userHome: home })).toBe(true);
+		expect(await decide("Read", { file_path: "tok" })).toMatchObject({ behavior: "deny" });
+	});
+
+	test("AC-1b a link cycle cannot be judged: not inside, and the secrets check blocks", async () => {
+		expect(editsInside("Write", { file_path: "c1" }, ws, home)).toBe(false);
+		expect(editsInside("Edit", { file_path: "c2/x" }, ws, home)).toBe(false);
+		expect(bashTouchesSecrets("cat c1", secrets, { cwd: ws, userHome: home })).toBe(true);
+		expect(await decide("Read", { file_path: "c1" })).toMatchObject({ behavior: "deny" });
+		// An ordinary command next to the cycle is still judged normally.
+		expect(bashTouchesSecrets("cat src/a.ts", secrets, { cwd: ws, userHome: home })).toBe(false);
+	});
+});
+
+// doc/plans/qa-i-low-fixes.md 묶음 A: each test names the qa-i item numbers it closes.
+describe("qa-i low A: dangerous Bash", () => {
+	test("#47 any git global option before a destructive subcommand still asks", () => {
+		for (const command of [
+			"git --literal-pathspecs reset --hard HEAD",
+			"git --no-optional-locks clean -fdx",
+			"git --exec-path=/x push --force origin x",
+			"git -C /srv/repo --no-optional-locks branch -D old",
+		])
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		expect(isDangerousBash("git --no-optional-locks status")).toBe(false);
+	});
+});
+
+describe("qa-i low A: dangerous Bash wrappers, kill signals and backticks", () => {
+	test("#38 a dangerous command inside backticks asks like one inside $( )", () => {
+		for (const command of ["echo `sudo ls`", 'echo "`docker rm -f db`"', "x=`systemctl stop nginx`"])
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		expect(isDangerousBash("echo `date`")).toBe(false);
+	});
+
+	test("#39 pkill and kill with KILL spelled out ask like kill -9", () => {
+		for (const command of [
+			'pkill -f "src/main.ts daemon"',
+			"kill -s KILL 4242",
+			"kill -KILL 1234",
+			"kill -SIGKILL 1234",
+			"kill -s 9 1234",
+			"kill -n 9 1234",
+			"kill --signal KILL 1234",
+		])
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		for (const command of ["kill 4242", "kill -TERM 4242", "rg pkill src", "kill -s HUP 1"])
+			expect([command, isDangerousBash(command)]).toEqual([command, false]);
+	});
+
+	test("#96 setsid, stdbuf, ionice, script, su, doas and busybox in front of a dangerous command ask", () => {
+		for (const command of [
+			"setsid docker rm -f db",
+			"stdbuf -oL docker rm -f db",
+			"ionice docker rm -f db",
+			"script -c 'docker rm -f db'",
+			"su -c 'docker rm -f db'",
+			"doas docker rm -f db",
+			"busybox docker rm -f db",
+		])
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		expect(isDangerousBash("stdbuf -oL bun test")).toBe(false);
+	});
+});
+
+describe("qa-i low A: secrets judgment", () => {
+	// Lexical fake home (nothing on disk); the real ~/.ompbot/secrets is never touched.
+	const secretsDir = "/h/u/.ompbot/secrets";
+	const userHome = "/h/u";
+	const workspace = "/h/u/.ompbot/workspace";
+	const touches = (command: string, at = workspace) => bashTouchesSecrets(command, secretsDir, { cwd: at, userHome });
+	const expectHits = (commands: ReadonlyArray<string | readonly [string, string]>, hit: boolean) => {
+		for (const entry of commands) {
+			const [command, at] = typeof entry === "string" ? [entry, workspace] : entry;
+			expect({ command, at, hit: touches(command, at) }).toEqual({ command, at, hit });
+		}
+	};
+
+	test("#35 #85 find that runs, deletes or writes from an ancestor of the secrets directory is blocked", () => {
+		expectHits(
+			[
+				"find ~/.ompbot -name slack-bot-token -exec cat {} +",
+				"find ~/.ompbot -name tok -delete",
+				"find -L /h/u -name tok -execdir cat {} ;",
+				"find ~ -ok rm {} ;",
+				"find ~/.ompbot -fprint /tmp/list",
+				["find -name tok -exec cat {} +", "/h/u"],
+			],
+			true,
+		);
+		expectHits(["find . -name '*.ts' -exec wc -l {} +", ["find . -name '*.ts'", "/h/u"], "find src -delete"], false);
+	});
+
+	test("#83 a search or copy named by its path is judged like its bare name", () => {
+		expectHits(["/bin/grep -r T ~/.ompbot", "/usr/bin/tar cf /tmp/b.tar ~/.ompbot", "/usr/bin/find ~ -delete"], true);
+		expectHits(["/bin/grep -r T src"], false);
+	});
+
+	test("#84 wrappers in front of a recursive search or copy do not hide it", () => {
+		expectHits(
+			[
+				"env grep -r T ~/.ompbot",
+				"nice -n 5 rg T ~/.ompbot",
+				"timeout 5 tar cf /tmp/b ~/.ompbot",
+				"echo x | xargs grep -r T ~/.ompbot",
+				"nohup cp -a ~/.ompbot /tmp/x",
+				"bash -c 'grep -r T ~/.ompbot'",
+			],
+			true,
+		);
+		expectHits(["env grep -r T src", "timeout 5 rg TODO", "nice cp -a src /tmp/x"], false);
+	});
+
+	test("#36 #93 a command line given to bash -c, sh -c, eval or env -S is judged with its own cd", () => {
+		expectHits(
+			[
+				'bash -c "cd ~/.ompbot && cat secrets/slack-bot-token"',
+				"bash -c 'cd ~/.ompbot && cat secrets/tok'",
+				"sh -ec 'cd ~/.ompbot; cat secrets/tok'",
+				"eval 'cd ~/.ompbot && cat secrets/tok'",
+				"env -S 'cd ~/.ompbot && cat secrets/tok'",
+			],
+			true,
+		);
+		expectHits(["bash -c 'cd src && ls'", "eval 'echo hi'"], false);
+	});
+
+	test("#37 #87 /proc/self/cwd is the shell's own directory; another process's cwd cannot be judged", () => {
+		expectHits(
+			[
+				"cat /proc/self/cwd/../secrets/tok",
+				"cat /proc/thread-self/cwd/../secrets/tok",
+				"cd ~/.ompbot && cat /proc/self/cwd/secrets/tok",
+				"cat /proc/1234/cwd/notes",
+			],
+			true,
+		);
+		expectHits(["cat /proc/self/cwd/notes", "cat /proc/self/status"], false);
+	});
+
+	test("#86 tar's -C<dir> and --directory=<dir> are the base of its members", () => {
+		expectHits(
+			[
+				"tar --directory=~/.ompbot -cf /tmp/b.tar secrets",
+				"tar -C/h/u/.ompbot -cf /tmp/b.tar secrets",
+				"tar --directory /h/u -cf /tmp/b.tar .ompbot/secrets",
+				"tar -C /h/u -cf /tmp/b.tar .ompbot",
+			],
+			true,
+		);
+		expectHits(["tar -C /h/u/work -cf /tmp/b.tar src", "tar --directory=src -czf /tmp/b.tgz ."], false);
+	});
+
+	test("#90 after a cd the guard cannot see succeed, the old directory is judged too", () => {
+		expectHits(["cd /nonexistent-qa; cat ../secrets/tok", "cd /nonexistent-qa || cat ../secrets/tok"], true);
+		expectHits(["cd /nonexistent-qa; cat notes"], false);
+	});
+
+	test("#91 a cd with CDPATH set cannot be followed", () => {
+		expectHits(
+			[
+				"CDPATH=~/.ompbot cd secrets && cat tok",
+				"CDPATH=~/.ompbot; cd secrets && cat tok",
+				"export CDPATH=~/.ompbot; cd secrets; cat tok",
+			],
+			true,
+		);
+		expectHits(["CDPATH=~/.ompbot cd ./src && cat a.ts"], false);
+	});
+
+	test('#92 a locale-quoted $"…" word is judged like a double-quoted one', () => {
+		expectHits(['cat $"/h/u/.ompbot/secrets/tok"', 'cat $"$HOME/.ompbot/secrets/tok"'], true);
+		expectHits(['echo $"hello"'], false);
 	});
 });

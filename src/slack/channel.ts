@@ -68,7 +68,6 @@ function blocksOf(msg: OutboundMessage): readonly unknown[] | undefined {
  */
 export class SlackChannel implements ChannelPort {
 	readonly platform = "slack";
-	readonly capabilities = { permalink: true, reactions: true };
 
 	constructor(readonly transport: SlackTransport) {}
 

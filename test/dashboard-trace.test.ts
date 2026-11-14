@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BoardSource } from "../src/dashboard/board";
 import { startDashboardServer } from "../src/dashboard/server";
 import type { DashboardSnapshot } from "../src/dashboard/snapshot";
 import { readTurnTrace, type TraceError, type TraceSpan, type TurnTrace } from "../src/dashboard/trace";
@@ -164,6 +165,72 @@ describe("api/turn/<id>/trace", () => {
 		} finally {
 			server.stop(true);
 			bare.stop(true);
+		}
+	});
+});
+
+describe("dashboard request log", () => {
+	test("hears the page with its view and each detail read once; polls and streams are not heard", async () => {
+		seed("dispatched");
+		const heard: string[] = [];
+		const server = startDashboardServer({
+			port: 0,
+			hostname: "127.0.0.1",
+			snapshot: async () => {
+				throw new Error("not built");
+			},
+			onError: () => {},
+			onRequest: (kind, detail) => heard.push(detail === undefined ? kind : `${kind}:${detail}`),
+			trace: (id) => readTurnTrace(home, id, NOW),
+			conversation: () => ({ ok: false, error: "unknown_origin" }),
+			monitorDetail: () => ({ ok: false, error: "unknown_monitor" }),
+			live: async () => null,
+			board: { source: new BoardSource({ origin: "http://127.0.0.1:9" }), tasks: () => [] },
+		});
+		const base = `http://127.0.0.1:${server.port}`;
+		try {
+			for (const path of [
+				"/?view=turns&origin=slack/dm/D1&card=c1",
+				"/x/",
+				"/api/turn/1/trace",
+				"/api/thread/conversation?origin=slack/dm/D1",
+				"/api/monitor/detail?id=m1",
+				"/api/pane/plan?card=c1",
+				"/healthz",
+				"/api/snapshot",
+				"/api/board",
+				"/api/thread/live?origin=slack/dm/D1",
+			]) {
+				await (await fetch(`${base}${path}`)).arrayBuffer();
+			}
+			for (const path of ["/api/board/events", "/api/thread/live/events?origin=slack/dm/D1"]) {
+				await fetch(`${base}${path}`, { method: "HEAD" });
+			}
+			expect(heard).toEqual(["page:turns", "page", "trace", "conversation", "monitor_detail", "board_pane"]);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("a request log that throws leaves the answer as it was", async () => {
+		seed("dispatched");
+		const server = startDashboardServer({
+			port: 0,
+			hostname: "127.0.0.1",
+			snapshot: async () => {
+				throw new Error("not asked");
+			},
+			onRequest: () => {
+				throw new Error("log unwritable");
+			},
+			trace: (id) => readTurnTrace(home, id, NOW),
+		});
+		try {
+			const ok = await fetch(`http://127.0.0.1:${server.port}/api/turn/1/trace`);
+			expect(ok.status).toBe(200);
+			expect(await ok.json()).toMatchObject({ ok: true, inboundId: 1 });
+		} finally {
+			server.stop(true);
 		}
 	});
 });

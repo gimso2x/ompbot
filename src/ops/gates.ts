@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { OmpbotConfig } from "../config";
 import { DEFAULT_SWEEP_MS, readSweepHeartbeat } from "../daemon/heartbeat";
 import { nextFireOf, toMonitor } from "../monitors/ledger";
 import { checkOmpRuntime } from "../omp/runtime-check";
@@ -19,6 +20,11 @@ import {
 	type StatfsReader,
 } from "./host-resources";
 import { OFFSITE_STAMP_FILE } from "./offsite";
+
+/** Opening a FIFO in the ledger's place blocks forever, so the ledger is opened only after this passes. */
+export function assertRegularLedger(dbPath: string): void {
+	if (!statSync(dbPath).isFile()) throw new Error("ledger is not a regular file");
+}
 
 /** A stale backup is the first thing to catch; the hub uses the same 36h window for its file-age check. */
 export const BACKUP_MAX_AGE_MS = 36 * 60 * 60_000;
@@ -55,7 +61,10 @@ export const MONITOR_FAILURE_WINDOW_MS = 24 * 60 * 60_000;
 export const TURNS_FAILING_WINDOW_MS = 60 * 60_000;
 export const TURNS_FAILING_THRESHOLD = 3;
 
-/** The Slack socket stays down this long before `slack_disconnected` opens (shorter blips reconnect by themselves). */
+/**
+ * The Slack socket (or the Discord gateway) stays down this long before `slack_disconnected` (`discord_disconnected`)
+ * opens; shorter blips reconnect by themselves.
+ */
 export const SOCKET_DOWN_MS = 10 * 60_000;
 /** An enabled monitor whose next fire is this far in the past means the monitor tick is not firing it. */
 export const MONITOR_OVERDUE_MS = 15 * 60_000;
@@ -80,6 +89,8 @@ export interface GatesOptions {
 	ompExecutable?: string;
 	/** True when config.json has an `offsite` target; only then does the `offsite_age` gate exist. */
 	offsiteConfigured?: boolean;
+	/** True when config.json has `channels.discord`; only then does the `discord_disconnected` gate exist. */
+	discordConfigured?: boolean;
 	/** Paths whose filesystems `disk_low` judges; default `defaultDiskPaths`. */
 	diskPaths?: string[];
 	/** Config `ompProfile`: its agent dir joins the default `disk_low` paths. */
@@ -94,6 +105,40 @@ export interface GatesOptions {
 	 * one there is nothing to judge and no gate.
 	 */
 	dailyCap?: { usd: number; timezone: string };
+}
+
+/** The part of {@link GatesOptions} config.json decides. */
+export type ConfigGateOptions = Pick<
+	GatesOptions,
+	"ompExecutable" | "ompProfile" | "offsiteConfigured" | "discordConfigured" | "dailyCap"
+>;
+
+/**
+ * The config-derived gate options. The daemon's gate sweep, `/status`, `ompbot status`/`gates`/`apply` and the
+ * dashboard all build their gates from this, so a gate the sweep alerts on is never missing from a status view. A
+ * db-only home (no config.json) gets none: no omp to check, no offsite target, no ceiling. `timezone` is where the
+ * cost ceiling's "today" is: the config's own zone unless the caller (the dashboard's partial config) names it.
+ */
+export function gateOptionsFromConfig(
+	config:
+		| (Partial<Pick<OmpbotConfig, "agent" | "ompExecutable" | "ompProfile" | "offsite" | "costCap" | "timezone">> & {
+				/** Only whether `discord` is there is read (the dashboard's config carries a partial `channels`). */
+				channels?: { discord?: object | undefined } | undefined;
+		  })
+		| undefined,
+	timezone: string | undefined = config?.timezone,
+): ConfigGateOptions {
+	if (config === undefined) return {};
+	const dailyUsd = config.costCap?.dailyUsd;
+	return {
+		...((config.agent ?? "omp") === "omp" && config.ompExecutable !== undefined
+			? { ompExecutable: config.ompExecutable }
+			: {}),
+		...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+		offsiteConfigured: config.offsite !== undefined,
+		discordConfigured: config.channels?.discord !== undefined,
+		...(dailyUsd === undefined || timezone === undefined ? {} : { dailyCap: { usd: dailyUsd, timezone } }),
+	};
 }
 
 function gate(name: string, open: boolean, detail: string): Gate {
@@ -305,6 +350,26 @@ export function collectGates(options: GatesOptions): Gate[] {
 		gates.push(gate("slack_disconnected", false, heartbeat.socket === undefined ? "socket=unknown" : "socket=up"));
 	}
 
+	// Discord only when configured. Unlike the Slack socket, a stamp without the discord field cannot be read as health:
+	// a daemon that runs Discord always reports its gateway, so a missing field means nothing to judge.
+	if (options.discordConfigured === true) {
+		if (heartbeat === undefined) gates.push(unknownGate("discord_disconnected", "stamp=missing"));
+		else if (heartbeat.discord === undefined) gates.push(unknownGate("discord_disconnected", "discord=missing"));
+		else if (heartbeat.discord.state === "up") gates.push(gate("discord_disconnected", false, "discord=up"));
+		else {
+			const downMs = now - heartbeat.discord.since.getTime();
+			gates.push(
+				downMs < -BACKUP_FUTURE_TOLERANCE_MS
+					? gate("discord_disconnected", true, "discord=down ts_in_future")
+					: gate(
+							"discord_disconnected",
+							downMs >= SOCKET_DOWN_MS,
+							`discord=down minutes=${Math.max(0, Math.floor(downMs / 60_000))}`,
+						),
+			);
+		}
+	}
+
 	// Open for as long as FROZEN exists, so a freeze the owner forgot keeps showing in `gates` and the gate alerts.
 	const freeze = readFreeze(homeDir);
 	gates.push(
@@ -345,6 +410,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 	let db: Database | undefined;
 	const ledger: Gate[] = [];
 	try {
+		assertRegularLedger(dbPath);
 		db = new Database(dbPath, { readonly: true, strict: true });
 		if (!tableExists(db, "inbound") || !tableExists(db, "deliveries")) throw new Error("ledger tables missing");
 		const lastSign = columnExists(db, "inbound", "last_event_at")

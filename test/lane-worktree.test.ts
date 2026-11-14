@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { laneLandBlockers } from "../src/lanes/land";
 import { LaneInputError } from "../src/lanes/manager";
 import { buildWorkStartTool } from "../src/lanes/tools";
 import { createTaskHostOps } from "../src/tasks/host";
@@ -65,10 +66,11 @@ describe("lane start creates its own worktree and branch (AC-1)", () => {
 			worktree,
 			branch: `lane/${laneId}`,
 			baseBranch,
-			risk: "L3",
 			acceptance: [],
 			baseSha,
 		});
+		// No risk named: none is stored, and the lane counts as DEFAULT_LANE_RISK (L3) wherever a risk is compared.
+		expect(lane.meta.risk).toBeUndefined();
 		expect(h.store.getLane(lane.name)?.meta).toMatchObject({ laneId, worktree, branch: `lane/${laneId}` });
 		expect(git(worktree, "branch", "--show-current")).toBe(`lane/${laneId}`);
 		expect(git(worktree, "rev-parse", "HEAD")).toBe(baseSha);
@@ -201,7 +203,14 @@ describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 		const h = laneHarness(home.dir);
 		const tool = buildWorkStartTool(h.manager, "D1");
 		await tool.execute({ title: "defaults", cwd: repo }, { signal: new AbortController().signal });
-		expect(h.store.getLane("defaults")?.meta).toMatchObject({ risk: "L3", acceptance: [] });
+		const lane = h.store.getLane("defaults");
+		if (lane === undefined) throw new Error("no lane defaults");
+		expect(lane.meta).toMatchObject({ acceptance: [] });
+		// Unrated: no risk is stored (lane-review-confidence E), and the auto-merge compares it as L3.
+		expect(lane.meta.risk).toBeUndefined();
+		expect(laneLandBlockers(lane, { repos: [repo], maxRisk: "L2" }, true, false)).toContain("위험 L3 > L2");
+		const atL3 = laneLandBlockers(lane, { repos: [repo], maxRisk: "L3" }, true, false);
+		expect(atL3.some((reason) => reason.startsWith("위험"))).toBe(false);
 		await h.settle();
 		h.close();
 	});

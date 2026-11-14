@@ -1,8 +1,8 @@
 // Text for Discord: core text written as Slack mrkdwn becomes Discord markdown (`mrkdwnToDiscord`), and a delivery body
 // (the model's markdown, which Discord mostly draws as is) becomes messages of at most 2000 characters
 // (`renderDiscordParts`), its valid ```card fences embeds of their own (`renderDiscordMessages`).
-import { splitCards, validateCard } from "../channel/card";
-import { chunkText, escapeMrkdwn, REDELIVERED_PREFIX } from "../channel/text";
+import { cardRuns, validateCard } from "../channel/card";
+import { chunkText, errorText, escapeMrkdwn, REDELIVERED_PREFIX, tableEndAt } from "../channel/text";
 import { cardToEmbed, type DiscordEmbed } from "./card";
 import { MESSAGE_CONTENT_LIMIT } from "./transport";
 
@@ -55,52 +55,31 @@ export function escapeDiscordMarkdown(text: string): string {
 	return escapeMrkdwn(text.replace(/[\\*_`~|>]/g, "\\$&"));
 }
 
-const TABLE_RULE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
-
-/** A row's cells: outer pipes optional, `\|` is a literal pipe inside a cell (GFM). */
-function rowCells(line: string): string[] {
-	return line
-		.trim()
-		.replace(/^\|/, "")
-		.replace(/(?<!\\)\|$/, "")
-		.split(/(?<!\\)\|/);
-}
-
-/** A table body row: any line holding an unescaped pipe. */
-function isTableRow(line: string): boolean {
-	return /(?<!\\)\|/.test(line);
-}
-
-/** A table starts at a header row followed by a `---` rule of the same cell count (2+), outer pipes optional. */
-function isTableStart(line: string, next: string): boolean {
-	if (!isTableRow(line) || !TABLE_RULE.test(next)) return false;
-	const cells = rowCells(line).length;
-	return cells >= 2 && cells === rowCells(next).length;
-}
-
 /**
- * GFM tables (a header row, a `|---|` rule, more rows) outside code fences, each wrapped in a code fence: Discord does
- * not draw tables. Returns the text and the wrapped spans, which a split must keep whole.
+ * GFM tables (a header row, a `|---|` rule of 3+ hyphens a cell, more rows) outside code fences, each wrapped in a code
+ * fence: Discord does not draw tables. Returns the text and the wrapped spans, which a split must keep whole.
  */
 function fenceTables(text: string): { text: string; spans: Array<[number, number]> } {
 	const lines = text.split("\n");
 	const out: string[] = [];
 	const spans: Array<[number, number]> = [];
 	let offset = 0;
-	let inFence = false;
+	let fenceRun = 0;
 	const push = (line: string): void => {
 		out.push(line);
 		offset += line.length + 1;
 	};
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
-		if (line.trimStart().startsWith("```")) inFence = !inFence;
-		if (inFence || !isTableStart(line, lines[i + 1] ?? "")) {
+		// A fence opens on a line of 3+ backticks and an info string without backticks, and closes on a line of backticks
+		// alone at least as long; a fence closed on its own line (```bash x```) opens nothing.
+		if (fenceRun === 0) fenceRun = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
+		else if ((/^ {0,3}(`+)[ \t]*$/.exec(line)?.[1]?.length ?? 0) >= fenceRun) fenceRun = 0;
+		const end = fenceRun > 0 ? undefined : tableEndAt(lines, i, 3);
+		if (end === undefined) {
 			push(line);
 			continue;
 		}
-		let end = i + 2;
-		while (end < lines.length && isTableRow(lines[end] ?? "")) end++;
 		const start = offset;
 		push("```");
 		for (const row of lines.slice(i, end)) push(row);
@@ -152,51 +131,26 @@ export type DiscordParts = DiscordPart[] & { cardIssues?: readonly string[] };
  */
 export function renderDiscordMessages(body: string, redelivered: boolean, footer?: string): DiscordParts {
 	const issues: string[] = [];
-	const pieces: Array<{ text: string } | { embed: DiscordEmbed }> = [];
 	const prefix = redelivered ? `${REDELIVERED_PREFIX}\n` : "";
 	const suffix = footer === undefined ? "" : `\n_${footer}_`;
 	const limit = MESSAGE_CONTENT_LIMIT - prefix.length - suffix.length;
-	let text: string[] = [];
-	let n = 0;
-	const flush = (): void => {
-		const joined = text
-			.join("\n")
-			.replace(/^(?:[ \t]*\n)+/, "")
-			.trimEnd();
-		if (joined.trim() !== "") for (const part of chunkPlain(joined, limit)) pieces.push({ text: part });
-		text = [];
-	};
-	for (const segment of splitCards(body)) {
-		if (segment.kind === "text") {
-			text.push(segment.text);
-			continue;
-		}
-		n += 1;
-		const validated = validateCard(segment.json);
-		if (!validated.ok) {
-			issues.push(...validated.issues.map((issue) => `card ${n}: ${issue}`));
-			text.push(segment.raw);
-			continue;
-		}
+	const runs = cardRuns<{ embed: DiscordEmbed }>(body, issues, (json) => {
+		const validated = validateCard(json);
+		if (!validated.ok) return validated.issues;
 		let embed: DiscordEmbed;
 		try {
 			embed = cardToEmbed(validated.card, validated.tone);
 		} catch (err) {
 			// A validated card the embed renderer still chokes on stays text, like an invalid one: the answer goes out.
-			issues.push(`card ${n}: ${err instanceof Error ? err.message : String(err)}`);
-			text.push(segment.raw);
-			continue;
+			return [errorText(err)];
 		}
 		// A card with nothing to show (no title, text, fields or image) would be an empty message Discord refuses.
-		if (Object.keys(embed).every((key) => key === "color")) {
-			issues.push(`card ${n}: the card has nothing to show`);
-			text.push(segment.raw);
-			continue;
-		}
-		flush();
-		pieces.push({ embed });
-	}
-	flush();
+		return Object.keys(embed).every((key) => key === "color") ? ["the card has nothing to show"] : { embed };
+	});
+	const pieces = runs.flatMap(
+		(run): Array<{ text: string } | { embed: DiscordEmbed }> =>
+			run.kind === "card" ? [run] : chunkPlain(run.text, limit).map((text) => ({ text })),
+	);
 	const parts: DiscordParts = pieces.some((piece) => "embed" in piece)
 		? pieces.map((piece, i) => {
 				const head = i === 0 ? prefix : "";

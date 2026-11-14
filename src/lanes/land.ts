@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { TASK_RISKS } from "../tasks/docs";
-import { type AutoLandPolicy, checkBlockers } from "../tasks/notify";
+import { type AutoLandPolicy, checkBlockers, type LaneReviewConfident } from "../tasks/notify";
+import { formatConfidence } from "./review";
 import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneRow } from "./status";
 import { defaultGit, type GitResult, type GitRunner, gitRunner } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
@@ -247,6 +248,108 @@ export async function landLane(request: LandRequest, deps: LanderDeps, hooks: La
 	return { state: "landed", preSha, ...(push === undefined ? {} : { pushed: push.pushed }), ...left };
 }
 
+export interface CoreRebaseRequest {
+	worktree: string;
+	/** `lane/<laneId>`: the branch the worktree must have checked out. */
+	branch: string;
+	baseBranch: string;
+}
+
+/** Why the core left a not-ff lane's rebase to the lane; the owner reads the word on the card. */
+export type CoreRebaseMiss = "레인 턴 진행 중" | "detached HEAD" | "충돌" | "빈 rebase" | "git 오류";
+
+export type CoreRebaseResult =
+	| { state: "rebased"; oldSha: string; newSha: string }
+	/**
+	 * Nothing was rebased; the worktree is back at `oldSha` (when it was read). `abortFailed`: a stopped rebase could not
+	 * be aborted — the worktree may still be in the middle of it.
+	 */
+	| { state: "missed"; why: CoreRebaseMiss; detail: string; abortFailed?: string };
+
+const gitError = (error: unknown): string => String(error).slice(0, 200);
+
+/**
+ * Rebases a not-ff lane's branch onto its base branch in the lane's worktree (`landLane` found it clean at the claim).
+ * Only a worktree on `refs/heads/<branch>` is touched; a stopped or thrown rebase is aborted, and a rebase that left
+ * nothing of the lane on top of the base (every commit already there) is reset back to `oldSha`. Never rejects.
+ */
+export async function coreRebase(git: GitRunner, request: CoreRebaseRequest): Promise<CoreRebaseResult> {
+	const { worktree, branch, baseBranch } = request;
+	const baseRef = `refs/heads/${baseBranch}`;
+	let oldSha: string;
+	try {
+		const ref = await git(["-C", worktree, "symbolic-ref", "-q", "HEAD"]);
+		if (ref.code !== 0 || ref.stdout.trim() !== `refs/heads/${branch}`) {
+			return {
+				state: "missed",
+				why: "detached HEAD",
+				detail: `HEAD가 ${branch}가 아님(${ref.stdout.trim() || "detached"})`,
+			};
+		}
+		const head = await git(["-C", worktree, "rev-parse", "--verify", "HEAD^{commit}"]);
+		if (head.code !== 0) return { state: "missed", why: "git 오류", detail: `rev-parse HEAD: ${failureLine(head)}` };
+		oldSha = head.stdout.trim();
+	} catch (error) {
+		return { state: "missed", why: "git 오류", detail: gitError(error) };
+	}
+	let miss: { why: CoreRebaseMiss; detail: string };
+	try {
+		const rebased = await git(["-C", worktree, "-c", "commit.gpgsign=false", "rebase", baseRef, branch]);
+		miss = { why: "충돌", detail: failureLine(rebased) };
+		if (rebased.code === 0) {
+			const head = await git(["-C", worktree, "rev-parse", "--verify", "HEAD^{commit}"]);
+			const newSha = head.stdout.trim();
+			const onBase = await git(["-C", worktree, "merge-base", "--is-ancestor", newSha, baseRef]);
+			if (head.code === 0 && onBase.code === 1) return { state: "rebased", oldSha, newSha };
+			// Every lane commit was already in the base branch (or git could not tell): the lane's work is the judge's.
+			miss =
+				head.code === 0 && onBase.code === 0
+					? { why: "빈 rebase", detail: `rebase 뒤 HEAD ${newSha.slice(0, 12)}가 ${baseBranch}의 조상` }
+					: { why: "git 오류", detail: `rebase 뒤 확인 실패: ${failureLine(head.code === 0 ? onBase : head)}` };
+			const reset = await git(["-C", worktree, "reset", "-q", "--hard", oldSha]);
+			if (reset.code !== 0) return { state: "missed", ...miss, abortFailed: `reset --hard: ${failureLine(reset)}` };
+			return { state: "missed", ...miss };
+		}
+	} catch (error) {
+		miss = { why: "git 오류", detail: gitError(error) };
+	}
+	const abortFailed = await abortRebase(git, worktree, branch, oldSha);
+	return { state: "missed", ...miss, ...(abortFailed === undefined ? {} : { abortFailed }) };
+}
+
+/**
+ * `git rebase --abort`; `undefined` once the worktree is clean on `branch` at `oldSha` again (an abort with no rebase
+ * to abort fails harmlessly), else what went wrong.
+ */
+async function abortRebase(
+	git: GitRunner,
+	worktree: string,
+	branch: string,
+	oldSha: string,
+): Promise<string | undefined> {
+	let aborted: string | undefined;
+	try {
+		const abort = await git(["-C", worktree, "rebase", "--abort"]);
+		if (abort.code !== 0) aborted = failureLine(abort);
+	} catch (error) {
+		aborted = gitError(error);
+	}
+	if (aborted === undefined) return undefined;
+	try {
+		const ref = await git(["-C", worktree, "symbolic-ref", "-q", "HEAD"]);
+		const head = await git(["-C", worktree, "rev-parse", "HEAD"]);
+		const status = await statusOf(git, worktree);
+		const restored =
+			ref.stdout.trim() === `refs/heads/${branch}` &&
+			head.stdout.trim() === oldSha &&
+			"dirty" in status &&
+			status.dirty.length === 0;
+		return restored ? undefined : `rebase --abort: ${aborted}`;
+	} catch {
+		return `rebase --abort: ${aborted}`;
+	}
+}
+
 /** Branch reflog subjects of a commit made on that branch (not a reset, merge, pull or the branch's creation). */
 const MADE_ON_BRANCH = /^(commit|commit \(amend\)|rebase( -i)? \(finish\)|cherry-pick):/;
 const CLAIM_SHA = /^[0-9a-f]{7,64}$/;
@@ -331,13 +434,33 @@ export function createLaneLander(deps: LanderDeps): LandLane {
 export const REVIEW_MISSING = "독립 리뷰 없음";
 export const REVIEW_BLOCK = "독립 리뷰 BLOCK";
 export const REVIEW_INCONCLUSIVE = "독립 리뷰 확인 불가";
+/** A `CLEAR` receipt of a lane in the confident band whose confidence is missing or under `minConfidence`. */
+export const reviewUnsure = (confidence: number | undefined, minConfidence: number, risk: string): string =>
+	`독립 리뷰 CLEAR(${confidence === undefined ? "확신도 없음" : `확신도 ${formatConfidence(confidence)} < ${formatConfidence(minConfidence)}`}, 위험 ${risk})`;
+
+/**
+ * `taskAutoLand.review.confident` when the lane is in its band: an explicit risk (never `DEFAULT_LANE_RISK` of a lane
+ * without one) above `policy.maxRisk` and at most `confident.maxRisk`. Such a lane is reviewed, and merges unasked on
+ * a `CLEAR` receipt of at least `minConfidence`.
+ */
+export function confidentBand(lane: LaneRow, policy: AutoLandPolicy): LaneReviewConfident | undefined {
+	const confident = policy.review?.confident;
+	const risk = lane.meta.risk;
+	if (confident === undefined || risk === undefined) return undefined;
+	const rank = TASK_RISKS.indexOf(risk);
+	return rank > TASK_RISKS.indexOf(policy.maxRisk) && rank <= TASK_RISKS.indexOf(confident.maxRisk)
+		? confident
+		: undefined;
+}
 
 /**
  * Why a closed lane is not merged without asking; `[]` = merge it. The rules are `autoLandBlockers`' (tasks), as far
  * as they apply to a lane: `repoMatched` is the git common-directory comparison against `taskAutoLand.repos`, the
  * checks are the ones the core re-ran at the claim commit (a timed-out one is counted apart from a failed one, and holds
  * the merge too), and a lane the owner let through an integrity refusal or timed-out checks is never merged unasked. `frozen`: auto-merge is autonomous, so a freeze holds it. With `policy.review` only a `CLEAR` receipt for
- * the claim commit (`meta.review.sha === meta.sha`) lets the lane through.
+ * the claim commit (`meta.review.sha === meta.sha`) lets the lane through; a lane in the `confidentBand` has no risk
+ * reason and needs that receipt's confidence to reach `minConfidence`. A lane above `maxRisk` outside the band gets the
+ * risk reason only: it is never reviewed, so a missing review is no reason of its own.
  */
 export function laneLandBlockers(
 	lane: LaneRow,
@@ -348,7 +471,10 @@ export function laneLandBlockers(
 	const blockers: string[] = [];
 	if (!repoMatched) blockers.push("저장소가 taskAutoLand.repos 밖");
 	const risk = lane.meta.risk ?? DEFAULT_LANE_RISK;
-	if (TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf(policy.maxRisk)) blockers.push(`위험 ${risk} > ${policy.maxRisk}`);
+	const band = confidentBand(lane, policy);
+	// Above `maxRisk` and outside the confident band: the risk alone holds it, and no review is expected.
+	const unreviewable = band === undefined && TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf(policy.maxRisk);
+	if (unreviewable) blockers.push(`위험 ${risk} > ${policy.maxRisk}`);
 	const recorded = lane.meta.checks;
 	const checks = recorded !== undefined && recorded.head === lane.meta.sha ? recorded.results : [];
 	if (checks.length === 0) blockers.push("재실행 검사 없음");
@@ -356,11 +482,14 @@ export function laneLandBlockers(
 	const held = lane.meta.land?.autoLandHeld;
 	if (held !== undefined)
 		blockers.push(held === INTEGRITY_APPROVED || held === INCONCLUSIVE_APPROVED ? `${held}으로 통과` : held);
-	if (policy.review !== undefined) {
+	if (policy.review !== undefined && !unreviewable) {
 		const review = lane.meta.review;
 		if (review === undefined || review.sha !== lane.meta.sha) blockers.push(REVIEW_MISSING);
 		else if (review.verdict === "BLOCK") blockers.push(REVIEW_BLOCK);
 		else if (review.verdict === "inconclusive") blockers.push(`${REVIEW_INCONCLUSIVE}(${review.reason ?? "?"})`);
+		else if (band !== undefined && !(review.confidence !== undefined && review.confidence >= band.minConfidence)) {
+			blockers.push(reviewUnsure(review.confidence, band.minConfidence, risk));
+		}
 	}
 	if (frozen) blockers.push("동결 중");
 	return blockers;

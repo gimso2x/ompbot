@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderConversation, renderDashboardMain, renderItemDetail } from "../src/dashboard/html";
+import { renderConversation, renderDashboardMain, renderDashboardPage, renderItemDetail } from "../src/dashboard/html";
 import { renderMarkdown } from "../src/dashboard/markdown";
 import { startDashboardServer } from "../src/dashboard/server";
 import { buildSnapshot, type DashboardSnapshot, type SnapshotDeps } from "../src/dashboard/snapshot";
@@ -601,5 +601,71 @@ describe("api/thread/conversation", () => {
 		expect(html).not.toMatch(/<script/i);
 		expect(html).not.toMatch(/<img/i);
 		expect(html).not.toContain("<b>bash</b>");
+	});
+});
+
+describe("터미널에서 보기: watch / attach commands to paste (lane-attach 3단계)", () => {
+	const LANE_ORIGIN = "ompbot/work/fix-login";
+
+	function seedLane(): void {
+		seed([
+			{ origin: "slack/ch/CA/t/1.0", text: "대화 요청", state: "answered", createdAt: NOW - 5 * MINUTE },
+			{ origin: LANE_ORIGIN, text: "레인 작업", state: "dispatched", createdAt: NOW - 4 * MINUTE },
+		]);
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run(
+			`INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at)
+			 VALUES ('fix-login', '로그인 고치기', 'CA:9.0', ?, '/srv/repo-l-1', '/srv/s', 'working', '[]', '{}', ?, ?)`,
+			[LANE_ORIGIN, NOW, NOW],
+		);
+		db.close();
+	}
+
+	test("AC-5: a lane shows watch and attach, a conversation watch only — no quotes or backticks — and nothing runs", async () => {
+		seedLane();
+		const ran: string[][] = [];
+		const snapshot = await buildSnapshot({
+			...deps(),
+			run: async (argv) => {
+				ran.push(argv);
+				return { code: 1, stdout: "", timedOut: false };
+			},
+		});
+		expect(snapshot.ompbotCli).toEqual(["bun", "/srv/ompbot/src/main.ts"]);
+		const cli = "bun /srv/ompbot/src/main.ts";
+		const commandsIn = (html: string): string[] =>
+			[...html.matchAll(/data-copy="([^"]*)" data-copy-label="명령"/g)].map((match) => match[1] ?? "");
+
+		const lane = renderItemDetail(snapshot, "lanes", "fix-login");
+		expect(lane).toContain("터미널에서 보기");
+		expect(commandsIn(lane)).toEqual([`${cli} lanes watch fix-login`, `${cli} lanes attach fix-login`]);
+
+		// The lane's own conversation on the turn board offers the lane commands; any other conversation watch only.
+		expect(commandsIn(renderItemDetail(snapshot, "turns", LANE_ORIGIN))).toEqual([
+			`${cli} lanes watch fix-login`,
+			`${cli} lanes attach fix-login`,
+		]);
+		const chat = renderItemDetail(snapshot, "turns", "slack/ch/CA/t/1.0");
+		expect(commandsIn(chat)).toEqual([`${cli} lanes watch slack/ch/CA/t/1.0`]);
+		for (const command of [...commandsIn(lane), ...commandsIn(chat)]) {
+			expect(command).not.toMatch(/["'`]/);
+		}
+		// An argument that would need quoting drops the command instead of showing one that breaks when pasted.
+		expect(
+			commandsIn(
+				renderItemDetail({ ...snapshot, ompbotCli: ["bun", "/srv/my ompbot/src/main.ts"] }, "lanes", "fix-login"),
+			),
+		).toEqual([]);
+		// The page only shows the commands: building and rendering it ran no ompbot command.
+		expect(ran.some((argv) => argv.some((word) => word === "lanes" || word.endsWith("main.ts")))).toBe(false);
+
+		// The shipped client renderer draws the same panels.
+		const script = /<script>([\s\S]*)<\/script>/.exec(renderDashboardPage(snapshot))?.[1] ?? "";
+		const client = new Function("document", "setInterval", `${script}\nreturn { renderItemDetail };`)(
+			{ getElementById: () => ({}) },
+			() => 0,
+		) as { renderItemDetail: typeof renderItemDetail };
+		expect(client.renderItemDetail(snapshot, "lanes", "fix-login")).toBe(lane);
+		expect(client.renderItemDetail(snapshot, "turns", "slack/ch/CA/t/1.0")).toBe(chat);
 	});
 });

@@ -6,9 +6,9 @@ import type { TeamsAuth } from "./auth";
 import type { TeamsActivity } from "./types";
 
 /** Larger bodies are refused before parsing (a Teams message Activity is a few KB). */
-export const MAX_ACTIVITY_BYTES = 1024 * 1024;
+const MAX_ACTIVITY_BYTES = 1024 * 1024;
 
-export interface TeamsServerOptions {
+interface TeamsServerOptions {
 	hostname: string;
 	/** 0: any free port (tests). */
 	port: number;

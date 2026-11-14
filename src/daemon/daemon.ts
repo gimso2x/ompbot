@@ -1,15 +1,22 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ChannelAdapter, ChannelBinding } from "../channel/adapter";
 import { ChannelRegistry } from "../channel/registry";
 import { escapeMrkdwn } from "../channel/text";
-import type { CoreSink, DeliverySource, GuestInboundMessage, IngestOutcome } from "../channel/types";
-import { DEPRECATED_KEYS, LANE_REVIEW_TIMEOUT_MS, loadConfig, type OmpbotConfig, primaryOwnerUserId } from "../config";
+import type { CoreSink, DeliveryItem, DeliverySource, GuestInboundMessage, IngestOutcome } from "../channel/types";
+import {
+	DEPRECATED_KEYS,
+	LANE_REVIEW_TIMEOUT_MS,
+	loadConfig,
+	type OmpbotConfig,
+	peerSilenceMinutes,
+	primaryOwnerUserId,
+} from "../config";
 import type { DriverFactory, ProviderLimitInfo, ThreadSource, TurnFailureEscalation } from "../core/mailbox";
-import { parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { conversationKind, parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
-import { type ChatPlatform, type IdPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
+import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { stuckStopText } from "../core/stuck";
 import {
 	COMMAND_OP_REF,
@@ -31,10 +38,12 @@ import {
 	herdrPromptExisting,
 	herdrReadAgent,
 	type ProcessRunner,
+	readRemoteLastAssistant,
 	realProcessRunner,
 	setLocalHerdrBin,
 } from "../dispatch/omp";
-import { parseLaneActionId } from "../lanes/card";
+import { boardNoticeFor, buildBoardTools } from "../lanes/board";
+import { type LaneAction, parseLaneActionId } from "../lanes/card";
 import { classifyLaneControl } from "../lanes/control";
 import type { LandLane } from "../lanes/land";
 import { DEFAULT_COMPLETION_NUDGES, LaneInputError, LaneManager } from "../lanes/manager";
@@ -55,7 +64,18 @@ import { buildMonitorTools, isPersonaOrigin } from "../monitors/tools";
 import { WebhookServer } from "../monitors/webhook";
 import type { ClaudeApprovalHook } from "../omp/claude-driver";
 import type { OmpDialogAnswerer, OmpSessionDriver } from "../omp/driver";
-import { readConfigText, recordLastGoodConfig } from "../ops/apply";
+import { lastAnswerOf, readLastAssistant } from "../omp/session-tail";
+import {
+	applyPathEnv,
+	isExecutableFile,
+	isReportOrigin,
+	readAutoLandHold,
+	readConfigText,
+	recordLastGoodConfig,
+	reportThreadPattern,
+	STAMP_PATTERN,
+	spawnRunner,
+} from "../ops/apply";
 import { type BackupOptions, type BackupResult, readStamp, runBackup } from "../ops/backup";
 import { formatCacheMissNotice, formatColdCacheNotice } from "../ops/cache-monitor";
 import {
@@ -70,13 +90,14 @@ import {
 	usd,
 } from "../ops/cost-cap";
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
-import { collectGates, type GateState } from "../ops/gates";
+import { collectGates, type GateState, gateOptionsFromConfig } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
 import type { HostLoadReader } from "../ops/host-resources";
 import { pruneMediaFiles } from "../ops/media";
 import { BRIEFING_TIMEOUT_MS, BRIEFING_WIDTH, renderPng } from "../ops/screenshot";
 import { allSessionFiles, conversationSessionFiles, renderUsage, summarizeSessionFiles } from "../ops/usage";
 import { redact } from "../redact";
+import { resolveCandidates, runCandidateProposals } from "../review/candidates";
 import {
 	installSkill,
 	readSessionDigest,
@@ -87,7 +108,7 @@ import {
 } from "../review/skills";
 import { ApprovalBroker, type ApprovalOutcome, parseApprovalRetryActionId } from "../safety/approval";
 import { answerDialogOnSlack } from "../safety/choice";
-import { buildHostTools, type HostToolDef } from "../safety/host-tools";
+import { buildHostTools, type HostToolDef, PEER_TOOL_DENIED } from "../safety/host-tools";
 import { buildFloorsPrompt, type FloorsSurface, teamsQaSystemPrompt } from "../safety/prompt";
 import {
 	type DeliveryRow,
@@ -96,6 +117,8 @@ import {
 	type InboundRow,
 	LOG_COPY_SUFFIX,
 	type LogChannels,
+	PEER_SILENCE_OP_PREFIX,
+	type PeerCallPolicy,
 	Store,
 } from "../store/db";
 import { notePrompt } from "../tasks/dispatch";
@@ -128,6 +151,7 @@ import {
 } from "./guest";
 import { DEFAULT_SWEEP_MS, EVENT_LOOP_WARN_MS, SweepHeartbeatWriter } from "./heartbeat";
 import { type IpcServer, startIpcServer } from "./ipc";
+import { pidAlive } from "./lock";
 import {
 	formatGateClosedNotice,
 	formatGateOpenNotice,
@@ -140,6 +164,7 @@ import {
 import { NamespacedDriver } from "./opref";
 import { type RestartCutEntry, recoverDispatched, writeRestartCut } from "./recovery";
 import { planReload, type ReloadResult } from "./reload";
+import { isSideOpRef, NOTIFY_OP_PREFIX, RestartLauncher, type RestartLauncherDeps } from "./restart";
 import {
 	pickRestartThreads,
 	RESTART_NOTICE_ACTIVE_MS,
@@ -154,13 +179,14 @@ import {
 	type DrainCounts,
 	frozenField,
 	openGateSummary,
+	renderContextLine,
 	renderStatusText,
 	type StatusReport,
 } from "./status";
 
 const MEDIA_SWEEP_INTERVAL_MS = 60 * 60_000;
 
-/** KV-cursor prefixes (like `mute:`) of a thread's peer hop cap: the last owner message and the notice already posted. */
+/** KV-cursor prefixes of a thread's peer hop cap: the last owner message and the notice already posted. */
 const PEER_HOP_RESET_CURSOR = "peerhop-reset:";
 const PEER_HOP_NOTICE_CURSOR = "peerhop-notice:";
 
@@ -266,8 +292,15 @@ export interface DaemonOptions {
 	landLane?: LandLane;
 	/** Test seam for the lanes' independent review (`taskAutoLand.review`); default runs the real `omp -p`. */
 	laneReviewRun?: ProcessRunner;
+	/** Test seam for whether an `ompbot lanes attach` process lives; default signal 0 on this machine. */
+	pidAlive?: (pid: number) => boolean;
 	/** Test seam for the [TASK] sweep's herdr calls (remind, agent status, board pane); default runs the real herdr. */
 	herdrRun?: ProcessRunner;
+	/**
+	 * Test seam for `!restart`: its git, systemctl and systemd-run runner, bun lookup and lock-holder check; default
+	 * the real ones on this machine.
+	 */
+	restart?: Partial<Pick<RestartLauncherDeps, "run" | "isAlive" | "isExecutable" | "pathEnv" | "repoDir">>;
 	/** Test seam for `!brief`'s chromium capture; default runs the real chromium. */
 	briefingRun?: ProcessRunner;
 	/** Test seam for the Teams guest/qa `omp -p` runs; default runs the real omp. */
@@ -303,12 +336,6 @@ const RECOMMEND_REJECTED_NOTE = '⚠️ 추천을 넣지 못함 — 스레드에
 const AUTO_LAND_TEXT = "머지해 (자동: Outcome 도달·재실행 검사 통과)";
 const AUTO_LAND_MARKER = "🤖 자동 머지";
 
-/**
- * Whether the bot answers a daemon-put owner message in `channel` as in a DM or as in a channel (where the bot mention
- * leads the text). Slack DM ids start with `D`; every other conversation counts as a channel.
- */
-const conversationKind = (channel: string): "dm" | "ch" => (channel.startsWith("D") ? "dm" : "ch");
-
 /** Sweep-retry state of one origin with stranded pending rows (see `#sweepPendingDispatch`). */
 interface PendingRetryState {
 	/** Clock time of the last retry attempt (the per-origin cadence gate). */
@@ -319,6 +346,19 @@ interface PendingRetryState {
 	failures: number;
 	/** Last drain error text (the alert incident's sign); empty while no retry has rejected. */
 	sign: string;
+}
+
+/** The peer call policy of a config: Discord peer bots with `peerSilenceAlert` on; `undefined` (off) otherwise. */
+function peerCallPolicyOf(config: OmpbotConfig): PeerCallPolicy | undefined {
+	const discord = config.channels.discord;
+	const minutes = peerSilenceMinutes(config);
+	if (discord?.peerBots === undefined || discord.peerBots.length === 0 || minutes === 0) return undefined;
+	return {
+		peers: discord.peerBots,
+		skipConversations: [discord.logChannelId].filter((id) => id !== undefined),
+		ownerUserId: discord.ownerUserId,
+		silenceMs: minutes * 60_000,
+	};
 }
 
 /** The ledger with the crash hooks and a delivery nudge wired into the state changes that matter. */
@@ -429,10 +469,15 @@ export class Daemon {
 	/** Background lane tick / mailbox idle sweep in flight: the sweep never awaits them, and never overlaps them. */
 	#laneTicking = false;
 	#idleSweeping = false;
+	/** The peer silence sweep runs only once the startup Discord recovery pass has fed in the posts missed meanwhile. */
+	#peerSilenceArmed = false;
 	/** Sweep-retry state per origin with stranded pending rows; progress deletes the entry. */
 	readonly #pendingRetries = new Map<string, PendingRetryState>();
 	#reviewing = false;
 	readonly #reviewedTurns = new Map<string, number>();
+	/** A candidate pass (and so its approval cards) is running. */
+	#proposingCandidates = false;
+	#lastCandidatePassAt = 0;
 	#pumping: Promise<void> = Promise.resolve();
 	#stopped = false;
 	/** The in-flight shutdown; a re-entering stop() awaits it instead of returning immediately. */
@@ -541,8 +586,9 @@ export class Daemon {
 	}
 
 	/**
-	 * A peer bot has written in this origin: its child gets the reduced host tool set and is told so in its system
-	 * prompt (driver factory). Judged from the ledger, not memory, so it survives a restart.
+	 * A peer bot has written in this origin: a child started from now on gets the reduced host tool set and is told so
+	 * in its system prompt (driver factory); a child already running keeps its list, and the call-time guard of
+	 * `hostToolsFor` reads this at every call. Judged from the ledger, not memory, so it survives a restart.
 	 */
 	peerTouched(originKey: string): boolean {
 		return this.#store?.originHasPeerInbound(originKey) === true;
@@ -601,17 +647,57 @@ export class Daemon {
 		return noLaneChannel ? { noLaneChannel, ...timezone, ...peers } : { ...timezone, ...peers };
 	}
 
-	/** Host tools for the omp child of `originKey`: file upload, owner approval, and the lane tools of its kind. */
+	/**
+	 * Host tools for the omp child of `originKey`, fixed for the child's life. A child started after a peer bot wrote
+	 * here gets the reduced set. A child started before keeps the full set (no restart, no prompt-cache rewrite), and
+	 * every tool missing from the reduced set re-reads the ledger when it runs: once a peer row exists it throws
+	 * instead of running. Each call runs inside the origin's mailbox: no stall alert while the child waits on the host
+	 * (an approval click can take minutes), and `drain` counts it as unfinished work.
+	 */
 	hostToolsFor(originKey: string): HostToolDef[] {
+		const reduced = this.#hostToolSet(originKey, true);
+		const allowed = new Set(reduced.map((tool) => tool.name));
+		const tools = this.peerTouched(originKey)
+			? reduced
+			: this.#hostToolSet(originKey, false).map((tool) =>
+					allowed.has(tool.name) ? tool : this.#peerGuarded(originKey, tool),
+				);
+		return tools.map((tool) => ({
+			...tool,
+			execute: (params, context) => {
+				const mailbox = this.#router?.mailbox(originKey);
+				return mailbox ? mailbox.trackHostTool(() => tool.execute(params, context)) : tool.execute(params, context);
+			},
+		}));
+	}
+
+	/** `tool` refused at call time once a peer bot has written in `originKey`; the ledger is read at every call. */
+	#peerGuarded(originKey: string, tool: HostToolDef): HostToolDef {
+		return {
+			...tool,
+			execute: async (params, context) => {
+				if (this.peerTouched(originKey)) {
+					this.#log.warn("host_tool_denied_peer", { origin: originKey, tool: tool.name });
+					throw new Error(PEER_TOOL_DENIED);
+				}
+				return tool.execute(params, context);
+			},
+		};
+	}
+
+	/**
+	 * The host tool set of `originKey` with (`peerTouched`) or without a peer bot in the conversation; `hostToolsFor`
+	 * builds both from here so the guarded difference follows any tool added later.
+	 */
+	#hostToolSet(originKey: string, peerTouched: boolean): HostToolDef[] {
 		const { config } = this.#options;
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
 		const chatOrigin = parseChatOrigin(originKey);
 		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : chatOrigin?.conversationId;
-		// Once a peer bot spoke in this origin its child gets only file upload, approval and dispatch (no lane or
-		// monitor tools); dispatch there asks the owner only for a high_risk brief, like anywhere else.
-		const peerTouched = this.peerTouched(originKey);
-		// The Graph chat tools read other people's conversations: the owner's own Teams 1:1 only, never once a peer
-		// bot has written there (the ledger's alias row must say a 1:1 the owner wrote in).
+		// With a peer bot in the conversation only file upload, approval and dispatch remain (no lane or monitor
+		// tools); dispatch there asks the owner only for a high_risk brief, like anywhere else.
+		// The Graph chat tools read other people's conversations: the owner's own Teams 1:1 only, never with a peer
+		// bot in it (the ledger's alias row must say a 1:1 the owner wrote in).
 		const teamsGraph =
 			this.#teamsGraph !== undefined &&
 			chatOrigin?.platform === "teams" &&
@@ -673,27 +759,19 @@ export class Daemon {
 		const otherPlatform =
 			chatOrigin !== undefined && chatOrigin.platform !== "slack" && chatOrigin.platform !== "discord";
 		const laneChannel = this.#laneChannelOf(originKey, channel);
-		const tools =
-			peerTouched || otherPlatform
-				? base
-				: !lanes
-					? [...base, ...monitorTools]
-					: lane
-						? [...base, ...buildLaneTools(lanes, originKey)]
-						: channel === undefined
-							? base
-							: laneChannel === undefined
-								? [...base, ...monitorTools]
-								: [...base, buildWorkStartTool(lanes, laneChannel), ...monitorTools];
-		// Each call runs inside the origin's mailbox: no stall alert while the child waits on the host (an approval
-		// click can take minutes), and `drain` counts it as unfinished work.
-		return tools.map((tool) => ({
-			...tool,
-			execute: (params, context) => {
-				const mailbox = this.#router?.mailbox(originKey);
-				return mailbox ? mailbox.trackHostTool(() => tool.execute(params, context)) : tool.execute(params, context);
-			},
-		}));
+		// The lane board: lane sessions and Slack/Discord conversations (doc/plans/lane-board.md).
+		const boardTools = store && (lane || chatOrigin) ? buildBoardTools(store, originKey) : [];
+		return peerTouched || otherPlatform
+			? base
+			: !lanes
+				? [...base, ...monitorTools, ...boardTools]
+				: lane
+					? [...base, ...buildLaneTools(lanes, originKey), ...boardTools]
+					: channel === undefined
+						? base
+						: laneChannel === undefined
+							? [...base, ...monitorTools, ...boardTools]
+							: [...base, buildWorkStartTool(lanes, laneChannel), ...monitorTools, ...boardTools];
 	}
 
 	/**
@@ -811,6 +889,7 @@ export class Daemon {
 			{ slack: config.logChannel, discord: config.channels.discord?.logChannelId },
 			config.timezone,
 		);
+		store.setPeerCallPolicy(peerCallPolicyOf(config));
 		this.#store = store;
 		this.#broker = new ApprovalBroker({
 			channels: this.#channels,
@@ -864,6 +943,21 @@ export class Daemon {
 
 		const sessionsRoot = join(config.homeDir, "sessions");
 		mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
+		const restart = new RestartLauncher({
+			homeDir: config.homeDir,
+			// The checkout holding this file (src/daemon/daemon.ts → repo root): the one the daemon runs and apply loads.
+			repoDir: resolve(import.meta.dir, "..", ".."),
+			pathEnv: applyPathEnv(process.env),
+			// As `apply --detach`: a daemon under a non-default home hands it to the unit.
+			...(process.env.OMPBOT_HOME === undefined ? {} : { homeEnv: config.homeDir }),
+			run: spawnRunner,
+			isAlive: this.#options.pidAlive ?? pidAlive,
+			isExecutable: isExecutableFile,
+			now: () => this.#clock.now(),
+			turnsRunning: () => (this.#router?.busyTurns() ?? 0) > 0,
+			log,
+			...this.#options.restart,
+		});
 		this.#router = new OriginRouter({
 			store,
 			clock: this.#clock,
@@ -871,7 +965,7 @@ export class Daemon {
 			log,
 			sessionsRoot,
 			sessionBackupsRoot: join(config.homeDir, "session-backups"),
-			statusProvider: () => renderStatusText(this.status()),
+			statusProvider: (originKey) => this.#statusText(originKey),
 			usageProvider: async (originKey) => {
 				const agent = this.#options.config.agent;
 				if (agent === "claude" || agent === "agy") return `${agent} 세션은 집계하지 않습니다`;
@@ -884,9 +978,18 @@ export class Daemon {
 			},
 			// Read on every turn: a reload replaces this.#options.config, a captured local config would not follow it.
 			recallEnabled: () => this.#options.config.recallEnabled !== false,
+			// Same test as the driver factory (run.ts): only an omp child gets the host tools.
+			hostTools: () => this.#options.config.agent !== "agy" && this.#options.config.agent !== "claude",
+			// Only where the board tools are (`#hostToolSet`): an omp child of a lane or a Slack/Discord conversation
+			// without a peer bot in it.
+			boardNotice: (originKey) =>
+				this.#options.config.agent === "agy" || this.#options.config.agent === "claude" || this.peerTouched(originKey)
+					? undefined
+					: boardNoticeFor(store, originKey),
 			costCap: () => this.#options.config.costCap,
 			budgetProvider: (arg) => this.#budgetCommand(arg),
 			briefingProvider: (originKey, threadRef) => this.#brief(originKey, threadRef),
+			restartProvider: (originKey, threadRef) => restart.request(originKey, threadRef),
 			distillProvider: (originKey) => this.#distill(originKey),
 			// Read on every turn and every `!undo`: a reload changes the repository list without a restart. The real git
 			// runs here: no `run` is passed, so the daemon never gains a test seam in production.
@@ -916,8 +1019,11 @@ export class Daemon {
 				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
 				this.#postThreadNotices([info.threadRef], redact(stuckStopText(info.toolName, info.count)));
 			},
-			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing.
-			isHeld: (originKey) => this.#store?.getLaneByOrigin(originKey)?.status === "paused",
+			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing; nor
+			// does one whose worktree the core is rebasing (a not-ff landing).
+			isHeld: (originKey) =>
+				this.#store?.getLaneByOrigin(originKey)?.status === "paused" || this.#lanes?.isCoreRebasing(originKey) === true,
+			isAttached: (originKey) => this.#store?.getLaneByOrigin(originKey)?.meta.attach !== undefined,
 			onHeldWork: (info) => this.#lanes?.onHeldWork(info.originKey),
 			// A new lane session starts with its acceptance criteria as omp todos; a lane turn's end may nudge it.
 			initialTodos: (originKey) => (isLaneOrigin(originKey) ? this.#lanes?.initialTodos(originKey) : undefined),
@@ -948,21 +1054,34 @@ export class Daemon {
 				this.#router?.mailbox(originKey).pauseTurn() ?? Promise.resolve({ busy: false, settled: true }),
 			resumePending: (originKey) => this.#router?.mailbox(originKey).resumePending() ?? Promise.resolve(),
 			sessionDirFor: (originKey) => sessionDirFor(sessionsRoot, originKey, 1),
+			session: this.#router.sessionOps(),
+			...(this.#options.pidAlive === undefined ? {} : { pidAlive: this.#options.pidAlive }),
 			frozen: this.#frozen,
 			approvals: { request: (channel, summary) => this.#approval.request(channel, summary) },
 			// taskAutoLand is a live setting: `ompbot reload` turns lane auto-merge on or off for the next close.
 			autoLandPolicy: () => this.#autoLandPolicy(),
+			// An apply that reverted the code holds auto-merge until the next ok apply (`<home>/autoland.hold`).
+			autoLandHold: () => readAutoLandHold(config.homeDir),
 			// Cards mention the owner on the platform of the lane's thread.
 			ownerUserId: (platform) =>
 				platform === "discord" ? config.channels.discord?.ownerUserId : config.channels.slack?.ownerUserId,
 			laneBusy: (originKey) => this.#router?.mailbox(originKey).state.busy ?? false,
 			// A live setting: `ompbot reload` changes it for the next lane turn end.
 			completionNudges: () => this.#options.config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES,
+			laneModels: () => this.#options.config.lanes?.models,
 			// The independent review before a lane's auto-merge: a one-shot `omp -p` under the same safety floors.
 			reviewer: {
 				ompBin: config.ompExecutable,
 				...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
-				systemPromptAppendix: buildFloorsPrompt(join(config.homeDir, "secrets")),
+				systemPromptAppendix: buildFloorsPrompt(
+					join(config.homeDir, "secrets"),
+					undefined,
+					false,
+					false,
+					false,
+					{},
+					false,
+				),
 				reviewsDir: join(config.homeDir, "reviews"),
 				...(this.#options.laneReviewRun === undefined ? {} : { run: this.#options.laneReviewRun }),
 			},
@@ -977,6 +1096,7 @@ export class Daemon {
 			log,
 			scriptsRoot: join(config.homeDir, "scripts"),
 			workspaceDir: config.workspaceDir,
+			homeDir: config.homeDir,
 			watcherRoots: config.watcherRoots,
 			frozen: this.#frozen,
 			budgetExceeded: () => {
@@ -1023,6 +1143,12 @@ export class Daemon {
 				// An owner message lets a peer-capped thread continue: the cap counts peer rows after this moment.
 				if (store.countPeerInboundSince(message.threadRef, 0) > 0) {
 					store.setCursor(`${PEER_HOP_RESET_CURSOR}${message.threadRef}`, String(this.#clock.now()));
+				}
+				if (parseCommand(message.text)?.kind === "restart") {
+					// Ahead of every lane, task and drain branch: the mailbox answers `!restart` at once, mid-drain too (held
+					// for the next process it would restart again), without a turn or a driver.
+					this.#dispatchPending(originKey);
+					return {};
 				}
 				if (lane) {
 					// `멈춰`/`계속` (the whole message) are the lane's hold and release: the core settles them itself,
@@ -1111,8 +1237,9 @@ export class Daemon {
 				this.#dispatchPending(message.originKey);
 				return {};
 			},
+			onPeerSeen: (seen) => void store.notePeerSeen(seen),
 			onCommand: ({ command, arg, originKey, channel }) => {
-				if (command === "status") return renderStatusText(this.status());
+				if (command === "status") return this.#statusText(originKey);
 				// A slash command leaves no Slack message to thread under, so it is recorded as an owner message at the
 				// top level of the conversation it was typed in: the answer lands right there as the only trace (empty
 				// ack — no placeholder root post, no "see the thread" redirect).
@@ -1124,17 +1251,11 @@ export class Daemon {
 					threadRef: threadRefOf(channel, TOP_LEVEL_TS),
 				});
 				// A drain holds the recorded command for the next process; say so, or the owner sees nothing and retypes it.
-				return this.#router?.draining === true ? DRAIN_DEFERRED_COMMAND_TEXT : undefined;
+				// `!restart` is never held: its answer is already on the ledger.
+				return this.#router?.draining === true && command !== "restart" ? DRAIN_DEFERRED_COMMAND_TEXT : undefined;
 			},
 			knowsThread: (threadRef) => store.getLaneByThread(threadRef) !== undefined || store.hasInboundThread(threadRef),
-			isThreadMuted: (threadRef) => store.isThreadMuted(threadRef),
 			isDraining: () => this.#router?.draining === true,
-			setThreadMute: (threadRef, muted) => store.setThreadMute(threadRef, muted),
-			// Mute commands never become inbound rows, so handled ones are remembered in the ledger's KV store
-			// (namespaced like the backfill cursors) — a backfill replay of the same event is a duplicate,
-			// not a re-toggle and a second 🤫/🔊 notice.
-			seenMuteCommand: (platformMessageId) => store.getCursor(`mute:${platformMessageId}`) !== undefined,
-			rememberMuteCommand: (platformMessageId) => store.setCursor(`mute:${platformMessageId}`, "1"),
 			// The thread of an approval card is `<card channel>:<card ts>` — the ledger's approval id.
 			onCardReply: ({ threadRef, platformMessageId, text, injected }) => {
 				const ts = parseThreadRef(platformMessageId)?.threadTs ?? platformMessageId;
@@ -1154,49 +1275,52 @@ export class Daemon {
 			},
 		};
 		// Each adapter takes only the deliveries whose thread ref is an id of its own platform.
-		const deliveriesOf = (platform: IdPlatform): DeliverySource => ({
-			claimDue: () =>
-				store.claimDue(undefined, platform).map((row) => ({
-					deliveryId: row.deliveryId,
-					originKey: row.originKey,
-					threadRef: row.threadRef,
-					body: row.body,
-					redelivered: row.redelivered,
-					finishThreadRefs: store.threadsOfOp(row.originKey, row.opRef),
-					// Only a `queue drop` re-links its target to the command op: those threads end 🚫 취소됨, a
-					// `/new` keeps finishing its casualties ✅ 완료 as before.
-					cancelThreadRefs: row.opRef.startsWith("queue:")
-						? store.discardedThreadsOfOp(row.originKey, row.opRef)
-						: undefined,
-					// A lane's own reports (no owner message behind them) must not stamp ✅ on its thread root.
-					finishUntracked:
-						!isLaneOrigin(row.originKey) &&
-						!row.originKey.startsWith(MONITOR_ORIGIN_PREFIX) &&
-						!row.opRef.endsWith(LOG_COPY_SUFFIX),
-					// Sent while its turn runs: the thread's ⏳ status and progress go on until the turn-end delivery.
-					keepStatus: row.opRef.includes(INTERIM_INFIX),
-					sentParts: row.sentParts,
-					replyTs: row.replyTs,
-				})),
+		const itemOf = (row: DeliveryRow): DeliveryItem => ({
+			deliveryId: row.deliveryId,
+			originKey: row.originKey,
+			threadRef: row.threadRef,
+			body: row.body,
+			redelivered: row.redelivered,
+			finishThreadRefs: store.threadsOfOp(row.originKey, row.opRef),
+			// A `queue drop` and a `!stop` re-link their targets (the dropped row; the waiting rows and the stopped
+			// turn's rows) to the command op: those threads end 🚫 취소됨, a `/new` keeps finishing its casualties ✅ 완료.
+			cancelThreadRefs:
+				row.opRef.startsWith("queue:") || row.opRef.startsWith("stop:")
+					? store.discardedThreadsOfOp(row.originKey, row.opRef)
+					: undefined,
+			// A lane's own reports (no owner message behind them) must not stamp ✅ on its thread root, nor may a
+			// `!restart` answer or an apply `notify` line (side posts in a thread whose turn may still run).
+			finishUntracked:
+				!isLaneOrigin(row.originKey) &&
+				!row.originKey.startsWith(MONITOR_ORIGIN_PREFIX) &&
+				!row.opRef.endsWith(LOG_COPY_SUFFIX) &&
+				!isSideOpRef(row.opRef),
+			// Sent while its turn runs: the thread's ⏳ status and progress go on until the turn-end delivery. A peer
+			// silence alert, a `!restart` answer and an apply `notify` line answer no turn, so they never finish the
+			// thread's status either.
+			keepStatus:
+				row.opRef.includes(INTERIM_INFIX) || row.opRef.startsWith(PEER_SILENCE_OP_PREFIX) || isSideOpRef(row.opRef),
+			sentParts: row.sentParts,
+			replyTs: row.replyTs,
+		});
+		const deliveriesOf = (platform: ChatPlatform): DeliverySource => ({
+			claimDue: () => store.claimDue(undefined, platform).map(itemOf),
+			takeExpired: () => store.takeExpired(platform).map(itemOf),
 			confirm: (deliveryId) => {
 				crash("after_post_before_confirm");
 				store.confirmDelivery(deliveryId);
 			},
 			fail: (deliveryId, error, outcome) => {
-				if (outcome === "definitive") store.failDelivery(deliveryId, error);
-				else store.markAmbiguous(deliveryId, error);
+				if (outcome === "ambiguous") {
+					store.markAmbiguous(deliveryId, error);
+					return true;
+				}
+				return store.failDelivery(deliveryId, error).state === "expired";
 			},
 			defer: (deliveryId, error, retry) => void store.deferDelivery(deliveryId, error, retry),
-			recordPost: (post) => store.feedback.recordPost(post),
-			isPost: (post) => store.feedback.isPost(post),
-			recordFeedback: (feedback) => {
-				const outcome = store.feedback.applyReaction(feedback);
-				log.info("turn_feedback", { ...feedback, outcome });
-			},
 		});
 		for (const binding of this.#options.channels) {
 			const platform = binding.port.platform;
-			if (platform === "telegram") throw new Error("telegram has no delivery ledger ids yet: it cannot be bound");
 			const adapter = binding.createAdapter({
 				core,
 				deliveries: deliveriesOf(platform),
@@ -1215,6 +1339,12 @@ export class Daemon {
 
 		// Missed messages since the last run: one recovery pass per platform now (each reconnect runs another).
 		for (const adapter of this.#adapters.values()) adapter.recover();
+		// A peer answer posted while the daemon was down comes back with that pass (`onPeerSeen`): the silence sweep
+		// waits for it, or it would alert a call already answered.
+		void (this.#adapters.get("discord")?.recoveryIdle?.() ?? Promise.resolve()).then(() => {
+			this.#peerSilenceArmed = true;
+			log.info("peer_silence_armed");
+		});
 
 		const herdrRun = this.#options.herdrRun;
 		setLocalHerdrBin(config.herdr?.bin);
@@ -1269,6 +1399,16 @@ export class Daemon {
 						...(herdrRun === undefined ? {} : { run: herdrRun }),
 					});
 				},
+				lastAnswer: async (row, sessionPath) => {
+					if (row.host === null) {
+						const found = readLastAssistant(sessionPath);
+						return found === undefined ? undefined : lastAnswerOf(found);
+					}
+					const entry = this.#options.config.dispatchHosts?.[row.host];
+					if (entry === undefined) throw new Error(`dispatchHosts has no ${row.host}`);
+					const found = await readRemoteLastAssistant(entry.ssh, sessionPath, herdrRun ?? realProcessRunner);
+					return found === undefined ? undefined : lastAnswerOf(found);
+				},
 				// herdrBoard is live too: a board added by `ompbot reload` links the next notice.
 				boardLink: async (row) => {
 					const board = this.#options.config.herdrBoard;
@@ -1298,6 +1438,7 @@ export class Daemon {
 					return undefined;
 				},
 				autoLand: (row) => this.autoLand(row),
+				autoLandHold: () => readAutoLandHold(config.homeDir),
 				channels: this.#channels,
 				ownerUserId: primaryOwnerUserId(config.channels),
 				now: () => this.#clock.now(),
@@ -1349,6 +1490,7 @@ export class Daemon {
 				link === undefined
 					? `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 새 스레드에서 진행 상황을 확인하세요.`
 					: `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 레인 스레드에서 진행 상황을 확인하세요: ${link}`;
+			if (lane.startNote !== undefined) reply += `\n${lane.startNote}`;
 		} catch (error) {
 			if (error instanceof LaneInputError) {
 				reply = `⚠️ 작업 레인을 시작하지 못했습니다: ${error.message}`;
@@ -1496,13 +1638,22 @@ export class Daemon {
 	 */
 	#heldLaneNotice(lane: LaneRow): void {
 		const store = this.store;
-		const key = `lane_held_notice:${lane.name}:${lane.meta.pausedAt ?? 0}`;
+		// A terminal hand-over says so once per attach; a plain pause once per pause.
+		const attach = lane.meta.attach;
+		const key =
+			attach === undefined
+				? `lane_held_notice:${lane.name}:${lane.meta.pausedAt ?? 0}`
+				: `lane_attach_notice:${lane.name}:${attach.at}`;
 		if (store.getCursor(key) !== undefined) return;
 		store.setCursor(key, String(this.#clock.now()));
 		const route = this.#channels.forThreadRef(lane.threadRef);
 		if (route === undefined) return;
+		const text =
+			attach === undefined
+				? "⏸ 멈춘 상태라 전달하지 않았습니다 — `계속`이라고 쓰면 전달합니다."
+				: "🖥 오너가 터미널에서 작업 중이라 전달하지 않았습니다 — 터미널 omp를 끝내면 전달합니다.";
 		void route.port
-			.post(route.target, { text: "⏸ 멈춘 상태라 전달하지 않았습니다 — `계속`이라고 쓰면 전달합니다." })
+			.post(route.target, { text })
 			.catch((error: unknown) => this.#log.warn("lane_held_notice_failed", { lane: lane.name, error: String(error) }));
 	}
 
@@ -1512,7 +1663,7 @@ export class Daemon {
 	 * first one still runs) takes nothing; a lane that no longer exists loses the buttons with a note.
 	 */
 	async #handleLaneButton(
-		action: { kind: "merge" | "discard" | "pause" | "resume"; name: string },
+		action: LaneAction,
 		channel: string | undefined,
 		messageTs: string | undefined,
 	): Promise<void> {
@@ -1531,15 +1682,17 @@ export class Daemon {
 			return;
 		}
 		const outcome =
-			kind === "merge"
-				? await lanes.requestLand(name, "owner")
-				: kind === "discard"
-					? await lanes.discard(name)
-					: kind === "pause"
-						? await lanes.pause(name, "button")
-						: await lanes.resume(name, "button");
+			action.kind === "session"
+				? await lanes.pickSession(name, action.index)
+				: kind === "merge"
+					? await lanes.requestLand(name, "owner")
+					: kind === "discard"
+						? await lanes.discard(name)
+						: kind === "pause"
+							? await lanes.pause(name, "button")
+							: await lanes.resume(name, "button");
 		this.#log.info(outcome.handled ? `lane_${kind}_requested` : `lane_${kind}_ignored`, { lane: name });
-		if (kind === "pause" || kind === "resume") {
+		if (kind === "pause" || kind === "resume" || kind === "session") {
 			// The status message changes, but the owner clicked: the answer tells what was re-read.
 			const lane = this.#store?.getLane(name);
 			const route = lane === undefined ? undefined : this.#channels.forThreadRef(lane.threadRef);
@@ -1570,7 +1723,13 @@ export class Daemon {
 			maxRisk: policy.maxRisk ?? "L2",
 			...(review === undefined
 				? {}
-				: { review: { model: review.model, timeoutMs: review.timeoutMs ?? LANE_REVIEW_TIMEOUT_MS } }),
+				: {
+						review: {
+							model: review.model,
+							timeoutMs: review.timeoutMs ?? LANE_REVIEW_TIMEOUT_MS,
+							...(review.confident === undefined ? {} : { confident: review.confident }),
+						},
+					}),
 		};
 	}
 
@@ -1721,11 +1880,17 @@ export class Daemon {
 			} catch (error) {
 				this.#log.warn("cost_cap_sweep_failed", { error: String(error) });
 			}
+			try {
+				this.#sweepPeerSilence();
+			} catch (error) {
+				this.#log.warn("peer_silence_sweep_failed", { error: String(error) });
+			}
 			void this.#broker
 				?.expireStale()
 				.catch((error: unknown) => this.#log.warn("approval_expire_failed", { error: String(error) }));
 			this.#sweepMedia();
 			this.#maybeReviewSkills();
+			this.#maybeProposeCandidates();
 			this.#beat();
 		} catch (error) {
 			this.#log.error("sweep_failed", { error: String(error) });
@@ -1871,18 +2036,10 @@ export class Daemon {
 		if (now - this.#lastGateSweepAt < interval) return;
 		this.#lastGateSweepAt = now;
 		const { config } = this.#options;
-		const omp = {
-			...((config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {}),
-			...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
-		};
 		for (const gate of collectGates({
 			homeDir: config.homeDir,
 			now,
-			offsiteConfigured: config.offsite !== undefined,
-			...(config.costCap?.dailyUsd === undefined
-				? {}
-				: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
-			...omp,
+			...gateOptionsFromConfig(config),
 			...(this.#options.hostLoad === undefined ? {} : { hostLoad: this.#options.hostLoad }),
 		})) {
 			// Nothing to judge (stamp or ledger missing): keep the previous state untouched — no notice, no incident
@@ -1945,6 +2102,15 @@ export class Daemon {
 			day: ledgerDay(now, this.#options.config.timezone),
 			cap: this.#options.config.costCap?.dailyUsd,
 		});
+	}
+
+	/** Peer silence alerts (doc/plans/peer-silence-alert.md 설계 4), from the first sweep after the startup recovery. */
+	#sweepPeerSilence(): void {
+		if (!this.#peerSilenceArmed) return;
+		const alerts = this.#store?.alertSilentPeers() ?? 0;
+		if (alerts === 0) return;
+		this.#log.info("peer_silence_alerted", { count: alerts });
+		this.#nudgePump();
 	}
 
 	/**
@@ -2112,6 +2278,12 @@ export class Daemon {
 		}
 	}
 
+	/** The owner's live DM origin on the platform of `ownerHome()`; undefined before the owner has a home. */
+	#ownerDmOrigin(store: Store): string | undefined {
+		const platform = store.ownerHome()?.platform;
+		return platform === undefined ? undefined : store.ownerDmOrigin(platform);
+	}
+
 	/**
 	 * Background skill review (hermes learning loop, minimal): every `skillReviewTurns` answered owner DM turns a
 	 * separate child reads the recent digest and proposes skills; only an explicit owner click installs them.
@@ -2122,8 +2294,9 @@ export class Daemon {
 		const store = this.#store;
 		if (store === undefined || this.#adapters.size === 0) return;
 		// Same latest-updated_at rule as the escalation/gate notices' ownerChannel(): a stale duplicate DM origin row
-		// must not make the answered count (and so the review cadence) follow a dead conversation.
-		const dmOrigin = store.ownerDmOrigin();
+		// must not make the answered count (and so the review cadence) follow a dead conversation. The DM is on the
+		// platform owner notices go to, so a Discord- or Teams-only install reviews too.
+		const dmOrigin = this.#ownerDmOrigin(store);
 		const channel = dmOrigin === undefined ? undefined : parseChatOrigin(dmOrigin)?.conversationId;
 		if (dmOrigin === undefined || channel === undefined) return;
 		const answered = store.countAnswered(dmOrigin);
@@ -2141,6 +2314,56 @@ export class Daemon {
 			return;
 		}
 		this.#startSkillReview(dmOrigin, channel);
+	}
+
+	/**
+	 * Improvement-candidate pass (`src/review/candidates.ts`): every `DEFAULT_GATE_SWEEP_MS` folds
+	 * `<workspace>/candidates.jsonl` and raises due candidates as a #log line or owner approval cards. Skipped while
+	 * frozen, draining or a previous pass (its cards) is still running. The daemon never edits rules or persona here.
+	 */
+	#maybeProposeCandidates(): void {
+		const config = this.#options.config;
+		const settings = resolveCandidates(config.candidates);
+		const gate = {
+			frozen: this.#frozen() !== undefined,
+			draining: this.#router?.draining === true,
+			openCards: this.#proposingCandidates ? 1 : 0,
+		};
+		if (!settings.enabled || gate.frozen || gate.draining || gate.openCards > 0) return;
+		const now = this.#clock.now();
+		if (now - this.#lastCandidatePassAt < DEFAULT_GATE_SWEEP_MS) return;
+		this.#lastCandidatePassAt = now;
+		const dmOrigin = this.#store === undefined ? undefined : this.#ownerDmOrigin(this.#store);
+		const ownerChannel = dmOrigin === undefined ? undefined : parseChatOrigin(dmOrigin)?.conversationId;
+		const logChannel = config.logChannel ?? config.channels.discord?.logChannelId;
+		this.#proposingCandidates = true;
+		void runCandidateProposals(
+			{
+				ledgerPath: join(config.workspaceDir, "candidates.jsonl"),
+				experimentsPath: join(config.workspaceDir, "experiments.md"),
+				settings,
+				timezone: config.timezone,
+				now: () => this.#clock.now(),
+				postLog: async (text) => {
+					const adapter = logChannel === undefined ? undefined : this.#adapterOfConversation(logChannel);
+					if (logChannel === undefined || adapter === undefined) {
+						this.#log.info("candidate_note", { text });
+						return;
+					}
+					await adapter.postNotice(logChannel, text);
+				},
+				requestApproval:
+					ownerChannel === undefined || this.#adapterOfConversation(ownerChannel) === undefined
+						? undefined
+						: (summary) => this.#approval.request(ownerChannel, summary),
+				log: this.#log,
+			},
+			gate,
+		)
+			.catch((error) => this.#log.warn("candidate_pass_failed", { error: String(error) }))
+			.finally(() => {
+				this.#proposingCandidates = false;
+			});
 	}
 
 	/**
@@ -2267,7 +2490,8 @@ export class Daemon {
 		const opRefs: RestartCutEntry[] = [];
 		const seen = new Set<string>();
 		for (const row of store.listInbound({ state: "dispatched" })) {
-			if (row.opRef === null || seen.has(row.opRef)) continue;
+			// A command op (lane landing, task bookkeeping, `/compact`) is not an omp turn to resume.
+			if (row.opRef === null || COMMAND_OP_REF.test(row.opRef) || seen.has(row.opRef)) continue;
 			seen.add(row.opRef);
 			const approval = approvals.get(row.originKey);
 			opRefs.push({ originKey: row.originKey, opRef: row.opRef, ...(approval === undefined ? {} : { approval }) });
@@ -2302,6 +2526,7 @@ export class Daemon {
 		this.#options.config = plan.next;
 		// `channels` is a restart key, so `plan.next` still carries the Discord values the daemon started with.
 		this.#store?.setLogChannel({ slack: plan.next.logChannel, discord: plan.next.channels.discord?.logChannelId });
+		if (plan.changed.includes("peerSilenceAlert")) this.#store?.setPeerCallPolicy(peerCallPolicyOf(plan.next));
 		this.#broker?.setEscalationChannel({
 			slack: plan.next.escalationChannel,
 			discord: plan.next.channels.discord?.escalationChannelId,
@@ -2385,6 +2610,18 @@ export class Daemon {
 		}
 	}
 
+	/** `!status` / `/status-ompbot`: the asking conversation's context line, then the daemon-wide status text. */
+	async #statusText(originKey: string): Promise<string> {
+		let state: Parameters<typeof renderContextLine>[0];
+		try {
+			state = (await this.#router?.driverState(originKey)) ?? "idle";
+		} catch (error) {
+			this.#log.warn("status_context_failed", { origin: originKey, error: String(error) });
+			state = "unknown";
+		}
+		return `${renderContextLine(state)}\n${renderStatusText(this.status())}`;
+	}
+
 	status(): StatusReport {
 		const router = this.#router;
 		const report = buildStatus(
@@ -2401,10 +2638,7 @@ export class Daemon {
 			openGateSummary(
 				join(this.#options.config.homeDir, "ompbot.db"),
 				this.#clock.now(),
-				this.#options.config.offsite !== undefined,
-				this.#options.config.costCap?.dailyUsd === undefined
-					? undefined
-					: { usd: this.#options.config.costCap.dailyUsd, timezone: this.#options.config.timezone },
+				gateOptionsFromConfig(this.#options.config),
 				this.#options.hostLoad,
 			),
 		);
@@ -2457,6 +2691,39 @@ export class Daemon {
 			throw new Error("inject_rejected: approval/choice card threads take only the owner's own reply");
 		if (outcome === "dropped") throw new Error("inject_rejected: message was not accepted");
 		return { nonce, threadRef: threadRefOf(channel, request.thread ?? markerTs) };
+	}
+
+	/**
+	 * IPC `notify` (`apply --report-plain`, doc/plans/owner-restart-command.md): one bot post in `thread` (or at the top
+	 * level) of a report origin, put on the delivery ledger like an answer under `notify:<stamp>` — no inbound row, no
+	 * turn, no omp session. The same stamp again is a no-op.
+	 */
+	notify(request: {
+		origin: string;
+		text: string;
+		thread?: string | undefined;
+		stamp?: string | undefined;
+	}): { ok: true; opRef: string } | { ok: false; error: string } {
+		const store = this.#store;
+		if (store === undefined) return { ok: false, error: "daemon not started" };
+		const { origin, thread } = request;
+		const ref = parseChatOrigin(origin);
+		if (ref === undefined || !isReportOrigin(origin))
+			return { ok: false, error: `notify origin must be slack|discord/(dm|ch)/<id>: ${origin}` };
+		if (thread !== undefined && !reportThreadPattern(origin).test(thread))
+			return { ok: false, error: `notify thread is not a message id: ${thread}` };
+		if (!this.#adapters.has(ref.platform)) return { ok: false, error: `${ref.platform} is not configured` };
+		const text = request.text.trim();
+		if (text === "") return { ok: false, error: "notify needs a non-empty text" };
+		const opRef = `${NOTIFY_OP_PREFIX}${request.stamp ?? randomBytes(6).toString("hex")}`;
+		store.recordAnswer({
+			originKey: origin,
+			opRef,
+			threadRef: threadRefOf(ref.conversationId, thread ?? TOP_LEVEL_TS),
+			parts: [text],
+		});
+		this.#log.info("notify_recorded", { origin, opRef });
+		return { ok: true, opRef };
 	}
 
 	/**
@@ -2725,6 +2992,35 @@ export class Daemon {
 		await redraw("⚠️ 다시 요청을 넣지 못함 — 스레드에 직접 다시 요청해 주세요");
 	}
 
+	/**
+	 * `ompbot lanes attach`: `lane_attach {lane, pid, wait?, keepPaused?}` hands the lane's session to the CLI's terminal
+	 * omp and answers the file to resume; `lane_detach {lane, sessionFile, newFiles}` gives it back. The request is the
+	 * signal — nothing is read from marker files or mtimes.
+	 */
+	async #laneAttachIpc(request: Record<string, unknown>): Promise<unknown> {
+		const lanes = this.#lanes;
+		if (lanes === undefined) return { ok: false, error: "lanes are not running" };
+		const lane = request.lane;
+		if (typeof lane !== "string") return { ok: false, error: `${String(request.op)} needs a lane string` };
+		if (request.op === "lane_attach") {
+			const pid = request.pid;
+			if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+				return { ok: false, error: "lane_attach needs a pid" };
+			}
+			return lanes.attach(lane, { pid, wait: request.wait === true, keepPaused: request.keepPaused === true });
+		}
+		const { sessionFile, newFiles } = request;
+		if (
+			typeof sessionFile !== "string" ||
+			!Array.isArray(newFiles) ||
+			!newFiles.every((file): file is string => typeof file === "string")
+		) {
+			return { ok: false, error: "lane_detach needs sessionFile and newFiles" };
+		}
+		const outcome = await lanes.detach(lane, { sessionFile, newFiles, by: "cli" });
+		return outcome.handled ? { ok: true, text: outcome.text } : { ok: false, error: outcome.text };
+	}
+
 	async #handleIpc(request: unknown): Promise<unknown> {
 		if (typeof request !== "object" || request === null || !("op" in request)) {
 			return { ok: false, error: "invalid request" };
@@ -2740,6 +3036,7 @@ export class Daemon {
 			if (typeof origin !== "string") return { ok: false, error: "session_file needs an origin string" };
 			return { ok: true, sessionFile: (await this.#router?.openSessionFile(origin)) ?? null };
 		}
+		if (request.op === "lane_attach" || request.op === "lane_detach") return this.#laneAttachIpc(request);
 		if (request.op === "reload") return this.reloadConfig("ipc");
 		if (request.op === "drain" || request.op === "drain_status" || request.op === "drain_cancel") {
 			if (request.op !== "drain_status") this.setDraining(request.op === "drain");
@@ -2764,6 +3061,21 @@ export class Daemon {
 			}
 			const asOwner = "asOwner" in request && request.asOwner === true;
 			return { ok: true, ...(await this.inject({ origin, asOwner, text, quoted, thread })) };
+		}
+		if (request.op === "notify") {
+			const origin = "origin" in request ? request.origin : undefined;
+			const thread = "thread" in request ? request.thread : undefined;
+			const text = "text" in request ? request.text : undefined;
+			const stamp = "stamp" in request ? request.stamp : undefined;
+			if (
+				typeof origin !== "string" ||
+				typeof text !== "string" ||
+				(thread !== undefined && typeof thread !== "string") ||
+				(stamp !== undefined && (typeof stamp !== "string" || !STAMP_PATTERN.test(stamp)))
+			) {
+				return { ok: false, error: "notify needs origin and text strings (thread and stamp optional)" };
+			}
+			return this.notify({ origin, text, thread, stamp });
 		}
 		if (request.op === "tasks_pause" || request.op === "tasks_resume") {
 			const id = "id" in request ? request.id : undefined;
@@ -2873,6 +3185,9 @@ export class Daemon {
 		if (this.#stopPromise === undefined) {
 			this.#stopped = true;
 			this.#router?.stopDispatching();
+			// Right away, before any await: a sweep still in flight must not start a cron command now, and the
+			// running ones are killed (their events stay dispatched for the next boot).
+			this.#monitors?.stop();
 			this.#stopPromise = this.#shutdown();
 		}
 		return this.#stopPromise;
@@ -2891,7 +3206,6 @@ export class Daemon {
 		this.#guestAbort.abort();
 		await this.#guestQueue.idle();
 		await this.#pumping;
-		this.#monitors?.stop();
 		await this.#monitors?.idle();
 		await this.#drainRunningTurns();
 		await this.#router?.close();

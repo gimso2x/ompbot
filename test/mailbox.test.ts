@@ -15,7 +15,9 @@ import {
 	type CacheMissInfo,
 	type ColdCacheInfo,
 	NO_MODEL_NOTICE,
+	NOTHING_TO_STOP_TEXT,
 	OriginMailbox,
+	OWNER_STOPPED_TEXT,
 	type SessionMismatchInfo,
 	STEER_BEFORE_ANSWER_SEEN_NOTE,
 	type StuckLoopInfo,
@@ -23,7 +25,14 @@ import {
 	type TurnSettledInfo,
 } from "../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor, slackDmOrigin } from "../src/core/origin";
-import { IDLE_STOP_MS, type InboundRecord, MONITOR_IDLE_STOP_MS } from "../src/core/types";
+import {
+	IDLE_STOP_MS,
+	type InboundRecord,
+	isTurnPromptFor,
+	MONITOR_IDLE_STOP_MS,
+	RESTART_DRAINING_TEXT,
+	RESTART_REFUSED_TEXT,
+} from "../src/core/types";
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
@@ -45,7 +54,9 @@ import {
 } from "../src/omp/fake-driver";
 import { healSessionModelFile } from "../src/omp/session-heal";
 import { redact } from "../src/redact";
+import { peerTouchedTurnNotice } from "../src/safety/prompt";
 import { openStore, type Store } from "../src/store/db";
+import { localDay } from "../src/time";
 
 class FakeClock {
 	t = 1_000_000;
@@ -99,6 +110,29 @@ class SteerFailingDriver extends FakeOmpDriver {
 			throw new OmpDriverError("rpc_error", "steer refused");
 		}
 		return super.steer(text);
+	}
+	/** Reject `abort()` like a wedged child whose RPC never answers in time. */
+	failAbort = false;
+	override async abort(): Promise<void> {
+		if (this.failAbort) {
+			this.calls.push("abort-rejected");
+			throw new OmpDriverError("rpc_error", "abort timed out");
+		}
+		return super.abort();
+	}
+	override async abortAndClearQueue(): Promise<void> {
+		if (this.failAbort) {
+			this.calls.push("abortAndClearQueue-rejected");
+			throw new OmpDriverError("rpc_error", "abort_and_restore_queue timed out");
+		}
+		return super.abortAndClearQueue();
+	}
+	/** `state()` calls so far, and the `queuedMessageCount` it reports (omp's own steer queue). */
+	stateCalls = 0;
+	queued = 0;
+	override async state(): Promise<OmpState> {
+		this.stateCalls += 1;
+		return { ...(await super.state()), queuedMessageCount: this.queued };
 	}
 	override async prompt(text: string): Promise<string> {
 		if (this.stale) throw new OmpDriverError("rpc_error", "Could not restore model: fake/alpha");
@@ -237,6 +271,8 @@ let drivers: SteerFailingDriver[];
 let driverOptions: FakeOmpDriverOptions;
 let failSteers: number;
 let statusCalls: string[];
+/** `restartProvider` calls: (origin, threadRef). */
+let restartCalls: Array<[string, string]>;
 let logLines: string[];
 let sessionStore: FakeSessionStore;
 let defaultModel: string | undefined;
@@ -248,6 +284,8 @@ let restoreListed: readonly string[] | undefined;
 let sessionBackupsRoot: string | undefined;
 /** Set: the router gets a Slack thread source whose `botUserId()` returns `id` (peer failure notices mention it). */
 let threadBot: { id: string | undefined } | undefined;
+/** Set: the router's `hostTools` answer (false = an agy/claude child without host tools). */
+let hostTools: boolean | undefined;
 
 /** Fresh router over the current test knobs; `defaultModel` is only readable here, so stale-model tests rebuild the router. */
 function buildRouter(): OriginRouter {
@@ -258,6 +296,7 @@ function buildRouter(): OriginRouter {
 		sessionsRoot: join(dir, "sessions"),
 		...(defaultModel === undefined ? {} : { defaultModel }),
 		...(escalateAfter === undefined ? {} : { escalateAfter }),
+		...(hostTools === undefined ? {} : { hostTools: () => hostTools ?? true }),
 		...(sessionBackupsRoot === undefined ? {} : { sessionBackupsRoot }),
 		...(threadBot === undefined
 			? {}
@@ -277,6 +316,10 @@ function buildRouter(): OriginRouter {
 		statusProvider: (origin) => {
 			statusCalls.push(origin);
 			return "status: ok";
+		},
+		restartProvider: async (origin, threadRef) => {
+			restartCalls.push([origin, threadRef]);
+			return "🔄 재시작을 접수했습니다(apply-x).";
 		},
 		onEscalate: (info) => escalations.push(info),
 		onCacheMiss: (info) => cacheMisses.push(info),
@@ -306,6 +349,7 @@ beforeEach(() => {
 	driverOptions = {};
 	failSteers = 0;
 	statusCalls = [];
+	restartCalls = [];
 	logLines = [];
 	sessionStore = new FakeSessionStore();
 	defaultModel = undefined;
@@ -316,6 +360,7 @@ beforeEach(() => {
 	restoreListed = undefined;
 	sessionBackupsRoot = undefined;
 	threadBot = undefined;
+	hostTools = undefined;
 	router = buildRouter();
 });
 
@@ -469,7 +514,8 @@ describe("mailbox: /new, /status, failures", () => {
 		await router.route(command);
 		await mailbox.sweepIdle(); // lets any (ignored) aborted final settle
 		expect(old.calls).toContain("abort");
-		expect(old.calls).toContain("newSession");
+		// The child is stopped right after the abort: a `newSession` on it would do nothing.
+		expect(old.calls).not.toContain("newSession");
 		expect(store.getInbound(pending.platformMessageId)?.state).toBe("discarded");
 		expect(store.listInbound({ originKey: ORIGIN, state: "dispatched" })).toHaveLength(0);
 		expect(store.listInbound({ originKey: ORIGIN, state: "answered" })).toHaveLength(0);
@@ -482,6 +528,26 @@ describe("mailbox: /new, /status, failures", () => {
 		await router.route(msg("fresh"));
 		expect(drivers).toHaveLength(2);
 		expect(drivers[1]?.calls).toEqual(["openSession", "prompt:fresh"]);
+	});
+
+	test("/new on a child whose abort throws still answers, leaves no pending row and charges the cut turn", async () => {
+		driverOptions = { holdTurns: true, sessionFile: join(dir, "gone", "session.jsonl") };
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("stuck turn"));
+		const old = drivers[0] as SteerFailingDriver;
+		old.emitTestEvent({
+			type: "message_end",
+			message: { role: "assistant", content: [], usage: { input: 1, output: 1, cost: { total: 1.25 } } },
+		});
+		old.failAbort = true;
+		const command = msg("/new-ompbot");
+		await router.route(command);
+		await mailbox.sweepIdle();
+		expect(old.calls).toContain("abort-rejected");
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["🆕 새 대화를 시작했습니다."]);
+		expect(store.listInbound({ originKey: ORIGIN, state: "pending" })).toHaveLength(0);
+		expect(store.getOrigin(ORIGIN)?.epoch).toBe(2);
+		expect(store.dailyCost(localDay(clock.now(), "Asia/Seoul"), ORIGIN)).toBeCloseTo(1.25, 6);
 	});
 
 	test("/status-ompbot is response-only: provider text becomes a delivery, omp is never touched", async () => {
@@ -574,6 +640,170 @@ describe("mailbox: queue drop", () => {
 		// The queue behind the dropped row is empty: no second turn is started.
 		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:first"]);
 		expect(store.getInbound(blocked.platformMessageId)?.state).toBe("discarded");
+	});
+});
+
+describe("mailbox: !stop stops the turn and keeps the session", () => {
+	const bodies = () => store.listDeliveries({ originKey: ORIGIN }).map((d) => [d.opRef, d.body]);
+
+	test("a running turn: one queue-clearing abort, one ⏹ answer, no failure, same child and epoch, next message is a new turn", async () => {
+		driverOptions = { holdTurns: true };
+		escalateAfter = 1;
+		const mailbox = router.mailbox(ORIGIN);
+		const job = msg("long job");
+		await router.route(job);
+		const driver = drivers[0] as SteerFailingDriver;
+		const stop = msg("!stop");
+		await router.route(stop);
+		await mailbox.sweepIdle(); // the fake's own aborted final is ignored behind it
+		expect(driver.calls.filter((c) => c.startsWith("abort"))).toEqual(["abortAndClearQueue"]);
+		expect(bodies()).toEqual([[`stop:${stop.platformMessageId}`, OWNER_STOPPED_TEXT]]);
+		expect(store.getInbound(job.platformMessageId)?.state).toBe("discarded");
+		expect(escalations).toEqual([]);
+		expect(mailbox.state).toMatchObject({ driverRunning: true, busy: false });
+		expect(store.getOrigin(ORIGIN)?.epoch).toBe(1);
+
+		const next = msg("다음 일");
+		await router.route(next);
+		expect(drivers).toHaveLength(1);
+		await untilFinal(mailbox, driver, () => driver.release());
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job", "prompt:다음 일"]);
+		expect(store.getInbound(next.platformMessageId)?.state).toBe("answered");
+	});
+
+	test("three !stop in a row never escalate (escalateAfter 1)", async () => {
+		driverOptions = { holdTurns: true };
+		escalateAfter = 1;
+		const mailbox = router.mailbox(ORIGIN);
+		for (const n of [1, 2, 3]) {
+			await router.route(msg(`job ${n}`));
+			await router.route(msg("!stop"));
+			await mailbox.sweepIdle();
+		}
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(driver.calls.filter((c) => c.startsWith("abort"))).toHaveLength(3);
+		expect(escalations).toEqual([]);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([
+			OWNER_STOPPED_TEXT,
+			OWNER_STOPPED_TEXT,
+			OWNER_STOPPED_TEXT,
+		]);
+	});
+
+	test("a turn with a steered owner message stops the same way and the steered text never runs again", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		const first = msg("first");
+		const steered = msg("끼워 넣은 글");
+		await router.route(first);
+		await router.route(steered);
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(driver.calls).toContain(`steer:${steered.text}`);
+		const stop = msg("!stop");
+		await router.route(stop);
+		await mailbox.sweepIdle();
+		for (const row of [first, steered]) {
+			expect(store.getInbound(row.platformMessageId)).toMatchObject({
+				state: "discarded",
+				opRef: `stop:${stop.platformMessageId}`,
+			});
+		}
+		expect(bodies()).toEqual([[`stop:${stop.platformMessageId}`, OWNER_STOPPED_TEXT]]);
+		await router.route(msg("third"));
+		await untilFinal(mailbox, driver, () => driver.release());
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:first", "prompt:third"]);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([OWNER_STOPPED_TEXT, "ECHO third"]);
+	});
+
+	test("rows waiting before !stop (a steer-blocked message, a !followup) are cancelled and the drain opens no turn", async () => {
+		driverOptions = { holdTurns: true };
+		failSteers = 2; // the !followup's drain tries the blocked row once more
+		const mailbox = router.mailbox(ORIGIN);
+		const first = msg("first");
+		const blocked = msg("끼워넣기 거부된 메시지");
+		const followup = msg("!followup 끝나고 할 일");
+		await router.route(first);
+		await router.route(blocked);
+		await router.route(followup);
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(store.listInbound({ originKey: ORIGIN, state: "pending" })).toHaveLength(2);
+		const stop = msg("!stop");
+		await router.route(stop);
+		await mailbox.sweepIdle();
+		const opRef = `stop:${stop.platformMessageId}`;
+		for (const row of [blocked, followup]) {
+			expect(store.getInbound(row.platformMessageId)).toMatchObject({ state: "discarded", opRef });
+		}
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:first"]);
+		expect(mailbox.state.busy).toBe(false);
+		expect(bodies()).toEqual([[opRef, `${OWNER_STOPPED_TEXT} 대기 2개를 취소했습니다.`]]);
+		// The command's delivery finishes these threads as 🚫 취소됨 (the daemon passes them as cancelThreadRefs).
+		expect(store.discardedThreadsOfOp(ORIGIN, opRef)).toEqual(
+			[first.threadRef, blocked.threadRef, followup.threadRef].sort(),
+		);
+
+		const after = msg("after");
+		await router.route(after);
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:first", "prompt:after"]);
+		await untilFinal(mailbox, driver, () => driver.release());
+		expect(store.getInbound(after.platformMessageId)?.state).toBe("answered");
+	});
+
+	test("an abort that throws: the child is stopped without another state() call, the answer stays, the next message reopens the same session", async () => {
+		driverOptions = { holdTurns: true, sessionFile: join(dir, "gone", "session.jsonl") };
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("stuck turn"));
+		const old = drivers[0] as SteerFailingDriver;
+		old.emitTestEvent({
+			type: "message_end",
+			message: { role: "assistant", content: [], usage: { input: 1, output: 1, cost: { total: 1.25 } } },
+		});
+		old.failAbort = true;
+		const sessionDir = store.getOrigin(ORIGIN)?.sessionDir;
+		const statesBefore = old.stateCalls;
+		await router.route(msg("!stop"));
+		await mailbox.sweepIdle();
+		expect(old.calls).toContain("abortAndClearQueue-rejected");
+		expect(old.stateCalls).toBe(statesBefore);
+		expect(mailbox.state.driverRunning).toBe(false);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([OWNER_STOPPED_TEXT]);
+		expect(store.dailyCost(localDay(clock.now(), "Asia/Seoul"), ORIGIN)).toBeCloseTo(1.25, 6);
+		expect(escalations).toEqual([]);
+
+		await router.route(msg("again"));
+		expect(drivers).toHaveLength(2);
+		expect(drivers[1]?.calls).toEqual(["openSession", "prompt:again"]);
+		expect(store.getOrigin(ORIGIN)).toMatchObject({ epoch: 1, sessionDir });
+	});
+
+	test("a driver without a queue-clearing abort: abort, then the child is stopped when omp still holds queued messages", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("job"));
+		const driver = drivers[0] as SteerFailingDriver;
+		Object.defineProperty(driver, "abortAndClearQueue", { value: undefined });
+		driver.queued = 1;
+		await router.route(msg("!stop"));
+		await mailbox.sweepIdle();
+		expect(driver.calls.filter((c) => c.startsWith("abort"))).toEqual(["abort"]);
+		expect(mailbox.state.driverRunning).toBe(false);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([OWNER_STOPPED_TEXT]);
+	});
+
+	test("no running turn: '멈출 작업이 없습니다.' and no abort", async () => {
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("!stop"));
+		expect(drivers).toHaveLength(0);
+		await router.route(msg("hello"));
+		await mailbox.sweepIdle();
+		await router.route(msg("/stop-ompbot"));
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(driver.calls.filter((c) => c.startsWith("abort"))).toEqual([]);
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([
+			NOTHING_TO_STOP_TEXT,
+			"ECHO hello",
+			NOTHING_TO_STOP_TEXT,
+		]);
 	});
 });
 
@@ -1928,6 +2158,64 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 	});
 });
 
+describe("mailbox: a child started before a peer bot wrote in its conversation", () => {
+	test("is kept; the notice leads the first prompted turn after the taint, survives a failed prompt, then is gone", async () => {
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("first"));
+		await mailbox.sweepIdle();
+		const driver = drivers[0] as SteerFailingDriver;
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "peer-1",
+			textRef: "peer",
+			threadRef: "peer-1",
+			peerUserId: "UPEER00001",
+		});
+
+		// Both queued turns (the peer's and the owner's) fail at the prompt: no notice reached the child yet.
+		driver.stale = true;
+		await router.route(msg("second"));
+		expect(logLines.filter((line) => line.includes("event=dispatch_failed"))).toHaveLength(2);
+		driver.stale = false;
+
+		const notice = peerTouchedTurnNotice(ORIGIN);
+		const prompts = () => driver.calls.filter((c) => c.startsWith("prompt:")).map((c) => c.slice("prompt:".length));
+		await router.route(msg("third"));
+		await mailbox.sweepIdle();
+		const [, told] = prompts();
+		expect(told?.startsWith(`${notice}\n\n`)).toBe(true);
+		expect(isTurnPromptFor(told ?? "", "third")).toBe(true);
+
+		await router.route(msg("fourth"));
+		await mailbox.sweepIdle();
+		expect(prompts()).toEqual(["first", told ?? "", "fourth"]);
+		expect(drivers).toHaveLength(1);
+		expect(logLines.some((line) => line.includes("driver_restart_peer_touched"))).toBe(false);
+	});
+
+	test("a child without host tools (agy, claude) is kept and gets no notice", async () => {
+		hostTools = false;
+		router = buildRouter();
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("first"));
+		await mailbox.sweepIdle();
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "peer-1",
+			textRef: "peer",
+			threadRef: "peer-1",
+			peerUserId: "UPEER00001",
+		});
+		await mailbox.resumePending();
+		await mailbox.sweepIdle();
+		await router.route(msg("second"));
+		await mailbox.sweepIdle();
+		const prompts = (drivers[0]?.calls ?? []).filter((c) => c.startsWith("prompt:"));
+		expect(prompts).toEqual(["prompt:first", "prompt:peer", "prompt:second"]);
+		expect(drivers).toHaveLength(1);
+	});
+});
+
 describe("mailbox: a peer bot's failed turn answers that bot", () => {
 	const PEER = "UPEER00001";
 	const BOT = "UBOT";
@@ -2351,5 +2639,75 @@ describe("mailbox: lane todos and turn-end report (doc/plans/lane-todos-nudge.md
 		} finally {
 			await mailbox.close();
 		}
+	});
+});
+
+describe("mailbox: !restart runs without a driver or a turn", () => {
+	const TEAMS = "teams/dm/t0123456789abcdef";
+
+	const deliveriesOf = (threadRef: string) => store.listDeliveries({}).filter((d) => d.threadRef === threadRef);
+
+	test("AC-2: the provider gets the conversation and thread once; its line is the one restart: answer", async () => {
+		const record = msg("!restart", { threadRef: "D1:100.1" });
+		await router.route(record);
+		expect(drivers).toHaveLength(0);
+		expect(restartCalls).toEqual([[ORIGIN, "D1:100.1"]]);
+		const answers = deliveriesOf("D1:100.1");
+		expect(answers.map((d) => [d.opRef, d.body])).toEqual([
+			[`restart:${record.platformMessageId}`, "🔄 재시작을 접수했습니다(apply-x)."],
+		]);
+		expect(store.getInbound(record.platformMessageId)?.state).not.toBe("pending");
+	});
+
+	test("AC-2: a running turn is neither steered nor aborted by !restart", async () => {
+		driverOptions = { holdTurns: true };
+		await router.route(msg("hello", { threadRef: "D1:100.2" }));
+		await router.route(msg("!restart", { threadRef: "D1:100.3" }));
+		const calls = drivers[0]?.calls ?? [];
+		expect(calls.filter((c) => c.startsWith("steer:") || c === "abort")).toEqual([]);
+		expect(restartCalls).toEqual([[ORIGIN, "D1:100.3"]]);
+		expect(router.mailbox(ORIGIN).state.busy).toBe(true);
+	});
+
+	test("AC-2: a peer bot's fenced !restart is never run as the command", async () => {
+		const origin = "slack/ch/C1/t/900.1";
+		store.ensureOrigin(origin, sessionDirFor(join(dir, "sessions"), origin, 1));
+		store.recordInbound({
+			originKey: origin,
+			platformMessageId: "C1:900.1",
+			textRef: "[피어 봇 떡의 요청 — 오너 지시가 아니다]\n<<<quoted-0123>>>\n!restart\n<<<end-quoted-0123>>>",
+			threadRef: "C1:900.1",
+			peerUserId: "UPEER00001",
+		});
+		await router.mailbox(origin).resumePending();
+		expect(restartCalls).toEqual([]);
+		expect(deliveriesOf("C1:900.1").some((d) => d.opRef.startsWith("restart:"))).toBe(false);
+	});
+
+	test("AC-2: a Teams conversation and a monitor origin are refused; the provider is never called", async () => {
+		const teams = msg("!restart", { originKey: TEAMS, threadRef: "t0123456789abcdef:act1" });
+		await router.route(teams);
+		const monitor = msg("!restart", { originKey: "monitor/self-retro", threadRef: "C1:-" });
+		await router.route(monitor);
+		expect(restartCalls).toEqual([]);
+		expect(deliveriesOf("t0123456789abcdef:act1").map((d) => d.body)).toEqual([RESTART_REFUSED_TEXT]);
+		// A monitor origin's answers go to its event ledger, not to a delivery: the row is settled, nothing launched.
+		expect(store.getInbound(monitor.platformMessageId)?.state).toBe("answered");
+	});
+
+	test("AC-3c: during a drain !restart is answered at once and never left pending for the next process", async () => {
+		router.draining = true;
+		const typed = msg("!restart", { threadRef: "D1:100.4" });
+		await router.route(typed);
+		// A row already pending when the drain began (recorded, its dispatch queued behind the flip) is settled too.
+		store.recordInbound({ originKey: ORIGIN, platformMessageId: "late", textRef: "!restart", threadRef: "D1:100.5" });
+		await router.mailbox(ORIGIN).resumePending();
+		expect(deliveriesOf("D1:100.4").map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
+		expect(deliveriesOf("D1:100.5").map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
+		expect(store.listInbound({ originKey: ORIGIN, state: "pending" })).toEqual([]);
+		router.draining = false;
+		await router.mailbox(ORIGIN).resumePending();
+		expect(restartCalls).toEqual([]);
+		expect(drivers).toHaveLength(0);
 	});
 });

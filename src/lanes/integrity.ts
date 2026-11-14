@@ -21,25 +21,31 @@ export interface IntegrityInput {
 }
 
 /** Files whose added lines are judged: code only. Markdown/docs are not code and stay exempt; code under docs/ or examples/ is judged. */
-const CODE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|sh|bash|go|rs|rb|java|kt|sql|json|toml|yaml|yml|css|html)$/i;
+const CODE_EXT =
+	/\.(?:ts|tsx|js|jsx|mjs|cjs|py|sh|bash|zsh|ps1|go|rs|rb|java|kt|kts|scala|groovy|php|c|h|cc|cpp|cxx|hpp|cs|swift|m|mm|dart|lua|pl|ex|exs|zig|vue|svelte|sql|json|toml|yaml|yml|css|scss|html)$/i;
 const TEST_PATH =
 	/(?:^|\/)(?:tests?|__tests__|specs?)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:go|py|rs)$/i;
 const LINKED_REASON = /(?:#\d+|https?:\/\/)/;
 const UNFINISHED = /\b(?:TODO|FIXME|XXX|HACK|WIP|TBD)\b/i;
-const SKIPPED_TEST = /(?:\b(?:test|it|describe)\.(?:skip|only|todo|skipIf)(?:\(|\.)|\b(?:xit|xtest|xdescribe)\()/;
-const STUB = /(?:not implemented|notimplemented|todo!\(|unimplemented!)/i;
+const SKIPPED_TEST =
+	/(?:\b(?:test|it|describe)(?:\.(?:concurrent|serial|failing|sequential))*\.(?:skip|only|todo|skipIf)(?:\(|\.)|\b(?:xit|xtest|xdescribe)\(|\b(?:test|it|describe)\b[^\n]*\{[^}]*\bskip\s*:\s*true\b)/;
+/** A stub is a throwing/panicking body, judged on the raw line (its message is a string), or a stub macro/call outside string literals. */
+const STUB_THROW = /\b(?:throw|raise|panic)\b.*not[ _-]?implemented/i;
+const STUB_CALL = /(?:todo!\(|unimplemented[!]|\bnot_?implemented\s*\()/i;
 const GUARD_WORD =
 	/\b(?:throw|refuse|deny|reject|validate|sanitize|permission|allowlist|forbid|guard|assert)\b|권한|거부|검증|금지/i;
 const NEGATIVE_TEST = /\b(?:refuses?|rejects?|denies?|blocks?|invalid|권한 없음|거부)/i;
 const CLAIM_WORD =
 	/(?:통과|검증 완료|수정 완료|고쳤|해결됐|해결됨|(?<![A-Za-z0-9_-])(?:verified|passing|passed|fixed|green)(?![A-Za-z0-9_-]))/i;
 const COMMAND_TOKEN =
-	/(?<![A-Za-z0-9_-])(?:bun\s+(?:run\s+)?(?:test|check|typecheck|x)|bunx|(?:npm|yarn|pnpm)\s+(?:run\s+)?test|tsc|biome|pytest|go\s+test|cargo\s+test|make\s+test|vitest|jest|git(?=\s))(?![A-Za-z0-9_-])/i;
+	/(?<![A-Za-z0-9_-])(?:bun\s+(?:run\s+)?(?:test|check|typecheck|x)|bunx|(?<![A-Za-z0-9_/.-])(?:tsc|biome)(?!\.\w)|(?:npm|yarn|pnpm)\s+(?:run\s+)?test|pytest|go\s+test|cargo\s+test|make\s+test|vitest|jest|git(?=\s))(?![A-Za-z0-9_-])/i;
 const MAX_REFUSALS = 8;
 
 interface DiffLine {
 	file: string;
 	text: string;
+	/** Hunk ordinal within the diff: a block comment opened in one hunk does not run into the next. */
+	hunk: number;
 }
 
 const OCTAL_ESCAPE_RUN = /(?:\\[0-3][0-7]{2})+/g;
@@ -73,6 +79,7 @@ function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 	let oldFile = "";
 	let newFile = "";
 	let inHunk = false;
+	let hunk = 0;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] as string;
 		if (line.startsWith("diff ")) {
@@ -90,12 +97,13 @@ function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 		}
 		if (line.startsWith("@@")) {
 			inHunk = true;
+			hunk += 1;
 			continue;
 		}
 		if (line.startsWith("+")) {
-			if (CODE_EXT.test(newFile)) added.push({ file: newFile, text: line.slice(1) });
+			if (CODE_EXT.test(newFile)) added.push({ file: newFile, text: line.slice(1), hunk });
 		} else if (line.startsWith("-")) {
-			if (CODE_EXT.test(oldFile)) removed.push({ file: oldFile, text: line.slice(1) });
+			if (CODE_EXT.test(oldFile)) removed.push({ file: oldFile, text: line.slice(1), hunk });
 		}
 	}
 	return { added, removed };
@@ -143,10 +151,26 @@ function commentText(text: string): string | undefined {
 	return undefined;
 }
 
-function isUnfinishedMarker(text: string): boolean {
-	if (!UNFINISHED.test(text)) return false;
-	const comment = commentText(text);
-	return comment !== undefined && UNFINISHED.test(comment);
+/** Whether the line carries an unfinished-work marker; `inBlock` carries an open slash-star comment from the line before. */
+function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; inBlock: boolean } {
+	let code = text;
+	let comment: string | undefined;
+	if (inBlock) {
+		const close = text.indexOf("*/");
+		if (close < 0) return { marker: UNFINISHED.test(text), inBlock: true };
+		comment = text.slice(0, close);
+		code = text.slice(close + 2);
+	}
+	const trailing = commentText(code);
+	const opensBlock = trailing?.startsWith("/*") === true && !trailing.includes("*/", 2);
+	const marker =
+		(comment !== undefined && UNFINISHED.test(comment)) || (trailing !== undefined && UNFINISHED.test(trailing));
+	return { marker, inBlock: opensBlock };
+}
+
+/** Blanks string literals so words inside quotes are not read as code. */
+function withoutStrings(text: string): string {
+	return text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, '""');
 }
 
 function refusal(category: IntegrityRefusal["category"], file: string, text: string): IntegrityRefusal {
@@ -173,11 +197,21 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 	const refusals: IntegrityRefusal[] = [];
 	const { added, removed } = parseDiff(input.diff);
 
+	let blockKey = "";
+	let inBlock = false;
 	for (const line of added) {
+		const key = `${line.file}\0${line.hunk}`;
+		if (key !== blockKey) {
+			blockKey = key;
+			inBlock = false;
+		}
+		const scan = isUnfinishedMarker(line.text, inBlock);
+		inBlock = scan.inBlock;
 		if (LINKED_REASON.test(line.text)) continue;
-		if (isUnfinishedMarker(line.text)) refusals.push(refusal("unfinished_work_marker", line.file, line.text));
+		if (scan.marker) refusals.push(refusal("unfinished_work_marker", line.file, line.text));
 		if (SKIPPED_TEST.test(line.text)) refusals.push(refusal("skipped_test", line.file, line.text));
-		if (STUB.test(line.text)) refusals.push(refusal("stub_implementation", line.file, line.text));
+		if (STUB_THROW.test(line.text) || STUB_CALL.test(withoutStrings(line.text)))
+			refusals.push(refusal("stub_implementation", line.file, line.text));
 	}
 
 	const addedText = new Set(added.map((line) => line.text.trim()));

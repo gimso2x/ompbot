@@ -22,12 +22,16 @@ export type CommandKind =
 	| "btw"
 	| "undo"
 	| "budget"
-	| "brief";
+	| "brief"
+	| "stop"
+	| "restart";
 
 /**
  * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` and `btw` are typed
  * as `!distill` / `!btw` only: their slash names are not in the Slack app manifests. `undo` restores the newest
- * conversation turn's files (doc/plans/turn-undo.md), so its slash name is registered.
+ * conversation turn's files (doc/plans/turn-undo.md), so its slash name is registered. `stop` (doc/plans/owner-stop-and-context.md)
+ * is typed as `!stop` only too, so it works without re-applying the manifests. `restart`
+ * (doc/plans/owner-restart-command.md) is typed as `!restart` only as well: the daemon restarts without a model turn.
  */
 export const COMMAND_TEXT: Record<CommandKind, string> = {
 	new: "/new-ompbot",
@@ -44,6 +48,8 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
 	undo: "/undo-ompbot",
 	budget: "/budget-ompbot",
 	brief: "/brief-ompbot",
+	stop: "/stop-ompbot",
+	restart: "/restart-ompbot",
 };
 
 /**
@@ -52,15 +58,20 @@ export const COMMAND_TEXT: Record<CommandKind, string> = {
  */
 export const COMMAND_ALIAS: Readonly<Partial<Record<CommandKind, string>>> = { brief: "!브리핑" };
 
+/**
+ * First half of a peer failure notice (`failedNotice` in the mailbox): a peer turn opened by it never mentions back,
+ * and a post carrying it is never recorded as a call the peer must answer (`peer_calls`).
+ */
+export const PEER_FAILURE_MARK = "응답 실패(";
+
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
 export const COMMAND_OP_REF = new RegExp(
-	`^(failed|lane|task|home|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
+	`^(failed|lane|task|home|notify|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
 );
 
 /**
- * `!home`: makes the conversation it is typed in the owner's notice home (`Store.ownerHome()`). Typed text only, like
- * `!shutup`: it has no slash name, so the Slack manifests and the Discord command set stay as they are. Only the bare
- * word counts.
+ * `!home`: makes the conversation it is typed in the owner's notice home (`Store.ownerHome()`). Typed text only: it has
+ * no slash name, so the Slack manifests and the Discord command set stay as they are. Only the bare word counts.
  */
 export const HOME_COMMAND = "!home";
 
@@ -130,19 +141,20 @@ export function isTurnPromptFor(entryText: string, promptText: string): boolean 
 	return entryText === promptText || entryText.endsWith(`\n\n${CURRENT_REQUEST_MARKER}\n${promptText}`);
 }
 
-/** Per-thread mute toggles the adapter handles itself (bookkeeping, never an omp prompt). */
-export type ThreadMuteCommand = "shutup" | "unshutup";
-
-/** `!shutup` / `!unshutup` — only the exact bare word counts, so a real prompt is never stolen. */
-export function parseThreadMuteCommand(text: string): ThreadMuteCommand | undefined {
-	const trimmed = text.trim();
-	if (trimmed === "!shutup") return "shutup";
-	if (trimmed === "!unshutup") return "unshutup";
-	return undefined;
-}
-
 /** Response-only provider behind `/status-ompbot`; the mailbox only stores its text as a delivery. */
 export type StatusProvider = (originKey: string) => string | Promise<string>;
+
+/**
+ * `!restart` (doc/plans/owner-restart-command.md): the daemon starts the detached apply for the asking conversation and
+ * thread, or says why not; the mailbox only stores the line as the command's answer. No model turn is involved.
+ */
+export type RestartProvider = (originKey: string, threadRef: string) => Promise<string>;
+
+/** `!restart` while a restart drain already runs: answered at once, never held for the next process. */
+export const RESTART_DRAINING_TEXT = "이미 재시작 중입니다";
+
+/** `!restart` from a Teams conversation or a monitor origin. */
+export const RESTART_REFUSED_TEXT = "이 대화에서는 쓸 수 없습니다";
 
 export interface MailboxClock {
 	now(): number;

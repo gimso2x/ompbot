@@ -1,4 +1,4 @@
-import { CARD_TONE_COLORS, type CardElement, type CardTone, splitCards } from "../channel/card";
+import { CARD_TONE_COLORS, type CardElement, type CardRun, type CardTone, cardRuns } from "../channel/card";
 import {
 	CHUNK_LIMIT,
 	chunkText,
@@ -6,6 +6,9 @@ import {
 	displayWidth,
 	FENCE_RESERVE,
 	REDELIVERED_PREFIX,
+	splitRowCells,
+	tableEndAt,
+	tableSpans,
 } from "../channel/text";
 import { CARD_MAX_BLOCKS, cardFallbackText, cardToBlocks, parseCard, type SlackBlock } from "./card";
 
@@ -34,11 +37,36 @@ function splitFences(text: string): string[] {
 		const run = open[1]?.length ?? 3;
 		const close = new RegExp(`^ {0,3}\`{${run},}[ \\t]*$`, "m").exec(text.slice(open.index + open[0].length + 1));
 		const end = close === null ? text.length : open.index + open[0].length + 1 + close.index + close[0].length;
-		parts.push(...text.slice(prose, open.index).split(/(```[\s\S]*?(?:```|$))/g), text.slice(open.index, end));
+		parts.push(...splitInlineFences(text.slice(prose, open.index)), text.slice(open.index, end));
 		prose = end;
 		FENCE_OPEN.lastIndex = end;
 	}
-	parts.push(...text.slice(prose).split(/(```[\s\S]*?(?:```|$))/g));
+	parts.push(...splitInlineFences(text.slice(prose)));
+	return parts;
+}
+
+/**
+ * Prose cut at its mid-line ``` runs: each opens code up to the next ``` (or the end). A run inside a GFM table stays
+ * prose, so the table detector sees its rows whole (a cell's ``` is a code span there).
+ */
+function splitInlineFences(prose: string): string[] {
+	const tables = tableSpans(prose);
+	const parts: string[] = [];
+	let from = 0;
+	let pos = 0;
+	for (let open = prose.indexOf("```", pos); open >= 0; open = prose.indexOf("```", pos)) {
+		const table = tables.find(([start, end]) => start <= open && open < end);
+		if (table !== undefined) {
+			pos = table[1];
+			continue;
+		}
+		const close = prose.indexOf("```", open + 3);
+		const end = close < 0 ? prose.length : close + 3;
+		parts.push(prose.slice(from, open), prose.slice(open, end));
+		from = end;
+		pos = end;
+	}
+	parts.push(prose.slice(from));
 	return parts;
 }
 
@@ -88,7 +116,8 @@ function codeSpanText(span: string): string {
 	return inner.startsWith(" ") && inner.endsWith(" ") && inner.trim() !== "" ? inner.slice(1, -1) : inner;
 }
 
-const LINK = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g;
+/** `[label](url)`; the URL may hold one level of balanced parentheses (`/wiki/Foo_(bar)`). */
+const LINK = /\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g;
 /** `<@U…>`/`<#C…>`, optionally labelled (`<#C0123|general>`, `<@U0123|name>`). */
 const USER_MENTION = /<(?:@[UW]|#[CG])[A-Z0-9]+(?:\|[^<>\n]*)?>/g;
 /** Placeholder sentinels (private-use chars) so masked spans and links survive every later regex. */
@@ -130,44 +159,6 @@ function convertProse(text: string): string {
 
 type ColumnAlign = "left" | "center" | "right";
 
-/** Splits one table row into cells; `\|` is a literal pipe inside a cell (GFM escaping). */
-function splitRowCells(line: string): string[] {
-	let trimmed = line.trim();
-	if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
-	if (trimmed.endsWith("|") && !trimmed.endsWith("\\|")) trimmed = trimmed.slice(0, -1);
-	const cells: string[] = [];
-	let cell = "";
-	for (let i = 0; i < trimmed.length; i++) {
-		const ch = trimmed[i];
-		if (ch === "\\" && trimmed[i + 1] === "|") {
-			cell += "|";
-			i++;
-			continue;
-		}
-		if (ch === "|") {
-			cells.push(cell.trim());
-			cell = "";
-			continue;
-		}
-		cell += ch;
-	}
-	cells.push(cell.trim());
-	return cells;
-}
-
-function hasUnescapedPipe(line: string): boolean {
-	for (let i = 0; i < line.length; i++) {
-		if (line[i] === "|") return true;
-		if (line[i] === "\\" && line[i + 1] === "|") i++;
-	}
-	return false;
-}
-
-/** A delimiter-row cell: hyphens with an optional leading/trailing colon. */
-function isAlignCell(cell: string): boolean {
-	return /^\s*:?-+:?\s*$/.test(cell);
-}
-
 function alignOf(cell: string): ColumnAlign {
 	const trimmed = cell.trim();
 	const left = trimmed.startsWith(":");
@@ -195,48 +186,6 @@ function maskTables(text: string, render: (block: string) => string): string {
 		i++;
 	}
 	return out.join("\n");
-}
-
-/** When a GFM table (see `maskTables`) starts at line `i`: the index of the first line after it. */
-function tableEndAt(lines: readonly string[], i: number): number | undefined {
-	const header = splitRowCells(lines[i] ?? "");
-	const delimiter = i + 1 < lines.length ? splitRowCells(lines[i + 1] ?? "") : undefined;
-	if (
-		delimiter === undefined ||
-		header.length < 2 ||
-		header.length !== delimiter.length ||
-		!delimiter.every(isAlignCell)
-	) {
-		return undefined;
-	}
-	let j = i + 2;
-	while (j < lines.length && hasUnescapedPipe(lines[j] ?? "")) j++;
-	return j;
-}
-
-/** `[start, end)` character spans of the GFM tables outside code fences: a chunk cut must not fall inside one. */
-function tableSpans(text: string): Array<readonly [number, number]> {
-	const lines = text.split("\n");
-	const starts: number[] = [];
-	let offset = 0;
-	for (const line of lines) {
-		starts.push(offset);
-		offset += line.length + 1;
-	}
-	const spans: Array<readonly [number, number]> = [];
-	let inFence = false;
-	let i = 0;
-	while (i < lines.length) {
-		const end = inFence ? undefined : tableEndAt(lines, i);
-		if (end !== undefined) {
-			spans.push([starts[i] ?? 0, (starts[end - 1] ?? 0) + (lines[end - 1] ?? "").length]);
-			i = end;
-			continue;
-		}
-		if (((lines[i] ?? "").match(/```/g) ?? []).length % 2 === 1) inFence = !inFence;
-		i++;
-	}
-	return spans;
 }
 
 function padCell(text: string, width: number, align: ColumnAlign): string {
@@ -290,6 +239,8 @@ export function renderParts(body: string, redelivered: boolean, footer?: string)
 
 /** One message of an answer Slack renders itself (a `markdown` block); Slack caps one payload's markdown at 12,000. */
 export const MARKDOWN_CHUNK_LIMIT = 11_000;
+/** The hard cap of one markdown block, applied after mentions are swapped for names. */
+const MARKDOWN_BLOCK_LIMIT = 12_000;
 /** `text` of a markdown message: what mobile notifications and block-less clients show. */
 const MARKDOWN_TEXT_LIMIT = 3_000;
 
@@ -339,56 +290,24 @@ export interface CardFallback {
 /** `renderMarkdownParts`' result; `cardIssues` lists why card fences stayed text (`card <n>: <issue>`). */
 export type MarkdownParts = MarkdownPart[] & { cardIssues?: readonly string[] };
 
-type Piece =
-	| { kind: "text"; text: string }
-	| { kind: "card"; card: CardElement; blocks: SlackBlock[]; raw: string; tone?: CardTone };
+type SlackCard = { card: CardElement; blocks: SlackBlock[]; tone?: CardTone };
+type Piece = CardRun<SlackCard>;
 
 /**
- * `content` as text and validated card pieces; a card that fails validation stays in the text around it, its issues
- * go to `issues`. `undefined` when no card validates (the answer renders exactly as without cards). With `headed`
- * the first message opens with a header block, so a card opening the answer gets one block less.
+ * `content` as text and validated card pieces (see `cardRuns`). `undefined` when no card validates (the answer renders
+ * exactly as without cards). With `headed` the first message opens with a header block, so a card opening the answer
+ * gets one block less.
  */
 function cardPieces(content: string, charts: boolean, headed: boolean, issues: string[]): Piece[] | undefined {
-	const pieces: Piece[] = [];
-	let text: string[] = [];
-	let n = 0;
-	const flush = (): void => {
-		const joined = text
-			.join("\n")
-			.replace(/^(?:[ \t]*\n)+/, "")
-			.trimEnd();
-		if (joined.trim() !== "") pieces.push({ kind: "text", text: joined });
-		text = [];
-	};
-	for (const segment of splitCards(content)) {
-		if (segment.kind === "text") {
-			text.push(segment.text);
-			continue;
-		}
-		n += 1;
-		const first = pieces.length === 0 && text.join("\n").trim() === "";
-		const parsed = parseCard(segment.json, { charts });
+	const pieces = cardRuns<SlackCard>(content, issues, (json, first) => {
+		const parsed = parseCard(json, { charts });
+		if (!parsed.ok) return parsed.issues;
 		const room = headed && first ? CARD_MAX_BLOCKS - 1 : CARD_MAX_BLOCKS;
-		const failure = !parsed.ok
-			? parsed.issues
-			: parsed.blocks.length > room
-				? [`the card needs ${parsed.blocks.length} blocks, at most ${room} under the header`]
-				: undefined;
-		if (!parsed.ok || failure !== undefined) {
-			issues.push(...(failure ?? []).map((issue) => `card ${n}: ${issue}`));
-			text.push(segment.raw);
-			continue;
+		if (parsed.blocks.length > room) {
+			return [`the card needs ${parsed.blocks.length} blocks, at most ${room} under the header`];
 		}
-		flush();
-		pieces.push({
-			kind: "card",
-			card: parsed.card,
-			blocks: parsed.blocks,
-			raw: segment.raw,
-			...(parsed.tone === undefined ? {} : { tone: parsed.tone }),
-		});
-	}
-	flush();
+		return { card: parsed.card, blocks: parsed.blocks, ...(parsed.tone === undefined ? {} : { tone: parsed.tone }) };
+	});
 	return pieces.some((piece) => piece.kind === "card") ? pieces : undefined;
 }
 
@@ -507,22 +426,31 @@ export function renderMarkdownParts(
 	const names = options.names ?? NO_NAMES;
 	const titled = options.monitorHeader === true ? monitorTitle(body, names) : undefined;
 	const content = titled?.rest ?? body;
-	const tables = tableSpans(content);
-	if (tables.some(([start, end]) => end - start > MARKDOWN_CHUNK_LIMIT - FENCE_RESERVE)) return undefined;
 	const charts = options.charts ?? true;
 	const cardIssues: string[] = [];
 	const cut = options.cards === true ? cardPieces(content, charts, titled !== undefined, cardIssues) : undefined;
-	const pieces: Piece[] =
-		cut === undefined
-			? chunkText(content, MARKDOWN_CHUNK_LIMIT, tables).map((text) => ({ kind: "text", text }))
-			: cut.flatMap((piece): Piece[] =>
-					piece.kind === "card"
-						? [piece]
-						: chunkText(piece.text, MARKDOWN_CHUNK_LIMIT, tableSpans(piece.text)).map((text) => ({
-								kind: "text",
-								text,
-							})),
-				);
+	// Names are longer than the tokens they replace: when a swapped piece passes Slack's cap, cut again on a budget
+	// scaled by how far the worst piece overshot.
+	let limit = MARKDOWN_CHUNK_LIMIT;
+	let pieces: Piece[];
+	for (;;) {
+		if (tableSpans(content).some(([start, end]) => end - start > limit - FENCE_RESERVE)) return undefined;
+		const chunk = (text: string, spans: ReadonlyArray<readonly [number, number]>): Piece[] =>
+			chunkText(text, limit, spans).map((chunked) => ({ kind: "text", text: chunked }));
+		pieces =
+			cut === undefined
+				? chunk(content, tableSpans(content))
+				: cut.flatMap((piece): Piece[] =>
+						piece.kind === "card" ? [piece] : chunk(piece.text, tableSpans(piece.text)),
+					);
+		const longest = Math.max(
+			...pieces.map((piece) =>
+				piece.kind === "text" ? swapTokensOutsideCode(piece.text, (token) => readableToken(token, names)).length : 0,
+			),
+		);
+		if (longest <= MARKDOWN_BLOCK_LIMIT) break;
+		limit = Math.floor((limit * MARKDOWN_BLOCK_LIMIT) / longest) - 1;
+	}
 	const tokens: string[] = [];
 	let found = 0;
 	const collect = (token: string): string => {

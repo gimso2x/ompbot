@@ -12,12 +12,15 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import type { DrainWaitResult } from "../cli/drain";
+import { type CodeRollbackMode, defaultHomeDir } from "../config";
 import { parseChatOrigin } from "../core/origin-key";
 import type { SweepHeartbeat } from "../daemon/heartbeat";
 import { RESTART_CUT_FILE } from "../daemon/recovery";
+import { redact } from "../redact";
 import { type BackupResult, backupStamp } from "./backup";
+import { type EnsureDepsResult, ensureDeps } from "./deps";
 import type { Gate } from "./gates";
 
 /** How long the restarted daemon gets to answer IPC `status` from a fresh start. */
@@ -73,6 +76,22 @@ export interface ApplyOptions {
 	mergedAt?: Date;
 	reportOrigin?: string;
 	reportThread?: string;
+	/** `--report-plain`: the report is a plain bot post (daemon `notify`), not a `[자동 후속]` model turn (`inject`). */
+	reportPlain?: boolean;
+	/**
+	 * Why this apply never reverts code after a failed config rollback (`--no-code-rollback`, or a peer install: the
+	 * first home's apply owns the shared checkout). Absent: the code rollback is on.
+	 */
+	codeRollbackOff?: string;
+	/**
+	 * How the code goes back (config `apply.codeRollback`, which the CLI always passes; its default is `detach`).
+	 * Absent: `push`, the behaviour from before the setting existed.
+	 */
+	codeRollback?: CodeRollbackMode;
+	/** `--clear-rollback`: the detach journal is removed first, then the ordinary checks run. */
+	clearRollback?: boolean;
+	/** `--allow-detached`: a detached HEAD picked by hand is applied as is (no journal); head.last-good stays as it was. */
+	allowDetached?: boolean;
 }
 
 /** Everything `runApply` touches outside the home directory; tests replace the external effects with fakes. */
@@ -82,8 +101,11 @@ export interface ApplyDeps {
 	unit: string;
 	/** Checkout holding `src/main.ts`; the daemon loads its code from here. */
 	repoDir: string;
-	/** Applies the same code to the other installs running from this checkout, after this one is up. */
-	peers?: () => Promise<PeerApply[]>;
+	/**
+	 * Applies the same code to the other installs running from this checkout, after this one is up. `afterCodeRollback`:
+	 * the checkout was just reverted, so every peer restarts onto it (no `--merged-at` shortcut).
+	 */
+	peers?: (afterCodeRollback?: boolean) => Promise<PeerApply[]>;
 	/** PATH (with ~/.local/bin and ~/.bun/bin prepended) for every child process and for finding bun. */
 	pathEnv: string;
 	now: () => number;
@@ -134,21 +156,56 @@ export async function findDaemonUnits(
 	repoDir: string,
 	defaultHome: string,
 ): Promise<DaemonUnit[]> {
+	try {
+		const units = await findCheckoutUnits(run, pathEnv, repoDir, defaultHome, "daemon");
+		return units.map(({ unit, homeDir }) => ({ unit, homeDir }));
+	} catch {
+		// no user bus or systemctl failed: no peers to apply to
+		return [];
+	}
+}
+
+/**
+ * Active `ompbot*` user units whose ExecStart runs `<repoDir>/src/main.ts <command>`, with their home and when they
+ * last became active (ms; undefined when systemd does not say).
+ */
+async function findCheckoutUnits(
+	run: Runner,
+	pathEnv: string,
+	repoDir: string,
+	defaultHome: string,
+	command: "daemon" | "dashboard",
+): Promise<Array<DaemonUnit & { activeSince: number | undefined }>> {
 	const env = { PATH: pathEnv };
 	const listed = await run(
 		["systemctl", "--user", "list-units", "--type=service", "--state=active", "--no-legend", "--plain", "ompbot*"],
 		{ env },
 	);
-	const names = listed.code === 0 ? listed.stdout.split("\n").flatMap((line) => line.trim().split(/\s+/, 1)) : [];
+	if (listed.code !== 0) throw new Error(`systemctl list-units rc=${listed.code}: ${listed.stderr.trim()}`);
+	const names = listed.stdout.split("\n").flatMap((line) => line.trim().split(/\s+/, 1));
 	const units = names.filter((name) => name.endsWith(".service"));
 	if (units.length === 0) return [];
 	const shown = await run(
-		["systemctl", "--user", "show", "-p", "Id", "-p", "Environment", "-p", "ExecStart", ...units],
+		[
+			"systemctl",
+			"--user",
+			"show",
+			"-p",
+			"Id",
+			"-p",
+			"Environment",
+			"-p",
+			"ExecStart",
+			"-p",
+			"ActiveEnterTimestamp",
+			"--timestamp=unix",
+			...units,
+		],
 		{ env },
 	);
-	if (shown.code !== 0) return [];
-	const daemonArgv = `${join(repoDir, "src", "main.ts")} daemon `;
-	const found: DaemonUnit[] = [];
+	if (shown.code !== 0) throw new Error(`systemctl show rc=${shown.code}: ${shown.stderr.trim()}`);
+	const argv = `${join(repoDir, "src", "main.ts")} ${command} `;
+	const found: Array<DaemonUnit & { activeSince: number | undefined }> = [];
 	for (const block of shown.stdout.split(/\n\s*\n/)) {
 		const props = new Map<string, string>();
 		for (const line of block.split("\n")) {
@@ -156,9 +213,13 @@ export async function findDaemonUnits(
 			if (eq > 0) props.set(line.slice(0, eq), line.slice(eq + 1));
 		}
 		const id = props.get("Id");
-		if (id === undefined || !(props.get("ExecStart") ?? "").includes(daemonArgv)) continue;
+		if (id === undefined || !(props.get("ExecStart") ?? "").includes(argv)) continue;
 		const home = /(?:^|\s)OMPBOT_HOME=(\S+)/.exec(props.get("Environment") ?? "")?.[1];
-		found.push({ unit: id.replace(/\.service$/, ""), homeDir: home ?? defaultHome });
+		found.push({
+			unit: id.replace(/\.service$/, ""),
+			homeDir: home ?? defaultHome,
+			activeSince: parseUnixTimestamp(props.get("ActiveEnterTimestamp") ?? ""),
+		});
 	}
 	return found;
 }
@@ -183,9 +244,16 @@ export interface ApplyReceipt {
 	head: string | undefined;
 	/** HEAD at preflight, set only when HEAD moved between preflight and the restart. */
 	headAtPreflight?: string;
-	/** Where HEAD pointed before the latest checkout/merge move (reflog), the code a revert would go back to. */
+	/** `<home>/head.last-good` at preflight: the commit the last verified apply loaded. */
+	lastGoodHead: string | undefined;
+	/**
+	 * The code a revert goes back to: `lastGoodHead` when recorded, else where HEAD pointed before the latest
+	 * checkout/merge move (reflog `HEAD@{1}`).
+	 */
 	previousHead: string | undefined;
 	revertCommand: string | undefined;
+	/** The code rollback mode this apply ran with. */
+	codeRollback: CodeRollbackMode;
 	configBackup: string | undefined;
 	backupFile: string | undefined;
 	steps: StepRecord[];
@@ -243,10 +311,12 @@ export function revertCommandFor(repoDir: string, prev: string): string {
 
 export const LAST_GOOD_SUFFIX = ".last-good";
 
-/** Text of `<home>/config.json`, or undefined when it cannot be read. */
+/** Text of `<home>/config.json`, or undefined when it cannot be read (or is no regular file: a FIFO would block). */
 export function readConfigText(homeDir: string): string | undefined {
 	try {
-		return readFileSync(join(homeDir, "config.json"), "utf8");
+		const path = join(homeDir, "config.json");
+		if (!statSync(path).isFile()) return undefined;
+		return readFileSync(path, "utf8");
 	} catch {
 		return undefined;
 	}
@@ -282,6 +352,89 @@ export function recordLastGoodConfig(
 }
 
 const msg = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+function atomicWrite0600(target: string, content: string): void {
+	const tmp = `${target}.tmp-${crypto.randomUUID()}`;
+	writeFileSync(tmp, content, { mode: 0o600 });
+	chmodSync(tmp, 0o600);
+	renameSync(tmp, target);
+}
+
+/**
+ * `<git dir>/ompbot-code-rollback.json`: written by a `detach` code rollback before it checks out head.last-good. It
+ * belongs to the checkout, so every home on it sees it: while it exists, apply runs only on that detached commit
+ * (the peers too) or on a main that moved past the commit that broke the daemon (which removes it).
+ */
+export const CODE_ROLLBACK_JOURNAL = "ompbot-code-rollback.json";
+
+export interface CodeRollbackJournal {
+	/** The commit checked out detached (head.last-good). */
+	lastGood: string;
+	/** HEAD (main) when the daemon failed to start: the commit that broke it. */
+	head: string;
+	stamp: string;
+	home: string;
+}
+
+/** The journal in `gitDir`; undefined when there is none. Throws when it exists but is not a complete journal. */
+export function readCodeRollbackJournal(gitDir: string): CodeRollbackJournal | undefined {
+	let text: string;
+	try {
+		text = readFileSync(join(gitDir, CODE_ROLLBACK_JOURNAL), "utf8");
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return undefined;
+		throw error;
+	}
+	const parsed: unknown = JSON.parse(text);
+	if (typeof parsed !== "object" || parsed === null) throw new Error("not a JSON object");
+	const fields = parsed as Record<string, unknown>;
+	for (const key of ["lastGood", "head", "stamp", "home"] as const) {
+		if (typeof fields[key] !== "string" || fields[key] === "") throw new Error(`no ${key}`);
+	}
+	return parsed as CodeRollbackJournal;
+}
+
+/** `<home>/head.last-good`: the commit the last apply that passed every check loaded (the code rollback target). */
+export const HEAD_LAST_GOOD_FILE = "head.last-good";
+/** Gates that, open after the restart, keep the loaded commit from becoming `head.last-good`. */
+const LAST_GOOD_BLOCKING_GATES: readonly string[] = ["omp_runtime", "turns_failing"];
+
+/** The commit in `<home>/head.last-good`; undefined when absent or not a full commit id. */
+export function readHeadLastGood(homeDir: string): string | undefined {
+	try {
+		const text = readFileSync(join(homeDir, HEAD_LAST_GOOD_FILE), "utf8").trim();
+		return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(text) ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * `<home>/autoland.hold`: written by an apply that reverted the code, so the commit that broke the daemon is not merged
+ * again unasked. Auto-merge (tasks and lanes) skips while it exists; the owner's own 머지 does not; the next apply
+ * that ends ok removes it.
+ */
+export const AUTOLAND_HOLD_FILE = "autoland.hold";
+
+/** Why auto-merge is held (`<reason> (<at>)`); undefined when there is no hold file. */
+export function readAutoLandHold(homeDir: string): string | undefined {
+	let text: string;
+	try {
+		text = readFileSync(join(homeDir, AUTOLAND_HOLD_FILE), "utf8");
+	} catch (error) {
+		return errorCode(error) === "ENOENT" ? undefined : `${AUTOLAND_HOLD_FILE} unreadable: ${msg(error)}`;
+	}
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (typeof parsed === "object" && parsed !== null && "reason" in parsed && typeof parsed.reason === "string") {
+			const at = "at" in parsed && typeof parsed.at === "string" ? ` (${parsed.at})` : "";
+			return `${parsed.reason}${at}`;
+		}
+	} catch {
+		// a hand-written or broken hold still holds
+	}
+	return text.trim() || AUTOLAND_HOLD_FILE;
+}
 
 /** Parses `systemctl show --timestamp=unix` output (`@<seconds>`) into ms; undefined for empty/unknown. */
 export function parseUnixTimestamp(text: string): number | undefined {
@@ -392,16 +545,6 @@ export function releaseApplyLock(lockPath: string, info: ApplyLockInfo): boolean
 	return true;
 }
 
-/** `kill(pid, 0)`: EPERM still means a live process owned by someone else. */
-export function pidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return errorCode(error) === "EPERM";
-	}
-}
-
 /** Why the receipt of the apply waited on does not cover this one; undefined when it does (finished ok, same HEAD). */
 function priorReceiptGap(path: string, head: string | undefined): string | undefined {
 	let parsed: unknown;
@@ -423,6 +566,160 @@ const isConnectFailure = (error: unknown): boolean => {
 	const code = errorCode(error);
 	return code === "ECONNREFUSED" || code === "ENOENT" || /Failed to connect|ECONNREFUSED|ENOENT/.test(msg(error));
 };
+
+/** What apply's preflight reads off the checkout: branch, HEAD against main, the code rollback journal, `src` changes. */
+export interface CheckoutCheck {
+	/** Why an apply SKIPs here; empty when the checkout may be applied. */
+	skipReasons: string[];
+	/** Informational preflight notes (`--clear-rollback` removing the journal). */
+	notes: string[];
+	head: string | undefined;
+	/** `<git dir>/ompbot-code-rollback.json`; "" when the git dir is unknown. */
+	journalPath: string;
+	/** A journal while HEAD is a main past the commit that broke the daemon: the apply that comes up removes it. */
+	journalOnMain: boolean;
+	/**
+	 * Passes on a detached HEAD (the journal's commit, or `--allow-detached`): not main, so no head.last-good is
+	 * recorded and neither the hold nor the journal is removed.
+	 */
+	detached: boolean;
+	/** How a passing non-plain checkout is described in the preflight detail; "" for a plain main. */
+	checkout: string;
+}
+
+/**
+ * The checkout half of apply's preflight, shared with `!restart` (which refuses up front rather than launch an apply
+ * that would SKIP). `clearRollback` removes the journal first, so only an apply passes it.
+ */
+export async function checkCheckout(
+	git: (...args: string[]) => Promise<RunResult>,
+	options: Pick<ApplyOptions, "clearRollback" | "allowDetached">,
+): Promise<CheckoutCheck> {
+	const result: CheckoutCheck = {
+		skipReasons: [],
+		notes: [],
+		head: undefined,
+		journalPath: "",
+		journalOnMain: false,
+		detached: false,
+		checkout: "",
+	};
+	const { skipReasons } = result;
+	const branch = (await git("branch", "--show-current")).stdout.trim();
+	const head = await git("rev-parse", "HEAD");
+	const main = await git("rev-parse", "main");
+	result.head = head.code === 0 ? head.stdout.trim() : undefined;
+	const current = result.head;
+	const onMain = branch === "main" && head.code === 0 && main.code === 0 && current === main.stdout.trim();
+	let journal: CodeRollbackJournal | undefined;
+	const gitDir = await git("rev-parse", "--absolute-git-dir");
+	if (gitDir.code !== 0) {
+		skipReasons.push(`git rev-parse --absolute-git-dir rc=${gitDir.code}: ${gitDir.stderr.trim()}`);
+	} else {
+		const journalPath = join(gitDir.stdout.trim(), CODE_ROLLBACK_JOURNAL);
+		result.journalPath = journalPath;
+		if (options.clearRollback === true && existsSync(journalPath)) {
+			rmSync(journalPath, { force: true });
+			result.notes.push(`${journalPath} cleared (--clear-rollback)`);
+		}
+		try {
+			journal = readCodeRollbackJournal(gitDir.stdout.trim());
+		} catch (error) {
+			skipReasons.push(`${journalPath} unreadable (${msg(error)}); remove it with apply --clear-rollback`);
+		}
+	}
+	if (journal !== undefined) {
+		const short = (sha: string | undefined): string => sha?.slice(0, 7) ?? "(unknown)";
+		if (branch === "" && current === journal.lastGood) {
+			result.detached = true;
+			result.checkout = `detached@${current} (code rollback of apply ${journal.stamp}, cause ${short(journal.head)})`;
+		} else if (onMain && current === journal.head) {
+			skipReasons.push(
+				`원인 커밋 ${short(journal.head)}가 아직 HEAD — 고친 커밋을 받은 뒤 apply, 환경만 고쳤으면 \`apply --clear-rollback\``,
+			);
+		} else if (onMain) {
+			result.journalOnMain = true;
+			result.checkout = `main@${current} past the cause ${short(journal.head)} of code rollback ${journal.stamp}`;
+		} else {
+			skipReasons.push(
+				`${result.journalPath}: HEAD ${short(current)} (branch "${branch || "(detached)"}") is neither the rolled-back ${short(journal.lastGood)} nor main past the cause ${short(journal.head)}; check the checkout, then apply --clear-rollback`,
+			);
+		}
+	} else if (branch === "" && options.allowDetached === true && current !== undefined) {
+		result.detached = true;
+		result.checkout = `detached@${current} (--allow-detached)`;
+	} else if (branch !== "main") skipReasons.push(`checkout is on branch "${branch || "(detached)"}", not main`);
+	else if (!onMain) skipReasons.push("HEAD differs from main");
+	const dirty = await git("status", "--porcelain", "--", "src");
+	if (dirty.code !== 0) skipReasons.push(`git status failed: ${dirty.stderr.trim()}`);
+	else if (dirty.stdout.trim() !== "") {
+		skipReasons.push(`uncommitted changes under src: ${dirty.stdout.trim().split("\n").length} file(s)`);
+	}
+	return result;
+}
+
+/** Prefix of every unit `apply --detach` (and `!restart`) starts; `ompbot-apply-<stamp>-<4 hex>`. */
+export const APPLY_UNIT_PREFIX = "ompbot-apply-";
+
+/**
+ * The `systemd-run` command that runs `apply <childArgs>` as a transient user unit, for `apply --detach` and
+ * `!restart` alike. The unit name carries a random suffix so two launches in the same second never collide; the
+ * receipt keeps the bare stamp. `homeEnv`: pass `OMPBOT_HOME` (the caller runs under a non-default home).
+ */
+export function detachedApplyCommand(input: {
+	bun: string;
+	repoDir: string;
+	pathEnv: string;
+	stamp: string;
+	childArgs: readonly string[];
+	homeEnv?: string;
+}): { unit: string; argv: string[] } {
+	const unit = `${APPLY_UNIT_PREFIX}${input.stamp}-${crypto.randomUUID().slice(0, 4)}`;
+	const setenv = [`--setenv=PATH=${input.pathEnv}`];
+	if (input.homeEnv !== undefined) setenv.push(`--setenv=OMPBOT_HOME=${input.homeEnv}`);
+	return {
+		unit,
+		argv: [
+			"systemd-run",
+			"--user",
+			"--collect",
+			`--unit=${unit}`,
+			`--working-directory=${input.repoDir}`,
+			...setenv,
+			input.bun,
+			join(input.repoDir, "src", "main.ts"),
+			...input.childArgs,
+		],
+	};
+}
+
+/**
+ * The model-free apply report (`--report-plain`, `!restart`): one line with the outcome and the loaded commit, the
+ * failed steps, the code rollback line of the model report, then the receipt path. Redacted: it is posted as is.
+ */
+export function plainReportText(input: {
+	status: ApplyStatus;
+	head: string | undefined;
+	steps: readonly StepRecord[];
+	gates: ApplyReceipt["gates"];
+	reverted: string;
+	receiptPath: string;
+}): string {
+	const head = input.head?.slice(0, 7) ?? "(head unknown)";
+	const failed = input.steps.filter((s) => !s.ok).map((s) => `${s.name}: ${s.detail}`);
+	let first: string;
+	if (input.status === "ok" || input.status === "already_applied") {
+		const gates = input.gates;
+		const health =
+			gates === undefined || gates.open === 0
+				? "gates 이상 없음"
+				: `gates 열림 ${gates.open}/${gates.total} (${gates.opened.join(", ")})`;
+		first = `✅ 재시작 ${input.status === "ok" ? "완료" : "이미 반영됨"} · ${head} · ${health}`;
+	} else {
+		first = `⚠️ 재시작 ${input.status} · ${head}${failed.length > 0 ? ` · ${failed.join("; ")}` : ""}`;
+	}
+	return redact(`${first}${input.reverted}\n영수증 ${input.receiptPath}`);
+}
 
 /**
  * One apply per home at a time: takes `<home>/apply.lock` (waiting for a live holder, taking over a stale one), runs
@@ -451,7 +748,9 @@ export async function runApply(options: ApplyOptions, deps: ApplyDeps): Promise<
 /**
  * Applies a merged change to the running daemon in one auditable pass: precheck → backup (db + config copy) →
  * drain → restart → wait for a fresh daemon and its chat transports → record gates/doctor → roll back config and restart once on failure.
- * Code is never reverted automatically; the receipt carries the previous HEAD and the revert command instead.
+ * When that restart fails too, the code goes back once to `head.last-good` (`apply.codeRollback`: a revert commit on
+ * main, pushed, or a detached checkout with main untouched) with one more restart; otherwise (`off`, or no safe
+ * target) the receipt carries the previous HEAD and the revert command.
  */
 async function applyUnderLock(
 	options: ApplyOptions & { stamp: string },
@@ -462,6 +761,7 @@ async function applyUnderLock(
 	const { homeDir, repoDir, unit } = deps;
 	const startedMs = deps.now();
 	const { stamp } = options;
+	const mode: CodeRollbackMode = options.codeRollback ?? "push";
 	const receiptPath = receiptPathFor(homeDir, stamp);
 	const steps: StepRecord[] = [];
 	const receipt: ApplyReceipt = {
@@ -472,8 +772,10 @@ async function applyUnderLock(
 		exitCode: 1,
 		repoDir,
 		head: undefined,
+		lastGoodHead: undefined,
 		previousHead: undefined,
 		revertCommand: undefined,
+		codeRollback: mode,
 		configBackup: undefined,
 		backupFile: undefined,
 		steps,
@@ -510,6 +812,10 @@ async function applyUnderLock(
 	// Set once the daemon confirmed `drain_cut`: every end of this apply (ok, failed, rolled back) removes the file
 	// then, after the restarts it covers. A dead apply leaves it to the 3-hour expiry of recovery.
 	let cutRecorded = false;
+	// The revert commit a code rollback made on main; the report names it so the owner fixes the cause and merges again.
+	let codeRevert: string | undefined;
+	// The commit a `detach` code rollback checked out (main untouched); the report says how to come back.
+	let codeDetached: string | undefined;
 	const finish = async (status: ApplyStatus, exitCode: 0 | 1 | 3): Promise<ApplyOutcome> => {
 		if (cutRecorded) {
 			const cutPath = join(homeDir, RESTART_CUT_FILE);
@@ -528,36 +834,58 @@ async function applyUnderLock(
 				.filter((s) => !s.ok)
 				.map((s) => `${s.name}: ${s.detail}`)
 				.join("; ");
-			const text =
-				`[자동 후속] apply 결과 ${status}${summary ? ` (${summary})` : ""}. 영수증 ${receiptPath}를 읽고 ` +
-				"증거와 함께 이 스레드에 짧게 보고해줘(새 수정·재시작 금지).";
+			const reverted =
+				codeRevert !== undefined
+					? ` 코드 롤백함: main에 revert 커밋 ${codeRevert.slice(0, 7)}, 원인 수정 뒤 다시 머지.`
+					: codeDetached !== undefined
+						? ` 코드 롤백함: ${codeDetached.slice(0, 7)}로 detached checkout(main 그대로), 고친 커밋을 받은 뒤 git checkout main && apply.`
+						: "";
+			// `--report-plain` (`!restart`): no model turn — the daemon posts the line itself (`notify`), so the report
+			// still arrives when the model is what is down.
+			const request =
+				options.reportPlain === true
+					? {
+							op: "notify",
+							origin: options.reportOrigin,
+							thread: options.reportThread,
+							stamp,
+							text: plainReportText({
+								status,
+								head: receipt.head,
+								steps,
+								gates: receipt.gates,
+								reverted,
+								receiptPath,
+							}),
+						}
+					: {
+							op: "inject",
+							origin: options.reportOrigin,
+							asOwner: true,
+							text:
+								`[자동 후속] apply 결과 ${status}${summary ? ` (${summary})` : ""}.${reverted} 영수증 ${receiptPath}를 읽고 ` +
+								"증거와 함께 이 스레드에 짧게 보고해줘(새 수정·재시작 금지).",
+							thread: options.reportThread,
+						};
+			const [done, verb] = options.reportPlain === true ? ["notified", "notify"] : ["injected", "inject"];
 			// A daemon restarting under someone else's apply (or by hand) refuses connections for a few seconds:
 			// retry those. A daemon that answered, even with a refusal, is not asked again.
 			let ok = false;
 			let detail = "";
 			for (let attempt = 1; ; attempt += 1) {
 				try {
-					const response = await deps.callDaemon(
-						{
-							op: "inject",
-							origin: options.reportOrigin,
-							asOwner: true,
-							text,
-							thread: options.reportThread,
-						},
-						30_000,
-					);
+					const response = await deps.callDaemon(request, 30_000);
 					ok = typeof response === "object" && response !== null && "ok" in response && response.ok === true;
 					detail = ok
-						? `injected attempts=${attempt}`
-						: `inject refused attempts=${attempt}: ${JSON.stringify(response)}`;
+						? `${done} attempts=${attempt}`
+						: `${verb} refused attempts=${attempt}: ${JSON.stringify(response)}`;
 					break;
 				} catch (error) {
 					if (isConnectFailure(error) && attempt < REPORT_INJECT_ATTEMPTS) {
 						await deps.sleep(REPORT_INJECT_RETRY_MS);
 						continue;
 					}
-					detail = `inject failed attempts=${attempt}: ${msg(error)}`;
+					detail = `${verb} failed attempts=${attempt}: ${msg(error)}`;
 					break;
 				}
 			}
@@ -632,33 +960,40 @@ async function applyUnderLock(
 	const skipReasons: string[] = [];
 	let bun: string | undefined;
 	let alreadyApplied: string | undefined;
+	// `<git dir>/ompbot-code-rollback.json`, known once preflight passed.
+	let journalPath = "";
+	// A journal while HEAD is a main past the commit that broke the daemon: the apply that comes up removes it.
+	let journalOnMain = false;
+	// Passed on a detached HEAD (the journal's commit, or `--allow-detached`): not main, so no head.last-good is
+	// recorded and neither the hold nor the journal is removed.
+	let detached = false;
+	let checkout = "";
+	const preflightNotes: string[] = [];
 	await step("preflight", async () => {
 		const exists = existsSync(join(repoDir, "src", "main.ts"));
 		if (!exists) skipReasons.push(`src/main.ts not found in ${repoDir}`);
 		else {
-			const branch = (await git("branch", "--show-current")).stdout.trim();
-			const head = await git("rev-parse", "HEAD");
-			const main = await git("rev-parse", "main");
-			receipt.head = head.code === 0 ? head.stdout.trim() : undefined;
-			if (branch !== "main") skipReasons.push(`checkout is on branch "${branch || "(detached)"}", not main`);
-			else if (head.code !== 0 || main.code !== 0 || head.stdout.trim() !== main.stdout.trim()) {
-				skipReasons.push("HEAD differs from main");
-			}
+			const check = await checkCheckout(git, options);
+			skipReasons.push(...check.skipReasons);
+			preflightNotes.push(...check.notes);
+			receipt.head = check.head;
+			({ journalPath, journalOnMain, detached, checkout } = check);
 			const active = await deps.run(["systemctl", "--user", "is-active", unit], {
 				env: { PATH: deps.pathEnv },
 			});
 			if (active.code !== 0) {
 				skipReasons.push(`systemctl --user is-active ${unit} rc=${active.code} (daemon not active or no user bus)`);
 			}
-			const dirty = await git("status", "--porcelain", "--", "src");
-			if (dirty.code !== 0) skipReasons.push(`git status failed: ${dirty.stderr.trim()}`);
-			else if (dirty.stdout.trim() !== "") {
-				skipReasons.push(`uncommitted changes under src: ${dirty.stdout.trim().split("\n").length} file(s)`);
+			// The last verified commit is the revert target; without one, the reflog's previous position.
+			receipt.lastGoodHead = readHeadLastGood(homeDir);
+			let prev = receipt.lastGoodHead;
+			if (prev === undefined) {
+				const reflog = await git("rev-parse", "--verify", "-q", "HEAD@{1}");
+				if (reflog.code === 0) prev = reflog.stdout.trim();
 			}
-			const prev = await git("rev-parse", "--verify", "-q", "HEAD@{1}");
-			if (prev.code === 0 && receipt.head !== undefined && prev.stdout.trim() !== receipt.head) {
-				receipt.previousHead = prev.stdout.trim();
-				receipt.revertCommand = revertCommandFor(repoDir, receipt.previousHead);
+			if (prev !== undefined && receipt.head !== undefined && prev !== receipt.head) {
+				receipt.previousHead = prev;
+				receipt.revertCommand = revertCommandFor(repoDir, prev);
 			}
 		}
 		bun = findBun(deps.pathEnv, deps.isExecutable);
@@ -673,25 +1008,65 @@ async function applyUnderLock(
 				alreadyApplied = `daemon active since ${new Date(enteredAt).toISOString()} is after merge ${options.mergedAt.toISOString()}`;
 			}
 		}
-		if (skipReasons.length > 0) return { ok: false, detail: skipReasons.join("; ") };
-		return { ok: true, detail: alreadyApplied ?? `main@${receipt.head} clean, bun=${bun}` };
+		if (skipReasons.length > 0) return { ok: false, detail: [...skipReasons, ...preflightNotes].join("; ") };
+		const ready = alreadyApplied ?? `${checkout || `main@${receipt.head}`} clean, bun=${bun}`;
+		return { ok: true, detail: [`${ready} codeRollback=${mode}`, ...preflightNotes].join("; ") };
 	});
 	if (skipReasons.length > 0) return finish("skipped", 3);
 
 	// Once this daemon runs the code, the other installs on the same checkout get it too. A peer that fails turns
 	// the whole apply into a failure (exit 1) so a caller does not mistake a half-applied checkout for done.
-	const finishWithPeers = async (status: "ok" | "already_applied"): Promise<ApplyOutcome> => {
+	// true when every peer applied (or there is none).
+	const runPeers = async (afterCodeRollback: boolean): Promise<boolean> => {
 		const peers = deps.peers;
-		if (peers === undefined) return finish(status, 0);
+		if (peers === undefined) return true;
 		let allOk = true;
 		await step("peers", async () => {
-			const results = await peers();
+			const results = await peers(afterCodeRollback);
 			allOk = results.every((p) => p.exitCode === 0);
 			const detail = results.map((p) => `${p.unit}=${p.status}(${p.receiptPath})`).join(" ");
 			return { ok: allOk, detail: detail || "no other install on this checkout" };
 		});
-		return allOk ? finish(status, 0) : finish("failed", 1);
+		return allOk;
 	};
+	const finishWithPeers = async (status: "ok" | "already_applied"): Promise<ApplyOutcome> =>
+		(await runPeers(false)) ? finish(status, 0) : finish("failed", 1);
+	// The status page is its own process on this checkout: one up since before this daemon still draws the old code
+	// (11-13 it missed a gate merged after it started). Only this home's page; whatever happens here is a detail, never
+	// the apply's status or exit code.
+	const restartDashboard = (): Promise<boolean> =>
+		step("dashboard", async () => {
+			try {
+				const env = { PATH: deps.pathEnv };
+				const pages = (
+					await findCheckoutUnits(deps.run, deps.pathEnv, repoDir, defaultHomeDir({}), "dashboard")
+				).filter((page) => resolve(page.homeDir) === resolve(homeDir));
+				if (pages.length === 0) return { ok: true, detail: "skipped: no active dashboard unit of this home" };
+				const show = await deps.run(
+					["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp", "--value", "--timestamp=unix", unit],
+					{ env },
+				);
+				const daemonSince = show.code === 0 ? parseUnixTimestamp(show.stdout) : undefined;
+				if (daemonSince === undefined) return { ok: true, detail: `skipped: ${unit} start time unknown` };
+				const details: string[] = [];
+				for (const page of pages) {
+					if (page.activeSince === undefined || page.activeSince > daemonSince) {
+						const why = page.activeSince === undefined ? "start time unknown" : "dashboard newer";
+						details.push(`skipped: ${why} (${page.unit})`);
+						continue;
+					}
+					const restarted = await deps.run(["systemctl", "--user", "restart", page.unit], { env });
+					details.push(
+						restarted.code === 0
+							? `restarted ${page.unit}`
+							: `failed: systemctl restart ${page.unit} rc=${restarted.code}: ${restarted.stderr.trim()}`,
+					);
+				}
+				return { ok: true, detail: details.join("; ") };
+			} catch (error) {
+				return { ok: true, detail: `failed: ${msg(error)}` };
+			}
+		});
 	// After waiting, the apply waited for may already have put this HEAD in place (here and on the peers): its receipt
 	// decides. Anything short of a finished ok/already_applied receipt on this HEAD runs the full apply below.
 	if (waitedFor !== undefined) {
@@ -707,7 +1082,10 @@ async function applyUnderLock(
 		});
 		if (covered) return finish("already_applied", 0);
 	}
-	if (alreadyApplied !== undefined) return finishWithPeers("already_applied");
+	if (alreadyApplied !== undefined) {
+		await restartDashboard();
+		return finishWithPeers("already_applied");
+	}
 
 	// 2. backup: ledger/bundle snapshot plus a config copy to roll back to.
 	const configPath = join(homeDir, "config.json");
@@ -854,6 +1232,27 @@ async function applyUnderLock(
 		}
 	};
 
+	const installDeps = async (): Promise<EnsureDepsResult> => {
+		try {
+			return await ensureDeps(repoDir, { ...deps, bun: bun ?? "bun", stamp });
+		} catch (error) {
+			return { ok: false, detail: msg(error), noted: true };
+		}
+	};
+
+	// 3b. dependencies: the restarted daemon loads node_modules as the checkout holds it. Recorded as a step only when
+	// the marker was not up to date; a failed install restarts nothing and lets the old daemon take turns again.
+	const depsT0 = deps.now();
+	const ensured = await installDeps();
+	if (ensured.noted) {
+		const detail = ensured.ok
+			? ensured.detail
+			: `${ensured.detail}\nnot restarted; by hand: cd ${repoDir} && bun install --frozen-lockfile && bun src/main.ts apply; ${await cancelDrain()}`;
+		steps.push({ name: "deps", ok: ensured.ok, detail, ms: deps.now() - depsT0 });
+		deps.log(`apply step=deps ok=${ensured.ok} detail=${detail}`);
+	} else deps.log(`apply deps ${ensured.detail}`);
+	if (!ensured.ok) return finish("failed", 1);
+
 	let restartAt = 0;
 	const restarted = await step("restart", async () => {
 		const r = await restartAndWait();
@@ -865,9 +1264,129 @@ async function applyUnderLock(
 		(await step("ready", () => waitReady(restartAt))) &&
 		(await step("transports", () => waitTransports(restartAt)));
 
-	// 7. rollback on failure: last known-good config back, one more restart; the code stays and is described in the receipt.
+	// Why the checkout may not be reverted to head.last-good now (a reason), or what to revert from and to. Never mixes
+	// in someone's work: main only, nothing staged, no tracked file edited.
+	const codeRollbackTarget = async (): Promise<string | { lastGood: string; head: string }> => {
+		if (options.codeRollbackOff !== undefined) return options.codeRollbackOff;
+		if (mode === "off") return "apply.codeRollback=off";
+		const lastGood = receipt.lastGoodHead;
+		if (lastGood === undefined) return `${HEAD_LAST_GOOD_FILE} 없음`;
+		const head = await git("rev-parse", "HEAD");
+		if (head.code !== 0) return `git rev-parse HEAD rc=${head.code}: ${head.stderr.trim()}`;
+		const current = head.stdout.trim();
+		if (current === lastGood) return `${HEAD_LAST_GOOD_FILE} ${lastGood.slice(0, 7)}가 HEAD와 같음`;
+		const ancestor = await git("merge-base", "--is-ancestor", lastGood, current);
+		if (ancestor.code !== 0)
+			return `${HEAD_LAST_GOOD_FILE} ${lastGood.slice(0, 7)}가 HEAD ${current.slice(0, 7)}의 조상이 아님`;
+		const branch = (await git("branch", "--show-current")).stdout.trim();
+		if (branch !== "main") return `브랜치가 main이 아님 (${branch || "(detached)"})`;
+		const staged = await git("diff", "--cached", "--quiet");
+		if (staged.code !== 0) return "staged 변경 있음";
+		const dirty = await git("status", "--porcelain", "--untracked-files=no");
+		if (dirty.code !== 0) return `git status failed: ${dirty.stderr.trim()}`;
+		if (dirty.stdout.trim() !== "") return `추적 파일 미커밋 변경 ${dirty.stdout.trim().split("\n").length}개`;
+		return { lastGood, head: current };
+	};
+
+	// 8. code rollback, once. `push`: a new commit on main with the tree of head.last-good (the 2-way read-tree of
+	// `revertCommandFor`), pushed. `detach`: the journal, then head.last-good checked out detached, main untouched.
+	// Then `ensureDeps` (installs when the deps marker differs) and one more restart.
+	const rollbackCode = async (target: { lastGood: string; head: string }): Promise<StepResult> => {
+		const details: string[] = [];
+		const failed = async (detail: string): Promise<StepResult> => {
+			details.push(detail, await cancelDrain());
+			return { ok: false, detail: details.join("; ") };
+		};
+		const moved = mode === "detach" ? await detachToLastGood(target, details) : await revertOnMain(target, details);
+		if (typeof moved === "string") return failed(moved);
+		try {
+			atomicWrite0600(join(homeDir, AUTOLAND_HOLD_FILE), `${JSON.stringify(moved)}\n`);
+			details.push(`${AUTOLAND_HOLD_FILE} written`);
+		} catch (error) {
+			details.push(`${AUTOLAND_HOLD_FILE} write failed: ${msg(error)}`);
+		}
+		const installed = await installDeps();
+		if (!installed.ok) {
+			return failed(
+				`${installed.detail}\nnot restarted; by hand: cd ${repoDir} && bun install --frozen-lockfile && systemctl --user restart ${unit}`,
+			);
+		}
+		details.push(installed.detail);
+		const r = await restartAndWait();
+		if (!r.ok) return failed(r.detail);
+		const w = await waitReady(r.restartAt);
+		if (!w.ok) return failed(`restart failed: ${w.detail}`);
+		const t = await waitTransports(r.restartAt);
+		if (!t.ok) return failed(`restart failed: ${t.detail}`);
+		details.push(`restart ok: ${w.detail}, ${t.detail}`);
+		return { ok: true, detail: details.join("; ") };
+	};
+
+	// `detach`: the journal goes first, so a crash after the checkout still leaves the checkout explained. A failed
+	// checkout removes it again (HEAD stays on main). The autoland hold to write, or why it failed.
+	async function detachToLastGood(
+		target: { lastGood: string; head: string },
+		details: string[],
+	): Promise<Record<string, string> | string> {
+		const { lastGood, head } = target;
+		const journal: CodeRollbackJournal = { lastGood, head, stamp, home: homeDir };
+		try {
+			atomicWrite0600(journalPath, `${JSON.stringify(journal)}\n`);
+		} catch (error) {
+			return `${journalPath} write failed: ${msg(error)}`;
+		}
+		const checkout = await git("checkout", "-q", "--detach", lastGood);
+		if (checkout.code !== 0) {
+			rmSync(journalPath, { force: true });
+			return `git checkout --detach ${lastGood} rc=${checkout.code}: ${checkout.stderr.trim()} (journal removed, HEAD stays at ${head})`;
+		}
+		codeDetached = lastGood;
+		details.push(`HEAD detached at ${lastGood}, main stays at ${head}; journal ${journalPath}`);
+		return {
+			reason: `코드 롤백(apply ${stamp}): detach → ${lastGood.slice(0, 7)} (main ${head.slice(0, 7)} 그대로)`,
+			at: new Date(deps.now()).toISOString(),
+			lastGood,
+			receipt: receiptPath,
+		};
+	}
+
+	// `push`: the revert commit on main, pushed (a failed push is recorded and the rollback goes on).
+	async function revertOnMain(
+		target: { lastGood: string; head: string },
+		details: string[],
+	): Promise<Record<string, string> | string> {
+		const { lastGood, head } = target;
+		const read = await git("read-tree", "-m", "-u", "HEAD", lastGood);
+		if (read.code !== 0) return `git read-tree rc=${read.code}: ${read.stderr.trim()}`;
+		const title = `revert(apply): ${stamp} 기동 실패로 ${lastGood.slice(0, 7)} 트리로 복원`;
+		const body = `되돌린 범위: ${lastGood}..${head}\n영수증: ${receiptPath}`;
+		// Hooks are skipped: the tree is one that already ran, and a hook must not keep the bot down.
+		const commit = await git("commit", "-q", "--no-verify", "-m", title, "-m", body);
+		if (commit.code !== 0) {
+			const back = await git("read-tree", "-m", "-u", lastGood, "HEAD");
+			return `git commit rc=${commit.code}: ${commit.stderr.trim()} (worktree ${back.code === 0 ? "restored to HEAD" : `restore failed: ${back.stderr.trim()}`})`;
+		}
+		const revert = (await git("rev-parse", "HEAD")).stdout.trim();
+		codeRevert = revert;
+		details.push(`revert ${revert} = tree of ${lastGood} (reverted ${lastGood}..${head})`);
+		const push = await git("push", "origin", "main");
+		const pushFailure =
+			push.code === 0 ? undefined : `push 실패: rc=${push.code} ${push.stderr.trim().split("\n").at(-1) ?? ""}`.trim();
+		details.push(pushFailure ?? "pushed origin main");
+		return {
+			reason: `코드 롤백(apply ${stamp}): revert ${revert.slice(0, 7)} → ${lastGood.slice(0, 7)} 트리${pushFailure === undefined ? "" : `; ${pushFailure}`}`,
+			at: new Date(deps.now()).toISOString(),
+			revert,
+			lastGood,
+			receipt: receiptPath,
+		};
+	}
+
+	// 7. rollback on failure: last known-good config back, one more restart. Only when that fails too, the code goes
+	// back to head.last-good (8); otherwise the code stays and the receipt describes how to revert it.
 	if (!ready) {
-		await step("rollback", async () => {
+		let codeTarget: { lastGood: string; head: string } | undefined;
+		const recovered = await step("rollback", async () => {
 			const details: string[] = [];
 			const lastGood = `${configPath}${LAST_GOOD_SUFFIX}`;
 			if (existsSync(lastGood)) {
@@ -881,32 +1400,86 @@ async function applyUnderLock(
 				const w = await waitReady(r.restartAt);
 				ok = w.ok;
 				details.push(`restart ${w.ok ? "ok" : "failed"}: ${w.detail}`);
+				// Answering IPC with every chat transport down is not a recovery: same bar as the apply restart.
+				if (w.ok) {
+					const t = await waitTransports(r.restartAt);
+					ok = t.ok;
+					details.push(`transports ${t.ok ? "ok" : "failed"}: ${t.detail}`);
+				}
 			}
-			if (!ok) details.push(await cancelDrain());
+			if (!ok) {
+				const target = await codeRollbackTarget();
+				if (typeof target === "string") details.push(await cancelDrain(), `code rollback skipped: ${target}`);
+				else {
+					codeTarget = target;
+					details.push(`code rollback to ${target.lastGood} follows`);
+					return { ok, detail: details.join("; ") };
+				}
+			}
 			if (receipt.revertCommand !== undefined) details.push(`code not reverted; to revert: ${receipt.revertCommand}`);
 			else details.push("code not reverted (previous HEAD unknown)");
 			return { ok, detail: details.join("; ") };
 		});
+		if (recovered || codeTarget === undefined) return finish("failed", 1);
+		const target = codeTarget;
+		const cameUp = await step("code_rollback", () => rollbackCode(target));
+		// The peers share the checkout: they restart onto the reverted code too. The apply still failed.
+		if (cameUp) await runPeers(true);
 		return finish("failed", 1);
 	}
 
 	// 6. record health; open gates or doctor failures are reported, they do not undo the apply.
+	const unverified: string[] = [];
+	let verified = false;
 	await step("verify", async () => {
 		const gates = deps.gates();
 		const open = gates.filter((g) => g.state === "open");
 		receipt.gates = { open: open.length, total: gates.length, opened: open.map((g) => `${g.name}(${g.detail})`) };
 		const doctor = await deps.doctor();
 		receipt.doctor = { code: doctor.code, failed: doctor.lines.filter((l) => l.startsWith("fail ")) };
+		if (doctor.code !== 0) unverified.push(`doctor rc=${doctor.code}`);
+		for (const g of open) if (LAST_GOOD_BLOCKING_GATES.includes(g.name)) unverified.push(`gate ${g.name} open`);
+		verified = true;
 		return {
 			ok: true,
 			detail: `gates open=${open.length}/${gates.length} doctor rc=${doctor.code} failed=${receipt.doctor.failed.length}`,
 		};
 	});
-	// The daemon came up on this config: remember it as the rollback target of the next failed apply.
+	// The daemon came up on this config: remember it as the rollback target of the next failed apply. Its code becomes
+	// the code rollback target only when doctor and the runtime gates agree. An auto-merge hold (and a detach journal)
+	// ends here only on main: a detached apply (a peer or a retry after a code rollback, `--allow-detached`) runs code
+	// that is not main, so it keeps both and records no head.last-good.
 	await step("last_good", () => {
-		const ok = recordLastGoodConfig(homeDir);
-		return { ok: true, detail: ok ? `${configPath}${LAST_GOOD_SUFFIX}` : "no config.json or copy failed" };
+		const details = [
+			recordLastGoodConfig(homeDir) ? `${configPath}${LAST_GOOD_SUFFIX}` : "no config.json or copy failed",
+		];
+		if (detached) {
+			details.push(`${HEAD_LAST_GOOD_FILE}, ${AUTOLAND_HOLD_FILE} and journal kept (detached HEAD)`);
+			return { ok: true, detail: details.join("; ") };
+		}
+		if (!verified) unverified.push("verify did not finish");
+		if (receipt.head === undefined) unverified.push("HEAD unknown");
+		if (unverified.length > 0) details.push(`${HEAD_LAST_GOOD_FILE} not recorded (${unverified.join(", ")})`);
+		else {
+			try {
+				atomicWrite0600(join(homeDir, HEAD_LAST_GOOD_FILE), `${receipt.head}\n`);
+				details.push(`${HEAD_LAST_GOOD_FILE}=${receipt.head}`);
+			} catch (error) {
+				details.push(`${HEAD_LAST_GOOD_FILE} write failed: ${msg(error)}`);
+			}
+		}
+		const holdPath = join(homeDir, AUTOLAND_HOLD_FILE);
+		if (existsSync(holdPath)) {
+			rmSync(holdPath, { force: true });
+			details.push(`${AUTOLAND_HOLD_FILE} removed`);
+		}
+		if (journalOnMain) {
+			rmSync(journalPath, { force: true });
+			details.push(`${journalPath} removed`);
+		}
+		return { ok: true, detail: details.join("; ") };
 	});
+	await restartDashboard();
 	return finishWithPeers("ok");
 }
 

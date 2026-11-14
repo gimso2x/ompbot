@@ -32,7 +32,8 @@ export function currentBootId(): string {
 	}
 }
 
-function isAlive(pid: number): boolean {
+/** Whether process `pid` exists on this machine: `kill(pid, 0)` succeeds, or fails with EPERM (someone else's process). */
+export function pidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -113,7 +114,7 @@ export function acquireLock(path: string, now: number = Date.now()): Lock {
 			};
 		}
 		const holder = readLock(path);
-		if (holder && holder.bootId === info.bootId && isAlive(holder.pid)) throw new LockHeldError(path, holder);
+		if (holder && holder.bootId === info.bootId && pidAlive(holder.pid)) throw new LockHeldError(path, holder);
 		if (holder === undefined && lockAgeMs(path, now) < UNREADABLE_LOCK_GRACE_MS)
 			throw new LockHeldError(path, undefined);
 		try {

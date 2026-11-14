@@ -51,10 +51,10 @@ export const REVIEW_DISABLED_DISCOVERY = [
 ] as const;
 
 /**
- * The reviewer's `--config` overlay, built from constants only (no input, so nothing to escape). Its
- * `disabledProviders` replaces the user's list on purpose: the reviewer only calls the one `--model` it is given.
+ * The isolation part of an isolated `omp -p` `--config` overlay (the lane reviewer's and the guest/qa runner's), built
+ * from constants only (no input, so nothing to escape). Its `disabledProviders` replaces the user's list on purpose.
  */
-export const REVIEW_OVERLAY_YAML = [
+export const ISOLATION_OVERLAY_YAML = [
 	"disabledProviders:",
 	...REVIEW_DISABLED_DISCOVERY.map((id) => `  - ${id}`),
 	"mcp:",
@@ -66,6 +66,13 @@ export const REVIEW_OVERLAY_YAML = [
 	"",
 ].join("\n");
 
+/**
+ * The reviewer's `--config` overlay: the isolation part, and no model fallback — the receipt's `model` (and the
+ * confidence scale it stands for) is the model that answered. omp's `retry.modelFallback` gates every switch to
+ * `retry.fallbackChains`, and a `--config` overlay merges over the user's config.yml.
+ */
+export const REVIEW_OVERLAY_YAML = `${ISOLATION_OVERLAY_YAML}retry:\n  modelFallback: false\n`;
+
 /** Section headers of the review prompt, in the order the reviewer reads them. */
 export const REVIEW_SECTIONS = {
 	spec: "## 1. 스펙",
@@ -75,6 +82,8 @@ export const REVIEW_SECTIONS = {
 } as const;
 
 const VERDICT_LINE = /^VERDICT:\s*(CLEAR|BLOCK)\s*$/;
+const CONFIDENCE_PREFIX = /^CONFIDENCE:/;
+const CONFIDENCE_LINE = /^CONFIDENCE:\s*(0(?:\.\d+)?|1(?:\.0+)?)\s*$/;
 
 export interface LaneReviewDeps {
 	ompBin: string;
@@ -137,6 +146,7 @@ export function buildReviewPrompt(input: { lane: LaneRow; diff: string; diffPath
 		"- 범위 밖 변경, 비밀값([REDACTED] 표시 포함), 되돌리기 어려운 부작용이 있는가.",
 		"구현자 보고(4절)는 마지막에 대조만 하고 판정 근거로 쓰지 않는다.",
 		"BLOCK이면 그 앞에 지적을 파일:줄과 함께 3개 이내로 쓴다.",
+		"마지막 줄 바로 위에는 `CONFIDENCE: <0.00~1.00>` 한 줄을 쓴다. 이 판정이 맞을 확률이다. 스펙·수락기준을 diff에서 하나하나 확인했고 의심할 데가 없으면 0.9 이상, 일부를 확인하지 못했거나 diff가 잘려 다 못 읽었으면 0.7 이하로 쓴다. 다른 줄에는 CONFIDENCE를 쓰지 않는다.",
 		"마지막 줄에는 정확히 `VERDICT: CLEAR` 또는 `VERDICT: BLOCK` 하나만 쓴다. 다른 줄에는 VERDICT를 쓰지 않는다.",
 		"",
 		REVIEW_SECTIONS.spec,
@@ -167,18 +177,37 @@ export function buildReviewPrompt(input: { lane: LaneRow; diff: string; diffPath
 	return `${head}\n\`\`\`diff\n${shown}\n\`\`\`${note}${tail}`;
 }
 
-/** The verdict of a review run's output: its last non-empty line, and that line only. */
-export function parseReviewVerdict(output: string): { verdict: "CLEAR" | "BLOCK"; notes: string } | { reason: string } {
+/**
+ * The verdict of a review run's output: its last non-empty line, and that line only. The confidence is set only when
+ * exactly one line starts with `CONFIDENCE:`, it is the non-empty line right above the VERDICT line and it is a number
+ * from 0 to 1; anything else leaves it unset without touching the verdict. Every `CONFIDENCE:` line is dropped from
+ * the notes, well-formed or not.
+ */
+export function parseReviewVerdict(
+	output: string,
+): { verdict: "CLEAR" | "BLOCK"; notes: string; confidence?: number } | { reason: string } {
 	const lines = output.split("\n").map((line) => line.trim());
 	if (lines.filter((line) => /^VERDICT:/.test(line)).length > 1) return { reason: "VERDICT 여러 줄" };
 	const last = lines.findLastIndex((line) => line !== "");
 	const match = last < 0 ? null : VERDICT_LINE.exec(lines[last] ?? "");
 	if (match === null) return { reason: "VERDICT 없음" };
+	const confidenceLines = lines.filter((line) => CONFIDENCE_PREFIX.test(line));
+	const above = lines.slice(0, last).findLast((line) => line !== "");
+	const value = confidenceLines.length === 1 && above !== undefined ? CONFIDENCE_LINE.exec(above) : null;
 	return {
 		verdict: match[1] as "CLEAR" | "BLOCK",
-		notes: output.split("\n").slice(0, last).join("\n").trim(),
+		notes: output
+			.split("\n")
+			.slice(0, last)
+			.filter((line) => !CONFIDENCE_PREFIX.test(line.trim()))
+			.join("\n")
+			.trim(),
+		...(value === null ? {} : { confidence: Number(value[1]) }),
 	};
 }
+
+/** A review confidence as cards and events show it: two decimals (`0.80`). */
+export const formatConfidence = (confidence: number): string => confidence.toFixed(2);
 
 /** Reviews the lane's claim commit once; resolves with its receipt and never throws. */
 export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): Promise<LaneReview> {
@@ -232,7 +261,8 @@ export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): 
 		if (result.code !== 0) return inconclusive(`종료 코드 ${result.code ?? "없음"}`, result.output);
 		const parsed = parseReviewVerdict(result.output);
 		if ("reason" in parsed) return inconclusive(parsed.reason, result.output);
-		return receipt(parsed.verdict, parsed.notes);
+		const reviewed = receipt(parsed.verdict, parsed.notes);
+		return parsed.confidence === undefined ? reviewed : { ...reviewed, confidence: parsed.confidence };
 	} catch (error) {
 		return inconclusive(`리뷰 실행 실패: ${String(error).slice(0, 200)}`);
 	}

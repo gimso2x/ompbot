@@ -8,7 +8,7 @@ import { redact } from "../redact";
 
 /**
  * One finished external call (a local herdr/git/omp child or an ssh command) made through `realProcessRunner` in the
- * daemon process, as the audit file records it. CLI runs (`ompbot offsite`, `backup`, `tasks`) install no audit.
+ * daemon process, as the audit file records it. CLI runs (`ompbot backup`, `tasks`) install no audit.
  */
 export interface AuditEntry {
 	ts: string;

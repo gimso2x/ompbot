@@ -60,6 +60,8 @@ export interface FakeOmpDriverOptions {
 	restoredModel?: string;
 	/** Reported as `state().sessionFile` (the transcript on disk a turn's cost is read from); absent = none. */
 	sessionFile?: string;
+	/** Reported as `state().context` (omp `contextUsage`); absent = the driver cannot tell. */
+	context?: OmpState["context"];
 	/** Emitted in order right after each turn starts, before `toolCalls` (omp payload shape, e.g. `auto_retry_start`). */
 	events?: readonly OmpEvent[];
 	/** Reported as `tool_execution_start` events right after each turn starts (omp payload shape). */
@@ -246,6 +248,13 @@ export class FakeOmpDriver implements OmpSessionDriver {
 		this.#turn?.abort();
 	}
 
+	/** Like omp's `abort_and_restore_queue`: the fake keeps no queue of its own, so only the call is recorded. */
+	async abortAndClearQueue(): Promise<void> {
+		this.#require();
+		this.calls.push("abortAndClearQueue");
+		this.#turn?.abort();
+	}
+
 	/** Appends the scripted messages (emitting `message_end` with `messageEvents`); returns the last assistant text. */
 	#playScript(steps: readonly FakeTurnMessage[]): string {
 		let last = "";
@@ -367,6 +376,7 @@ export class FakeOmpDriver implements OmpSessionDriver {
 			model: this.#model,
 			thinking: this.#thinking,
 			...(this.#options.sessionFile === undefined ? {} : { sessionFile: this.#options.sessionFile }),
+			...(this.#options.context === undefined ? {} : { context: this.#options.context }),
 		};
 	}
 

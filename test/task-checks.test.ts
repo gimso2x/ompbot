@@ -110,6 +110,7 @@ function fakeHost(
 		commitDocs: unused,
 		commitOnTaskBranch: unused,
 		readFile: async (path) => ({ ok: true, value: files[path] }),
+		readBytes: async (path) => ({ ok: true, value: files[path] === undefined ? undefined : Buffer.from(files[path]) }),
 		runCheck: async ({ worktree, argv, timeoutMs }) => {
 			runs.push({ worktree, argv, timeoutMs });
 			const result = over.run?.(argv) ?? { code: 0, output: "5 pass\n 0 fail\n" };
@@ -446,8 +447,8 @@ describe("host runCheck / headOf", () => {
 					"BatchMode=yes",
 					"-o",
 					"ConnectTimeout=8",
-					"wsl",
 					"--",
+					"wsl",
 					"export",
 					'PATH="$HOME/.local/bin:$PATH"',
 					"&&",
@@ -470,6 +471,26 @@ describe("host runCheck / headOf", () => {
 		);
 		const slow = createTaskHostOps({ sshTarget: "wsl", run: recorder({ code: null, timedOut: true }).run });
 		expect(await slow.runCheck({ worktree: "/r/wt", argv: ["sleep"], timeoutMs: 1 })).toMatchObject({ timedOut: true });
+	});
+
+	test("readBytes over ssh reads base64 and returns the file's exact bytes; a failed read is a missing file", async () => {
+		const bytes = Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x41, 0x0a]);
+		const { calls, run } = recorder({ stdout: `${bytes.toString("base64")}\n` });
+		const ops = createTaskHostOps({ sshTarget: "wsl", run });
+		expect(await ops.readBytes("/r/wt/bin.dat")).toEqual({ ok: true, value: bytes });
+		expect(calls[0]?.cmd.slice(-4)).toEqual(["--", "wsl", "base64", "/r/wt/bin.dat"]);
+		const missing = createTaskHostOps({ sshTarget: "wsl", run: recorder({ code: 1 }).run });
+		expect(await missing.readBytes("/r/wt/none")).toEqual({ ok: true, value: undefined });
+	});
+
+	test("headOf reads untracked files whatever the repo config says (qa-i #124)", async () => {
+		const seen: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			seen.push([...cmd]);
+			return { code: 0, stdout: cmd.includes("rev-parse") ? `${"c".repeat(40)}\n` : "", timedOut: false };
+		};
+		await createTaskHostOps({ run }).headOf("/r/wt");
+		expect(seen.find((cmd) => cmd.includes("status"))).toContain("--untracked-files=all");
 	});
 
 	test("headOf: HEAD sha plus whether git status --porcelain is empty; git failure throws", async () => {
@@ -748,6 +769,33 @@ describe("diff integrity of the task branch", () => {
 			const swept = await evaluateTask(g.row, counted, cache());
 			expect(swept.ok && swept.judgement.reached).toBe(false);
 			expect(reads).toBe(1);
+		} finally {
+			rmSync(g.root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("file checks read the worktree file's bytes (qa-i #126)", () => {
+	test("a binary file passes with its exact sha256 and fails with a wrong one; json: still reads text", async () => {
+		const g = await gitTask();
+		try {
+			const bytes = new Uint8Array([0x00, 0xff, 0xfe, 0x80, 0x41, 0x0a]);
+			const sha = createHash("sha256").update(bytes).digest("hex");
+			writeFileSync(join(g.row.worktree, "bin.dat"), bytes);
+			writeFileSync(join(g.row.worktree, "a.json"), '{"v":"é"}');
+			const wt = gitAt(g.row.worktree);
+			wt("add", "--", "bin.dat", "a.json");
+			wt("commit", "-q", "-m", "data");
+			const run = await runWorktreeChecks(g.ops, g.row.worktree, () => new Map(), [
+				{ id: "AC-1", signal: `file bin.dat sha256=${sha}` },
+				{ id: "AC-2", signal: `file bin.dat sha256=${"0".repeat(64)}` },
+				{ id: "AC-3", signal: 'file a.json json:.v="é"' },
+			]);
+			expect("results" in run && run.results.map((result) => [result.id, result.ok])).toEqual([
+				["AC-1", true],
+				["AC-2", false],
+				["AC-3", true],
+			]);
 		} finally {
 			rmSync(g.root, { recursive: true, force: true });
 		}

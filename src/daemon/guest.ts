@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { oneLine } from "../channel/text";
 import { stripFenceLookalikes, wrapQuoted } from "../core/normalize";
 import { type ProcessRunner, runOmpPrint } from "../dispatch/omp";
-import { REVIEW_OVERLAY_YAML } from "../lanes/review";
+import { ISOLATION_OVERLAY_YAML } from "../lanes/review";
 import type { Logger } from "../log";
 
 /** The only tool a guest/qa run gets: no read, grep, glob, bash, edit or write (they run with host rights). */
@@ -42,9 +42,9 @@ export const GUEST_ANSWER_MAX_CHARS = 8_000;
 
 /**
  * The `--config` overlay of a guest/qa run: memory off, no project MCP config, no autolearn, every discovery provider
- * off (the lane reviewer's overlay, built from constants only).
+ * off (the isolation part of the lane reviewer's overlay, built from constants only; the model fallback stays on).
  */
-export const GUEST_OVERLAY_YAML = REVIEW_OVERLAY_YAML;
+export const GUEST_OVERLAY_YAML = ISOLATION_OVERLAY_YAML;
 
 /** The agent dir a guest/qa run gets as `PI_CODING_AGENT_DIR`, under the ompbot home. */
 export const QA_AGENT_DIR_NAME = "omp-qa";

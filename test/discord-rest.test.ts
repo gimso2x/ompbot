@@ -277,13 +277,12 @@ describe("DiscordRest", () => {
 		expect(server.seen).toHaveLength(0);
 	});
 
-	test("a global 429 blocks bot routes but not interaction routes; errors never carry the interaction token", async () => {
+	test("a global 429 blocks bot routes but not interaction routes", async () => {
 		server = startServer((req) => {
 			if (req.path.endsWith("/messages")) return Response.json({ retry_after: 5, global: true }, { status: 429 });
-			if (req.method === "PATCH") return new Response("not json", { status: 200 });
 			return new Response(null, { status: 204 });
 		});
-		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base, applicationId: "600", now: () => 0 });
+		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base, now: () => 0 });
 		const first = await caught(client.createMessage({ channelId: CHANNEL, content: "a" }));
 		expect((first as DiscordRateLimitedError).global).toBe(true);
 		const blocked = await caught(client.createMessage({ channelId: "222222222222222222", content: "b" }));
@@ -291,39 +290,14 @@ describe("DiscordRest", () => {
 		expect((blocked as DiscordRateLimitedError).retryAfterMs).toBe(5_000);
 		expect(server.seen).toHaveLength(1);
 		await client.respondInteraction({ interactionId: "77", token: "itok-secret", response: { type: 6 } });
-		const odd = await caught(client.editInteractionResponse({ token: "itok-secret", content: "done" }));
-		expect((odd as DiscordCallError).kind).toBe("ambiguous");
-		expect(String(odd)).not.toContain("itok-secret");
-		expect(server.seen).toHaveLength(3);
+		expect(server.seen).toHaveLength(2);
 	});
 
-	test("interaction callback and the original-response follow-ups use the interaction and webhook routes", async () => {
-		server = startServer((req) =>
-			req.method === "PATCH" ? Response.json({ id: "1" }) : new Response(null, { status: 204 }),
-		);
-		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base, applicationId: "600" });
+	test("interaction callback uses the interaction route", async () => {
+		server = startServer(() => new Response(null, { status: 204 }));
+		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base });
 		await client.respondInteraction({ interactionId: "77", token: "itok", response: { type: 6 } });
-		await client.editInteractionResponse({ token: "itok", content: "done", allowedMentions: { parse: [] } });
-		await client.deleteInteractionResponse({ token: "itok" });
-		expect(server.seen.map((r) => `${r.method} ${r.path}`)).toEqual([
-			"POST /api/v10/interactions/77/itok/callback",
-			"PATCH /api/v10/webhooks/600/itok/messages/@original",
-			"DELETE /api/v10/webhooks/600/itok/messages/@original",
-		]);
+		expect(server.seen.map((r) => `${r.method} ${r.path}`)).toEqual(["POST /api/v10/interactions/77/itok/callback"]);
 		expect(JSON.parse(server.seen[0]?.body ?? "")).toEqual({ type: 6 });
-		expect(JSON.parse(server.seen[1]?.body ?? "")).toEqual({ content: "done", allowed_mentions: { parse: [] } });
-	});
-
-	test("command registration overwrites the global set, or one server's with a guild id", async () => {
-		server = startServer(() => Response.json([]));
-		const client = new DiscordRest({ token: TOKEN, baseUrl: server.base, applicationId: "600" });
-		const commands = [{ name: "status-ompbot", description: "상태", options: [] }];
-		await client.registerCommands({ commands });
-		await client.registerCommands({ guildId: "300000000000000001", commands });
-		expect(server.seen.map((r) => `${r.method} ${r.path}`)).toEqual([
-			"PUT /api/v10/applications/600/commands",
-			"PUT /api/v10/applications/600/guilds/300000000000000001/commands",
-		]);
-		expect(JSON.parse(server.seen[0]?.body ?? "")).toEqual(commands);
 	});
 });

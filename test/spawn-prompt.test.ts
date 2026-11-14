@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LogFields, Logger } from "../src/log";
 import {
 	buildFloorsPrompt,
+	FLOORS_DYNAMIC_HEADING,
 	floorsSystemPrompt,
 	type PersonaFiles,
 	PINNED_OWNER_DOCS_FILE,
@@ -203,21 +205,186 @@ describe("owner docs pinned per epoch while the cache is warm (AC-2)", () => {
 		expect(spawn()).toContain(OWNER_V2);
 		expect(lastSpawnLog().pinned).toBe(false);
 	});
+});
 
-	test("floors are never pinned: a changed floors input shows at once next to the pinned owner docs", () => {
+/** The sidecar body (after its header line): the pinned static floors plus owner docs. */
+const sidecarBody = (dirPath = sessionDir()): string => {
+	const raw = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
+	return raw.slice(raw.indexOf("\n") + 1);
+};
+const sidecarHeader = (dirPath = sessionDir()): string => {
+	const raw = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
+	return raw.slice(0, raw.indexOf("\n"));
+};
+const sha16 = (text: string): string => createHash("sha256").update(text).digest("hex").slice(0, 16);
+const HERDR_MARK = "herdr";
+
+describe("static floors pinned with the owner docs while the cache is warm (AC-1)", () => {
+	test("a changed static floors input on a warm respawn keeps the first spawn's text byte for byte", () => {
 		const first = spawn({ herdr: false });
+		expect(first).not.toContain(HERDR_MARK);
 		sessionWithCall(sessionDir(), 10 * MINUTE);
-		writeFileSync(files.owner as string, OWNER_V2);
 
 		const second = spawn({ herdr: true });
 		expect(lastSpawnLog().pinned).toBe(true);
-		const newFloors = buildFloorsPrompt("/home/test/.ompbot/secrets", ORIGIN, true);
-		expect(second.startsWith(newFloors)).toBe(true);
+		expect(Buffer.from(second).equals(Buffer.from(first))).toBe(true);
+		expect(second).not.toContain(HERDR_MARK);
+		// The sidecar holds the static floors and the owner docs together.
+		expect(sidecarBody().startsWith("# ompbot 운영 안내 / ompbot operating floors")).toBe(true);
+		expect(sidecarBody()).toContain(OWNER_V1);
+	});
+
+	test("cold cache: the new static floors go in and the sidecar is rewritten with them", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 61 * MINUTE);
+
+		const text = spawn({ herdr: true });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).toBe(floorsSystemPrompt("/home/test/.ompbot/secrets", ORIGIN, files, undefined, true));
+		expect(sidecarBody()).toContain(HERDR_MARK);
+		expect(text.startsWith(sidecarBody())).toBe(true);
+		expect(statSync(join(sessionDir(), PINNED_OWNER_DOCS_FILE)).mode & 0o777).toBe(0o600);
+	});
+
+	test("warm but no sidecar: fresh static floors, the sidecar is written, no warning", () => {
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const text = spawn({ herdr: true });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).toContain(HERDR_MARK);
+		expect(sidecarBody()).toContain(HERDR_MARK);
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		spawn({ herdr: false });
+		expect(lastSpawnLog().pinned).toBe(true);
+	});
+
+	test("warm but a corrupt v2 sidecar: fresh static floors replace it", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const sidecar = join(sessionDir(), PINNED_OWNER_DOCS_FILE);
+		writeFileSync(sidecar, readFileSync(sidecar, "utf8").replace("Hard floors", "Soft floors"));
+
+		const text = spawn({ herdr: true });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).toContain(HERDR_MARK);
+		expect(sidecarBody()).toContain(HERDR_MARK);
+	});
+});
+
+describe("dynamic lines are never pinned and always last (AC-2)", () => {
+	const PEERS = { peers: [{ name: "peer-bot", mention: "<@U999>" }] };
+
+	test("a warm respawn with changed dynamic lines keeps the pinned prefix byte for byte and swaps only the tail", () => {
+		const first = spawn({ peerTouched: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const prefix = sidecarBody();
+		expect(first.startsWith(prefix)).toBe(true);
+
+		const second = spawn({ peerTouched: true, surface: PEERS });
+		expect(lastSpawnLog().pinned).toBe(true);
+		expect(second.startsWith(prefix)).toBe(true);
 		expect(second).not.toBe(first);
-		expect(second).toContain(OWNER_V1);
-		// The sidecar holds only the owner docs part, never the floors.
-		const sidecar = readFileSync(join(sessionDir(), PINNED_OWNER_DOCS_FILE), "utf8");
-		expect(sidecar).not.toContain("ompbot operating floors");
+		const tail = second.slice(prefix.length);
+		expect(tail.startsWith(FLOORS_DYNAMIC_HEADING)).toBe(true);
+		expect(tail).toContain("peer-bot = <@U999>");
+		expect(String(lastSpawnLog().floors_dynamic).split(",")).toEqual(
+			expect.arrayContaining(["peerTouched", "peers", "resume"]),
+		);
+		// The pinned unit never holds a dynamic line.
+		expect(prefix).not.toContain("peer-bot");
+		expect(prefix).not.toContain(FLOORS_DYNAMIC_HEADING);
+	});
+
+	test("the dynamic block comes after the owner docs and the answer format section", () => {
+		const text = spawn({ peerTouched: true, surface: { noLaneChannel: true, ...PEERS } });
+		const at = text.indexOf(FLOORS_DYNAMIC_HEADING);
+		expect(at).toBeGreaterThan(text.indexOf(PERSONA));
+		expect(at).toBeGreaterThan(text.indexOf("## 답변 형식 / Answer format"));
+		expect(text.slice(at)).toContain("ompbot_work_start");
+		expect(text.indexOf("[자동 후속]")).toBeGreaterThan(at);
+	});
+
+	test("the unpinned text with dynamic lines equals floorsSystemPrompt for the same inputs", () => {
+		const surface = { noLaneChannel: true, ...PEERS };
+		expect(spawn({ herdr: true, peerTouched: true, surface })).toBe(
+			floorsSystemPrompt("/home/test/.ompbot/secrets", ORIGIN, files, undefined, true, false, true, surface),
+		);
+	});
+});
+
+describe("sidecar format versions (AC-3)", () => {
+	test("a v1 sidecar (owner docs only) is replaced without a warning", () => {
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const v1Body = `\n\n[오너 관찰지] old\n${OWNER_V2}`;
+		writeFileSync(
+			join(sessionDir(), PINNED_OWNER_DOCS_FILE),
+			`ompbot-pinned-owner-docs v1 sha256=${createHash("sha256").update(v1Body).digest("hex")}\n${v1Body}`,
+		);
+		const text = spawn();
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).toContain(OWNER_V1);
+		expect(text).not.toContain(OWNER_V2);
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v2 ")).toBe(true);
+	});
+
+	test("an unknown header is replaced without a warning", () => {
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		writeFileSync(join(sessionDir(), PINNED_OWNER_DOCS_FILE), `something-else v9\n${OWNER_V2}`);
+		const text = spawn();
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).not.toContain(OWNER_V2);
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v2 ")).toBe(true);
+	});
+});
+
+describe("callers and hashes (AC-4)", () => {
+	test("buildFloorsPrompt (Teams QA, dispatch simple) puts the static floors first and the dynamic block last", () => {
+		const text = buildFloorsPrompt("/home/test/.ompbot/secrets", ORIGIN, false, false, true);
+		const at = text.indexOf(FLOORS_DYNAMIC_HEADING);
+		expect(at).toBeGreaterThan(text.indexOf("## 답변 형식 / Answer format"));
+		expect(text.slice(at)).toContain("[자동 후속]");
+		expect(text.slice(0, at)).not.toContain("[자동 후속]");
+		// No dynamic line, no dynamic block.
+		expect(buildFloorsPrompt("/s", "monitor/m1")).not.toContain(FLOORS_DYNAMIC_HEADING);
+	});
+
+	test("a lane origin with dynamic lines: no sidecar, dynamic block last", () => {
+		const lane = "ompbot/work/lane1";
+		const laneDir = sessionDir(1, lane);
+		sessionWithCall(laneDir, 10 * MINUTE);
+		const text = spawn({ originKey: lane, sessionDir: laneDir, peerTouched: true });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text.indexOf(FLOORS_DYNAMIC_HEADING)).toBeGreaterThan(0);
+		expect(() => statSync(join(laneDir, PINNED_OWNER_DOCS_FILE))).toThrow();
+	});
+
+	test("a monitor origin pins its static floors and owner docs while warm", () => {
+		const monitor = "monitor/m1";
+		const monitorDir = sessionDir(1, monitor);
+		const first = spawn({ originKey: monitor, sessionDir: monitorDir });
+		expect(first).toContain(OWNER_V1);
+		sessionWithCall(monitorDir, 10 * MINUTE);
+		writeFileSync(files.owner as string, OWNER_V2);
+
+		const second = spawn({ originKey: monitor, sessionDir: monitorDir, secretsDir: "/other/secrets" });
+		expect(lastSpawnLog().pinned).toBe(true);
+		expect(second).toBe(first);
+		expect(second).not.toContain("/other/secrets");
+	});
+
+	test("a pinned spawn logs floors_static and owner_docs hashed from the text it sends", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		writeFileSync(files.owner as string, OWNER_V2);
+		const text = spawn({ herdr: true, peerTouched: true });
+		const fields = lastSpawnLog();
+		expect(fields.pinned).toBe(true);
+		const ownerAt = text.indexOf("\n\n[정체성(soul)]");
+		const dynamicAt = text.indexOf(FLOORS_DYNAMIC_HEADING);
+		expect(fields.floors_static).toBe(sha16(text.slice(0, ownerAt)));
+		expect(fields.owner_docs).toBe(sha16(text.slice(ownerAt, dynamicAt)));
+		expect(fields.prompt).toBe(sha16(text));
 	});
 });
 

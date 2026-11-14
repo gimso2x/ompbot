@@ -8,6 +8,7 @@ import { previewLine } from "../src/dashboard/snapshot";
 import { type HerdrAgentStatusResult, realProcessRunner, setLocalHerdrBin } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import type { LastAnswer } from "../src/omp/session-tail";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
@@ -118,11 +119,19 @@ interface Rig {
 	/** What the fake `herdr agent read` answers, and how often the sweeper asked. */
 	screen: { value: { ok: boolean; output?: string; error?: string } };
 	readCalls: { count: number };
+	/** What the fake session reader answers (an `Error` is thrown), and the paths it was asked for. */
+	answer: { value: LastAnswer | undefined | Error };
+	answerCalls: string[];
+	warnings: Array<{ event: string; fields?: Record<string, unknown> }>;
+	infos: Array<{ event: string; fields?: Record<string, unknown> }>;
 }
 
 function rig(
 	over: Partial<
-		Pick<TaskSweepDeps, "boardLink" | "log" | "frozen" | "remind" | "autoLandPolicy" | "repoMatches" | "autoLand">
+		Pick<
+			TaskSweepDeps,
+			"boardLink" | "log" | "frozen" | "remind" | "autoLandPolicy" | "repoMatches" | "autoLand" | "autoLandHold"
+		>
 	> = {},
 	task: Partial<Pick<TaskRow, "host" | "risk">> = {},
 ): Rig {
@@ -147,6 +156,10 @@ function rig(
 	const statusCalls = { count: 0 };
 	const screen: Rig["screen"] = { value: { ok: true, output: "› 승인할까요? [y/n]" } };
 	const readCalls = { count: 0 };
+	const answer: Rig["answer"] = { value: undefined };
+	const answerCalls: string[] = [];
+	const warnings: Rig["warnings"] = [];
+	const infos: Rig["infos"] = [];
 	const deps: TaskSweepDeps = {
 		ledger,
 		evaluate: async () => {
@@ -166,10 +179,18 @@ function rig(
 			readCalls.count += 1;
 			return screen.value;
 		},
+		lastAnswer: async (_row, path) => {
+			answerCalls.push(path);
+			if (answer.value instanceof Error) throw answer.value;
+			return answer.value;
+		},
 		channels: registryOf(new SlackChannel(transport)),
 		ownerUserId: "UOWN",
 		now: () => clock.ms,
-		log: noop,
+		log: {
+			info: (event, fields) => infos.push({ event, fields }),
+			warn: (event, fields) => warnings.push({ event, fields }),
+		},
 		...over,
 	};
 	return {
@@ -187,6 +208,10 @@ function rig(
 		statusCalls,
 		screen,
 		readCalls,
+		answer,
+		answerCalls,
+		warnings,
+		infos,
 	};
 }
 
@@ -1433,6 +1458,36 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 			expect(posts(r)).toHaveLength(2);
 		},
 	);
+
+	// T-20261113-08 AC-5: after an apply code rollback `<home>/autoland.hold` stops auto-merge until the next good apply.
+	test("autoland.hold: no autoLand, task_autoland_held logged, the 머지 card names the hold", async () => {
+		let hold: string | undefined = "코드 롤백(apply 20261113-070000): revert 1234567";
+		let autoLands = 0;
+		const infos: Array<[string, Record<string, unknown> | undefined]> = [];
+		const r: Rig = rig({
+			autoLandPolicy: () => POLICY,
+			repoMatches: async () => true,
+			autoLandHold: () => hold,
+			autoLand: async () => {
+				autoLands += 1;
+				return true;
+			},
+			log: { info: (event, fields) => infos.push([event, fields]), warn() {} },
+		});
+		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+		await r.sweeper.sweep();
+		expect(autoLands).toBe(0);
+		expect(infos.find(([event]) => event === "task_autoland_held")?.[1]).toMatchObject({
+			task: r.row.taskId,
+			reason: hold,
+		});
+		expect(posts(r)).toHaveLength(1);
+		expect(hasMergeButton(posts(r)[0])).toBe(true);
+		expect(textOf(posts(r)[0])).toContain(`자동 머지 안 함: autoland.hold: ${hold}`);
+		hold = undefined;
+		await r.sweeper.sweep();
+		expect(autoLands).toBe(0); // the reach was already reported; the owner's 머지 is not blocked by the hold
+	});
 });
 
 describe("daemon: sweep, IPC and CLI on a real local worktree", () => {
@@ -1741,6 +1796,8 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 		reminders: string[];
 		/** herdr status per task id (idle when unset). */
 		agents: Map<string, HerdrAgentStatusResult>;
+		/** The last answer each task's session reader gives (none when unset). */
+		answers: Map<string, LastAnswer>;
 		remindOk: { value: boolean };
 		next: { value: TaskEvaluation };
 		logs: string[];
@@ -1769,6 +1826,7 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 		const asked: string[] = [];
 		const reminders: string[] = [];
 		const agents = new Map<string, HerdrAgentStatusResult>();
+		const answers = new Map<string, LastAnswer>();
 		const remindOk = { value: true };
 		const next: { value: TaskEvaluation } = { value: { ok: true, judgement: judgement() } };
 		const logs: string[] = [];
@@ -1782,6 +1840,7 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 			},
 			agentStatus: async (row) => agents.get(row.taskId) ?? { ok: true, status: "idle" },
 			readAgent: async () => ({ ok: true, output: "" }),
+			lastAnswer: async (row) => answers.get(row.taskId),
 			changedPaths: async (row) => {
 				asked.push(row.taskId);
 				return paths.get(row.taskId);
@@ -1791,7 +1850,7 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 			now: () => clock.ms,
 			log: { info: (event) => logs.push(event), warn: (event) => logs.push(event) },
 		});
-		return { sweeper, ledger, transport, clock, a, b, paths, asked, reminders, agents, remindOk, next, logs };
+		return { sweeper, ledger, transport, clock, a, b, paths, asked, reminders, agents, answers, remindOk, next, logs };
 	}
 
 	const threadPosts = (r: OverlapRig) =>
@@ -1876,6 +1935,21 @@ describe("TaskSweeper: file overlap between active tasks of one repository", () 
 		expect(r.reminders.map((line) => line.split(":")[0])).toEqual([r.b.taskId, r.a.taskId]);
 		await r.sweeper.sweep();
 		expect(r.reminders).toHaveLength(2);
+	});
+
+	test("question stop (AC-3): an agent stopped on a question gets no overlap prompt; the other one does", async () => {
+		const r = overlapRig();
+		r.paths.set(r.a.taskId, ["src/daemon/daemon.ts"]);
+		r.paths.set(r.b.taskId, ["src/daemon/daemon.ts"]);
+		r.agents.set(r.a.taskId, { ok: true, status: "idle", sessionPath: "/s/a.jsonl" });
+		r.answers.set(r.a.taskId, { text: "A로 할까요?", errored: false, pendingTool: false, userAfter: false });
+		await r.sweeper.sweep();
+		expect(threadPosts(r).filter((p) => p.text.startsWith("⚠️ 파일 겹침"))).toHaveLength(2);
+		expect(r.reminders.map((line) => line.split(":")[0])).toEqual([r.b.taskId]);
+		expect(Object.keys(r.ledger.require(r.a.taskId).notices).some((key) => key.startsWith("overlapworker:"))).toBe(
+			false,
+		);
+		expect(r.logs).toContain("task_overlap_remind_deferred");
 	});
 
 	test("AC-4b: a failed prompt records nothing and is sent on the next sweep that succeeds", async () => {
@@ -2416,5 +2490,161 @@ describe("TaskSweeper: checks pass while blocked, held during a freeze or an own
 			expect(passPrompts(r)).toHaveLength(1);
 			expect(passMarks(r)).toHaveLength(1);
 		}
+	});
+});
+
+describe("TaskSweeper: a worker that asks in prose and stops (question stop)", () => {
+	const SESSION = "/home/u/.omp/agent/sessions/w/2026-11-13.jsonl";
+	const UNMET = ["AC-1: outcome.md에 절이 없습니다"];
+	const asking = (text: string): LastAnswer => ({ text, errored: false, pendingTool: false, userAfter: false });
+	const QUESTION = "두 가지 방법이 있습니다.\nA로 할까요, B로 할까요?";
+	const questionCards = (r: Rig) =>
+		posts(r).filter((post) => "text" in post && (post.text as string).startsWith("❓ 워커 질문"));
+
+	test("AC-3: idle + unmet conditions + a question: one card, no prompt, no nudge counted; the same question again posts nothing", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ problems: UNMET }) };
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		await r.sweeper.sweep();
+		expect(r.reminders).toEqual([]);
+		expect(questionCards(r)).toHaveLength(1);
+		expect(Object.keys(r.ledger.require(r.row.taskId).notices).filter((key) => key.startsWith("unmet:"))).toEqual([]);
+		r.clock.ms += TASK_SWEEP_MS;
+		await r.sweeper.sweep();
+		expect(questionCards(r)).toHaveLength(1);
+		expect(r.reminders).toEqual([]);
+	});
+
+	test("AC-3: the card carries the answer's end, the owner mention and the reply-through-the-bot line", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(
+			`${Array.from({ length: 14 }, (_, i) => `줄 ${i}`).join("\n")}\n토큰 xoxb-TEST-0 은 어디에 둘까요?`,
+		);
+		const [result] = await r.sweeper.sweep();
+		expect(result?.actions).toContain("question notice");
+		const text = (questionCards(r)[0] as { text: string }).text;
+		expect(text.split("\n")[0]).toBe(
+			"❓ 워커 질문 · 로그 회전 — herdr 에이전트 `t-20261026-01`가 질문하고 멈췄습니다 (local/t-20261026-01 · T-20261026-01) <@UOWN>",
+		);
+		expect(text).toContain("이 스레드에 답을 적어 주시면 그 답을 담당 에이전트에 넘겨 재개합니다.");
+		expect(text).not.toContain("줄 2\n");
+		expect(text).toContain("줄 3");
+		expect(text).not.toContain("xoxb-TEST-0");
+		expect(text).toContain("어디에 둘까요?");
+		expect(r.answerCalls).toEqual([SESSION]);
+	});
+
+	test("AC-3: done + unmet conditions + a question behaves the same", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ problems: UNMET }) };
+		r.agent.value = { ok: true, status: "done", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		await r.sweeper.sweep();
+		r.clock.ms += TASK_SWEEP_MS;
+		await r.sweeper.sweep();
+		expect(questionCards(r)).toHaveLength(1);
+		expect(r.reminders).toEqual([]);
+		expect(Object.keys(r.ledger.require(r.row.taskId).notices).filter((key) => key.startsWith("unmet:"))).toEqual([]);
+	});
+
+	test("AC-3: the 30-minute reminder is deferred as a question and logged", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		r.clock.ms = T0 + STALE_REMIND_MS;
+		const [result] = await r.sweeper.sweep();
+		expect(r.reminders).toEqual([]);
+		expect(result?.actions).toContain("reminder deferred (question)");
+		expect(r.infos).toContainEqual({
+			event: "task_remind_deferred",
+			fields: { task: r.row.taskId, agentStatus: "question" },
+		});
+	});
+
+	test("AC-3: a failed card post records nothing and is posted again on the next sweep", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		const recorded = () =>
+			Object.keys(r.ledger.require(r.row.taskId).notices).filter((key) => key.startsWith("question:"));
+		r.transport.failNext.postMessage = [new Error("slack down")];
+		await r.sweeper.sweep();
+		// The fake records the call before it throws: one attempt, nothing recorded.
+		expect(questionCards(r)).toHaveLength(1);
+		expect(recorded()).toEqual([]);
+		await r.sweeper.sweep();
+		expect(questionCards(r)).toHaveLength(2);
+		expect(recorded()).toHaveLength(1);
+		await r.sweeper.sweep();
+		expect(questionCards(r)).toHaveLength(2);
+		expect(r.reminders).toEqual([]);
+	});
+
+	test("AC-3: a new question (another digest) posts one more card", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		await r.sweeper.sweep();
+		r.answer.value = asking("그럼 C도 넣을까요?");
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(questionCards(r)).toHaveLength(2);
+	});
+
+	test("AC-3: two hours on a question: the stale notice mentions the owner", async () => {
+		const r = rig();
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking(QUESTION);
+		r.clock.ms = T0 + STALE_NOTICE_MS;
+		await r.sweeper.sweep();
+		const stale = posts(r).find((post) => "text" in post && (post.text as string).startsWith("⏰")) as { text: string };
+		expect(stale.text).toContain("120분 넘게 갱신되지 않았습니다");
+		expect(stale.text).toContain("워커가 질문하고 기다립니다. <@UOWN>");
+		expect(r.reminders).toEqual([]);
+	});
+
+	test("AC-3: no question: the unmet nudge goes out once, as before", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ problems: UNMET }) };
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = asking("끝났습니다.");
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(1);
+		expect(r.reminders[0]).toStartWith("Outcome 판정이 아직 미도달입니다.");
+		expect(questionCards(r)).toHaveLength(0);
+	});
+
+	test("AC-3: a failed session read: the nudge goes out once, one warning per run of failures", async () => {
+		const r = rig();
+		r.next.value = { ok: true, judgement: judgement({ problems: UNMET }) };
+		r.agent.value = { ok: true, status: "idle", sessionPath: SESSION };
+		r.answer.value = new Error("ENOENT: no such file");
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(r.reminders).toHaveLength(1);
+		expect(r.answerCalls).toHaveLength(2);
+		expect(r.warnings.filter((w) => w.event === "task_question_read_failed")).toEqual([
+			{ event: "task_question_read_failed", fields: { task: r.row.taskId, error: "ENOENT: no such file" } },
+		]);
+		// A read that works again ends the run: the next failure is told once more.
+		r.answer.value = asking("끝났습니다.");
+		await r.sweeper.sweep();
+		r.answer.value = new Error("EACCES");
+		await r.sweeper.sweep();
+		expect(r.warnings.filter((w) => w.event === "task_question_read_failed")).toHaveLength(2);
+	});
+
+	test("AC-3: working, blocked and gone never ask the session reader", async () => {
+		const r = rig();
+		r.answer.value = asking(QUESTION);
+		for (const status of ["working", "blocked", "gone"] as const) {
+			r.agent.value = { ok: true, status, sessionPath: SESSION };
+			await r.sweeper.sweep();
+		}
+		expect(r.answerCalls).toEqual([]);
+		expect(questionCards(r)).toHaveLength(0);
 	});
 });

@@ -2,18 +2,20 @@
 // `https://api.botframework.com/.default`, then `POST/PUT/DELETE <serviceUrl>/v3/conversations/{id}/activities[/{id}]`.
 // The service URL comes from an inbound Activity; the bearer token only ever goes to a Microsoft Bot Connector host.
 
-export const BOT_CONNECTOR_SCOPE = "https://api.botframework.com/.default";
-export const tokenUrlOf = (tenant: string): string => `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+const BOT_CONNECTOR_SCOPE = "https://api.botframework.com/.default";
+const tokenUrlOf = (tenant: string): string => `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
 /** A cached token is renewed this long before it expires. */
 const TOKEN_EARLY_RENEW_MS = 5 * 60_000;
 /** Retry-After when a 429 names none. */
 const DEFAULT_RETRY_AFTER_MS = 5_000;
+/** Per request: the delivery pump waits on each platform in turn, so one stuck Teams call must not hold the others. */
+const CALL_TIMEOUT_MS = 15_000;
 
 /** Hosts the Bot Connector answers on for Teams (public cloud). */
 const CONNECTOR_HOSTS = [".botframework.com", ".trafficmanager.net", ".teams.microsoft.com"];
 
 /** Default `allowServiceUrl`: https on a Bot Connector host, so the bearer token never goes elsewhere. */
-export function isConnectorServiceUrl(serviceUrl: string): boolean {
+function isConnectorServiceUrl(serviceUrl: string): boolean {
 	try {
 		const url = new URL(serviceUrl);
 		return url.protocol === "https:" && CONNECTOR_HOSTS.some((suffix) => url.hostname.endsWith(suffix));
@@ -47,14 +49,14 @@ export class TeamsRateLimitedError extends Error {
 }
 
 /** The part of an outbound Activity ompbot sends. */
-export interface OutboundActivity {
+interface OutboundActivity {
 	type: "message" | "typing";
 	text?: string;
 	textFormat?: "markdown" | "plain";
 	replyToId?: string;
 }
 
-export interface TeamsConnectorOptions {
+interface TeamsConnectorOptions {
 	appId: string;
 	/** Read at every token request, so a rotated secret file needs no restart of the connector. */
 	clientSecret: () => string;
@@ -111,6 +113,7 @@ export class TeamsConnector {
 				method: "POST",
 				headers: { "content-type": "application/x-www-form-urlencoded" },
 				body,
+				signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
 			});
 		} catch (err) {
 			throw new TeamsCallError(
@@ -146,6 +149,7 @@ export class TeamsConnector {
 				method,
 				headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 				...(body === undefined ? {} : { body: JSON.stringify(body) }),
+				signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
 			});
 		} catch (err) {
 			throw new TeamsCallError(

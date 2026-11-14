@@ -86,6 +86,12 @@ class SettlingTransport extends WaitingTransport {
 
 class SteerSignalDriver extends FakeOmpDriver {
 	readonly steered = Promise.withResolvers<void>();
+	readonly prompted = Promise.withResolvers<void>();
+	override async prompt(text: string): Promise<string> {
+		const opRef = await super.prompt(text);
+		this.prompted.resolve();
+		return opRef;
+	}
 	override async steer(text: string): Promise<void> {
 		await super.steer(text);
 		this.steered.resolve();
@@ -213,6 +219,30 @@ describe("status messages are finished for every row of a turn and for commands"
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});
+
+	test("!stop: its one answer finishes the stopped turn's and the waiting followup's ⏳ as 🚫 취소됨", async () => {
+		const transport = new SettlingTransport();
+		const d = await boot(transport, true);
+		await d.inject({ origin: ORIGIN, asOwner: true, text: "long job" });
+		await transport.waitForPosts((t) => t.startsWith("⏳"), 1);
+		await d.inject({ origin: ORIGIN, asOwner: true, text: "/followup-ompbot next job" });
+		await transport.waitForPosts((t) => t.startsWith("⏳"), 2);
+		const statuses = transport.posts((t) => t.startsWith("⏳")).map((c) => c.ts);
+		await d.inject({ origin: ORIGIN, asOwner: true, text: "!stop" });
+		await transport.waitForPosts((t) => t.startsWith("⏹"));
+		const cancelled = () =>
+			transport.calls.flatMap((c) => (c.method === "updateMessage" && c.text.startsWith("🚫 취소됨") ? [c.ts] : []));
+		await transport.settled(() => statuses.every((ts) => cancelled().includes(ts)));
+		const driver = drivers[0];
+		if (!driver) throw new Error("driver not created");
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job"]);
+		expect(transport.posts((t) => t.startsWith("⏹")).map((c) => c.text)).toEqual([
+			"⏹ 멈췄습니다. 세션은 그대로라 이어서 말하면 됩니다. 대기 1개를 취소했습니다.",
+		]);
+		expect(transport.posts((t) => t.startsWith("ANSWER") || t.startsWith("[turn failed]"))).toEqual([]);
+		expect(transport.stuckStatuses()).toEqual([]);
+		expect(transport.eyesLeft()).toEqual([]);
+	});
 });
 
 describe("interim deliveries go out while the turn runs", () => {
@@ -250,6 +280,38 @@ describe("interim deliveries go out while the turn runs", () => {
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
 		await transport.settled(() => transport.deleted().length >= 1);
 		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => c.text)).toEqual(["ANSWER 지도 완료"]);
+		expect(transport.stuckStatuses()).toEqual([]);
+		expect(transport.eyesLeft()).toEqual([]);
+	});
+});
+
+/** Every answer post fails like a dropped connection (ambiguous: it may have reached Slack). */
+class LosingTransport extends SettlingTransport {
+	override async postMessage(args: {
+		channel: string;
+		text: string;
+		threadTs?: string | undefined;
+		blocks?: readonly unknown[] | undefined;
+	}): Promise<{ ts: string }> {
+		if (args.text.startsWith("ANSWER")) throw new Error("socket hang up");
+		return super.postMessage(args);
+	}
+}
+
+describe("an answer that could not be sent", () => {
+	test("an ambiguous send failure ends the ⏳ as ⚠️ 답을 보내지 못했습니다 and removes the 👀", async () => {
+		const transport = new LosingTransport();
+		const d = await boot(transport, true);
+		await d.inject({ origin: ORIGIN, asOwner: true, text: "lost answer" });
+		await transport.waitForPosts((t) => t.startsWith("⏳"), 1);
+		const driver = drivers[0];
+		if (!driver) throw new Error("driver not created");
+		await driver.prompted.promise;
+		driver.release();
+		await transport.settled(() =>
+			transport.calls.some((c) => c.method === "updateMessage" && c.text.startsWith("⚠️ 답을 보내지 못했습니다")),
+		);
+		expect(transport.posts((t) => t.startsWith("ANSWER"))).toEqual([]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});

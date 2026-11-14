@@ -1,3 +1,4 @@
+import { countsTowardDeadLetter, SingleFlightBackfill } from "../channel/backfill";
 import type { Logger } from "../log";
 import { redact } from "../redact";
 import { type HistoryMessage, SlackCallError, type SlackMessageEvent, type SlackTransport } from "./transport";
@@ -207,19 +208,6 @@ async function scanAscending(
 	return { messages, truncated, reachedWatermark: !truncated, oldestSeen: messages[0]?.ts };
 }
 
-const TRANSIENT_STORE_ERROR = /SQLITE_(BUSY|LOCKED|FULL|IOERR)/;
-
-/**
- * Whether an ingest failure is a per-message failure that counts toward the dead-letter budget. Transient Slack errors
- * and transient ledger errors (busy/locked/full/io) stay retryable without counting: they are not the message's fault.
- */
-function countsTowardDeadLetter(error: unknown): boolean {
-	if (error instanceof SlackCallError) return error.kind === "definitive";
-	const code = (error as { code?: unknown } | null)?.code;
-	if (typeof code === "string" && TRANSIENT_STORE_ERROR.test(code)) return false;
-	return !TRANSIENT_STORE_ERROR.test(error instanceof Error ? error.message : String(error));
-}
-
 async function backfillTarget(input: {
 	key: string;
 	channel: string;
@@ -307,7 +295,7 @@ async function backfillTarget(input: {
 			}
 			input.attempts.delete(attemptKey);
 		} catch (error) {
-			if (countsTowardDeadLetter(error)) {
+			if (countsTowardDeadLetter(error, error instanceof SlackCallError ? error.kind === "definitive" : undefined)) {
 				const attemptCount = (input.attempts.get(attemptKey) ?? 0) + 1;
 				input.attempts.set(attemptKey, attemptCount);
 				if (attemptCount >= MAX_MESSAGE_ATTEMPTS) {
@@ -510,47 +498,23 @@ export async function runBackfillPass(
  * Single-flight trigger (upstream RecoveryScheduler): concurrent triggers coalesce into one follow-up pass instead of
  * stacking. `SlackBinding` wires it as the adapter's `recover()`: startup and every socket reconnect (`transport.onReady`).
  */
-export class BackfillRunner {
-	#running = false;
-	#followUp = false;
-	#lastRun: Promise<void> = Promise.resolve();
+export class BackfillRunner extends SingleFlightBackfill {
 	readonly #state = { attempts: new Map<string, number>(), quarantine: new Map<string, number>() };
 
-	constructor(private readonly buildDeps: () => BackfillDeps) {}
-
-	trigger(): void {
-		if (this.#running) {
-			this.#followUp = true;
-			return;
-		}
-		this.#running = true;
-		this.#lastRun = this.#drain();
+	constructor(private readonly buildDeps: () => BackfillDeps) {
+		super();
 	}
 
-	/** Resolves when no pass is in flight and no follow-up is pending (tests and graceful shutdown). */
-	waitForIdle(): Promise<void> {
-		return this.#lastRun;
+	protected pass(): Promise<BackfillSummary> {
+		return runBackfillPass(this.buildDeps(), this.#state);
 	}
 
-	/** Never throws: when building the deps is what failed there is no logger, so fall back to stderr. */
-	#reportFailure(error: unknown): void {
+	/** When building the deps is what failed there is no logger, so fall back to stderr. */
+	protected failed(error: unknown): void {
 		try {
 			this.buildDeps().log.error("slack_backfill_failed", { error: String(error) });
 		} catch {
 			console.error(redact(`[ompbot] slack_backfill_failed: ${String(error)}`));
-		}
-	}
-
-	async #drain(): Promise<void> {
-		try {
-			do {
-				this.#followUp = false;
-				await runBackfillPass(this.buildDeps(), this.#state);
-			} while (this.#followUp);
-		} catch (error) {
-			this.#reportFailure(error);
-		} finally {
-			this.#running = false;
 		}
 	}
 }

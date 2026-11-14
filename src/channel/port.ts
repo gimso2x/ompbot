@@ -1,4 +1,4 @@
-// What the core may ask of a chat platform. Platform ids (Slack channel/ts, Telegram chat/message ids) only appear as
+// What the core may ask of a chat platform. Platform ids (Slack channel/ts, Discord ids) only appear as
 // opaque `conversationId`/`messageId`/`threadId` strings; each adapter maps them onto its own API.
 import type { ChatPlatform } from "../core/origin-key";
 
@@ -43,7 +43,6 @@ export interface OutboundMessage {
 
 export interface ChannelPort {
 	readonly platform: ChatPlatform;
-	readonly capabilities: { permalink: boolean; reactions: boolean };
 	post(target: PostTarget, msg: OutboundMessage): Promise<MessageRef>;
 	edit(ref: MessageRef, msg: OutboundMessage): Promise<void>;
 	/** Adds (`on`) or removes one reaction emoji by name. */

@@ -96,7 +96,7 @@ export const RULES: readonly Rule[] = [
 	{
 		kind: "instruction override",
 		matches: re(
-			/ignore (?:all |any |the )?(?:previous|prior|above|earlier) (?:instructions?|prompts?|rules?)|disregard (?:your |the )?(?:instructions?|rules?)|이전\s*지시(?:를|사항을|는)?\s*(?:무시|잊)|앞(?:의|서)\s*(?:지시|명령|규칙)(?:를|을)?\s*(?:무시|잊)|지시를?\s*(?:잊어|무시해)|(?:忽略|无视|忘掉|忘记)(?:之前|以上|先前|前面)(?:的)?(?:所有)?(?:指令|指示|提示|规则)/iu,
+			/ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?)|disregard\s+(?:your\s+|the\s+)?(?:instructions?|rules?)|이전\s*지시(?:를|사항을|는)?\s*(?:무시|잊)|앞(?:의|서)\s*(?:지시|명령|규칙)(?:를|을)?\s*(?:무시|잊)|지시를?\s*(?:잊어|무시해)|(?:忽略|无视|忘掉|忘记)(?:之前|以上|先前|前面)(?:的)?(?:所有)?(?:指令|指示|提示|规则)/iu,
 		),
 	},
 	// A message pretending to be the system or the agent's own scaffolding.
@@ -110,7 +110,7 @@ export const RULES: readonly Rule[] = [
 	{
 		kind: "role reassignment",
 		matches: re(
-			/you are (?:now |no longer )(?:a|an|the)\b|from now on,? you (?:are|will|must|answer)|지금부터\s*(?:너는|당신은|넌)\s*\S|이제부터\s*(?:너는|넌)\s*\S|(?:从现在起|从现在开始)[，,]?\s*你(?:是|就是|将是)\S/iu,
+			/you\s+are\s+(?:now\s+|no\s+longer\s+)(?:a|an|the)\b|from\s+now\s+on,?\s+you\s+(?:are|will|must|answer)|지금부터\s*(?:너는|당신은|넌)\s*\S|이제부터\s*(?:너는|넌)\s*\S|(?:从现在起|从现在开始)[，,]?\s*你(?:是|就是|将是)\S/iu,
 		),
 	},
 	// Fake tool calls written as text.
@@ -129,9 +129,13 @@ export const RULES: readonly Rule[] = [
 	{ kind: "instruction hidden in data", matches: hiddenInstruction },
 ];
 
-/** Every rule that matches `text`, at most one finding per rule. */
+/** Characters that render as nothing (zero-width space/joiners, word joiner, BOM, soft hyphen): they split no word. */
+const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+
+/** Every rule that matches `text` with its invisible characters dropped, at most one finding per rule. */
 export function scanForInjection(text: string, where: string): InjectionFinding[] {
-	return RULES.filter((rule) => rule.matches(text)).map((rule) => ({ kind: rule.kind, where }));
+	const visible = text.replace(INVISIBLE, "");
+	return RULES.filter((rule) => rule.matches(visible)).map((rule) => ({ kind: rule.kind, where }));
 }
 
 /** Start of every `injectionWarning` line (recall drops these lines before picking topic words). */

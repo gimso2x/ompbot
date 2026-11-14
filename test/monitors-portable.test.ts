@@ -1,9 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	cpSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openMonitorLedger } from "../src/monitors/ledger";
-import { exportMonitors } from "../src/monitors/portable";
+import { applyMonitors, exportMonitors } from "../src/monitors/portable";
 import { parseMonitorSpec } from "../src/monitors/spec";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
@@ -121,6 +132,48 @@ describe("ompbot monitors export/apply", () => {
 		const script = rowsOf(b)["disk check"]?.trigger;
 		expect(script?.kind === "script" && script.command).toEqual([join(b.dir, "scripts", "check.sh"), "--quiet"]);
 
+		expect((await monitors(b, "export", "--dir", dirB)).code).toBe(0);
+		expect(jsonFiles(dirB)).toEqual(jsonFiles(dirA));
+	});
+
+	test("a cron command round-trips as @SCRIPTS@/ with its timeout, and --with-files carries the script", async () => {
+		const a = home("ompbot-portable-a-");
+		const b = home("ompbot-portable-b-");
+		const script = join(a.dir, "scripts", "brief.sh");
+		writeFileSync(script, "#!/bin/sh\necho brief\n");
+		chmodSync(script, 0o755);
+		addMonitor(a, {
+			name: "brief",
+			trigger: { kind: "cron", schedule: "0 8 * * *", command: [script, "--days", "7"], timeoutMs: 900_000 },
+			instruction: "post the script output",
+			deliver: "verbatim",
+		});
+		const dirA = tempDir("ompbot-export-a-");
+		const dirB = tempDir("ompbot-export-b-");
+		expect((await monitors(a, "export", "--dir", dirA, "--with-files")).code).toBe(0);
+		const exported = JSON.parse(readFileSync(join(dirA, "brief.json"), "utf8")) as {
+			trigger: Record<string, unknown>;
+			deliver?: string;
+		};
+		expect([exported.trigger.command, exported.trigger.timeoutMs, exported.deliver]).toEqual([
+			["@SCRIPTS@/brief.sh", "--days", "7"],
+			900_000,
+			"verbatim",
+		]);
+		expect(readdirSync(join(dirA, "files", "scripts"))).toEqual(["brief.sh"]);
+		cpSync(join(dirA, "files", "scripts"), join(b.dir, "scripts"), { recursive: true });
+
+		const applied = await monitors(b, "apply", "--dir", dirA);
+		expect([applied.code, applied.stdout]).toEqual([0, "added=1 updated=0 unchanged=0 removed=0\n"]);
+		const row = rowsOf(b).brief;
+		expect(row?.trigger).toEqual({
+			kind: "cron",
+			schedule: "0 8 * * *",
+			timezone: "Asia/Seoul",
+			command: [join(b.dir, "scripts", "brief.sh"), "--days", "7"],
+			timeoutMs: 900_000,
+		});
+		expect(row?.deliver).toBe("verbatim");
 		expect((await monitors(b, "export", "--dir", dirB)).code).toBe(0);
 		expect(jsonFiles(dirB)).toEqual(jsonFiles(dirA));
 	});
@@ -273,5 +326,107 @@ describe("monitors export --with-files: arguments with ..", () => {
 		expect(result.warnings.some((warning) => warning.includes(dotted))).toBe(true);
 		expect(readFileSync(join(dir, "files", "scripts", "data.txt"), "utf8")).toBe("data\n");
 		expect(readFileSync(join(dir, "files", "scripts", "check.sh"), "utf8")).toBe("#!/bin/sh\nexit 0\n");
+	});
+});
+
+describe("monitors export --with-files: symlinks", () => {
+	test("qa-h n60: a file under a root linking outside it is not copied and warned; a link inside is copied", () => {
+		const base = tempDir("ompbot-n60-");
+		const scriptsRoot = join(base, "h", "scripts");
+		const workspaceDir = join(base, "h", "workspace");
+		mkdirSync(scriptsRoot, { recursive: true });
+		mkdirSync(join(workspaceDir, "proc"), { recursive: true });
+		const script = join(scriptsRoot, "check.sh");
+		writeFileSync(script, "#!/bin/sh\nexit 0\n");
+		chmodSync(script, 0o755);
+		writeFileSync(join(scriptsRoot, "real.txt"), "inside\n");
+		const secret = join(base, "outside-secret.txt");
+		writeFileSync(secret, "victim\n");
+		for (const name of ["procedure.md", "inner.md", "gone.md"]) writeFileSync(join(workspaceDir, "proc", name), "x\n");
+		const ctx = { scriptsRoot, workspaceDir, defaultTimezone: "Asia/Seoul" };
+		const ledger = openMonitorLedger(join(base, "ompbot.db"));
+		cleanups.push(() => ledger.close());
+		const outArg = join(scriptsRoot, "out.txt");
+		const inArg = join(scriptsRoot, "in.txt");
+		writeFileSync(outArg, "x\n");
+		writeFileSync(inArg, "x\n");
+		ledger.addMonitor(
+			parseMonitorSpec(
+				{
+					name: "linked",
+					trigger: { kind: "script", command: [script, outArg, inArg], intervalMs: 300_000 },
+					instruction: "x",
+					procedureFiles: ["proc/procedure.md", "proc/inner.md", "proc/gone.md"],
+				},
+				ctx,
+			),
+		);
+		// Swapped for links after the monitor was stored, the way a model can do it in the workspace.
+		const relink = (path: string, target: string) => {
+			rmSync(path);
+			symlinkSync(target, path);
+		};
+		relink(join(workspaceDir, "proc", "procedure.md"), secret);
+		relink(outArg, secret);
+		relink(join(workspaceDir, "proc", "inner.md"), "../notes.md");
+		writeFileSync(join(workspaceDir, "notes.md"), "notes\n");
+		relink(inArg, "real.txt");
+		relink(join(workspaceDir, "proc", "gone.md"), join(base, "nonexistent.md"));
+		const dir = join(base, "export");
+		const { warnings } = exportMonitors(ledger, dir, ctx, { withFiles: true });
+		expect(warnings).toContain(
+			`linked: referenced file resolves outside ${workspaceDir}, not copied: ${join(workspaceDir, "proc", "procedure.md")}`,
+		);
+		expect(warnings).toContain(`linked: referenced file resolves outside ${scriptsRoot}, not copied: ${outArg}`);
+		expect(warnings).toContain(`referenced file not found, not copied: ${join(workspaceDir, "proc", "gone.md")}`);
+		expect(existsSync(join(dir, "files", "workspace", "proc", "procedure.md"))).toBe(false);
+		expect(existsSync(join(dir, "files", "scripts", "out.txt"))).toBe(false);
+		expect(readFileSync(join(dir, "files", "workspace", "proc", "inner.md"), "utf8")).toBe("notes\n");
+		expect(readFileSync(join(dir, "files", "scripts", "in.txt"), "utf8")).toBe("inside\n");
+		expect(readFileSync(join(dir, "files", "scripts", "check.sh"), "utf8")).toBe("#!/bin/sh\nexit 0\n");
+	});
+});
+
+describe("monitors portable apply/export on odd entries (qa-i low)", () => {
+	const portableCtx = (h: TestHome) => ({
+		scriptsRoot: join(h.dir, "scripts"),
+		workspaceDir: h.config.workspaceDir,
+		webhook: { port: 1 },
+		defaultTimezone: "Asia/Seoul",
+	});
+
+	test("apply skips a FIFO and a directory named *.json instead of blocking or failing", () => {
+		const h = home("portable-odd-");
+		const dir = tempDir("portable-odd-dir-");
+		writeFileSync(join(dir, "ok.json"), JSON.stringify({ name: "ok", trigger: { kind: "webhook" }, instruction: "x" }));
+		mkdirSync(join(dir, "dir.json"));
+		expect(Bun.spawnSync(["mkfifo", join(dir, "pipe.json")]).exitCode).toBe(0);
+		const result = applyMonitors(ledgerOf(h), dir, portableCtx(h));
+		expect(result.added).toBe(1);
+		expect(result.warnings.sort()).toEqual([
+			"dir.json: not a regular file, skipped",
+			"pipe.json: not a regular file, skipped",
+		]);
+	});
+
+	test("export --with-files warns for an unreadable referenced file and still finishes", () => {
+		const h = home("portable-eacces-");
+		const scripts = join(h.dir, "scripts");
+		const locked = join(scripts, "locked.sh");
+		writeFileSync(locked, "#!/bin/sh\nexit 0\n");
+		chmodSync(locked, 0o755);
+		writeFileSync(join(scripts, "fine.md"), "fine\n");
+		addMonitor(h, {
+			name: "m",
+			trigger: { kind: "script", command: [locked, join(scripts, "fine.md")], intervalMs: 300_000 },
+			instruction: "x",
+		});
+		chmodSync(locked, 0o200);
+		const dir = join(tempDir("portable-eacces-out-"), "e");
+		const { warnings } = exportMonitors(ledgerOf(h), dir, portableCtx(h), { withFiles: true });
+		chmodSync(locked, 0o600);
+		expect(warnings.some((w) => w.includes("referenced file not copied") && w.includes(locked))).toBe(true);
+		expect(readFileSync(join(dir, "files", "scripts", "fine.md"), "utf8")).toBe("fine\n");
+		expect(existsSync(join(dir, "m.json"))).toBe(true);
 	});
 });

@@ -1671,3 +1671,54 @@ describe("inline code opened with several backticks (CommonMark backtick runs)",
 		]);
 	});
 });
+
+describe("a new turn in a thread whose previous turn is still finishing", () => {
+	const TS2 = "1800000000.000900";
+	const REF = `D1:${TS}`;
+	const deletedTs = () => transport.calls.flatMap((c) => (c.method === "deleteMessage" ? [c.ts] : []));
+
+	test("IMP-28: the old finish completing after the new message arrived leaves the new turn's status tracked", async () => {
+		await transport.emitMessage(dm());
+		const oldStatusTs = posts()[0]?.ts ?? "";
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const deleteMessage = transport.deleteMessage.bind(transport);
+		transport.deleteMessage = async (args) => {
+			reached.resolve();
+			await release.promise;
+			return deleteMessage(args);
+		};
+		const finishing = adapter.finishStatus(REF, "done", "delete");
+		await reached.promise;
+		await transport.emitMessage(dm({ ts: TS2, thread_ts: TS, text: "하나 더" }));
+		const newStatusTs = posts().at(-1)?.ts ?? "";
+		release.resolve();
+		await finishing;
+		await adapter.finishStatus(REF, "done", "delete");
+		expect(deletedTs()).toEqual([oldStatusTs, newStatusTs]);
+		expect(transport.calls.flatMap((c) => (c.method === "removeReaction" ? [`${c.timestamp} ${c.name}`] : []))).toEqual(
+			[`${TS} eyes`, `${TS2} eyes`],
+		);
+	});
+
+	test("IMP-105: the old turn's rate-limited ⏳ delete and 👀 removal are retried after a new turn took the thread", async () => {
+		await transport.emitMessage(dm());
+		const oldStatusTs = posts()[0]?.ts ?? "";
+		transport.failNext.deleteMessage = [new SlackRateLimitedError(5_000)];
+		transport.failNext.removeReaction = [new SlackRateLimitedError(5_000)];
+		await adapter.finishStatus(REF, "done", "delete");
+		await transport.emitMessage(dm({ ts: TS2, thread_ts: TS, text: "하나 더" }));
+		const newStatusTs = posts().at(-1)?.ts ?? "";
+		now += 5_000;
+		await adapter.tick();
+		expect(deletedTs()).toEqual([oldStatusTs, oldStatusTs]);
+		expect(transport.calls.flatMap((c) => (c.method === "removeReaction" ? [`${c.timestamp} ${c.name}`] : []))).toEqual(
+			[`${TS} eyes`, `${TS} eyes`],
+		);
+		// The new turn is still the thread's running status.
+		await adapter.finishStatus(REF, "done", "delete");
+		expect(deletedTs()).toEqual([oldStatusTs, oldStatusTs, newStatusTs]);
+		await adapter.tick();
+		expect(deletedTs()).toHaveLength(3);
+	});
+});

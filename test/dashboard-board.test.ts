@@ -187,7 +187,6 @@ const SNAPSHOT: DashboardSnapshot = {
 	timezone: "Asia/Seoul",
 	daemon: { ok: false, error: "no daemon" },
 	turns: { ok: true, items: [], threads: [] },
-	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	tasks: {
 		ok: true,
 		items: [

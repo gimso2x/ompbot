@@ -17,7 +17,7 @@ import {
 	type Stats,
 	statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parseStampFields, parseStampTs, writeAtomic0600 } from "./stamp";
 
 /** Daily backup files live at `<home>/backups/ompbot-YYYYMMDD-HHMMSS.db`; the stamp sits next to them. */
@@ -56,7 +56,10 @@ export class BackupError extends Error {
 
 export interface BackupOptions {
 	homeDir: string;
-	/** How many newest daily backups to keep. 0 disables pruning. Default 14. */
+	/**
+	 * How many days of daily backups to keep, per kind: every file of this run's day, the latest file of each other
+	 * day (see `retentionDoomed`). 0 disables pruning. Default 14.
+	 */
 	keep?: number;
 	/** Timestamp used for the file name (tests inject this). */
 	now?: Date;
@@ -64,6 +67,11 @@ export interface BackupOptions {
 	maxBundleBytes?: number;
 	/** The tar binary (tests inject this). Default `tar` on PATH. */
 	tarBin?: string;
+	/**
+	 * Snapshot the db only (`apply`'s pre-restart backup): no bundle, and the stamp is left as it is - a stamp without a
+	 * bundle would fail doctor's `backup bundle` check, and the daily backup keeps the stamp and its bundle fresh.
+	 */
+	skipBundle?: boolean;
 }
 
 export interface BackupResult {
@@ -75,7 +83,8 @@ export interface BackupResult {
 	bundle: string | undefined;
 	bundleBytes: number | undefined;
 	bundleSha256: string | undefined;
-	stamp: string;
+	/** Path of the success stamp this run wrote; `undefined` with `skipBundle` (the stamp was left alone). */
+	stamp: string | undefined;
 	kept: string[];
 	removed: string[];
 }
@@ -212,6 +221,9 @@ function createPendingBundle(
 		const secrets = secretInodes(secretsReal);
 		/** Top-level symlinked sources and their real targets: only that one link is followed, never links inside it. */
 		const linked = new Map<string, string>();
+		/** Real path of every source seen so far, plain ones included: a link into a plain source would archive it twice. */
+		const reals = new Map<string, string>();
+		const homeReal = realpathSync(homeDir);
 		/** Directory sources that had entries before tar ran: their archive must carry at least one member below them. */
 		const nonEmpty = new Set<string>();
 		let bytes = 0;
@@ -234,13 +246,15 @@ function createPendingBundle(
 				if (stat.isDirectory() !== (source !== "config.json")) {
 					throw new BackupError("bundle_failed", `${source} links to the wrong kind of file`);
 				}
-				for (const [other, otherReal] of linked) {
-					if (real === otherReal || real.startsWith(`${otherReal}/`) || otherReal.startsWith(`${real}/`)) {
-						throw new BackupError("bundle_failed", `${source} and ${other} link to overlapping paths`);
-					}
-				}
 				linked.set(source, real);
 			}
+			const here = linked.get(source) ?? join(homeReal, source);
+			for (const [other, otherReal] of reals) {
+				if (here === otherReal || here.startsWith(`${otherReal}/`) || otherReal.startsWith(`${here}/`)) {
+					throw new BackupError("bundle_failed", `${source} and ${other} link to overlapping paths`);
+				}
+			}
+			reals.set(source, here);
 			if (stat.isDirectory()) {
 				bytes += treeBytes(real, source, secrets);
 				if (readdirSync(real).length > 0) nonEmpty.add(source);
@@ -306,7 +320,8 @@ function createPendingBundle(
  * with `PRAGMA quick_check`, and only then renamed into place - a failed backup never leaves a newest-mtime file
  * behind that a freshness check could mistake for a good one. The bundle is built and listed before either rename,
  * so a bundle failure leaves no partial backup at all. The success stamp (`last-backup.ok`, including the bundle's
- * name and sha256) is written last, and pruning runs only after the new backup is on disk.
+ * name and sha256) is written last, and pruning runs only after the new backup is on disk. `skipBundle` makes and
+ * verifies the db snapshot alone and writes no stamp.
  */
 export function runBackup(options: BackupOptions): BackupResult {
 	const keep = options.keep ?? DEFAULT_KEEP;
@@ -352,13 +367,16 @@ export function runBackup(options: BackupOptions): BackupResult {
 		}
 		if (check !== "ok") throw new BackupError("integrity_check_failed", `quick_check=${check}`);
 
-		bundle = createPendingBundle(
-			homeDir,
-			backupsDir,
-			stamp,
-			options.maxBundleBytes ?? DEFAULT_MAX_BUNDLE_BYTES,
-			options.tarBin ?? "tar",
-		);
+		bundle =
+			options.skipBundle === true
+				? undefined
+				: createPendingBundle(
+						homeDir,
+						backupsDir,
+						stamp,
+						options.maxBundleBytes ?? DEFAULT_MAX_BUNDLE_BYTES,
+						options.tarBin ?? "tar",
+					);
 		renameSync(tmp, target);
 		if (bundle !== undefined) renameSync(bundle.tmp, bundle.target);
 		fsyncPath(backupsDir);
@@ -380,12 +398,22 @@ export function runBackup(options: BackupOptions): BackupResult {
 	const bundleBytes = bundle === undefined ? undefined : statSync(bundle.target).size;
 	const bundleSha256 = bundle === undefined ? undefined : sha256File(bundle.target);
 	const bundleName = bundle === undefined ? undefined : bundle.target.split("/").pop();
-	const stampPath = writeStampAtomic(
-		backupsDir,
-		`ts=${now.toISOString()} file=${target.split("/").pop()} bytes=${bytes} sha256=${sha256} integrity=ok check=quick_check${
-			bundle === undefined ? "" : ` bundle=${bundleName} bundle_bytes=${bundleBytes} bundle_sha256=${bundleSha256}`
-		}\n`,
-	);
+	let stampPath: string | undefined;
+	if (options.skipBundle !== true) {
+		try {
+			stampPath = writeStampAtomic(
+				backupsDir,
+				`ts=${now.toISOString()} file=${target.split("/").pop()} bytes=${bytes} sha256=${sha256} integrity=ok check=quick_check${
+					bundle === undefined ? "" : ` bundle=${bundleName} bundle_bytes=${bundleBytes} bundle_sha256=${bundleSha256}`
+				}\n`,
+			);
+		} catch (error) {
+			// Both targets were checked absent before the run: without their stamp they are leftovers, not a backup.
+			rmSync(target, { force: true });
+			if (bundle !== undefined) rmSync(bundle.target, { force: true });
+			throw error;
+		}
+	}
 
 	const removed =
 		keep > 0 ? pruneBackups(backupsDir, keep, bundle === undefined ? target : [target, bundle.target]) : [];
@@ -393,7 +421,6 @@ export function runBackup(options: BackupOptions): BackupResult {
 		.filter((name) => BACKUP_FILE_PATTERN.test(name))
 		.sort()
 		.reverse()
-		.slice(0, keep > 0 ? keep : undefined)
 		.map((name) => join(backupsDir, name));
 
 	return {
@@ -410,22 +437,52 @@ export function runBackup(options: BackupOptions): BackupResult {
 }
 
 /**
- * Deletes the oldest daily backups beyond `keep`, newest-first by name, with the same policy for the db snapshots
- * and the bundles (their names sort chronologically within a kind, not across kinds). The patterns only match the
- * timestamped daily names, so manual copies (`ompbot-pre-upgrade-…db`, `.bak-…`) and the stamp are never touched.
+ * Day retention for one kind of daily file (`pattern`), shared by the local prune and the off-site pass. A day is
+ * the `YYYYMMDD` of the name's stamp (no time zone conversion). The base day is the day of the `protect` names (the
+ * files this run made) - or, without one, the newest stamp's day - and every file of it stays; the other `keep - 1`
+ * newest days keep only their latest file, so a clock that stepped back (future-dated names) cannot shrink the run's
+ * own day. Returns the names to delete, newest name first; names outside `pattern` and `protect` are never in it.
+ */
+export function retentionDoomed(
+	names: readonly string[],
+	keep: number,
+	protect: readonly string[],
+	pattern: RegExp,
+): string[] {
+	const daily = names
+		.filter((name) => pattern.test(name))
+		.sort()
+		.reverse();
+	const dayOf = (name: string) => name.match(/(\d{8})-\d{6}/)?.[1] ?? "";
+	const baseDays = new Set(protect.filter((name) => pattern.test(name)).map(dayOf));
+	if (baseDays.size === 0 && daily[0] !== undefined) baseDays.add(dayOf(daily[0]));
+	const otherDays = [...new Set(daily.map(dayOf))].filter((day) => !baseDays.has(day));
+	const keptDays = new Set(otherDays.slice(0, Math.max(0, keep - baseDays.size)));
+	const doomed: string[] = [];
+	for (const name of daily) {
+		const day = dayOf(name);
+		// a protected name's day is a base day, so protect is never doomed
+		if (baseDays.has(day)) continue;
+		// daily is newest-first, so the first name seen of a kept day is its latest
+		if (keptDays.delete(day)) continue;
+		doomed.push(name);
+	}
+	return doomed;
+}
+
+/**
+ * Applies `retentionDoomed` to the db snapshots and the bundles separately (`keep` days per kind, `protect` = the
+ * absolute paths this run made), deleting newest-first by name. The patterns only match the timestamped daily
+ * names, so manual copies (`ompbot-pre-upgrade-…db`, `.bak-…`) and the stamp are never touched.
  */
 export function pruneBackups(backupsDir: string, keep: number, protect: string | readonly string[]): string[] {
-	const guarded = new Set(typeof protect === "string" ? [protect] : protect);
+	const guarded = (typeof protect === "string" ? [protect] : protect).map((path) => basename(path));
 	const names = readdirSync(backupsDir, { withFileTypes: true })
 		.filter((e) => e.isFile())
 		.map((e) => e.name);
 	const removed: string[] = [];
 	for (const kind of [BACKUP_FILE_PATTERN, BUNDLE_FILE_PATTERN]) {
-		const daily = names
-			.filter((name) => kind.test(name) && !guarded.has(join(backupsDir, name)))
-			.sort()
-			.reverse();
-		for (const name of daily.slice(Math.max(0, keep - 1))) {
+		for (const name of retentionDoomed(names, keep, guarded, kind)) {
 			const path = join(backupsDir, name);
 			try {
 				rmSync(path, { force: true });
@@ -455,6 +512,8 @@ export function readStamp(backupsDir: string, name: string = STAMP_FILE): StampI
 	const stampPath = join(backupsDir, name);
 	let text: string;
 	try {
+		// A FIFO in the stamp's place would block the read forever.
+		if (!statSync(stampPath).isFile()) return undefined;
 		text = readFileSync(stampPath, "utf8");
 	} catch {
 		return undefined;

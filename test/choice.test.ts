@@ -61,7 +61,6 @@ interface CardWrite {
 
 class RecordingPort implements ChannelPort {
 	readonly platform = "slack" as const;
-	readonly capabilities = { permalink: false, reactions: false };
 	readonly writes = new Seen<CardWrite>();
 	#next = 1;
 

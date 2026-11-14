@@ -7,8 +7,15 @@ import type { FreezeState } from "../ops/freeze";
 import type { Store } from "../store/db";
 import { firesBetween } from "./cron";
 import { type ClaimResult, type MonitorEventRow, type MonitorRow, monitorOrigin, NO_REPORT, SILENT } from "./ledger";
-import { runScript } from "./script";
-import { MAX_PROCEDURE_BYTES, MonitorSpecError, type MonitorTrigger, parseAt, resolveProcedureFile } from "./spec";
+import { runScript, type ScriptResult } from "./script";
+import {
+	MAX_PROCEDURE_BYTES,
+	MonitorSpecError,
+	type MonitorTrigger,
+	parseAt,
+	resolveProcedureFile,
+	SCRIPT_TIMEOUT_MS,
+} from "./spec";
 import { WatcherSet, type WatchStarter } from "./watcher";
 
 /** A restart replays at most this many due cron slots (the newest) ... */
@@ -33,7 +40,9 @@ export interface MonitorSchedulerDeps {
 	scriptsRoot: string;
 	/** cwd of script checks. */
 	workspaceDir: string;
-	/** Test seam; default 60 s. */
+	/** The bot home, handed to scripts as `OMPBOT_HOME`. */
+	homeDir: string;
+	/** Test seam; default 60 s (a cron command's own `timeoutMs` wins). */
 	scriptTimeoutMs?: number;
 	/** `config.watcherRoots`: watcher monitors whose root is not inside one of them never start a watch. */
 	watcherRoots?: readonly string[] | undefined;
@@ -161,6 +170,21 @@ export function buildMonitorPrompt(
 }
 
 /**
+ * The owner-facing reason of a failed cron command: `timed out after <n>s` first for a timeout, then the first stdout
+ * line, else the last stderr line, else the spawn/path error or the exit code.
+ */
+function commandFailure(result: ScriptResult, timeoutMs: number): string {
+	const lines = (text: string) =>
+		text
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line !== "");
+	const detail = lines(result.stdout)[0] ?? lines(result.stderr).at(-1) ?? result.error;
+	if (result.timedOut) return `timed out after ${timeoutMs / 1000}s${detail === undefined ? "" : `: ${detail}`}`;
+	return detail ?? `exit=${result.exitCode}`;
+}
+
+/**
  * Drives monitors from the daemon sweep: claims due slots exactly once, runs script checks, dispatches each admitted
  * event to the monitor's own origin (`monitor/<id>`) through the origin router, and reconciles deliveries. A fire that
  * finds its origin idle starts a fresh session (epoch bump): the per-fire context cost stays the size of the fire.
@@ -175,6 +199,10 @@ export class MonitorScheduler {
 	readonly #watchers: WatcherSet;
 	/** Due `at` monitors already logged as held during the current freeze (one log line per monitor per freeze). */
 	readonly #heldAt = new Set<string>();
+	/** Aborts of the cron commands running now; `stop()` fires them all. */
+	readonly #commands = new Set<AbortController>();
+	/** Set by `stop()`: no new cron command starts, so the daemon's shutdown never waits for one. */
+	#stopping = false;
 
 	constructor(deps: MonitorSchedulerDeps) {
 		this.#deps = deps;
@@ -183,16 +211,24 @@ export class MonitorScheduler {
 			clock: deps.clock,
 			watchRoots: () => deps.watcherRoots,
 			starter: deps.watch,
+			onError: (id, error) => void deps.store.monitors.recordCheckError(id, error),
+			onStarted: (id) => deps.store.monitors.clearCheckError(id),
 		});
 	}
 
-	/** Closes every filesystem watch (daemon shutdown). A later tick starts them again. */
+	/**
+	 * Daemon shutdown: closes every filesystem watch (a later tick starts them again), starts no further cron command and
+	 * kills the running ones. Their events stay `dispatched`, so the next process's `start()` runs them again.
+	 */
 	stop(): void {
+		this.#stopping = true;
+		for (const command of this.#commands) command.abort();
 		this.#watchers.stop();
 	}
 
-	/** Startup: events whose prompt never reached the ledger are admitted again. */
+	/** Startup: events whose prompt never reached the ledger (or whose command was cut off) are admitted again. */
 	start(): number {
+		this.#stopping = false;
 		const requeued = this.#deps.store.monitors.reconcileDispatched();
 		if (requeued > 0) this.#deps.log.info("monitor_requeued", { count: requeued });
 		return requeued;
@@ -320,7 +356,8 @@ export class MonitorScheduler {
 				skip,
 			);
 		}
-		store.monitors.setCursor(monitor.id, now);
+		// A span with no slot needs no cursor move: the next fire after the old cursor and after `now` is the same.
+		if (tooOld.length + recent.length > 0) store.monitors.setCursor(monitor.id, now);
 		const skipped = tooOld.length + overLimit.length;
 		if (skipped > 0) {
 			summary.skippedCatchUp += skipped;
@@ -397,6 +434,7 @@ export class MonitorScheduler {
 						scriptsRoot: this.#deps.scriptsRoot,
 						cwd: this.#deps.workspaceDir,
 						monitorId: monitor.id,
+						homeDir: this.#deps.homeDir,
 						...(this.#deps.scriptTimeoutMs === undefined ? {} : { timeoutMs: this.#deps.scriptTimeoutMs }),
 					});
 					const outcome = result.fired
@@ -426,6 +464,9 @@ export class MonitorScheduler {
 					const claim = store.monitors.recordScriptCheck({
 						monitorId: monitor.id,
 						outcome,
+						...(outcome === "error"
+							? { error: result.error ?? (result.timedOut ? "timed out" : "killed before exiting") }
+							: {}),
 						slotAt: now,
 						payload: result.stdout,
 						...(hash === undefined ? {} : { hash }),
@@ -487,6 +528,10 @@ export class MonitorScheduler {
 				}
 				continue;
 			}
+			if (monitor.deliver === "verbatim" && monitor.trigger.kind === "cron" && monitor.trigger.command !== undefined) {
+				if (this.#runCommand(monitor, monitor.trigger.command, monitor.trigger.timeoutMs, event)) dispatched += 1;
+				continue;
+			}
 			if (monitor.deliver === "verbatim") {
 				if (this.#deliverVerbatim(monitor, event)) {
 					dispatched += 1;
@@ -529,6 +574,83 @@ export class MonitorScheduler {
 			);
 		}
 		return { dispatched, settledVerbatim };
+	}
+
+	/**
+	 * Runs a cron command for one event of its monitor and posts the stdout as the answer (no router, no inbound row, no
+	 * omp child). The event is `dispatched` while it runs, which holds the monitor's next event back. A failure ends the
+	 * event as failed_no_retry with one owner notice; a run cut off by `stop()` leaves it `dispatched` for the next
+	 * `start()`. Returns true when it started.
+	 */
+	#runCommand(
+		monitor: MonitorRow,
+		command: readonly string[],
+		triggerTimeoutMs: number | undefined,
+		event: MonitorEventRow,
+	): boolean {
+		if (this.#stopping) return false;
+		const { store, log } = this.#deps;
+		const attempt = event.attempts + 1;
+		const opRef = `monitor:${monitor.id}:${event.eventId}:${attempt}:verbatim`;
+		if (!store.monitors.markDispatched(event.eventId, opRef)) return false;
+		log.info("monitor_command", { monitor: monitor.id, event: event.eventId, attempt });
+		const timeoutMs = triggerTimeoutMs ?? this.#deps.scriptTimeoutMs ?? SCRIPT_TIMEOUT_MS;
+		const controller = new AbortController();
+		this.#commands.add(controller);
+		this.#track(
+			(async () => {
+				try {
+					const result = await runScript(command, {
+						scriptsRoot: this.#deps.scriptsRoot,
+						cwd: this.#deps.workspaceDir,
+						monitorId: monitor.id,
+						homeDir: this.#deps.homeDir,
+						timeoutMs,
+						signal: controller.signal,
+					});
+					// Killed by shutdown (ours, or a signal to the whole unit): the next process runs it again.
+					if (result.aborted === true || (this.#stopping && result.exitCode !== 0)) {
+						log.info("monitor_command_aborted", { monitor: monitor.id, event: event.eventId, exit: result.exitCode });
+						return;
+					}
+					if (result.exitCode === 0 && !result.timedOut && result.error === undefined) {
+						// `{"wakeAgent": false}` as the last line: the check ran and has nothing to say.
+						if (store.deliverMonitorVerbatim(event.eventId, opRef, result.wakeOff ? "" : result.stdout)) {
+							log.info("monitor_verbatim", { monitor: monitor.id, event: event.eventId, attempt, exit: 0 });
+						}
+						return;
+					}
+					log.warn("monitor_command_failed", {
+						monitor: monitor.id,
+						event: event.eventId,
+						exit: result.exitCode,
+						timed_out: result.timedOut,
+						...(result.error === undefined ? {} : { error: result.error }),
+						...(result.stderr === "" ? {} : { tail: result.stderr }),
+					});
+					store.failMonitorEvent(event.eventId, `[command failed] ${commandFailure(result, timeoutMs)}`, {
+						retry: false,
+					});
+				} catch (error) {
+					// Never rethrown: a rejection here would take the daemon down and rerun the command on every boot.
+					log.error("monitor_command_failed", { monitor: monitor.id, event: event.eventId, error: String(error) });
+					try {
+						store.failMonitorEvent(event.eventId, `[command failed] ${String(error)}`, { retry: false });
+					} catch (settleError) {
+						log.error("monitor_command_settle_failed", {
+							monitor: monitor.id,
+							event: event.eventId,
+							error: String(settleError),
+						});
+					}
+				} finally {
+					this.#commands.delete(controller);
+					// The finished command frees the monitor's next queued event.
+					if (!this.#stopping) this.kick();
+				}
+			})(),
+		);
+		return true;
 	}
 
 	/**

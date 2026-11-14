@@ -30,6 +30,11 @@ export interface DashboardServerOptions {
 	snapshot: () => Promise<DashboardSnapshot>;
 	/** Hears a snapshot that could not be built (answered as 500). */
 	onError?: (error: unknown) => void;
+	/**
+	 * Hears one owner-opened request: `page` (detail = the `view` query), `trace`, `conversation`, `monitor_detail` and
+	 * `board_pane`. Polls and streams (health, snapshot, board, live, board events) are not heard. A throw is ignored.
+	 */
+	onRequest?: (kind: string, detail?: string) => void;
 	/** Absent when config has no `herdrBoard`: the board routes answer 404 `board_disabled`. */
 	board?: DashboardBoardOptions;
 	/** `api/turn/<id>/trace`: one turn's waterfall (read per request, never cached); absent = 404 `trace_disabled`. */
@@ -49,8 +54,6 @@ export interface DashboardServerOptions {
 	 * op); throws when the daemon cannot be asked. Absent = 404 `live_disabled`.
 	 */
 	live?: (originKey: string) => Promise<LiveView | null>;
-	/** Wait between the end of one live read and the next one of an origin with subscribers. Default 1000 ms. */
-	liveIntervalMs?: number;
 	/** Schedules the next live read and returns its cancel (default `setTimeout`/`clearTimeout`); tests run it by hand. */
 	liveSchedule?: (fn: () => void, ms: number) => () => void;
 	/** Hears an origin's live subscriber count after every change (subscribe or the server handling a disconnect). */
@@ -229,15 +232,14 @@ interface LiveChannel {
 
 /**
  * Live reads per origin, held only while a stream of that origin is open: one read at a time, the next scheduled
- * `liveIntervalMs` after the previous one ended (so a stuck daemon never piles up reads), and an event only when the
+ * `LIVE_INTERVAL_MS` after the previous one ended (so a stuck daemon never piles up reads), and an event only when the
  * answer changed — another seq or turn, null, or the daemon becoming unreachable.
  */
 function liveFanout(
 	live: (originKey: string) => Promise<LiveView | null>,
-	options: Pick<DashboardServerOptions, "liveIntervalMs" | "liveSchedule" | "onLiveSubscribers">,
+	options: Pick<DashboardServerOptions, "liveSchedule" | "onLiveSubscribers">,
 ): { add(originKey: string, send: (chunk: string) => void): () => void } {
 	const channels = new Map<string, LiveChannel>();
-	const intervalMs = options.liveIntervalMs ?? LIVE_INTERVAL_MS;
 	const schedule =
 		options.liveSchedule ??
 		((fn: () => void, ms: number) => {
@@ -272,7 +274,7 @@ function liveFanout(
 			channel.event = `event: live\ndata: ${JSON.stringify(body)}\n\n`;
 			for (const send of channel.senders) send(channel.event);
 		}
-		plan(originKey, channel, intervalMs);
+		plan(originKey, channel, LIVE_INTERVAL_MS);
 	};
 	return {
 		add(originKey, send) {
@@ -321,6 +323,13 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 	const boardPanel = (): BoardPanel => panel() ?? { ok: false, error: "board_disabled" };
 	const fanout = board === undefined ? undefined : boardFanout(board, boardPanel);
 	const live = options.live === undefined ? undefined : liveFanout(options.live, options);
+	const heard = (kind: string, detail?: string): void => {
+		try {
+			options.onRequest?.(kind, detail);
+		} catch {
+			// The request log is a usage count; failing to write it must not change the answer.
+		}
+	};
 	return Bun.serve({
 		port: options.port,
 		hostname: options.hostname,
@@ -351,6 +360,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 			}
 			const trace = TRACE.exec(pathname);
 			if (trace !== null) {
+				heard("trace");
 				if (options.trace === undefined) return jsonReply({ error: "trace_disabled" }, 404, head);
 				let answer: TurnTrace;
 				try {
@@ -384,6 +394,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 				}
 			}
 			if (THREAD_CONVERSATION.test(pathname)) {
+				heard("conversation");
 				if (options.conversation === undefined) return jsonReply({ error: "conversation_disabled" }, 404, head);
 				let answer: ThreadConversation;
 				try {
@@ -404,6 +415,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 					: jsonReply({ error: answer.error }, 404, head);
 			}
 			if (MONITOR_DETAIL.test(pathname)) {
+				heard("monitor_detail");
 				if (options.monitorDetail === undefined) return jsonReply({ error: "monitor_detail_disabled" }, 404, head);
 				const id = (url.searchParams.get("id") ?? "").trim();
 				if (id === "") return jsonReply({ error: "invalid_id" }, 400, head);
@@ -431,6 +443,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 							})
 						: boardEvents(request, board, fanout, boardPanel);
 				}
+				heard("board_pane");
 				// The pane proxy needs only the live card, not the TASK-matched board view (no database read).
 				const card = board.source.card(url.searchParams.get("card") ?? "");
 				if (card === undefined) return jsonReply({ error: "unknown_pane" }, 404, head);
@@ -449,6 +462,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 					headers: { ...COMMON_HEADERS, "content-type": "text/plain; charset=utf-8" },
 				});
 			}
+			if (isPage) heard("page", url.searchParams.get("view") || undefined);
 			let snapshot: DashboardSnapshot;
 			try {
 				snapshot = await options.snapshot();
@@ -460,7 +474,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 				});
 			}
 			const param = (name: string): string | undefined => url.searchParams.get(name) || undefined;
-			const [view, card, task, item, layout] = ["view", "card", "task", "item", "layout"].map(param);
+			const [view, card, task, item, layout, stale] = ["view", "card", "task", "item", "layout", "stale"].map(param);
 			return isPage
 				? reply(
 						renderDashboardPage(snapshot, {
@@ -470,6 +484,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 							...(task === undefined ? {} : { task }),
 							...(item === undefined ? {} : { item }),
 							...(layout === undefined ? {} : { layout }),
+							...(stale === undefined ? {} : { stale }),
 						}),
 						"text/html; charset=utf-8",
 						{ "content-security-policy": PAGE_CSP },

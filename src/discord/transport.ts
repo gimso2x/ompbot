@@ -1,7 +1,7 @@
 // Every Discord call the adapter makes goes through DiscordTransport; tests use FakeDiscordTransport.
 
-/** GUILDS | GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES | DIRECT_MESSAGE_REACTIONS | MESSAGE_CONTENT. */
-export const DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 15);
+/** GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT. */
+export const DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 
 /** Longest `content` Discord accepts in one message. */
 export const MESSAGE_CONTENT_LIMIT = 2000;
@@ -47,16 +47,6 @@ export interface DiscordMessageEvent {
 	timestamp?: string | undefined;
 }
 
-/** `MESSAGE_REACTION_ADD` / `MESSAGE_REACTION_REMOVE`; `emoji.name` is the unicode emoji for standard emoji. */
-export interface DiscordReactionEvent {
-	type: "add" | "remove";
-	user_id: string;
-	channel_id: string;
-	message_id: string;
-	guild_id?: string | undefined;
-	emoji: { id: string | null; name: string | null };
-}
-
 /** `INTERACTION_CREATE`: type 2 application command, type 3 message component. */
 export interface DiscordInteraction {
 	id: string;
@@ -69,21 +59,16 @@ export interface DiscordInteraction {
 		| {
 				custom_id?: string | undefined;
 				component_type?: number | undefined;
-				name?: string | undefined;
-				options?: ReadonlyArray<{ name: string; type: number; value?: unknown }> | undefined;
 		  }
 		| undefined;
 	/** Guild interactions carry the user under `member`, DM interactions under `user`. */
 	member?: { user: DiscordUser } | undefined;
 	user?: DiscordUser | undefined;
-	/** The channel it came from; its `type` tells the bot's DM (1) from a group DM (3). */
-	channel?: { id: string; type: number } | undefined;
 	message?: { id: string; channel_id: string } | undefined;
 }
 
 export interface DiscordHandlers {
 	message(event: DiscordMessageEvent): Promise<void>;
-	reaction(event: DiscordReactionEvent): Promise<void>;
 	interaction(interaction: DiscordInteraction): Promise<void>;
 	/** Every Ready (`resumed: false`: a new session, the events in between are lost) and Resumed (`resumed: true`). */
 	ready?(info: { resumed: boolean }): void;
@@ -180,28 +165,6 @@ export interface RespondInteractionArgs {
 	response: InteractionResponse;
 }
 
-export interface EditInteractionResponseArgs {
-	token: string;
-	content?: string | undefined;
-	components?: readonly unknown[] | undefined;
-	allowedMentions?: AllowedMentions | undefined;
-}
-
-/** One chat-input (slash) command as `PUT …/commands` takes it. */
-export interface ApplicationCommand {
-	/** 1–32 characters, lower-case letters, digits and `-`. */
-	name: string;
-	/** 1–100 characters. */
-	description: string;
-	options?: ReadonlyArray<{ type: number; name: string; description: string; required: boolean }> | undefined;
-}
-
-/** Replaces the application's whole command set: global, or one server's (shown there at once). */
-export interface RegisterCommandsArgs {
-	guildId?: string | undefined;
-	commands: readonly ApplicationCommand[];
-}
-
 export interface DiscordTransport {
 	/** Connects the gateway, wires the handlers and resolves the bot's user id and application id on Ready. */
 	start(handlers: DiscordHandlers): Promise<{ botUserId: string; applicationId: string }>;
@@ -224,9 +187,6 @@ export interface DiscordTransport {
 	downloadAttachment(args: DownloadAttachmentArgs): Promise<void>;
 	/** Must happen within 3 s of the interaction or its token is void. */
 	respondInteraction(args: RespondInteractionArgs): Promise<void>;
-	editInteractionResponse(args: EditInteractionResponseArgs): Promise<void>;
-	deleteInteractionResponse(args: { token: string }): Promise<void>;
-	registerCommands(args: RegisterCommandsArgs): Promise<void>;
 	/** `POST /channels/{id}/typing`: Discord shows "typing…" in that channel for about 10 s. */
 	triggerTyping(channelId: string): Promise<void>;
 }

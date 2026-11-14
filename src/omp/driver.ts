@@ -154,6 +154,11 @@ export interface OmpState {
 	/** `provider/id` of the active model. */
 	model?: string;
 	thinking?: string;
+	/**
+	 * The conversation's context use (omp `get_state.contextUsage`); absent when the driver cannot tell or omp sent
+	 * something else. `tokens`/`percent` are null when omp does not know them yet — never a made-up 0.
+	 */
+	context?: { tokens: number | null; window: number; percent: number | null };
 }
 
 export interface OmpCompactResult {
@@ -193,6 +198,12 @@ export interface OmpSessionDriver {
 	/** Queue a steering message into the running turn. */
 	steer(text: string): Promise<void>;
 	abort(): Promise<void>;
+	/**
+	 * Abort the turn and empty omp's own steer/follow-up queue too (omp RPC `abort_and_restore_queue`; the queue it
+	 * returns is dropped), so a message steered into the stopped turn never runs afterwards. Absent on drivers without
+	 * such a queue call: the owner's `!stop` then aborts and stops the child when something is still queued.
+	 */
+	abortAndClearQueue?(): Promise<void>;
 	newSession(): Promise<{ cancelled: boolean }>;
 	/** Continue the newest session in this driver's `sessionDir` (or start a fresh one). */
 	openSession(): Promise<OmpOpenResult>;

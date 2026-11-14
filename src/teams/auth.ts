@@ -4,19 +4,19 @@
 // `crypto.subtle`; `aud` must be the bot's app id, `exp`/`nbf` hold within a 5-minute clock skew, the `serviceurl`
 // claim matches the Activity's `serviceUrl` (a trailing `/` aside) and an Entra token's tenant is the configured one.
 
-export const BOT_FRAMEWORK_ISSUER = "https://api.botframework.com";
-export const BOT_FRAMEWORK_OPENID_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration";
+const BOT_FRAMEWORK_ISSUER = "https://api.botframework.com";
+const BOT_FRAMEWORK_OPENID_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration";
 export const entraOpenIdUrl = (tenantId: string): string =>
 	`https://login.microsoftonline.com/${tenantId}/v2.0/.well-known/openid-configuration`;
 
 /** Clock skew allowed on `exp` and `nbf`. */
-export const CLOCK_SKEW_MS = 5 * 60_000;
+const CLOCK_SKEW_MS = 5 * 60_000;
 /** How long one fetched key set is trusted. */
-export const JWKS_TTL_MS = 24 * 60 * 60_000;
+const JWKS_TTL_MS = 24 * 60 * 60_000;
 /** An unknown `kid` refetches the key set at most this often (a stream of forged kids cannot hammer the metadata). */
 const KID_REFETCH_MIN_MS = 60_000;
 
-export type TeamsAuthReason =
+type TeamsAuthReason =
 	| "missing_bearer"
 	| "malformed"
 	| "algorithm"
@@ -31,9 +31,9 @@ export type TeamsAuthReason =
 	| "tenant"
 	| "endorsement";
 
-export type TeamsAuthResult = { ok: true; issuer: string } | { ok: false; reason: TeamsAuthReason };
+type TeamsAuthResult = { ok: true; issuer: string } | { ok: false; reason: TeamsAuthReason };
 
-export interface TeamsAuthOptions {
+interface TeamsAuthOptions {
 	appId: string;
 	tenantId: string;
 	fetchImpl?: typeof fetch;
@@ -55,7 +55,7 @@ interface KeySet {
 }
 
 /** A service URL as the claim and the Activity are compared: trailing slashes do not count. */
-export function normalizeServiceUrl(url: string): string {
+function normalizeServiceUrl(url: string): string {
 	return url.replace(/\/+$/, "");
 }
 

@@ -7,14 +7,12 @@ import {
 	type DiscordChannelInfo,
 	type DiscordMessageEvent,
 	DiscordRateLimitedError,
-	type EditInteractionResponseArgs,
 	type EditMessageArgs,
 	type ListMessagesArgs,
 	MESSAGE_CONTENT_LIMIT,
 	type MessageReference,
 	type MessageTarget,
 	type ReactionArgs,
-	type RegisterCommandsArgs,
 	type RespondInteractionArgs,
 	type StartThreadArgs,
 	UPLOAD_LIMIT_BYTES,
@@ -29,8 +27,6 @@ const DEFAULT_USER_AGENT = "DiscordBot (https://ompbot.invalid, 1)";
 export interface DiscordRestOptions {
 	token: string;
 	baseUrl?: string;
-	/** Needed by the interaction follow-up routes; the gateway learns it on Ready (`setApplicationId`). */
-	applicationId?: string;
 	fetchImpl?: typeof fetch;
 	now?: () => number;
 	userAgent?: string;
@@ -103,7 +99,6 @@ export class DiscordRest {
 	readonly #now: () => number;
 	readonly #userAgent: string;
 	readonly #timeoutMs: number;
-	#applicationId: string | undefined;
 	/** Route key → epoch ms when its spent bucket resets. */
 	readonly #blocked = new Map<string, number>();
 	#globalUntil = 0;
@@ -115,11 +110,6 @@ export class DiscordRest {
 		this.#now = options.now ?? Date.now;
 		this.#userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
 		this.#timeoutMs = options.timeoutMs ?? 15_000;
-		this.#applicationId = options.applicationId;
-	}
-
-	setApplicationId(id: string): void {
-		this.#applicationId = id;
 	}
 
 	/** Latest reset among the currently blocked routes (and a global block); 0 when nothing is blocked. */
@@ -206,13 +196,6 @@ export class DiscordRest {
 		);
 	}
 
-	#appId(): string {
-		if (this.#applicationId === undefined) {
-			throw new DiscordCallError("definitive", "discord application id unknown (gateway not ready)");
-		}
-		return this.#applicationId;
-	}
-
 	/** `GET /gateway/bot`: the WebSocket URL to connect to. */
 	async getGatewayBot(): Promise<{ url: string }> {
 		const body = (await this.#request("GET", "/gateway/bot")) as { url?: unknown } | undefined;
@@ -284,16 +267,7 @@ export class DiscordRest {
 	}
 
 	async getChannel(channelId: string): Promise<DiscordChannelInfo> {
-		const body = (await this.#request("GET", `/channels/${channelId}`)) as Record<string, unknown> | undefined;
-		if (typeof body?.id !== "string" || typeof body.type !== "number") {
-			throw new DiscordCallError("ambiguous", "GET /channels returned no channel");
-		}
-		return {
-			id: body.id,
-			type: body.type,
-			...(typeof body.parent_id === "string" ? { parentId: body.parent_id } : {}),
-			...(typeof body.guild_id === "string" ? { guildId: body.guild_id } : {}),
-		};
+		return channelInfo(await this.#request("GET", `/channels/${channelId}`), "GET /channels");
 	}
 
 	async listMessages(args: ListMessagesArgs): Promise<DiscordMessageEvent[]> {
@@ -344,31 +318,24 @@ export class DiscordRest {
 		await this.#request("POST", `/interactions/${args.interactionId}/${args.token}/callback`, { json: args.response });
 	}
 
-	async editInteractionResponse(args: EditInteractionResponseArgs): Promise<void> {
-		checkContent(args.content);
-		await this.#request("PATCH", `/webhooks/${this.#appId()}/${args.token}/messages/@original`, {
-			json: {
-				...(args.content === undefined ? {} : { content: args.content }),
-				...(args.components === undefined ? {} : { components: args.components }),
-				...mentions(args.allowedMentions),
-			},
-		});
-	}
-
-	async deleteInteractionResponse(args: { token: string }): Promise<void> {
-		await this.#request("DELETE", `/webhooks/${this.#appId()}/${args.token}/messages/@original`);
-	}
-
 	/** `POST /channels/{id}/typing` (no body): the typing indicator for about 10 s. */
 	async triggerTyping(channelId: string): Promise<void> {
 		await this.#request("POST", `/channels/${channelId}/typing`);
 	}
+}
 
-	/** `PUT /applications/{app}[/guilds/{guild}]/commands`: overwrites the whole set, so a repeat is harmless. */
-	async registerCommands(args: RegisterCommandsArgs): Promise<void> {
-		const scope = args.guildId === undefined ? "" : `/guilds/${args.guildId}`;
-		await this.#request("PUT", `/applications/${this.#appId()}${scope}/commands`, { json: args.commands });
+/** A channel object as the adapter caches it. */
+function channelInfo(value: unknown, what: string): DiscordChannelInfo {
+	const body = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+	if (typeof body.id !== "string" || typeof body.type !== "number") {
+		throw new DiscordCallError("ambiguous", `${what} returned no channel`);
 	}
+	return {
+		id: body.id,
+		type: body.type,
+		...(typeof body.parent_id === "string" ? { parentId: body.parent_id } : {}),
+		...(typeof body.guild_id === "string" ? { guildId: body.guild_id } : {}),
+	};
 }
 
 /** The `id` of a created message or thread; a 2xx without one leaves the outcome unknown. */

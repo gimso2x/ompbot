@@ -3,6 +3,8 @@
 // `:-` delivery and the monitor event waits; after the owner's first message (or `!home`) both land in that
 // conversation.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { OmpbotConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordBinding } from "../src/discord/binding";
@@ -11,6 +13,7 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { ledgerDay } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
+import { SKILL_REVIEW_ORIGIN } from "../src/review/skills";
 import { Store } from "../src/store/db";
 import { DISCORD_OWNER, makeHome, type TestHome, WaitingDiscordTransport, withDiscord } from "./helpers/bot-home";
 
@@ -23,6 +26,8 @@ let home: TestHome;
 let daemon: Daemon;
 let discord: WaitingDiscordTransport;
 let logs: string[];
+/** Origin of every omp child the daemon started, in order. */
+let driverOrigins: string[];
 
 /** `withDiscord` minus every Slack key: Discord is the only platform. */
 function discordOnly(extra: Partial<OmpbotConfig> = {}): OmpbotConfig {
@@ -44,7 +49,10 @@ async function boot(config: OmpbotConfig): Promise<void> {
 		ompVersion: "omp-test 0",
 		bootId: "boot",
 		gateSweepMs: 0,
-		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		driverFactory: (origin, sessionDir) => {
+			driverOrigins.push(origin);
+			return new FakeOmpDriver({ sessionDir, store: sessions });
+		},
 	});
 	await daemon.start();
 }
@@ -76,6 +84,7 @@ async function ownerSays(id: string, channelId: string, content: string, guildId
 beforeEach(() => {
 	home = makeHome("ompbot-owner-home-");
 	logs = [];
+	driverOrigins = [];
 });
 
 afterEach(async () => {
@@ -152,6 +161,48 @@ describe("ownerHome without Slack", () => {
 		expect(store.monitors.listEvents({ monitorId: monitor.id })[0]?.stage).toBe("failed_no_retry");
 		expect(unroutable().some((line) => line.includes(`op=monitor-notice:${queued.eventId}`))).toBe(true);
 		expect(brokenRows()).toEqual([]);
+	});
+});
+
+describe("owner DM features without Slack", () => {
+	const answer = async (id: string, text: string) => {
+		await ownerSays(id, DISCORD_DM, text);
+		await discord.waitForPosts((posted) => posted.includes(`ECHO ${text}`));
+	};
+
+	test("the periodic skill review counts the Discord owner DM's turns and starts", async () => {
+		await boot(discordOnly({ skillReviewTurns: 1 }));
+		await answer("700000000000000011", "하나");
+		await daemon.sweep(); // first look at the DM: the baseline, no review yet
+		expect(driverOrigins).not.toContain(SKILL_REVIEW_ORIGIN);
+		await answer("700000000000000012", "둘");
+		await daemon.sweep();
+		expect(driverOrigins).toContain(SKILL_REVIEW_ORIGIN);
+	});
+
+	test("a due improvement candidate in card mode raises its approval card in the Discord owner DM", async () => {
+		const day = (back: number) => new Date(Date.now() - back * 86_400_000).toISOString().slice(0, 10);
+		const seen = (back: number) =>
+			JSON.stringify({
+				v: 1,
+				ts: `${day(back)}T00:00:00Z`,
+				key: "cand-discord",
+				event: "seen",
+				day: day(back),
+				kind: "fix",
+				evidence: `reflections/${day(back)}.md#1`,
+				summary: "디스코드 후보 반복",
+			});
+		const config = discordOnly({ candidates: { mode: "card" } });
+		writeFileSync(join(config.workspaceDir, "candidates.jsonl"), `${[1, 2, 3].map(seen).join("\n")}\n`);
+		await boot(config);
+		await answer("700000000000000021", "안녕");
+		await daemon.sweep();
+		await discord.waitForPosts((text) => text.includes("디스코드 후보 반복"));
+		expect(discord.posts((text) => text.includes("디스코드 후보 반복")).map((post) => post.channelId)).toEqual([
+			DISCORD_DM,
+		]);
+		expect(logs.filter((line) => line.includes("event=candidate_card_unroutable"))).toEqual([]);
 	});
 });
 

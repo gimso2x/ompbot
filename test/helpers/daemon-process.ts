@@ -115,6 +115,51 @@ export async function runMain(homeDir: string, args: string[], env: Record<strin
 	return { code, stdout, stderr };
 }
 
+let capturing = false;
+
+/**
+ * `runCli(args)` in this process, shaped like {@link runMain}: OMPBOT_HOME is `homeDir` (undefined = none, also not
+ * an inherited one) over `process.env` and `env`. stdout and stderr writes are collected while it runs and the real
+ * writers come back afterwards, also when the command throws. One call at a time: a second one while the first runs
+ * throws, since both would write into the same replaced writers. Swapping `process.stdout.write` stays inside one
+ * test file only under `bun test --parallel` (a worker per file).
+ */
+export async function runCliCapture(
+	homeDir: string | undefined,
+	args: string[],
+	env: Record<string, string> = {},
+): Promise<CliResult> {
+	if (capturing) throw new Error("runCliCapture: another call is still running");
+	capturing = true;
+	const cliEnv: Record<string, string | undefined> = { ...process.env, OMPBOT_HOME: homeDir, ...env };
+	if (cliEnv.OMPBOT_HOME === undefined) delete cliEnv.OMPBOT_HOME;
+	const out: string[] = [];
+	const err: string[] = [];
+	const decoder = new TextDecoder();
+	const realOut = process.stdout.write;
+	const realErr = process.stderr.write;
+	const collect =
+		(into: string[]) =>
+		(chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
+			into.push(typeof chunk === "string" ? chunk : decoder.decode(chunk));
+			const done = rest.find((arg) => typeof arg === "function");
+			if (typeof done === "function") done();
+			return true;
+		};
+	process.stdout.write = collect(out) as typeof process.stdout.write;
+	process.stderr.write = collect(err) as typeof process.stderr.write;
+	try {
+		// Loaded on first use: most files importing this helper never run the CLI in-process.
+		const { runCli } = await import("../../src/cli");
+		const code = await runCli(args, cliEnv);
+		return { code, stdout: out.join(""), stderr: err.join("") };
+	} finally {
+		process.stdout.write = realOut;
+		process.stderr.write = realErr;
+		capturing = false;
+	}
+}
+
 export interface LoggedPost {
 	method: "postMessage";
 	channel: string;

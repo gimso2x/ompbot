@@ -2,6 +2,8 @@
 // session, a restart or a failed live ingest does not, so a pass reads every Discord conversation's channel after its
 // watermark and feeds the messages through the adapter's live ingest path, where the ledger's duplicate check stops
 // anything already taken. Snowflake ids grow with time, so `after=<watermark>` is the whole window.
+import { countsTowardDeadLetter, SingleFlightBackfill } from "../channel/backfill";
+import { errorText } from "../channel/text";
 import type { IngestOutcome } from "../channel/types";
 import type { Logger } from "../log";
 import { redact } from "../redact";
@@ -22,7 +24,6 @@ export const BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60_000;
 export const MAX_MESSAGE_ATTEMPTS = 3;
 /** Discord JSON error codes of a channel the bot cannot read: Unknown Channel, Missing Access. */
 const UNREADABLE_CODES: ReadonlySet<number> = new Set([10003, 50001]);
-const TRANSIENT_STORE_ERROR = /SQLITE_(BUSY|LOCKED|FULL|IOERR)/;
 /** First millisecond of the Discord epoch (2015-01-01T00:00:00Z); a snowflake's top 42 bits count from here. */
 const DISCORD_EPOCH_MS = 1_420_070_400_000n;
 
@@ -85,68 +86,30 @@ export interface DiscordBackfillDeps {
 	maxPages?: number | undefined;
 }
 
-function errorText(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
-
 /** Unknown Channel / Missing Access: the bot cannot read the channel at all. */
 function unreadable(err: unknown): boolean {
 	return err instanceof DiscordCallError && err.code !== undefined && UNREADABLE_CODES.has(err.code);
 }
 
-/** Whether an ingest failure is the message's own: rate limits, Discord 5xx/network and a busy ledger are not. */
-function countsTowardDeadLetter(err: unknown): boolean {
-	if (err instanceof DiscordRateLimitedError) return false;
-	if (err instanceof DiscordCallError) return err.kind === "definitive";
-	const code = (err as { code?: unknown } | null)?.code;
-	if (typeof code === "string" && TRANSIENT_STORE_ERROR.test(code)) return false;
-	return !TRANSIENT_STORE_ERROR.test(errorText(err));
-}
-
 /**
- * Single-flight recovery: a trigger while a pass runs asks for one more pass after it instead of a second one beside
- * it. A channel the bot cannot read is quarantined until the restart, so a left server costs one failed read.
+ * Single-flight recovery. A channel the bot cannot read is quarantined until the restart, so a left server costs one
+ * failed read.
  */
-export class DiscordBackfill {
+export class DiscordBackfill extends SingleFlightBackfill {
 	readonly #deps: DiscordBackfillDeps;
 	readonly #quarantined = new Set<string>();
 	readonly #attempts = new Map<string, number>();
-	#running = false;
-	#followUp = false;
-	#lastRun: Promise<void> = Promise.resolve();
 
 	constructor(deps: DiscordBackfillDeps) {
+		super();
 		this.#deps = deps;
 	}
 
-	trigger(): void {
-		if (this.#running) {
-			this.#followUp = true;
-			return;
-		}
-		this.#running = true;
-		this.#lastRun = this.#drain();
+	protected failed(err: unknown): void {
+		this.#deps.log.error("discord_backfill_failed", { error: redact(errorText(err)) });
 	}
 
-	/** Resolves when no pass runs and none is pending. */
-	waitForIdle(): Promise<void> {
-		return this.#lastRun;
-	}
-
-	async #drain(): Promise<void> {
-		try {
-			do {
-				this.#followUp = false;
-				await this.#pass();
-			} while (this.#followUp);
-		} catch (err) {
-			this.#deps.log.error("discord_backfill_failed", { error: redact(errorText(err)) });
-		} finally {
-			this.#running = false;
-		}
-	}
-
-	async #pass(): Promise<void> {
+	protected async pass(): Promise<void> {
 		const { log } = this.#deps;
 		if (!(await this.#deps.ready())) {
 			log.warn("discord_backfill_skipped", { reason: "not_ready" });
@@ -253,7 +216,13 @@ export class DiscordBackfill {
 					if (outcome === "recorded") recovered.push(message.id);
 					this.#attempts.delete(attemptKey);
 				} catch (err) {
-					if (!countsTowardDeadLetter(err)) {
+					const platform =
+						err instanceof DiscordRateLimitedError
+							? false
+							: err instanceof DiscordCallError
+								? err.kind === "definitive"
+								: undefined;
+					if (!countsTowardDeadLetter(err, platform)) {
 						// Rate limit, Discord 5xx/network or a busy ledger: not the message's fault, the next pass retries it.
 						log.warn("backfill_message_retryable", { target: key, id: message.id, error: redact(errorText(err)) });
 						if (watermark !== stored) cursors.setCursor(key, watermark);

@@ -30,10 +30,23 @@ export interface GcResult {
 	turnSnapshotsRemoved: number;
 	/** Teams guest/qa context rows (`teams_qa`) older than `TEAMS_QA_RETENTION_DAYS` deleted. */
 	teamsQaRemoved: number;
+	/** Finished conversation rows past `LEDGER_RETENTION_DAYS` deleted (counted only on a dry run). */
+	ledgerRemoved: LedgerRemoved;
+}
+
+/** Row counts `gcLedger` removed per table; `deliveryPosts` are the posts of the removed deliveries. */
+export interface LedgerRemoved {
+	inbound: number;
+	deliveries: number;
+	deliveryPosts: number;
+	monitorEvents: number;
 }
 
 /** How long a Teams guest/qa question and answer stay as conversation context. */
 export const TEAMS_QA_RETENTION_DAYS = 30;
+
+/** How long finished inbound, delivery and monitor-event rows stay in the ledger. */
+export const LEDGER_RETENTION_DAYS = 90;
 
 /** Newest modification time of a directory tree (symlinks are not followed). */
 function newestMtimeMs(path: string): number {
@@ -64,6 +77,7 @@ export function gcSessions(options: GcOptions): GcResult {
 		monitorOriginsRemoved: [],
 		turnSnapshotsRemoved: 0,
 		teamsQaRemoved: 0,
+		ledgerRemoved: { inbound: 0, deliveries: 0, deliveryPosts: 0, monitorEvents: 0 },
 	};
 	const dbPath = join(options.homeDir, "ompbot.db");
 	if (!existsSync(dbPath)) return result;
@@ -85,8 +99,7 @@ export function gcSessions(options: GcOptions): GcResult {
 				}>
 			).map((row) => row.origin_key),
 		);
-		const hasMonitors = db.query("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'monitors'").get();
-		if (hasMonitors) {
+		if (hasTable(db, "monitors")) {
 			monitorIds = new Set((db.query("SELECT id FROM monitors").all() as Array<{ id: string }>).map((row) => row.id));
 		}
 	} finally {
@@ -158,16 +171,63 @@ export function gcSessions(options: GcOptions): GcResult {
 		}
 		result.turnSnapshotsRemoved = gcTurnSnapshots(write, options);
 		result.teamsQaRemoved = gcTeamsQa(write, options);
+		result.ledgerRemoved = gcLedger(write, options);
 	} finally {
 		write.close();
 	}
 	return result;
 }
 
+function hasTable(db: Database, name: string): boolean {
+	return db.query("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== null;
+}
+
+/**
+ * Finished conversation rows past `LEDGER_RETENTION_DAYS` leave the ledger, in one transaction; a dry run only counts.
+ * - inbound: `answered`/`failed_notified`/`discarded`, unless a pending approval card was asked from its thread
+ *   (`origin_thread_ref`).
+ * - deliveries: `confirmed`/`failed_ambiguous`/`expired`; its `delivery_posts` rows (written by older versions) go
+ *   first. The gc connection never turns `foreign_keys` on (origins expire at 30 days, inbound at 90, so the origin
+ *   delete would be refused), which is why the posts→deliveries order is kept here by hand.
+ * - monitor_events: the final stages only, aged by `updated_at`.
+ * Waiting and running rows, approvals, usage and alert incidents are never touched. A table missing from an old
+ * home makes its rule empty instead of failing.
+ */
+function gcLedger(db: Database, options: GcOptions): LedgerRemoved {
+	const cutoff = options.now - LEDGER_RETENTION_DAYS * DAY_MS;
+	const inboundWhere = [
+		"i.created_at < ? AND i.state IN ('answered','failed_notified','discarded')",
+		hasTable(db, "approvals")
+			? "NOT EXISTS (SELECT 1 FROM approvals a WHERE a.status = 'pending' AND a.origin_thread_ref = i.thread_ref)"
+			: undefined,
+	]
+		.filter((term) => term !== undefined)
+		.join(" AND ");
+	const deliveriesWhere = "d.created_at < ? AND d.state IN ('confirmed','failed_ambiguous','expired')";
+	const posts = hasTable(db, "delivery_posts");
+	const events = hasTable(db, "monitor_events");
+	const postsWhere = `delivery_id IN (SELECT d.delivery_id FROM deliveries d WHERE ${deliveriesWhere})`;
+	const eventsWhere = "stage IN ('delivered','failed_no_retry','skipped','no_report') AND updated_at < ?";
+	const count = (sql: string) => (db.query(`SELECT COUNT(*) AS n FROM ${sql}`).get(cutoff) as { n: number }).n;
+	const removed: LedgerRemoved = {
+		inbound: count(`inbound i WHERE ${inboundWhere}`),
+		deliveries: count(`deliveries d WHERE ${deliveriesWhere}`),
+		deliveryPosts: posts ? count(`delivery_posts WHERE ${postsWhere}`) : 0,
+		monitorEvents: events ? count(`monitor_events WHERE ${eventsWhere}`) : 0,
+	};
+	if (options.dryRun === true) return removed;
+	db.transaction(() => {
+		if (posts) db.query(`DELETE FROM delivery_posts WHERE ${postsWhere}`).run(cutoff);
+		db.query(`DELETE FROM deliveries AS d WHERE ${deliveriesWhere}`).run(cutoff);
+		db.query(`DELETE FROM inbound AS i WHERE ${inboundWhere}`).run(cutoff);
+		if (events) db.query(`DELETE FROM monitor_events WHERE ${eventsWhere}`).run(cutoff);
+	})();
+	return removed;
+}
+
 /** Teams guest/qa context rows past `TEAMS_QA_RETENTION_DAYS` leave the ledger; a dry run only counts them. */
 function gcTeamsQa(db: Database, options: GcOptions): number {
-	const table = db.query("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'teams_qa'").get();
-	if (table === null) return 0;
+	if (!hasTable(db, "teams_qa")) return 0;
 	const cutoff = options.now - TEAMS_QA_RETENTION_DAYS * DAY_MS;
 	const row = db.query("SELECT COUNT(*) AS n FROM teams_qa WHERE at < ?").get(cutoff) as { n: number };
 	if (row.n > 0 && options.dryRun !== true) db.query("DELETE FROM teams_qa WHERE at < ?").run(cutoff);

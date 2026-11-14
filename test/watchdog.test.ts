@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,22 +39,27 @@ if (mode === "stopped") {
 }
 `;
 
-let dir: string;
+type Mode = "block" | "idle" | "stopped";
+const dirs: string[] = [];
 const children = new Set<Bun.Subprocess>();
 
-beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), "ompbot-watchdog-"));
+/**
+ * Runs one child to its end in a directory of its own (its script and `ompbot.log`: the `block` child's kill line
+ * must not reach another child's log). Bounded: a child still running after `limitMs` is killed and reported.
+ */
+interface ChildResult {
+	code: number;
+	signal: number | NodeJS.Signals | null;
+	stdout: string;
+	stderr: string;
+	log: string;
+	elapsedMs: number;
+}
+
+async function runChild(mode: Mode, limitMs = 15_000): Promise<ChildResult> {
+	const dir = mkdtempSync(join(tmpdir(), `ompbot-watchdog-${mode}-`));
+	dirs.push(dir);
 	writeFileSync(join(dir, "child.ts"), CHILD);
-});
-
-afterEach(() => {
-	for (const child of children) child.kill("SIGKILL");
-	children.clear();
-	rmSync(dir, { recursive: true, force: true });
-});
-
-/** Runs one child to its end (bounded: a child still running after `limitMs` is killed and reported). */
-async function runChild(mode: "block" | "idle" | "stopped", limitMs = 15_000) {
 	const logPath = join(dir, "ompbot.log");
 	const child = Bun.spawn(["bun", join(dir, "child.ts"), mode, logPath], {
 		stdout: "pipe",
@@ -81,8 +86,20 @@ async function runChild(mode: "block" | "idle" | "stopped", limitMs = 15_000) {
 }
 
 describe("startWatchdog (child bun process)", () => {
-	test("a main thread stuck in a loop is SIGKILLed a few seconds after the stall limit, with watchdog_kill on stderr and in the log", async () => {
-		const result = await runChild("block");
+	// The three children run at the same time: the file waits for the longest one instead of their sum.
+	let results: Record<Mode, ChildResult>;
+	beforeAll(async () => {
+		const [block, idle, stopped] = await Promise.all([runChild("block"), runChild("idle"), runChild("stopped")]);
+		results = { block, idle, stopped };
+	}, 20_000);
+	afterAll(() => {
+		for (const child of children) child.kill("SIGKILL");
+		children.clear();
+		for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("a main thread stuck in a loop is SIGKILLed a few seconds after the stall limit, with watchdog_kill on stderr and in the log", () => {
+		const result = results.block;
 		expect(result.stdout).toBe("ready\n");
 		expect(result.signal).toBe("SIGKILL");
 		expect(result.elapsedMs).toBeGreaterThanOrEqual(STALL_MS);
@@ -91,18 +108,17 @@ describe("startWatchdog (child bun process)", () => {
 		expect(line).toMatchObject({ level: "error", event: "watchdog_kill" });
 		expect(line.stalled_ms).toBeGreaterThanOrEqual(STALL_MS);
 		expect(result.log).toContain('"event":"watchdog_kill"');
-	}, 20_000);
+	});
 
-	test("an idle but responsive main thread outlives three stall windows", async () => {
-		const result = await runChild("idle");
+	test("an idle but responsive main thread outlives three stall windows", () => {
+		const result = results.idle;
 		expect(result).toMatchObject({ code: 0, signal: null, stdout: "ready\nsurvived\n", log: "" });
 		expect(result.stderr).not.toContain("watchdog_kill");
-	}, 20_000);
+	});
 
-	test("after stop() a stalled main thread is left alone", async () => {
-		const result = await runChild("stopped");
-		expect(result).toMatchObject({ code: 0, signal: null, stdout: "ready\nsurvived\n", log: "" });
-	}, 20_000);
+	test("after stop() a stalled main thread is left alone", () => {
+		expect(results.stopped).toMatchObject({ code: 0, signal: null, stdout: "ready\nsurvived\n", log: "" });
+	});
 
 	test("the stall limit is 120 s unless the test hooks set it", () => {
 		expect(watchdogStallMs({})).toBe(WATCHDOG_STALL_MS);

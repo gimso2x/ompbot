@@ -40,6 +40,7 @@ import {
 	floorsSystemPrompt,
 	OMPBOT_BUN,
 	OMPBOT_MAIN,
+	ompbotCli,
 	WAIT_INTERIM_LINE,
 } from "../src/safety/prompt";
 import { SlackBinding } from "../src/slack/binding";
@@ -207,6 +208,14 @@ describe("floors prompt answer format", () => {
 		}
 	});
 
+	test("the thread lookup line names this home's ledger, not ~/.ompbot/ompbot.db", () => {
+		for (const originKey of ["slack/dm/D1", "discord/dm/123456789012345678"]) {
+			const prompt = buildFloorsPrompt("/home/u/.ompbot-songbak/secrets", originKey);
+			expect(prompt).toContain("`/home/u/.ompbot-songbak/ompbot.db`");
+			expect(prompt).not.toContain("~/.ompbot/ompbot.db");
+		}
+	});
+
 	test("chat sessions are told a note next to `wait` reaches the owner right away; monitor sessions are not", () => {
 		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1"]) {
 			expect(buildFloorsPrompt("/s", originKey)).toContain(WAIT_INTERIM_LINE);
@@ -226,10 +235,16 @@ describe("floors prompt answer format", () => {
 			["discord/dm/3", "--origin discord/dm/3 --as-owner"],
 		] as const;
 		for (const [originKey, target] of cases) {
-			const line = backgroundResumeLine(originKey);
+			const line = backgroundResumeLine(originKey, {});
 			expect(line).toContain(`\`${OMPBOT_BUN} ${OMPBOT_MAIN} inject ${target} --text '[자동 후속]`);
-			expect(buildFloorsPrompt("/s", originKey)).toContain(line as string);
+			expect(buildFloorsPrompt("/s", originKey)).toContain(backgroundResumeLine(originKey) as string);
+			// A second install (OMPBOT_HOME set) names its own home, else the inject reaches the default ~/.ompbot socket.
+			expect(backgroundResumeLine(originKey, { OMPBOT_HOME: "/h/.ompbot-x" })).toContain(
+				`\`env OMPBOT_HOME=/h/.ompbot-x ${OMPBOT_BUN} ${OMPBOT_MAIN} inject ${target} --text '[자동 후속]`,
+			);
 		}
+		expect(ompbotCli({ OMPBOT_HOME: "" })).toBe(`${OMPBOT_BUN} ${OMPBOT_MAIN}`);
+		expect(ompbotCli({ OMPBOT_HOME: "/h/a b" })).toBe(`env 'OMPBOT_HOME=/h/a b' ${OMPBOT_BUN} ${OMPBOT_MAIN}`);
 		expect(OMPBOT_MAIN).toBe(join(import.meta.dir, "..", "src", "main.ts"));
 		// A detached systemd unit has no ~/.bun/bin on PATH: the line names this bun by absolute path (11-11 exit 127).
 		expect(OMPBOT_BUN).toBe(process.execPath);
@@ -245,9 +260,9 @@ describe("floors prompt answer format", () => {
 		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "herdr-on-base.json"), "utf8")) as {
 			prompts: Record<string, string>;
 		};
-		// The fixture keeps the checkout-dependent CLI path as a placeholder.
+		// The fixture keeps the checkout-dependent CLI path and the home-dependent ledger path as placeholders.
 		const fixed = (prompt: string): string =>
-			prompt.replaceAll(`${OMPBOT_BUN} ${OMPBOT_MAIN}`, "<bun> <ompbot>/src/main.ts");
+			prompt.replaceAll(ompbotCli(), "<bun> <ompbot>/src/main.ts").replaceAll("`/h/ompbot.db`", "`<home>/ompbot.db`");
 		const origins = Object.keys(base.prompts);
 		expect(origins.length).toBe(3);
 		for (const originKey of origins) {
@@ -619,6 +634,12 @@ describe("host tools", () => {
 		expect(tool("discord_send_file").description).toContain("owner's Discord");
 		const slackUpload = build().find((t) => t.name === "slack_send_file");
 		expect(tool("discord_send_file").parameters).toEqual(slackUpload?.parameters ?? {});
+	});
+
+	test("a Teams origin gets no upload tool: the Teams port cannot send files (qa-i #110)", () => {
+		for (const origin of ["teams/dm/t0123456789abcdef", "teams/ch/tfedcba9876543210"]) {
+			expect(build(origin).map((t) => t.name)).toEqual(["ompbot_dispatch", "ompbot_request_approval"]);
+		}
 	});
 
 	test("host tools are registered with object schemas (dispatch, upload, approval)", () => {

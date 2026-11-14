@@ -9,6 +9,7 @@ import { rpcOverlayFor, TEAMS_GROUP_OVERLAY_YAML, teamsGroupOverlayPath } from "
 import type { ProcessRunner } from "../../src/dispatch/omp";
 import { createLogger } from "../../src/log";
 import { clearSecretIndex, maskKnownFragments, REDACTED } from "../../src/redact";
+import { PEER_TOOL_DENIED } from "../../src/safety/host-tools";
 import { indexRuntimeSecrets } from "../../src/safety/secret-index";
 import { writeGraphTokenFile } from "../../src/teams/graph";
 import { teamsAlias } from "../../src/teams/types";
@@ -29,8 +30,8 @@ import {
 } from "./harness";
 
 const GRAPH_TOOLS = ["teams_list_chats", "teams_read_chat"];
-/** The host tools of an owner Teams 1:1 before this feature (graph absent). */
-const TEAMS_DM_TOOLS = ["ompbot_dispatch", "teams_send_file", "ompbot_request_approval"];
+/** The host tools of an owner Teams 1:1 before this feature (graph absent); no upload tool, the port cannot send files. */
+const TEAMS_DM_TOOLS = ["ompbot_dispatch", "ompbot_request_approval"];
 const GUEST_CHAT = "a:1guestpersonalchat";
 const REFRESH = "fake-daemon-refresh-token-0001-abcdefghij";
 const ACCESS = "fake-daemon-access-token-0001-ABCDEFGHIJ";
@@ -136,6 +137,46 @@ describe("graph + ownerMode full (AC-2)", () => {
 			peerUserId: "29:peer",
 		});
 		expect(names(ownerDm).filter((name) => GRAPH_TOOLS.includes(name))).toEqual([]);
+	});
+
+	test("깨끗할 때 잡은 두 도구는 실행되다가 피어 글이 들어오면 실행 순간 거부된다 (호출 시점 가드)", async () => {
+		writeGraphTokenFile(tokenFile(), {
+			refresh_token: REFRESH,
+			scope: "offline_access Chat.Read User.Read",
+			obtainedAt: "2026-11-12T00:00:00.000Z",
+			accountId: OWNER_AAD,
+		});
+		graph.routes.set(tokenPath(TENANT), () => Response.json({ access_token: ACCESS, expires_in: 3600 }));
+		graph.routes.set("/v1.0/me/chats", () => Response.json({ value: [] }));
+		graph.routes.set("/v1.0/chats/*", () => Response.json({ value: [] }));
+		const port = await boot({ graph: { tokenFile: tokenFile() } });
+		await say(port, { id: "dm-1", conversationId: PERSONAL_CHAT, personal: true });
+		await ms.waitFor((call) => String(call.body.text).includes("ECHO 질문 dm-1"));
+		const clean = daemon?.hostToolsFor(ownerDm) ?? [];
+		const signal = new AbortController().signal;
+		const run = (name: string, params: Record<string, unknown>) =>
+			clean.find((tool) => tool.name === name)?.execute(params, { signal });
+		const params: Record<string, Record<string, unknown>> = {
+			teams_list_chats: {},
+			teams_read_chat: { chatId: "19:one@unq.gbl.spaces" },
+		};
+		for (const name of GRAPH_TOOLS) expect(await run(name, params[name] ?? {})).toBeString();
+		const graphCalls = graph.calls.length;
+
+		daemon?.store.recordInbound({
+			originKey: ownerDm,
+			platformMessageId: `${teamsAlias(PERSONAL_CHAT)}:peer-1`,
+			textRef: "peer",
+			peerUserId: "29:peer",
+		});
+		// F \ R by name is exactly the two Graph tools.
+		const reduced = new Set(names(ownerDm));
+		expect(clean.map((tool) => tool.name).filter((name) => !reduced.has(name))).toEqual(GRAPH_TOOLS);
+		for (const name of GRAPH_TOOLS) await expect(run(name, params[name] ?? {})).rejects.toThrow(PEER_TOOL_DENIED);
+		expect(graph.calls).toHaveLength(graphCalls);
+		const denied = logs.filter((line) => line.includes("event=host_tool_denied_peer"));
+		expect(denied).toHaveLength(2);
+		for (const name of GRAPH_TOOLS) expect(denied.some((line) => line.includes(`tool=${name}`))).toBe(true);
 	});
 
 	test("손님 1:1·그룹 질문은 읽기 전용 실행으로만 가고 도구를 받지 않는다", async () => {

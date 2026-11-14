@@ -48,6 +48,8 @@ interface RpcStateLike {
 	messageCount: number;
 	model?: { provider?: string; id?: string };
 	thinkingLevel?: string;
+	/** `{ tokens, contextWindow, percent }` in omp 18.20; read field by field (`contextOf`), never trusted as typed. */
+	contextUsage?: unknown;
 }
 
 interface RpcClientLike {
@@ -59,6 +61,8 @@ interface RpcClientLike {
 	prompt(message: string): Promise<string>;
 	steer(message: string): Promise<void>;
 	abort(): Promise<void>;
+	/** `abort_and_restore_queue`: aborts and withdraws omp's steer/follow-up queue, returning it (ompbot drops it). */
+	abortAndRestoreQueue(): Promise<unknown>;
 	newSession(): Promise<{ cancelled: boolean }>;
 	openSession(sessionDir: string): Promise<{ cancelled: boolean; resumed: boolean; sessionId: string }>;
 	getState(): Promise<RpcStateLike>;
@@ -103,6 +107,7 @@ export const REQUIRED_RPC_METHODS = [
 	"prompt",
 	"steer",
 	"abort",
+	"abortAndRestoreQueue",
 	"newSession",
 	"openSession",
 	"switchSession",
@@ -114,6 +119,10 @@ export const REQUIRED_RPC_METHODS = [
 	"getAvailableThinkingLevels",
 	"setThinkingLevel",
 	"compact",
+	"setTodos",
+	"btw",
+	"cancelBtw",
+	"onBtwRecord",
 ] as const;
 
 /**
@@ -132,6 +141,24 @@ export function missingRpcMethods(ctor: unknown): string[] {
 	return REQUIRED_RPC_METHODS.filter(
 		(name) => !isRecord(proto) || typeof (proto as Record<string, unknown>)[name] !== "function",
 	);
+}
+
+/** A finite number of at least `min`, else undefined. */
+function countOf(value: unknown, min: number): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= min ? value : undefined;
+}
+
+/**
+ * `OmpState.context` from omp's `contextUsage`: nothing without a positive window (an unknown model), `tokens`/`percent`
+ * null when omp sends no number (right after a compaction it does not know them yet).
+ */
+function contextOf(usage: unknown): Pick<OmpState, "context"> {
+	if (!isRecord(usage)) return {};
+	const window = countOf(usage.contextWindow, 1);
+	if (window === undefined) return {};
+	const tokens = countOf(usage.tokens, 0) ?? null;
+	const percent = tokens === null ? null : (countOf(usage.percent, 0) ?? null);
+	return { context: { tokens, window, percent } };
 }
 
 interface ChildLike {
@@ -202,7 +229,12 @@ export interface RpcOmpDriverOptions {
  * throws, or the frame does not parse, the dialog is answered `cancelled` (fail-closed). omp's `method:"cancel"`
  * (its own timeout or an aborted turn) aborts the waiting answer, and nothing is written for that dialog afterwards.
  *
- * `unreadable` gets every non-blank line that is not one JSON object (see `isJsonObjectLine`).
+ * `unreadable` gets every non-blank line that is not one JSON object (see `parseRecord`).
+ *
+ * `localCommand` hears about a prompt omp handled as a local slash command: its `prompt` response says
+ * `agentInvoked: false` and no `prompt_result` follows (omp's RpcClient drops the response data, so only the raw
+ * stream shows it). The text is the `command_output` frames written since the previous `prompt` response — omp writes
+ * a command's output before answering the prompt that ran it — joined by newlines, "" when there were none.
  */
 export async function tapExtensionUi(
 	stream: ReadableStream<Uint8Array>,
@@ -210,9 +242,11 @@ export async function tapExtensionUi(
 	reply: (frame: Record<string, unknown>) => void,
 	answer?: OmpDialogAnswerer,
 	unreadable?: (line: string) => void,
+	localCommand?: (id: string, output: string) => void,
 ): Promise<void> {
 	const decoder = new TextDecoder();
 	const waiting = new Map<string, AbortController>();
+	const commandOutput: string[] = [];
 	let buffer = "";
 	try {
 		for await (const chunk of stream) {
@@ -222,7 +256,24 @@ export async function tapExtensionUi(
 				const line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
 				newline = buffer.indexOf("\n");
-				if (unreadable !== undefined && line.trim() !== "" && !isJsonObjectLine(line)) unreadable(line);
+				if (unreadable !== undefined && line.trim() !== "" && parseRecord(line) === undefined) unreadable(line);
+				// omp writes compact JSON, so a top-level type shows as this exact text (a nested string escapes its quotes).
+				if (
+					localCommand !== undefined &&
+					(line.includes('"type":"command_output"') || line.includes('"type":"response"'))
+				) {
+					const frame = parseRecord(line);
+					if (frame?.type === "command_output" && typeof frame.text === "string") {
+						commandOutput.push(frame.text);
+						continue;
+					}
+					if (frame?.type === "response" && frame.command === "prompt") {
+						const output = commandOutput.splice(0).join("\n");
+						const local = frame.success === true && isRecord(frame.data) && frame.data.agentInvoked === false;
+						if (local && typeof frame.id === "string") localCommand(frame.id, output);
+						continue;
+					}
+				}
 				if (!line.includes('"extension_ui_request"')) continue;
 				let frame: unknown;
 				try {
@@ -260,15 +311,15 @@ export async function tapExtensionUi(
 }
 
 /**
- * Whether a stdout line is one JSON object: anything else (broken JSON, `null`, an array) stops omp's own RpcClient
- * reader, after which no `prompt_result` arrives. An object of an unknown type is fine.
+ * A stdout line as one JSON object, undefined when it is anything else: broken JSON, `null` or an array stops omp's
+ * own RpcClient reader, after which no `prompt_result` arrives. An object of an unknown type is fine.
  */
-function isJsonObjectLine(line: string): boolean {
+function parseRecord(line: string): Record<string, unknown> | undefined {
 	try {
 		const frame: unknown = JSON.parse(line);
-		return isRecord(frame) && !Array.isArray(frame);
+		return isRecord(frame) && !Array.isArray(frame) ? frame : undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -394,7 +445,8 @@ export class RpcOmpDriver implements OmpSessionDriver {
 	readonly #eventListeners = new Set<(event: OmpEvent) => void>();
 	readonly #exitListeners = new Set<(info: OmpExitInfo) => void>();
 	readonly #admitted = new Set<string>();
-	readonly #early = new Map<string, PromptResultFrame>();
+	/** Ends of prompts whose `prompt()` has not resolved yet, delivered on admission so onFinal never precedes it. */
+	readonly #early = new Map<string, () => void>();
 	/** Last leafId this driver saw from a `leafId()` read; seed for the delta read in `leafIdViaCursor`. */
 	readonly #leafCursor: { since?: string } = {};
 	#unsubscribers: Array<() => void> = [];
@@ -485,6 +537,9 @@ export class RpcOmpDriver implements OmpSessionDriver {
 					(line) => {
 						if (this.#child === child) this.#onUnreadable(line);
 					},
+					(id, output) => {
+						if (this.#child === child) this.#onLocalCommand(id, output);
+					},
 				);
 				this.#child = child;
 				void child.exited.then(
@@ -569,12 +624,23 @@ export class RpcOmpDriver implements OmpSessionDriver {
 	#onPromptResult(frame: PromptResultFrame): void {
 		const id = frame.id;
 		if (id === undefined) return;
-		if (!this.#admitted.has(id)) {
-			// `prompt()` has not resolved yet; hold the result so onFinal never precedes it.
-			this.#early.set(id, frame);
-			return;
-		}
-		void this.#finalize(id, frame);
+		const deliver = () => void this.#finalize(id, frame);
+		if (this.#admitted.has(id)) deliver();
+		else this.#early.set(id, deliver);
+	}
+
+	/**
+	 * A prompt omp ran as a local slash command: no `prompt_result` will come, so it ends here, completed with the
+	 * command's output. The last assistant text is not read — it is the previous turn's answer.
+	 */
+	#onLocalCommand(id: string, output: string): void {
+		const deliver = () => {
+			this.#admitted.delete(id);
+			const final: OmpFinal = { opRef: id, status: "completed", text: output };
+			for (const listener of this.#finalListeners) listener(final);
+		};
+		if (this.#admitted.has(id)) deliver();
+		else this.#early.set(id, deliver);
 	}
 
 	async #finalize(opRef: string, frame: PromptResultFrame): Promise<void> {
@@ -611,7 +677,7 @@ export class RpcOmpDriver implements OmpSessionDriver {
 		const early = this.#early.get(opRef);
 		if (early) {
 			this.#early.delete(opRef);
-			void this.#finalize(opRef, early);
+			early();
 		}
 		return opRef;
 	}
@@ -622,6 +688,11 @@ export class RpcOmpDriver implements OmpSessionDriver {
 
 	abort(): Promise<void> {
 		return this.#call((client) => client.abort());
+	}
+
+	async abortAndClearQueue(): Promise<void> {
+		// The withdrawn queue is dropped: those messages are ledger rows of the stopped turn, settled with it.
+		await this.#call((client) => client.abortAndRestoreQueue());
 	}
 
 	newSession(): Promise<{ cancelled: boolean }> {
@@ -644,6 +715,7 @@ export class RpcOmpDriver implements OmpSessionDriver {
 			messageCount: raw.messageCount,
 			model: raw.model?.id === undefined ? undefined : `${raw.model.provider ?? "?"}/${raw.model.id}`,
 			...(raw.thinkingLevel === undefined ? {} : { thinking: raw.thinkingLevel }),
+			...contextOf(raw.contextUsage),
 		};
 	}
 

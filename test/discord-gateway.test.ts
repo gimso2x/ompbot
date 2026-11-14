@@ -8,7 +8,6 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
-	type DiscordReactionEvent,
 } from "../src/discord/transport";
 
 const WAIT_MS = 5_000;
@@ -171,7 +170,6 @@ function startHarness(): Harness {
 
 interface Recorded {
 	messages: DiscordMessageEvent[];
-	reactions: DiscordReactionEvent[];
 	interactions: DiscordInteraction[];
 	ready: Array<{ resumed: boolean }>;
 	fatal: DiscordGatewayFatalError[];
@@ -199,7 +197,6 @@ function make(
 ): { gw: DiscordGateway; rec: Recorded } {
 	const rec: Recorded = {
 		messages: [],
-		reactions: [],
 		interactions: [],
 		ready: [],
 		fatal: [],
@@ -209,10 +206,6 @@ function make(
 	const handlers: DiscordHandlers = {
 		message: async (event) => {
 			rec.messages.push(event);
-			h.notify();
-		},
-		reaction: async (event) => {
-			rec.reactions.push(event);
 			h.notify();
 		},
 		interaction: async (interaction) => {
@@ -265,9 +258,9 @@ describe("DiscordGateway", () => {
 		expect(conn?.search).toContain("v=10");
 		expect(conn?.search).toContain("encoding=json");
 		const identify = conn?.received.find((f) => f.op === 2)?.d as Record<string, unknown>;
-		expect(DISCORD_INTENTS).toBe(46593);
+		expect(DISCORD_INTENTS).toBe(37377);
 		expect(identify.token).toBe(TOKEN);
-		expect(identify.intents).toBe(46593);
+		expect(identify.intents).toBe(37377);
 		expect(identify.properties).toMatchObject({ browser: "ompbot", device: "ompbot" });
 		expect(identify.presence).toEqual({ status: "online", since: null, activities: [], afk: false });
 		expect(gw.session()).toEqual({
@@ -551,28 +544,22 @@ describe("DiscordGateway", () => {
 		expect(rejected).toBeUndefined();
 	});
 
-	test("Dispatch events reach the message, reaction and interaction handlers; other events are ignored", async () => {
+	test("Dispatch events reach the message and interaction handlers; other events are ignored", async () => {
 		const h = startHarness();
 		harness = h;
 		const timers = new FakeTimers();
 		const { gw, rec } = make(h, timers);
 		await gw.start();
 		const message = { id: "10", channel_id: "20", guild_id: "40", author: { id: "30" }, content: "hi", type: 0 };
-		const reaction = { user_id: "30", channel_id: "20", message_id: "10", emoji: { id: null, name: "👍" } };
 		const interaction = { id: "77", application_id: APP, type: 3, token: "itok", data: { custom_id: "x" } };
 		h.send(0, { op: 0, t: "GUILD_CREATE", s: 2, d: { id: "40" } });
 		h.send(0, { op: 0, t: "MESSAGE_CREATE", s: 3, d: message });
-		h.send(0, { op: 0, t: "MESSAGE_REACTION_ADD", s: 4, d: reaction });
-		h.send(0, { op: 0, t: "MESSAGE_REACTION_REMOVE", s: 5, d: reaction });
-		h.send(0, { op: 0, t: "INTERACTION_CREATE", s: 6, d: interaction });
-		await h.until(() => rec.interactions.length === 1 && rec.reactions.length === 2);
+		h.send(0, { op: 0, t: "MESSAGE_REACTION_ADD", s: 4, d: { user_id: "30", channel_id: "20", message_id: "10" } });
+		h.send(0, { op: 0, t: "INTERACTION_CREATE", s: 5, d: interaction });
+		await h.until(() => rec.interactions.length === 1);
 		expect(rec.messages).toEqual([message as DiscordMessageEvent]);
-		expect(rec.reactions).toEqual([
-			{ type: "add", ...reaction },
-			{ type: "remove", ...reaction },
-		]);
 		expect(rec.interactions).toEqual([interaction as DiscordInteraction]);
-		expect(gw.session().seq).toBe(6);
+		expect(gw.session().seq).toBe(5);
 	});
 
 	test("a throwing handler is reported and the connection stays", async () => {
@@ -585,7 +572,6 @@ describe("DiscordGateway", () => {
 				message: async () => {
 					throw new Error("handler boom");
 				},
-				reaction: async () => {},
 				interaction: async () => {},
 			},
 			onError: (error) => {
@@ -679,7 +665,6 @@ describe("DiscordSocketTransport", () => {
 					messages.push(event);
 					h.notify();
 				},
-				reaction: async () => {},
 				interaction: async () => {},
 			});
 			expect(started).toEqual({ botUserId: BOT, applicationId: APP });
@@ -727,7 +712,6 @@ describe("DiscordSocketTransport", () => {
 			);
 			const started = await transport.start({
 				message: async () => {},
-				reaction: async () => {},
 				interaction: async () => {},
 			});
 			expect(started).toEqual({ botUserId: BOT, applicationId: APP });

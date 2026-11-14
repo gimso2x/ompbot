@@ -184,6 +184,8 @@ function readOptions(s: string, from: number, kind: string, allowed: (key: strin
 			throw new SignalSyntaxError(`${kind}: key=값 또는 key~"정규식"이 와야 합니다: ${s.slice(i, i + 30)}`);
 		const key = match[1] as string;
 		if (!allowed(key)) throw new SignalSyntaxError(`${kind}: 모르는 옵션 ${key}`);
+		if (options.some((seen) => seen.key === key))
+			throw new SignalSyntaxError(`${kind}: 옵션 ${key}가 두 번 나왔습니다`);
 		i += match[0].length;
 		const read = readValue(s, i);
 		options.push({ key, op: match[2] as "=" | "~", value: read.value, text: read.text });
@@ -227,6 +229,7 @@ function parseFile(s: string, at: number): Signal {
 			continue;
 		}
 		if (option.op !== "=") throw new SignalSyntaxError("json:<경로>는 =<json 값>을 받습니다");
+		if (signal.json !== undefined) throw new SignalSyntaxError("file에는 json: 옵션을 하나만 쓸 수 있습니다");
 		const fields = option.key
 			.slice("json:".length)
 			.replace(/^\./, "")
@@ -252,8 +255,11 @@ export function parseSignal(raw: string): Signal {
 export interface SignalIo {
 	/** `argv` without a shell in the worktree under `CHECK_TIMEOUT_MS`; `output` is stdout then stderr. */
 	runCheck(argv: string[]): Promise<{ code: number | null; output: string; timedOut: boolean }>;
-	/** A worktree-relative file; `undefined` when it does not exist (an unreadable host throws). */
-	readFile(path: string): Promise<string | undefined>;
+	/**
+	 * A worktree-relative file's bytes; `undefined` when it does not exist (an unreadable host throws). Bytes, not text:
+	 * `sha256` must hash the file itself, which a UTF-8 decode would change for a binary file (qa-i #126).
+	 */
+	readBytes(path: string): Promise<Uint8Array | undefined>;
 }
 
 /** The last characters of an output on one line: where a test runner prints its verdict. */
@@ -297,16 +303,16 @@ export async function runSignal(raw: string, io: SignalIo): Promise<SignalCheck>
 			return verdict(false, `exit 0, 출력이 ${parsed.stdout}와 맞지 않습니다: ${tail(result.output) || "(출력 없음)"}`);
 		return verdict(true, parsed.stdout === undefined ? "exit 0" : `exit 0, 출력이 ${parsed.stdout}와 맞습니다`);
 	}
-	const text = await io.readFile(parsed.path);
-	if (text === undefined) return verdict(false, `파일이 없습니다: ${parsed.path}`);
+	const bytes = await io.readBytes(parsed.path);
+	if (bytes === undefined) return verdict(false, `파일이 없습니다: ${parsed.path}`);
 	if (parsed.sha256 !== undefined) {
-		const got = createHash("sha256").update(text, "utf8").digest("hex");
+		const got = createHash("sha256").update(bytes).digest("hex");
 		if (got !== parsed.sha256) return verdict(false, `sha256 ${got.slice(0, 12)}… ≠ ${parsed.sha256.slice(0, 12)}…`);
 	}
 	if (parsed.json !== undefined) {
 		let document: unknown;
 		try {
-			document = JSON.parse(text);
+			document = JSON.parse(Buffer.from(bytes).toString("utf8"));
 		} catch {
 			return verdict(false, `JSON이 아닙니다: ${parsed.path}`);
 		}

@@ -67,11 +67,20 @@ interface EpisodicRow {
 	summaryOf?: string;
 }
 
-/** A minimal Mnemopi bank (only the columns the scripts read) at `<dir>/<name>/mnemopi.db`. */
+/**
+ * A minimal Mnemopi bank (only the columns the scripts read) at `<dir>/<name>/mnemopi.db`. Built in one transaction:
+ * one autocommit (and fsync) per statement made the fixture most of each case's time, and that part grew with disk load.
+ */
 function makeBank(dir: string, name: string, working: WorkingRow[], episodic: EpisodicRow[] = []): string {
 	mkdirSync(join(dir, name), { recursive: true });
 	const path = join(dir, name, "mnemopi.db");
 	const db = new Database(path);
+	db.transaction(() => fillBank(db, working, episodic))();
+	db.close();
+	return path;
+}
+
+function fillBank(db: Database, working: WorkingRow[], episodic: EpisodicRow[]): void {
 	db.run(`CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT, timestamp TEXT,
 		recall_count INTEGER DEFAULT 0, valid_until TIMESTAMP DEFAULT NULL, superseded_by TEXT DEFAULT NULL, metadata_json TEXT)`);
 	db.run(`CREATE TABLE episodic_memory (id TEXT UNIQUE NOT NULL, content TEXT NOT NULL, timestamp TEXT,
@@ -109,8 +118,6 @@ function makeBank(dir: string, name: string, working: WorkingRow[], episodic: Ep
 	f.run("f2", "version", "is", "1.2.4");
 	f.run("f3", "iso_date", "is", "2026-11-01");
 	f.run("f4", "ompbot", "uses", "bun");
-	db.close();
-	return path;
 }
 
 const ID = {

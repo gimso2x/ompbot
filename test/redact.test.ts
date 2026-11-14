@@ -63,6 +63,41 @@ describe("redact", () => {
 	});
 });
 
+describe("fable IMP-13: cloud keys, webhook URLs and private keys", () => {
+	// Assembled at run time so no secret scanner reads these fakes as real credentials.
+	test.each([
+		["AKIA", "TESTTESTTEST0000"],
+		["AIza", `Sy${"T".repeat(31)}-0`],
+		["glpat-", "TEST_TEST_TEST_TEST_0"],
+		["https://hooks.slack.com/services/", "T00000000/B00000000/TESTTESTTESTTESTTESTTEST"],
+		["https://discord.com/api/webhooks/", `123456789012345678/${"T".repeat(68)}`],
+		["https://discordapp.com/api/webhooks/", `123456789012345678/${"t".repeat(68)}`],
+	])("%s… is replaced", (head, tail) => {
+		expect(redact(`before ${head}${tail} after`)).toBe(`before ${REDACTED} after`);
+	});
+
+	test("a PEM private key block is masked from BEGIN to END, the text around it stays", () => {
+		const kind = "RSA PRIVATE KEY";
+		const block = [
+			`-----BEGIN ${kind}-----`,
+			"MIIEowIBAAKCAQEAtest",
+			"TESTTESTTESTTEST==",
+			`-----END ${kind}-----`,
+		].join("\n");
+		expect(redact(`key:\n${block}\ndone`)).toBe(`key:\n${REDACTED}\ndone`);
+		const ssh = "OPENSSH PRIVATE KEY";
+		expect(redact([`-----BEGIN ${ssh}-----`, "b3BlbnNzaC1rZXktdjEAtest", `-----END ${ssh}-----`].join("\n"))).toBe(
+			REDACTED,
+		);
+	});
+
+	test("lookalikes survive: a public key, AKIA in a word, a webhook docs URL", () => {
+		const text =
+			"-----BEGIN PUBLIC KEY----- AKIAX https://discord.com/api/webhooks docs https://hooks.slack.com/ glpat-x";
+		expect(redact(text)).toBe(text);
+	});
+});
+
 describe("qa50b I-20: a token split by a line break", () => {
 	test("is masked whole, both halves", () => {
 		const out = redact("card: ghp_abcdefghijklmnop\nqrstuvwxyz0123456789 end");

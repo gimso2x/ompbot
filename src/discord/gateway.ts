@@ -7,7 +7,6 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
-	type DiscordReactionEvent,
 	FATAL_CLOSE_CODES,
 } from "./transport";
 
@@ -34,8 +33,6 @@ export interface DiscordGatewayOptions {
 	now?: () => number;
 	backoffBaseMs?: number;
 	backoffMaxMs?: number;
-	/** A connection with no HELLO this long after it was made is closed and retried after the backoff. */
-	helloTimeoutMs?: number;
 	/** Every Ready (`resumed: false`, a new session: events in between are lost) and Resumed (`resumed: true`). */
 	onReady?: (info: { resumed: boolean }) => void;
 	/** A non-retryable close (4004, 4010–4014): the gateway has stopped for good. */
@@ -56,6 +53,9 @@ const OP = {
 	HELLO: 10,
 	HEARTBEAT_ACK: 11,
 } as const;
+
+/** A connection with no HELLO this long after it was made is closed and retried after the backoff. */
+const HELLO_TIMEOUT_MS = 30_000;
 
 /** Client-side close code that keeps the session resumable (1000/1001 would end it). */
 const RESUMABLE_CLOSE = 4900;
@@ -102,7 +102,6 @@ export class DiscordGateway {
 	readonly #intents: number;
 	readonly #backoffBaseMs: number;
 	readonly #backoffMaxMs: number;
-	readonly #helloTimeoutMs: number;
 	#ws: WebSocket | undefined;
 	/** Bumped whenever a socket is replaced; callbacks of older sockets compare against it and bail. */
 	#generation = 0;
@@ -133,7 +132,6 @@ export class DiscordGateway {
 		this.#intents = options.intents ?? DISCORD_INTENTS;
 		this.#backoffBaseMs = options.backoffBaseMs ?? 1_000;
 		this.#backoffMaxMs = options.backoffMaxMs ?? 60_000;
-		this.#helloTimeoutMs = options.helloTimeoutMs ?? 30_000;
 		this.#since = this.#now();
 	}
 
@@ -248,7 +246,7 @@ export class DiscordGateway {
 		this.#timers.clear(this.#helloTimer);
 		this.#helloTimer = this.#timers.set(() => {
 			if (gen === this.#generation) this.#reconnect("hello timeout", { newSession: false, delay: "backoff" });
-		}, this.#helloTimeoutMs);
+		}, HELLO_TIMEOUT_MS);
 		const resuming = resumeUrl !== undefined;
 		const current = (): boolean => gen === this.#generation && this.#ws === ws;
 		ws.addEventListener("message", (ev) => {
@@ -381,12 +379,6 @@ export class DiscordGateway {
 			// Handlers start in arrival order; each runs on its own so a slow one does not hold the socket.
 			case "MESSAGE_CREATE":
 				this.#run(() => handlers.message(data as DiscordMessageEvent));
-				return;
-			case "MESSAGE_REACTION_ADD":
-				this.#run(() => handlers.reaction({ ...d, type: "add" } as DiscordReactionEvent));
-				return;
-			case "MESSAGE_REACTION_REMOVE":
-				this.#run(() => handlers.reaction({ ...d, type: "remove" } as DiscordReactionEvent));
 				return;
 			case "INTERACTION_CREATE":
 				this.#run(() => handlers.interaction(data as DiscordInteraction));

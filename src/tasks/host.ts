@@ -42,6 +42,8 @@ export interface TaskHostOps {
 	writeFile(path: string, content: string): Promise<HostResult<null>>;
 	/** `value: undefined` = the file does not exist; an unreachable host is a failure, never "missing". */
 	readFile(path: string): Promise<HostResult<string | undefined>>;
+	/** `readFile` as the file's bytes (a `sha256` file check hashes them); over ssh they travel as base64. */
+	readBytes(path: string): Promise<HostResult<Uint8Array | undefined>>;
 	/**
 	 * Whether `hash` is a commit on `branch` after the branch's `docs(task): <taskId> 4문서` commit; throws when the host
 	 * cannot be asked or git fails unexpectedly (never answers "no" for "unknown").
@@ -106,7 +108,7 @@ export interface TaskHostOptions {
 const REMOTE_CHECK_PATH = 'PATH="$HOME/.local/bin:$PATH"';
 
 export function sshCommand(sshTarget: string, remote: string[]): string[] {
-	return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", sshTarget, "--", ...remote];
+	return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", sshTarget, ...remote];
 }
 
 function assertPath(path: string): void {
@@ -228,6 +230,24 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			if (result.code !== 0) return { ok: true, value: undefined };
 			if (result.stdout.length >= DEFAULT_STDOUT_CAP) return { ok: false, error: `${path} is too large to read` };
 			return { ok: true, value: result.stdout };
+		},
+
+		async readBytes(path) {
+			assertPath(path);
+			if (sshTarget === undefined) {
+				try {
+					return { ok: true, value: await readFile(path) };
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, value: undefined };
+					return fail(error);
+				}
+			}
+			// The runner collects stdout as UTF-8 text, which would mangle a binary file: base64 keeps every byte.
+			const result = await run(sshCommand(sshTarget, ["base64", path]), { timeoutMs: IO_TIMEOUT_MS });
+			if (unreachable(result)) return { ok: false, error: `host unreachable: ${unreachableReason(result)}` };
+			if (result.code !== 0) return { ok: true, value: undefined };
+			if (result.stdout.length >= DEFAULT_STDOUT_CAP) return { ok: false, error: `${path} is too large to read` };
+			return { ok: true, value: Buffer.from(result.stdout, "base64") };
 		},
 
 		async commitOnTaskBranch({ worktree, branch, taskId, hash }) {
@@ -361,7 +381,7 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			};
 			const sha = await git("rev-parse", "HEAD");
 			if (!FULL_HASH.test(sha)) throw new Error(`cannot read HEAD of ${worktree}: ${sha.slice(0, 80)}`);
-			return { sha, clean: (await git("status", "--porcelain")) === "" };
+			return { sha, clean: (await git("status", "--porcelain", "--untracked-files=all")) === "" };
 		},
 
 		async progressLag({ worktree, taskId }) {
@@ -390,7 +410,7 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 				if (!Number.isInteger(codeCommitsSince))
 					return { ok: false, error: `git rev-list: ${count.value.trim().slice(0, 80)}` };
 			}
-			const status = await git("status", "--porcelain");
+			const status = await git("status", "--porcelain", "--untracked-files=all");
 			if (!status.ok) return status;
 			const entries = status.value.split("\n").filter((line) => line.trim() !== "");
 			const progressDirty = entries.some((line) => line.slice(3) === progressPath);

@@ -92,6 +92,7 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	if (!TASK_PATH_PATTERN.test(repo) || repo.includes("..")) {
 		throw new TaskSpecError(`taskSpec.repo는 대상 호스트의 git 저장소 절대경로여야 합니다(영숫자·_ . / - 만): ${repo}`);
 	}
+	if (repo.replace(/\/+$/, "") === "") throw new TaskSpecError(`taskSpec.repo는 루트(/)일 수 없습니다: ${repo}`);
 	const background = record.background;
 	if (background !== undefined && typeof background !== "string")
 		throw new TaskSpecError("taskSpec.background는 문자열이어야 합니다");

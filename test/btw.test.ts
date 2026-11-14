@@ -273,6 +273,7 @@ export class RpcClient {
 	}
 }
 for (const name of ${JSON.stringify(REQUIRED_RPC_METHODS)}) {
+	if (Object.hasOwn(RpcClient.prototype, name)) continue;
 	RpcClient.prototype[name] = name.startsWith("on") ? () => () => undefined : async () => undefined;
 }
 `;

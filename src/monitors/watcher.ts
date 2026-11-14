@@ -6,7 +6,7 @@ import { MonitorSpecError, resolveWatchRoot } from "./spec";
 
 /** Changed paths listed in one event's payload; the rest is summarized as a count. */
 export const MAX_WATCH_PATHS = 50;
-/** Distinct paths remembered per pending event (dedupes repeated writes); further new paths only raise `overflow`. */
+/** Distinct paths remembered per pending event (dedupes repeated writes); further new paths only join `overflow` (still deduped, so the count stays distinct paths). */
 const MAX_TRACKED_PATHS = 1000;
 
 /** What a watch hands back; the test seam replaces `fs.watch`. */
@@ -44,7 +44,7 @@ interface Entry {
 	identity: string;
 	handle: WatchHandle;
 	paths: Set<string>;
-	overflow: number;
+	overflow: Set<string>;
 	lastChangeAt: number;
 	/** Bumped when the watch died; the next reconcile starts a fresh one. */
 	failed: boolean;
@@ -64,6 +64,9 @@ export class WatcherSet {
 			clock: { now(): number };
 			watchRoots: () => readonly string[] | undefined;
 			starter?: WatchStarter | undefined;
+			/** Every failed start or dead watch (the ledger's check error streak); a started watch calls `onStarted`. */
+			onError?: ((id: string, error: string) => void) | undefined;
+			onStarted?: ((id: string) => void) | undefined;
 		},
 	) {}
 
@@ -115,10 +118,10 @@ export class WatcherSet {
 		const entry = this.#entries.get(id);
 		if (entry === undefined || entry.paths.size === 0 || now - entry.lastChangeAt < debounceMs) return undefined;
 		const lines = [...entry.paths].slice(0, MAX_WATCH_PATHS);
-		const more = entry.paths.size + entry.overflow - lines.length;
+		const more = entry.paths.size + entry.overflow.size - lines.length;
 		if (more > 0) lines.push(`… and ${more} more`);
 		entry.paths.clear();
-		entry.overflow = 0;
+		entry.overflow.clear();
 		return lines.join("\n");
 	}
 
@@ -153,6 +156,12 @@ export class WatcherSet {
 			this.#lastError.set(id, text);
 			this.deps.log.error("monitor_watch_error", { monitor: id, error: text });
 		}
+		// The fs error callback has no caller to throw to: a failed record is a log line.
+		try {
+			this.deps.onError?.(id, text);
+		} catch (err) {
+			this.deps.log.error("monitor_watch_record_failed", { monitor: id, error: String(err) });
+		}
 	}
 
 	#start(id: string, root: string): void {
@@ -163,7 +172,7 @@ export class WatcherSet {
 				identity: rootIdentity(real),
 				handle: { close() {} },
 				paths: new Set(),
-				overflow: 0,
+				overflow: new Set(),
 				lastChangeAt: 0,
 				failed: false,
 			};
@@ -175,7 +184,7 @@ export class WatcherSet {
 					entry.lastChangeAt = this.deps.clock.now();
 					if (entry.paths.has(path)) return;
 					if (entry.paths.size < MAX_TRACKED_PATHS) entry.paths.add(path);
-					else entry.overflow += 1;
+					else entry.overflow.add(path);
 				},
 				(error) => {
 					entry.failed = true;
@@ -184,6 +193,7 @@ export class WatcherSet {
 			);
 			this.#entries.set(id, entry);
 			this.#lastError.delete(id);
+			this.deps.onStarted?.(id);
 		} catch (error) {
 			this.#fail(id, error instanceof MonitorSpecError ? error.message : error);
 		}

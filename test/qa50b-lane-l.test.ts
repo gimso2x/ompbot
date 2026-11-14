@@ -40,7 +40,7 @@ describe("qa50b-low lane L", () => {
 			mkdirSync(home);
 			const dbPath = join(home, "ompbot.db");
 			writeFileSync(dbPath, bytes);
-			const report = readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul", false, undefined, IDLE_HOST_LOAD);
+			const report = readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul", {}, IDLE_HOST_LOAD);
 			expect(report.daemonRunning).toBe(false);
 			expect(report.origins).toEqual([]);
 			expect(report.openGates.map((gate) => gate.name)).toContain("ledger_unreadable");

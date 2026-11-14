@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -209,6 +210,17 @@ describe("owner DM origin", () => {
 	});
 });
 
+describe("teams_qa", () => {
+	test("a guest question and its answer are stored masked, and read back masked", () => {
+		const store = open();
+		const id = store.recordTeamsQuestion({ alias: "t1", askerAad: "aad-1", question: "토큰 xoxb-TEST-0 왜 안 돼?" });
+		store.recordTeamsAnswer(id, "xoxb-TEST-0 는 붙여 넣지 마세요");
+		expect(store.teamsQaContext("t1", 5)).toEqual([
+			{ askerName: undefined, question: "토큰 [REDACTED] 왜 안 돼?", answer: "[REDACTED] 는 붙여 넣지 마세요" },
+		]);
+	});
+});
+
 describe("answer transaction", () => {
 	test("exception between answered and delivery rows rolls both back", () => {
 		const store = open({
@@ -382,23 +394,7 @@ describe("delivery backoff, expiry, ambiguity", () => {
 	});
 });
 
-describe("thread mutes", () => {
-	test("!shutup mute is durable across reopen; unshutup and double toggles are idempotent", () => {
-		const first = open();
-		expect(first.isThreadMuted("C1:1.1")).toBe(false);
-		first.setThreadMute("C1:1.1", true);
-		first.setThreadMute("C1:1.1", true); // redelivery of the same !shutup
-		expect(first.isThreadMuted("C1:1.1")).toBe(true);
-		expect(first.isThreadMuted("C1:1.2")).toBe(false); // thread-scoped, not channel-wide
-		first.close();
-
-		const second = open();
-		expect(second.isThreadMuted("C1:1.1")).toBe(true);
-		second.setThreadMute("C1:1.1", false);
-		second.setThreadMute("C1:1.1", false); // clearing an already-clear mute
-		expect(second.isThreadMuted("C1:1.1")).toBe(false);
-	});
-
+describe("latestInboundThread", () => {
 	test("latestInboundThread returns the origin's newest recorded thread", () => {
 		const store = open();
 		store.ensureOrigin("slack/dm/D1", "/s/d1");
@@ -459,5 +455,176 @@ describe("reopen", () => {
 		const second = open();
 		expect(second.getInbound("m1")?.state).toBe("pending");
 		expect(second.getOrigin("o1")?.epoch).toBe(1);
+	});
+});
+
+/**
+ * Fable audit batch 2 (OPT-04·05·06·30·35): each hot query is judged by its EXPLAIN QUERY PLAN, and its rows by a
+ * fixed fixture. The store's own statements are captured as they run (SQL and bound parameters), so the plan judged
+ * is the one the code really executes; the dashboard's queries are quoted verbatim from `dashboard/snapshot.ts`.
+ */
+describe("ledger query plans", () => {
+	const DAY = 24 * 60 * 60_000;
+
+	/** Plans (EXPLAIN QUERY PLAN `detail` lines joined) of every statement `call` ran through `store`'s connection. */
+	function plansOf(store: Store, call: () => unknown): string[] {
+		// The connection is private to Store; the judge must watch that very connection, not a second one.
+		const live = store as unknown as { db: Database };
+		const db = live.db;
+		const original = db.query.bind(db);
+		const seen: Array<{ sql: string; args: unknown[] }> = [];
+		Object.assign(db, {
+			query: (sql: string) => {
+				const statement = original(sql);
+				return new Proxy(statement, {
+					get(target, property) {
+						const value = Reflect.get(target, property);
+						if (property !== "all" && property !== "get") {
+							return typeof value === "function" ? value.bind(target) : value;
+						}
+						return (...args: unknown[]) => {
+							seen.push({ sql, args });
+							return (value as (...a: unknown[]) => unknown).apply(target, args);
+						};
+					},
+				});
+			},
+		});
+		try {
+			call();
+		} finally {
+			delete (db as unknown as Record<string, unknown>).query;
+		}
+		return seen.map(({ sql, args }) => planOf(db, sql, args));
+	}
+
+	function planOf(db: Database, sql: string, args: unknown[] = []): string {
+		const rows = db.query(`EXPLAIN QUERY PLAN ${sql}`).all(...(args as [])) as Array<{ detail: string }>;
+		return rows.map((row) => row.detail).join("\n");
+	}
+
+	function rawDb(): Database {
+		const db = new Database(dbPath, { strict: true });
+		opened.push({ close: () => db.close() } as unknown as Store);
+		return db;
+	}
+
+	test("OPT-04 listInbound: filtered reads search an index, only the unfiltered read scans", () => {
+		const store = open();
+		store.ensureOrigin("o1", "/s/o1");
+		store.ensureOrigin("o2", "/s/o2");
+		store.recordInbound({ originKey: "o1", platformMessageId: "m1", textRef: "a" });
+		store.recordInbound({ originKey: "o1", platformMessageId: "m2", textRef: "b" });
+		store.recordInbound({ originKey: "o2", platformMessageId: "m3", textRef: "c" });
+		store.markDispatched("m2", { opRef: "op1", entryCursor: null });
+		const ids = (filter: Parameters<Store["listInbound"]>[0]) =>
+			store.listInbound(filter).map((row) => row.platformMessageId);
+		expect(ids({})).toEqual(["m1", "m2", "m3"]);
+		expect(ids({ state: "pending" })).toEqual(["m1", "m3"]);
+		expect(ids({ originKey: "o1" })).toEqual(["m1", "m2"]);
+		expect(ids({ originKey: "o1", state: "pending" })).toEqual(["m1"]);
+		expect(ids({ originKey: "o2", state: "dispatched" })).toEqual([]);
+		const filters: Array<Parameters<Store["listInbound"]>[0]> = [
+			{ state: "pending" },
+			{ originKey: "o1" },
+			{ originKey: "o1", state: "pending" },
+		];
+		for (const filter of filters) {
+			const plans = plansOf(store, () => store.listInbound(filter));
+			expect(plans).toHaveLength(1);
+			expect(plans[0]).not.toContain("SCAN inbound");
+		}
+	});
+
+	test("OPT-05 turnDurationSamples: the 30-day window is a WHERE bound on dispatched_at, same samples at the edge", () => {
+		clock.t = 200 * DAY;
+		const store = open();
+		const raw = rawDb();
+		const key = "slack/dm/D1";
+		store.ensureOrigin(key, "/s/d1");
+		let seq = 0;
+		const turn = (dispatchedAt: number, ms: number) => {
+			const opRef = `op${++seq}`;
+			raw
+				.query(
+					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, op_ref) VALUES (?, ?, 1, 'x', 'answered', ?, ?, ?)",
+				)
+				.run(`m${seq}`, key, dispatchedAt - 10, dispatchedAt, opRef);
+			raw
+				.query(
+					"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES (?, ?, 0, 'T', 'b', 'confirmed', 0, ?)",
+				)
+				.run(key, opRef, dispatchedAt + ms);
+		};
+		turn(clock.t - 31 * DAY, 1000);
+		turn(clock.t - 29 * DAY, 7000);
+		turn(clock.t - DAY, 3000);
+		expect(store.turnDurationSamples(key)).toEqual([3000, 7000]);
+		expect(store.turnDurationSamples()).toEqual([3000, 7000]);
+		const [plan] = plansOf(store, () => store.turnDurationSamples());
+		expect(plan).toMatch(/SEARCH i USING INDEX \S+ \([^)]*dispatched_at>\?\)/);
+	});
+
+	test("OPT-06 turn board: a thread's newest and oldest rows come off an index, no temp sort", () => {
+		const store = open();
+		store.ensureOrigin("slack/ch/C1/t/1.1", "/s/t");
+		for (let i = 0; i < 5; i += 1) {
+			clock.advance(1000);
+			store.recordInbound({ originKey: "slack/ch/C1/t/1.1", platformMessageId: `m${i}`, textRef: "x" });
+		}
+		const raw = rawDb();
+		const columns = `inbound_id, platform_message_id, origin_key, text_ref, thread_ref, state, created_at,
+				dispatched_at, last_event_at`;
+		// dashboard/snapshot.ts: the board thread's `recent` and `first` reads.
+		const recent = `SELECT ${columns} FROM inbound WHERE origin_key = ? ORDER BY created_at DESC, inbound_id DESC LIMIT ?`;
+		const first = `SELECT ${columns} FROM inbound WHERE origin_key = ? ORDER BY created_at, inbound_id LIMIT 1`;
+		expect(planOf(raw, recent, ["slack/ch/C1/t/1.1", 3])).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+		expect(planOf(raw, first, ["slack/ch/C1/t/1.1"])).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+		const rows = raw.query(recent).all("slack/ch/C1/t/1.1", 3) as Array<{ platform_message_id: string }>;
+		expect(rows.map((row) => row.platform_message_id)).toEqual(["m4", "m3", "m2"]);
+	});
+
+	test("OPT-30 recall candidates: the 90-day window reads inbound through an index, same rows", () => {
+		clock.t = 200 * DAY;
+		const store = open();
+		const raw = rawDb();
+		store.ensureOrigin("slack/ch/C1/t/1.1", "/s/t1");
+		store.ensureOrigin("slack/ch/C1/t/2.2", "/s/t2");
+		raw
+			.query(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('old', 'slack/ch/C1/t/1.1', 1, '오래된 질문', ?, 'C1:1.1')",
+			)
+			.run(clock.t - 91 * DAY);
+		raw
+			.query(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('new', 'slack/ch/C1/t/2.2', 1, '최근 질문', ?, 'C1:2.2')",
+			)
+			.run(clock.t - 89 * DAY);
+		expect(store.listRecallCandidates("C1", "C1:9.9", 50).map((c) => c.text)).toEqual(["최근 질문"]);
+		const [plan] = plansOf(store, () => store.listRecallCandidates("C1", "C1:9.9", 50));
+		expect(plan).toContain("inbound");
+		expect(plan).not.toContain("SCAN inbound");
+	});
+
+	test("interimBodies: the op prefix is an index range on op_ref, only that op's interims", () => {
+		const store = open();
+		store.ensureOrigin("o1", "/s/o1");
+		store.recordInterim({ originKey: "o1", opRef: "op1", threadRef: "t", index: 0, body: "first" });
+		store.recordInterim({ originKey: "o1", opRef: "op10", threadRef: "t", index: 0, body: "other op" });
+		store.recordInterim({ originKey: "o1", opRef: "op1", threadRef: "t", index: 1, body: "second" });
+		store.recordAnswer({ originKey: "o1", opRef: "op1", threadRef: "t", parts: ["final"] });
+		expect(store.interimBodies("o1", "op1")).toEqual(["first", "second"]);
+		expect(store.interimBodies("o1", "op10")).toEqual(["other op"]);
+		const [plan] = plansOf(store, () => store.interimBodies("o1", "op1"));
+		expect(plan).toMatch(/SEARCH deliveries USING INDEX \S+ \(origin_key=\? AND op_ref>\? AND op_ref<\?\)/);
+	});
+
+	test("OPT-35 monitor_events: a monitor's newest events come off an index, no temp sort", () => {
+		open();
+		const raw = rawDb();
+		// dashboard/snapshot.ts and dashboard/monitor-detail.ts: a monitor's latest-events strip.
+		const sql =
+			"SELECT stage, slot_at, updated_at, attempts, manual FROM monitor_events WHERE monitor_id = ? ORDER BY event_id DESC LIMIT ?";
+		expect(planOf(raw, sql, ["m1", 7])).not.toContain("TEMP B-TREE");
 	});
 });

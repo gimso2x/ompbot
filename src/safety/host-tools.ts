@@ -21,6 +21,9 @@ export interface HostToolDef {
 	execute(params: Record<string, unknown>, context: { signal: AbortSignal }): Promise<string>;
 }
 
+/** Thrown by the daemon's call-time guard when a tool only an untouched conversation may use runs after a peer bot wrote there. */
+export const PEER_TOOL_DENIED = "피어 봇 글이 들어온 대화에서는 쓸 수 없는 도구다";
+
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 /** Uploads are scanned for token-like strings in chunks of this many bytes (whole-file `redact` would need GBs). */
 export const UPLOAD_SCAN_CHUNK_BYTES = 1024 * 1024;
@@ -35,7 +38,10 @@ export const UPLOAD_SCAN_CARRY_CHARS = 4096;
  * as UTF-8 is full of short `sk-…` runs. Chat masking (`redact`) keeps the shorter shape.
  */
 const UPLOAD_SECRET_PATTERN = new RegExp(secretShapes("{20,}"));
-/** PEM private keys (`RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, bare): an upload-only check, chat masking does not use it. */
+/**
+ * PEM private key header (`RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, bare): uploads refuse it even without its END line in the
+ * scanned span; chat masking (`secretShapes`) masks whole BEGIN–END blocks only.
+ */
 const PRIVATE_KEY_HEADER = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/;
 /** How deep and how many files of one protected directory the hard-link check walks. */
 const HARD_LINK_SCAN_DEPTH = 3;
@@ -86,7 +92,6 @@ function protectedInodeMatches(root: string, target: { dev: number; ino: number 
 const PLATFORM_NAMES: Record<ChatPlatform, string> = {
 	slack: "Slack",
 	discord: "Discord",
-	telegram: "Telegram",
 	teams: "Teams",
 };
 
@@ -129,7 +134,8 @@ export interface HostToolDeps {
 	herdr?: DispatchToolDeps["herdr"];
 	/**
 	 * The owner's delegated Graph session (`channels.teams.graph`): `teams_list_chats` and `teams_read_chat` are added
-	 * for a `teams/dm/*` origin only. The caller passes it only for the owner's own 1:1 no peer bot has written in.
+	 * for a `teams/dm/*` origin only. The caller passes it only for the owner's own 1:1, and refuses the two tools when
+	 * they run once a peer bot has written there.
 	 */
 	teamsGraph?: TeamsGraphClient;
 }
@@ -213,6 +219,7 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	const platform =
 		chatOrigin?.platform ?? (channel === undefined ? undefined : platformOfConversationId(channel)) ?? "slack";
 	const platformName = PLATFORM_NAMES[platform];
+	const fileTool = sendFileToolName(platform);
 	const needChannel = (): string => {
 		if (channel === undefined) throw new Error(`origin is not a Slack conversation: ${deps.originKey}`);
 		return channel;
@@ -242,47 +249,52 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	return [
 		...(dispatch === undefined ? [] : [dispatch]),
 		...teamsGraph,
-		{
-			name: sendFileToolName(platform),
-			label: "Send file to owner",
-			description: `Upload a local file into the current conversation thread in the owner's ${platformName} (the channel's main view when there is no thread). Files in secret directories or containing tokens are refused.`,
-			parameters: {
-				type: "object",
-				properties: {
-					path: { type: "string", description: "Absolute path (or relative to the workspace) of the file" },
-					title: { type: "string", description: "Optional title" },
-					comment: { type: "string", description: "Optional message shown with the file" },
-				},
-				required: ["path"],
-				additionalProperties: false,
-			},
-			async execute(params) {
-				const target = needChannel();
-				const path = stringParam(params, "path");
-				if (path === undefined) throw new Error("path is required");
-				const real = checkUploadable(path, deps);
-				const comment = stringParam(params, "comment");
-				const title = stringParam(params, "title");
-				const threadTs = deps.threadTs?.();
-				const { fileId } = await deps.channels.portFor(target).uploadFile(
-					{ conversationId: target, ...(threadTs === undefined ? {} : { threadId: threadTs }) },
+		// Only where the platform's port can upload: Teams cannot, so its sessions get no upload tool (qa-i #110).
+		...(fileTool === undefined
+			? []
+			: [
 					{
-						path: real,
-						...(title === undefined ? {} : { title }),
-						...(comment === undefined ? {} : { comment: redact(comment) }),
-					},
-				);
-				deps.log.info("file_uploaded", {
-					origin: deps.originKey,
-					file: basename(real),
-					id: fileId,
-					...(threadTs === undefined ? {} : { thread: threadTs }),
-				});
-				return `uploaded ${basename(real)} ${
-					threadTs === undefined ? "to the owner DM" : "to the conversation thread"
-				} (file id ${fileId})`;
-			},
-		},
+						name: fileTool,
+						label: "Send file to owner",
+						description: `Upload a local file into the current conversation thread in the owner's ${platformName} (the channel's main view when there is no thread). Files in secret directories or containing tokens are refused.`,
+						parameters: {
+							type: "object",
+							properties: {
+								path: { type: "string", description: "Absolute path (or relative to the workspace) of the file" },
+								title: { type: "string", description: "Optional title" },
+								comment: { type: "string", description: "Optional message shown with the file" },
+							},
+							required: ["path"],
+							additionalProperties: false,
+						},
+						async execute(params) {
+							const target = needChannel();
+							const path = stringParam(params, "path");
+							if (path === undefined) throw new Error("path is required");
+							const real = checkUploadable(path, deps);
+							const comment = stringParam(params, "comment");
+							const title = stringParam(params, "title");
+							const threadTs = deps.threadTs?.();
+							const { fileId } = await deps.channels.portFor(target).uploadFile(
+								{ conversationId: target, ...(threadTs === undefined ? {} : { threadId: threadTs }) },
+								{
+									path: real,
+									...(title === undefined ? {} : { title }),
+									...(comment === undefined ? {} : { comment: redact(comment) }),
+								},
+							);
+							deps.log.info("file_uploaded", {
+								origin: deps.originKey,
+								file: basename(real),
+								id: fileId,
+								...(threadTs === undefined ? {} : { thread: threadTs }),
+							});
+							return `uploaded ${basename(real)} ${
+								threadTs === undefined ? "to the owner DM" : "to the conversation thread"
+							} (file id ${fileId})`;
+						},
+					} satisfies HostToolDef,
+				]),
 		{
 			name: "ompbot_request_approval",
 			label: "Ask owner for approval",

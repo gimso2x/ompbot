@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { parseTaskSpecInput, TaskSpecError } from "../src/tasks/docs";
 import { CHECK_TIMEOUT_MS, checkSignalsOf, parseSignal, runSignal, SignalSyntaxError } from "../src/tasks/signals";
 
@@ -94,12 +95,18 @@ describe("signal grammar", () => {
 		expect(() => parseSignal('command [] stdout~"x"')).toThrow(SignalSyntaxError);
 	});
 
+	test("a repeated option is rejected instead of silently dropping the earlier one (qa-i #59)", () => {
+		expect(() => parseSignal("file data.json json:.a=1 json:.b=2")).toThrow(SignalSyntaxError);
+		expect(() => parseSignal("file data.json json:.a=1 json:.a=2")).toThrow(SignalSyntaxError);
+		expect(() => parseSignal('command ["echo"] stdout~"a" stdout~"b"')).toThrow(SignalSyntaxError);
+	});
+
 	test("a malformed signal that reached the sweep fails instead of throwing", async () => {
 		const io = {
 			runCheck: async () => {
 				throw new Error("not run");
 			},
-			readFile: async () => undefined,
+			readBytes: async () => undefined,
 		};
 		expect(await runSignal("command bun test", io)).toMatchObject({
 			ok: false,
@@ -111,7 +118,7 @@ describe("signal grammar", () => {
 		expect(CHECK_TIMEOUT_MS).toBe(300_000);
 		const io = {
 			runCheck: async () => ({ code: null, output: "partial", timedOut: true }),
-			readFile: async () => undefined,
+			readBytes: async () => undefined,
 		};
 		expect(await runSignal('command ["sleep","999"]', io)).toEqual({
 			signal: 'command ["sleep","999"]',
@@ -121,15 +128,31 @@ describe("signal grammar", () => {
 		});
 	});
 
+	test("sha256 hashes the file's bytes: invalid UTF-8 with its exact hash passes, a wrong hash fails (qa-i #126)", async () => {
+		const bytes = new Uint8Array([0x00, 0xff, 0xfe, 0x80, 0x41, 0x0a]);
+		const sha = createHash("sha256").update(bytes).digest("hex");
+		const io = {
+			runCheck: async () => {
+				throw new Error("not run");
+			},
+			readBytes: async (path: string) => (path === "bin.dat" ? bytes : undefined),
+		};
+		expect(await runSignal(`file bin.dat sha256=${sha}`, io)).toMatchObject({ ok: true });
+		expect(await runSignal(`file bin.dat sha256=${"0".repeat(64)}`, io)).toMatchObject({
+			ok: false,
+			detail: expect.stringMatching(/^sha256 /),
+		});
+	});
+
 	test("only a timeout is inconclusive: every other failure is a violation", async () => {
 		const body = "hello\n";
 		const commandIo = (code: number | null, output = "") => ({
 			runCheck: async () => ({ code, output, timedOut: false }),
-			readFile: async () => undefined,
+			readBytes: async () => undefined,
 		});
 		const fileIo = {
 			runCheck: commandIo(0).runCheck,
-			readFile: async (path: string) => (path === "a.txt" ? body : undefined),
+			readBytes: async (path: string) => (path === "a.txt" ? Buffer.from(body) : undefined),
 		};
 		const violations = [
 			await runSignal('command ["false"]', commandIo(1, "boom")),

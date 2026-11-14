@@ -78,16 +78,6 @@ describe("ChannelRegistry", () => {
 			{ text: `수정 ${REDACTED}`, ...expected },
 		]);
 	});
-
-	test("forOrigin resolves a chat origin to its port and target; other origins have none", () => {
-		const { registry, port } = setup();
-		const resolved = registry.forOrigin("slack/ch/C1/t/1.2");
-		expect(resolved?.port).toBe(port);
-		expect(resolved?.port.platform).toBe("slack");
-		expect(resolved?.target).toEqual({ conversationId: "C1", threadId: "1.2" });
-		expect(registry.forOrigin("monitor/x")).toBeUndefined();
-		expect(registry.forOrigin("telegram/dm/42")).toBeUndefined();
-	});
 });
 
 /** A second platform's port that records what reached it. */
@@ -95,7 +85,6 @@ function fakePort(platform: ChatPlatform): ChannelPort & { posts: Array<{ target
 	const posts: Array<{ target: PostTarget; text: string }> = [];
 	return {
 		platform,
-		capabilities: { permalink: false, reactions: true },
 		posts,
 		post: async (target, msg) => {
 			posts.push({ target, text: msg.text });

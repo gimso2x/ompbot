@@ -11,7 +11,9 @@ import {
 	TURNS_FAILING_THRESHOLD,
 	TURNS_FAILING_WINDOW_MS,
 } from "../ops/gates";
+import { formatTypicalRange, typicalNote } from "../store/turn-duration";
 import type { BoardCard, BoardPanel } from "./board";
+import { hostChecksLevel, repoCountsText } from "./host-checks";
 import { renderMarkdown } from "./markdown";
 import type { MonitorDetailRun, MonitorProcedure } from "./monitor-detail";
 import type {
@@ -120,13 +122,17 @@ export function gateText(name: string): { label: string; todo: string } {
 		backup_age: [`백업이 ${span(limits.backupMaxAgeMs)} 넘게 없음`, "백업 타이머·`ompbot backup` 확인"],
 		offsite_age: [
 			`오프사이트 백업이 ${span(limits.backupMaxAgeMs)} 넘게 없음`,
-			"오프사이트 접속·`ompbot offsite` 확인",
+			"오프사이트 접속·`ompbot backup` 재실행 확인",
 		],
 		sweep_stalled: [
 			`스윕 하트비트가 ${span(limits.sweepStalledMs)} 넘게 멈춤`,
 			"`systemctl --user status ompbot`으로 데몬 확인",
 		],
 		slack_disconnected: [`Slack 소켓이 ${span(limits.socketDownMs)} 넘게 끊김`, "네트워크·Slack 토큰과 데몬 로그 확인"],
+		discord_disconnected: [
+			`Discord 게이트웨이가 ${span(limits.socketDownMs)} 넘게 끊김`,
+			"네트워크·Discord 토큰과 데몬 로그 확인",
+		],
 		inbound_starved: [`턴이 ${span(limits.inboundStarvationMs)} 넘게 응답 없음`, "`ompbot status`로 멈춘 턴 확인"],
 		origin_silent: [`받은 메시지가 ${span(limits.originSilentMs)} 넘게 대기`, "`ompbot status`로 대기 중인 대화 확인"],
 		deliveries_overdue: [
@@ -177,6 +183,10 @@ export interface DashboardUi {
 	theme?: string;
 	/** `?layout=list` of the turns view: its threads as one table instead of the three columns. */
 	layout?: string;
+	/** `?stale=1` of the inbox and list views: only 방치 panes ({@link isStale}). */
+	stale?: boolean;
+	/** Inbox entry ids unread in this browser ({@link unreadIds}): a dot on their cards and rows, a count per column. */
+	unread?: string[];
 }
 
 /**
@@ -299,6 +309,24 @@ export function inboxEntries(s: DashboardSnapshot, live?: BoardPanel | null): In
 	return entries;
 }
 
+/** How long an idle or finished pane with no TASK sits in 완료·대기 before it counts as 방치. Shipped to the page. */
+const STALE_MS = 24 * 3_600_000;
+
+/**
+ * A 방치 entry: a herdr pane in 완료·대기 tied to no TASK (no merged TASK and no `taskId`, so a TASK pane stays out
+ * while the TASK list cannot be read), in that state for `STALE_MS` or since an unknown time (`since` 0). Self-contained
+ * apart from `STALE_MS` (shipped beside it).
+ */
+export function isStale(entry: InboxEntry, now: number): boolean {
+	return (
+		entry.kind === "card" &&
+		entry.col === "wait" &&
+		entry.task === undefined &&
+		entry.taskId === "" &&
+		(entry.since === 0 || now - entry.since >= STALE_MS)
+	);
+}
+
 /**
  * The 확인 필요 group of an entry: 0 failed (TASK documents not judged, worker check failed or gone, unknown pane state),
  * 1 blocked, 2 the rest (no agent card…). Self-contained (shipped).
@@ -409,6 +437,151 @@ export function orderKeyTarget(input: OrderKeyInput, numberedIds: string[]): str
 export function replyKeyTarget(input: OrderKeyInput, replyHref: string | null | undefined): string | null {
 	if (input.typing || input.modalOpen || input.meta || input.ctrl || input.alt || input.view !== "inbox") return null;
 	return input.key === "r" && replyHref ? replyHref : null;
+}
+
+/** The `localStorage` key of the inbox read marks ({@link readUnread}); this browser only. Shipped to the page. */
+export const UNREAD_KEY = "ompbot-inbox-seen";
+/** How long the read mark of an entry no longer in the snapshot is kept, from when it was read. Shipped. */
+export const UNREAD_KEEP_MS = 14 * 86_400_000;
+/** The most read marks kept; past it the longest-read entries no longer in the snapshot go first. Shipped. */
+export const UNREAD_MAX = 1000;
+
+/** What the owner saw of an entry: its {@link entrySig}, its `since`, and when it was read. */
+export interface UnreadMark {
+	sig: string;
+	since: number;
+	at: number;
+}
+
+/** The stored read marks; `seeded` once the first whole inbox was recorded as read. */
+export interface UnreadState {
+	v: 1;
+	seeded: boolean;
+	seen: Record<string, UnreadMark>;
+}
+
+/** Where the read marks live: the page's `localStorage[UNREAD_KEY]`, a fake one in tests. */
+export interface UnreadStorage {
+	get(): string | null;
+	set(value: string): void;
+}
+
+/**
+ * The stored read marks, or the empty unseeded state for nothing stored, broken JSON or another shape (never throws
+ * on bad data); a mark of the wrong shape is dropped. Self-contained (shipped).
+ */
+export function readUnread(store: UnreadStorage): UnreadState {
+	const empty: UnreadState = { v: 1, seeded: false, seen: {} };
+	let raw: unknown;
+	try {
+		raw = JSON.parse(store.get() ?? "");
+	} catch {
+		return empty;
+	}
+	if (typeof raw !== "object" || raw === null) return empty;
+	const value = raw as { v?: unknown; seeded?: unknown; seen?: unknown };
+	if (value.v !== 1 || typeof value.seeded !== "boolean") return empty;
+	if (typeof value.seen !== "object" || value.seen === null || Array.isArray(value.seen)) return empty;
+	const seen: Record<string, UnreadMark> = {};
+	for (const [id, item] of Object.entries(value.seen as Record<string, unknown>)) {
+		const mark = item as { sig?: unknown; since?: unknown; at?: unknown } | null;
+		if (mark && typeof mark.sig === "string" && typeof mark.since === "number" && typeof mark.at === "number") {
+			seen[id] = { sig: mark.sig, since: mark.since, at: mark.at };
+		}
+	}
+	return { v: 1, seeded: value.seeded, seen };
+}
+
+/**
+ * The state of an entry the owner cares to see change: a card's pane status, its TASK's status and whether its
+ * documents failed, and the column; a lone TASK's status, failure, worker check and column. No `since` and no
+ * PROGRESS update, so a worker writing its progress does not make a TASK unread. Self-contained (shipped).
+ */
+export function entrySig(entry: InboxEntry): string {
+	const task = entry.task;
+	const taskPart = task === undefined ? "-" : `${task.status}/${task.error === undefined ? "" : "error"}`;
+	if (entry.kind === "card") return `card|${entry.card?.status ?? ""}|${taskPart}|${entry.col}`;
+	const herdr = task?.herdr;
+	const herdrPart = herdr === undefined ? "-" : herdr.ok ? `ok/${herdr.status}` : "fail";
+	return `task|${taskPart}|${herdrPart}|${entry.col}`;
+}
+
+/**
+ * The ids of the entries changed since the owner last opened them in this browser: a changed {@link entrySig}, a card
+ * whose `since` moved (both known, so a pane back in the same state counts), or — once seeded — an entry never seen.
+ * Self-contained apart from `readUnread`/`entrySig` (shipped beside it).
+ */
+export function unreadIds(entries: InboxEntry[], store: UnreadStorage): string[] {
+	const state = readUnread(store);
+	return entries
+		.filter((entry) => {
+			const mark = Object.hasOwn(state.seen, entry.id) ? state.seen[entry.id] : undefined;
+			if (mark === undefined) return state.seeded;
+			if (mark.sig !== entrySig(entry)) return true;
+			return entry.kind === "card" && mark.since !== 0 && entry.since !== 0 && mark.since !== entry.since;
+		})
+		.map((entry) => entry.id);
+}
+
+/**
+ * Whether a snapshot reads the whole inbox: the TASK list read and, with the board on (`board` not undefined), the
+ * board read too. Seeding or pruning on less would mark the missing half unread once it comes back. Self-contained.
+ */
+export function unreadReady(s: DashboardSnapshot, board: BoardPanel | null | undefined): boolean {
+	return s.tasks.ok && (board === undefined || board?.ok === true);
+}
+
+/**
+ * The first visit: records every inbox entry (before any search) as read and marks the store seeded, once a snapshot
+ * reads the whole inbox ({@link unreadReady}). `board` undefined = the board is off. Returns whether it wrote.
+ * Self-contained apart from `unreadReady`/`readUnread`/`inboxEntries`/`entrySig` (shipped beside it).
+ */
+export function seedStore(
+	store: UnreadStorage,
+	s: DashboardSnapshot,
+	board: BoardPanel | null | undefined,
+	now: number,
+): boolean {
+	if (!unreadReady(s, board)) return false;
+	const state = readUnread(store);
+	if (state.seeded) return false;
+	const seen = { ...state.seen };
+	for (const entry of inboxEntries(s, board)) seen[entry.id] = { sig: entrySig(entry), since: entry.since, at: now };
+	store.set(JSON.stringify({ v: 1, seeded: true, seen }));
+	return true;
+}
+
+/** Records an entry as read now: its {@link entrySig} and `since`. Self-contained apart from `readUnread`/`entrySig`. */
+export function markSeen(store: UnreadStorage, entry: InboxEntry, now: number): void {
+	const state = readUnread(store);
+	state.seen[entry.id] = { sig: entrySig(entry), since: entry.since, at: now };
+	store.set(JSON.stringify(state));
+}
+
+/**
+ * Drops the marks of entries gone from the snapshot and read more than `UNREAD_KEEP_MS` ago, then the longest-read
+ * gone ones past `UNREAD_MAX`; an entry still in the snapshot keeps its mark however old. Only on a snapshot that reads
+ * the whole inbox ({@link unreadReady}); writes only when something goes. Returns whether it wrote. Self-contained apart
+ * from `unreadReady`/`readUnread`/`inboxEntries`/`UNREAD_KEEP_MS`/`UNREAD_MAX` (shipped beside it).
+ */
+export function pruneStore(
+	store: UnreadStorage,
+	s: DashboardSnapshot,
+	board: BoardPanel | null | undefined,
+	now: number,
+): boolean {
+	if (!unreadReady(s, board)) return false;
+	const state = readUnread(store);
+	const present = new Set(inboxEntries(s, board).map((entry) => entry.id));
+	const all = Object.entries(state.seen);
+	const kept = all
+		.filter(([id, mark]) => present.has(id) || now - mark.at <= UNREAD_KEEP_MS)
+		.sort(([a, x], [b, y]) => Number(present.has(b)) - Number(present.has(a)) || y.at - x.at);
+	const presentCount = kept.filter(([id]) => present.has(id)).length;
+	const left = kept.slice(0, Math.max(UNREAD_MAX, presentCount));
+	if (left.length === all.length) return false;
+	store.set(JSON.stringify({ v: 1, seeded: state.seeded, seen: Object.fromEntries(left) }));
+	return true;
 }
 
 export function renderDashboardMain(
@@ -541,6 +714,10 @@ export function renderDashboardMain(
 	const selected = ui.selected ?? "";
 	const isSel = (id: string): boolean => id !== "" && id === selected;
 	const theme = ui.theme === "light" || ui.theme === "dark" ? ui.theme : "system";
+	// Read marks change no order, number, next line or tab title: unread is no 확인 필요.
+	const unread = new Set(ui.unread ?? []);
+	const unreadDot = (id: string): string =>
+		unread.has(id) ? '<span class="unread-dot" title="안 읽음" role="img" aria-label="안 읽음"></span>' : "";
 
 	// ---- the inbox: one entry per agent pane, plus the open TASKs no pane carries ----
 	type Col = InboxCol;
@@ -551,14 +728,19 @@ export function renderDashboardMain(
 	// 확인 필요 keeps the one order (longest wait first); the other columns show the newest first.
 	const byDefault = (a: Entry, b: Entry): number =>
 		RANK[a.col] - RANK[b.col] || (a.col === "attention" ? byAttention(a, b) : b.since - a.since);
-	const shown = entries.filter((entry) =>
-		hit(entry.title, entry.taskId, entry.machine, entry.card?.paneLabel, entry.card?.name),
+	// The 방치 filter lives on the inbox and list only; its chip counts before the search.
+	const staleOn = ui.stale === true && (view === "inbox" || view === "list");
+	const staleCount = entries.filter((entry) => isStale(entry, clock)).length;
+	const shown = entries.filter(
+		(entry) =>
+			(!staleOn || isStale(entry, clock)) &&
+			hit(entry.title, entry.taskId, entry.machine, entry.card?.paneLabel, entry.card?.name),
 	);
 	// The next line and the tab count use every 확인 필요 entry, whatever the search hides.
 	const attention = entries.filter((entry) => entry.col === "attention").sort(byAttention);
 	const next = attention[0];
 	const signalBad = !s.daemon.ok || !s.daemon.running || (board !== undefined && !board.ok);
-	const closed = tasks.filter((task) => !task.open && hit(task.title, task.taskId, task.host));
+	const closed = staleOn ? [] : tasks.filter((task) => !task.open && hit(task.title, task.taskId, task.host));
 
 	const linkOf = (entry: { kind: string; id: string }): string =>
 		entry.kind === "card"
@@ -571,6 +753,7 @@ export function renderDashboardMain(
 		if (task !== undefined) out.push(state(task.status));
 		else if (entry.card?.unknown) out.push(badge(`알 수 없음 · ${entry.card.status || "?"}`, "is-warning"));
 		else if (entry.card !== undefined) out.push(state(entry.card.status));
+		if (isStale(entry, clock)) out.push(badge("방치", ""));
 		if (task !== undefined && entry.card === undefined && task.open) {
 			const herdr = task.herdr;
 			if (herdr !== undefined && !herdr.ok) out.push(badge("워커 확인 실패", "is-danger"));
@@ -578,6 +761,9 @@ export function renderDashboardMain(
 			else if (live !== undefined) out.push(badge("에이전트 카드 없음", "is-warning"));
 		}
 		if (task?.error !== undefined) out.push(badge("문서 판정 실패", "is-danger"));
+		if (task?.typical !== undefined && (task.elapsedMs ?? 0) > task.typical.p90Ms) {
+			out.push(badge("평소보다 길어짐", "is-warning"));
+		}
 		return out.join("");
 	};
 	const summaryOf = (entry: Entry): string => {
@@ -616,12 +802,12 @@ export function renderDashboardMain(
 		const isNext = next !== undefined && next.kind === entry.kind && next.id === entry.id;
 		const classes = `card${isSel(entry.id) ? " is-selected" : ""}${isNext ? " is-next" : ""}${
 			entry.col === "attention" && attentionGroup(entry) === 0 ? " is-fail" : ""
-		}`;
+		}${unread.has(entry.id) ? " is-unread" : ""}`;
 		return `<a class="${classes}" data-state="${esc(stateKeyOf(entry))}" ${linkOf(entry)} data-row="${esc(entry.id)}"${
 			order > 0 ? ` data-order="${order}"` : ""
 		}${isSel(entry.id) ? ' aria-current="true"' : ""}><p class="card-eyebrow">${
 			order > 0 ? `<span class="order-no">${order}</span>` : ""
-		}${esc(eyebrow)}</p><p class="card-title">${esc(entry.title)}</p><p class="card-sum">${esc(summaryOf(entry))}</p>${
+		}${unreadDot(entry.id)}${esc(eyebrow)}</p><p class="card-title">${esc(entry.title)}</p><p class="card-sum">${esc(summaryOf(entry))}</p>${
 			entry.card?.status === "blocked" && entry.card.question && (entry.card.options ?? []).length > 0
 				? `<p class="card-options">${(entry.card.options ?? []).map((option) => esc(option)).join(" / ")}</p>`
 				: ""
@@ -693,8 +879,19 @@ export function renderDashboardMain(
 		q !== ""
 			? `<button type="button" class="button is-ghost is-sm" data-clear-search>검색 '${esc(ui.q)}' 지우기 (Esc)</button>`
 			: "";
-	const nothing =
-		q !== ""
+	const staleOffBtn = '<button type="button" class="button is-ghost is-sm" data-stale-off>방치 필터 끄기</button>';
+	/** The 방치 chip and, while the filter is on, the button that turns it off; no chip with nothing 방치 and the filter off. */
+	const staleHead =
+		staleCount === 0 && !staleOn
+			? ""
+			: `<button type="button" class="chip" data-stale aria-pressed="${staleOn}">방치 <b>${staleCount}</b></button>${
+					staleOn ? staleOffBtn : ""
+				}`;
+	const nothing = staleOn
+		? `<div class="empty-box" role="status"><p class="note">${
+				q !== "" ? "검색어와 방치 필터를 모두 만족하는 항목이 없어요" : "방치된 패널이 없어요"
+			}</p><p class="note-sub">다음 행동: 방치 필터를 끄면 모든 항목이 다시 보여요.</p>${staleOffBtn}</div>`
+		: q !== ""
 			? `<div class="empty-box" role="status"><p class="note">'${esc(ui.q)}'와 맞는 항목이 없어요.</p><p class="note-sub">다음 행동: 검색어를 지우거나(Esc) 다른 제목·TASK ID·머신 이름으로 다시 검색해 보세요.</p><button type="button" class="button is-ghost is-sm" data-clear-search>검색어 지우기 (Esc)</button></div>`
 			: "";
 	const head = (title: string, count: number | string | undefined, extra = ""): string =>
@@ -727,6 +924,12 @@ export function renderDashboardMain(
 				cards.length === 0
 					? `<div class="col-empty-wrap"><p class="col-empty">${esc(none)}</p><p class="col-empty-sub">${esc(hint)}</p></div>`
 					: cards.map((entry, index) => cardOf(entry, id === "attention" && index < 9 ? index + 1 : 0)).join("");
+			// Below the head, not in it: the unread count of the cards on screen and a button that reads them all.
+			const unreadCount = cards.filter((entry) => unread.has(entry.id)).length;
+			const unreadLine =
+				unreadCount === 0
+					? ""
+					: `<div class="col-unread"><span>안 읽음 <b>${unreadCount}</b></span><button type="button" class="button is-ghost is-sm" data-mark-read="${id}">모두 읽음</button></div>`;
 			const recent =
 				id !== "wait" || closed.length === 0
 					? ""
@@ -742,7 +945,7 @@ export function renderDashboardMain(
 				cards.length === 0 && recent === "" ? " data-empty" : ""
 			}><h2 class="col-head"><span>${esc(
 				label,
-			)}</span><span class="count-chip">${cards.length}</span></h2>${body}${recent}</section>`;
+			)}</span><span class="count-chip">${cards.length}</span></h2>${unreadLine}${body}${recent}</section>`;
 		}).join("");
 		const herdr = s.herdr;
 		// Without a live board, the `herdr agent list` of every host stays visible under the inbox.
@@ -783,10 +986,9 @@ export function renderDashboardMain(
 					}</section>`;
 		// The head names what it counts: the 진행 중 column, the same number as the side nav.
 		const working = shown.filter((entry) => entry.col === "working").length;
-		if (q !== "" && shown.length === 0 && closed.length === 0) {
-			return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nextLine()}${nothing}${agents}`;
-		}
-		return `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${machines}`)}${banners.join("")}${nextLine()}${
+		const top = `${head("에이전트 인박스", undefined, `<span class="view-sum">진행 중 <b>${working}</b></span>${staleHead}${machines}`)}${banners.join("")}${nextLine()}`;
+		if ((q !== "" || staleOn) && shown.length === 0 && closed.length === 0) return `${top}${nothing}${agents}`;
+		return `${top}${
 			shown.length === 0 ? nothing : ""
 		}<nav class="col-chips" aria-label="열로 이동">${chips}</nav><div class="inbox">${columns}</div>${agents}`;
 	};
@@ -834,14 +1036,14 @@ export function renderDashboardMain(
 				(entry) =>
 					`<tr data-row="${esc(entry.id)}" data-state="${esc(stateKeyOf(entry))}"${isSel(entry.id) ? ' class="is-selected"' : ""}><td><span class="badges">${badgesOf(
 						entry,
-					)}</span></td><td class="list-title"><a ${linkOf(entry)}${isSel(entry.id) ? ' aria-current="true"' : ""}>${esc(
+					)}</span></td><td class="list-title">${unreadDot(entry.id)}<a ${linkOf(entry)}${isSel(entry.id) ? ' aria-current="true"' : ""}>${esc(
 						entry.title,
 					)}</a></td><td>${esc(entry.machine)}</td><td class="mono">${esc(entry.taskId || "-")}</td><td class="num">${
 						entry.task === undefined ? "-" : esc(`${entry.task.acChecked ?? "-"}/${entry.task.acTotal}`)
 					}</td><td class="num">${ago(entry.since)}</td></tr>`,
 			)
 			.join("");
-		return `${head("에이전트 목록", rows.length)}${banners.join("")}${
+		return `${head("에이전트 목록", rows.length, staleHead)}${banners.join("")}${
 			rows.length === 0
 				? nothing ||
 					'<div class="empty-box"><p class="note">보여 줄 에이전트나 TASK가 없어요.</p><p class="note-sub">새로운 작업이 시작되면 목록에 표시됩니다.</p></div>'
@@ -956,18 +1158,9 @@ export function renderDashboardMain(
 			};
 			const threadLink = (key: string): string =>
 				`href="?view=turns&amp;item=${esc(encodeURIComponent(key))}" data-item="${esc(key)}"`;
-			const verdicts = s.feedback.ok ? s.feedback.verdicts : {};
-			/** The owner's 👍/👎 on the turn of `inboundId`; nothing without a verdict. */
-			const feedbackBadge = (inboundId: number): string => {
-				const verdict = verdicts[String(inboundId)];
-				return verdict === undefined
-					? ""
-					: `<span class="badge" data-feedback="${verdict}" title="오너 피드백">${verdict === "up" ? "👍" : "👎"}</span>`;
-			};
 			const threadBadges = (thread: (typeof threads)[number]): string =>
 				[
 					state(thread.latest.state),
-					feedbackBadge(thread.latest.inboundId),
 					...(thread.stalledCount > 0 ? [badge("정체", "is-warning")] : []),
 					...(restartHeld.has(thread.originKey) ? [badge("재시작이 기다리는 턴", "is-warning")] : []),
 				].join("");
@@ -1371,13 +1564,24 @@ export function renderDashboardMain(
 			bad: ["문제", "is-danger"],
 		};
 		const cards: string[] = [];
-		const pushCard = (id: string, title: string, level: string, body: string, wide = false): void => {
+		const pushCard = (
+			id: string,
+			title: string,
+			level: string,
+			body: string,
+			wide = false,
+			link?: { href: string; text: string },
+		): void => {
 			const [word, tone] = LEVELS[level] ?? ["?", ""];
 			if (!hit(id, title, word, body.replace(/<[^>]*>/g, " "))) return;
+			const anchor =
+				link === undefined
+					? ""
+					: `<a class="sys-link" href="${esc(link.href)}" target="_blank" rel="noopener noreferrer">${esc(link.text)}</a>`;
 			cards.push(
 				`<section class="sys-card${wide ? " is-wide" : ""}" data-card="${id}" aria-label="${esc(title)}"><header class="sys-head"><span class="sys-dot ${tone}" aria-hidden="true"></span><h3 class="h3">${esc(
 					title,
-				)}</h3>${badge(word, tone)}</header>${body}</section>`,
+				)}</h3>${anchor}${badge(word, tone)}</header>${body}</section>`,
 			);
 		};
 		const note = (text: string): string => `<p class="note">${esc(text)}</p>`;
@@ -1576,6 +1780,69 @@ export function renderDashboardMain(
 			]),
 		);
 
+		// Other hosts' ops-check results (config `dashboard.opsStatus`): not a gate, alert or menu count.
+		const checks = s.hostChecks;
+		if (checks !== undefined) {
+			const link = s.hostChecksUrl === undefined ? undefined : { href: s.hostChecksUrl, text: "전체 보기" };
+			if (!checks.ok) {
+				pushCard("hosts", "호스트 점검", "bad", note(`호스트 점검을 읽지 못했어요: ${checks.error}`), true, link);
+			} else {
+				const rows: Array<[string, string]> = [];
+				const lines: string[] = [];
+				const line = (key: string, state: string, tone: string, word: string, label: string, detail: string) =>
+					`<li class="gate-row is-open" data-check="${esc(key)}" data-state="${esc(state)}"><span class="sys-dot ${tone}" aria-hidden="true"></span><span class="gate-word">${word}</span><span class="gate-label">${esc(
+						label,
+					)}</span><code class="gate-detail">${esc(detail)}</code></li>`;
+				for (const host of checks.hosts) {
+					const age = host.reportAgeMs === null ? "보고 없음" : `${dur(host.reportAgeMs)} 전`;
+					const repo = host.repoCounts === undefined ? undefined : repoCountsText(host.repoCounts);
+					const repoShown = repo !== undefined && host.issues.some((issue) => issue.detail === repo);
+					rows.push([
+						host.label,
+						host.online
+							? [
+									`정상 ${host.okCount}/${host.total}`,
+									age,
+									...(host.skipped > 0 ? [`건너뜀 ${host.skipped}`] : []),
+									...(repo === undefined || repoShown ? [] : [`저장소 ${repo}`]),
+								]
+									.map(esc)
+									.join(" · ")
+							: badge(`보고 끊김 · ${age}`, "is-danger"),
+					]);
+					const stale = host.online ? [] : host.issues.filter((issue) => issue.state === "stale");
+					for (const issue of host.issues) {
+						if (stale.includes(issue)) continue;
+						const alert = issue.state === "fail" && issue.severity === "alert";
+						const word = issue.severity === "alert" ? "❌" : issue.severity === "notice" ? "🆕" : "ℹ";
+						lines.push(
+							line(
+								`${host.host}:${issue.id}`,
+								issue.state,
+								alert ? "is-danger" : "is-warning",
+								word,
+								`${host.label} · ${issue.label}`,
+								issue.detail,
+							),
+						);
+					}
+					if (stale.length > 0) {
+						lines.push(
+							line(host.host, "stale", "is-danger", "판정 보류", host.label, `점검 ${stale.length}개 판정 보류`),
+						);
+					}
+				}
+				pushCard(
+					"hosts",
+					"호스트 점검",
+					hostChecksLevel(checks),
+					`${facts(rows)}${lines.length === 0 ? "" : `<ul class="gate-list">${lines.join("")}</ul>`}`,
+					true,
+					link,
+				);
+			}
+		}
+
 		return `${head("시스템", undefined)}${banners.join("")}${
 			cards.length === 0 ? nothing : `<div class="sys-grid">${cards.join("")}</div>`
 		}`;
@@ -1701,6 +1968,12 @@ export function renderTaskFacts(task: TaskInfo): string {
 		],
 		["PROGRESS", task.progress ? `${esc(task.progress.status || "?")} · ${at(task.progress.updated)}` : "-"],
 	];
+	if (task.typical !== undefined && task.elapsedMs !== undefined) {
+		rows.push([
+			"걸린 시간",
+			esc(`경과 ${Math.floor(task.elapsedMs / 60_000)}분 · ${typicalNote(task.elapsedMs, task.typical) ?? ""}`),
+		]);
+	}
 	if (task.progress?.blockedReason) rows.push(["막힌 이유", esc(task.progress.blockedReason)]);
 	if (task.herdr !== undefined) {
 		rows.push([
@@ -1870,6 +2143,12 @@ export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: bool
 		const clipped = chars.length > 50 ? `${chars.slice(0, 49).join("")}…` : chars.join("");
 		const msg = clipped !== "" && step.stage.tone !== "done" ? ` · ${clipped}` : "";
 		const open = panel ? "" : ` data-item="${esc(step.taskId)}" data-row="${esc(step.taskId)}"`;
+		const took =
+			step.typical === undefined || step.elapsedMs === undefined
+				? ""
+				: `<span class="flow-bs">${esc(
+						`경과 ${Math.floor(step.elapsedMs / 60_000)}분 · ${typicalNote(step.elapsedMs, step.typical) ?? ""}`,
+					)}</span>`;
 		return `<a class="flow-box t-${esc(step.stage.tone)}${here ? " is-here" : ""}${
 			selected ? " is-selected" : ""
 		}" href="?view=flow&amp;item=${esc(encodeURIComponent(step.taskId))}"${open} data-state="${esc(
@@ -1880,7 +2159,7 @@ export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: bool
 			here ? '<span class="flow-here-chip">지금 여기</span>' : ""
 		}</span><span class="flow-bt">${esc(step.title)}</span><span class="flow-bs s-${esc(step.stage.tone)}">${esc(
 			step.stage.label,
-		)}${esc(msg)}</span></a>`;
+		)}${esc(msg)}</span>${took}</a>`;
 	};
 	/** An open TASK (or one whose close time does not parse) ends this long after its registration, for grouping. */
 	const OPEN_JOIN_MS = 10 * 60_000;
@@ -2138,6 +2417,30 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 		`<p class="eyebrow">${esc(LABELS[view] ?? view)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 			title,
 		)}</h2><dl class="facts">${rows.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${value}</dd>`).join("")}</dl>`;
+	// 터미널에서 보기: commands to paste on a phone, so no quotes or backticks — a word that would need them (a path with
+	// a space, an odd origin key) drops the command rather than show one that breaks. Shown only; nothing runs here.
+	const SHELL_WORD = /^[A-Za-z0-9._/:@=+,-]+$/;
+	const terminal = (args: string[][]): string => {
+		const cli = s.ompbotCli;
+		if (cli === undefined) return "";
+		const commands = args
+			.map((words) => [...cli, ...words])
+			.filter((words) => words.every((word) => SHELL_WORD.test(word)))
+			.map((words) => words.join(" "));
+		if (commands.length === 0) return "";
+		return `<details class="detail-terminal"><summary>터미널에서 보기</summary><p class="note-sub">복사해 터미널에 붙여 넣으세요. 현황판은 실행하지 않아요.</p>${commands
+			.map(
+				(command) =>
+					`<div class="terminal-cmd"><code>${esc(command)}</code><button type="button" class="copy-btn" data-copy="${esc(
+						command,
+					)}" data-copy-label="명령" aria-label="명령 복사">복사</button></div>`,
+			)
+			.join("")}</details>`;
+	};
+	const laneCommands = (name: string): string[][] => [
+		["lanes", "watch", name],
+		["lanes", "attach", name],
+	];
 	if (view === "turns" && s.jobs.ok) {
 		const job = s.jobs.items.find((item) => `job:${item.name}` === id);
 		if (job) {
@@ -2172,19 +2475,12 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 			const latest = thread.latest;
 			// The conversation's TASK chain, when the request became TASKs.
 			const chain = s.flows?.ok ? s.flows.items.find((item) => item.originKey === thread.originKey) : undefined;
-			const verdicts = s.feedback.ok ? s.feedback.verdicts : {};
-			const feedbackBadge = (inboundId: number): string => {
-				const verdict = verdicts[String(inboundId)];
-				return verdict === undefined
-					? ""
-					: `<span class="badge" data-feedback="${verdict}" title="오너 피드백">${verdict === "up" ? "👍" : "👎"}</span>`;
-			};
 			const recent = thread.recent
 				.map(
 					(turn) =>
 						`<li><button type="button" class="turn-recent-item" data-trace-turn="${esc(turn.inboundId)}"><span class="mono">${at(
 							turn.createdAt,
-						)}</span><span class="badge">${esc(turn.state)}</span>${feedbackBadge(turn.inboundId)}<span class="turn-recent-text">${esc(
+						)}</span><span class="badge">${esc(turn.state)}</span><span class="turn-recent-text">${esc(
 							turn.preview ?? "-",
 						)}</span></button></li>`,
 				)
@@ -2213,7 +2509,11 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				["입수 번호", esc(latest.inboundId)],
 				["턴", esc(`${thread.turnCount}${thread.openCount > 0 ? ` · ${openTurnsText(thread)}` : ""}`)],
 				["대화", `<code>${esc(thread.originKey)}</code>`],
-			])}${chain === undefined ? "" : renderFlowChain(chain, "", true)}<h3 class="h2">최근 턴</h3><ol class="turn-recent" aria-label="최근 턴 (누르면 트레이스)">${recent}</ol>`;
+			])}${terminal(
+				((lane) => (lane === undefined ? [["lanes", "watch", thread.originKey]] : laneCommands(lane.name)))(
+					s.lanes.ok ? s.lanes.items.find((item) => item.originKey === thread.originKey) : undefined,
+				),
+			)}${chain === undefined ? "" : renderFlowChain(chain, "", true)}<h3 class="h2">최근 턴</h3><ol class="turn-recent" aria-label="최근 턴 (누르면 트레이스)">${recent}</ol>`;
 		}
 	}
 	if (view === "flow" && s.flows?.ok) {
@@ -2246,6 +2546,11 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 						: `<a href="?view=turns&amp;item=${esc(encodeURIComponent(chain.originKey))}">${esc(chain.title)}</a>`,
 				],
 			])}${
+				// An open TASK on this machine: its herdr worker's session (a remote one is watched on its host).
+				step.host === "local" && step.status !== "done" && step.status !== "cancelled"
+					? terminal([["lanes", "watch", step.taskId]])
+					: ""
+			}${
 				task === undefined
 					? ""
 					: `<section class="detail-task" aria-label="TASK 진행"><h3 class="h3">진행</h3>${renderTaskFacts(task)}</section>`
@@ -2255,12 +2560,12 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 	if (view === "lanes" && s.lanes.ok) {
 		const lane = s.lanes.items.find((item) => item.name === id);
 		if (lane) {
-			return show(lane.title, [
+			return `${show(lane.title, [
 				["이름", esc(lane.name)],
 				["상태", esc(lane.status)],
 				["cwd", `<code>${esc(lane.cwd)}</code>`],
 				["갱신", at(lane.updatedAt)],
-			]);
+			])}${terminal(laneCommands(lane.name))}`;
 		}
 	}
 	if (view === "approvals" && s.approvals.ok) {
@@ -2691,6 +2996,8 @@ const alertText = ${alertText.toString()};
 const openTurnsText = ${openTurnsText.toString()};
 const cardWithSay = ${cardWithSay.toString()};
 const inboxEntries = ${inboxEntries.toString()};
+const STALE_MS = ${STALE_MS};
+const isStale = ${isStale.toString()};
 const attentionGroup = ${attentionGroup.toString()};
 const byAttention = ${byAttention.toString()};
 const inboxAttention = ${inboxAttention.toString()};
@@ -2699,6 +3006,20 @@ const faviconHref = ${faviconHref.toString()};
 const tabSignal = ${tabSignal.toString()};
 const orderKeyTarget = ${orderKeyTarget.toString()};
 const replyKeyTarget = ${replyKeyTarget.toString()};
+const UNREAD_KEY = ${JSON.stringify(UNREAD_KEY)};
+const UNREAD_KEEP_MS = ${JSON.stringify(UNREAD_KEEP_MS)};
+const UNREAD_MAX = ${JSON.stringify(UNREAD_MAX)};
+const readUnread = ${readUnread.toString()};
+const entrySig = ${entrySig.toString()};
+const unreadIds = ${unreadIds.toString()};
+const unreadReady = ${unreadReady.toString()};
+const seedStore = ${seedStore.toString()};
+const markSeen = ${markSeen.toString()};
+const pruneStore = ${pruneStore.toString()};
+const formatTypicalRange = ${formatTypicalRange.toString()};
+const typicalNote = ${typicalNote.toString()};
+const hostChecksLevel = ${hostChecksLevel.toString()};
+const repoCountsText = ${repoCountsText.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderFlowChain = ${renderFlowChain.toString()};
@@ -2738,7 +3059,7 @@ function boot() {
 	// The board the server drew the page with, so the first snapshot refresh does not redraw without it.
 	const seeded = boardOn ? document.getElementById("board-data") : null;
 	let board = seeded && seeded.textContent ? JSON.parse(seeded.textContent) : null;
-	const ui = { view: "inbox", q: "", sort: "", desc: false, theme: "system", layout: "" };
+	const ui = { view: "inbox", q: "", sort: "", desc: false, theme: "system", layout: "", stale: false };
 	let open = null;
 	let tab = "head";
 	// The turn the 트레이스 tab shows when not the thread's last one (a 최근 턴 row, or the old one-turn address).
@@ -2778,6 +3099,24 @@ function boot() {
 	const changedUntil = new Map();
 	// Cards that newly need the owner or moved column: a 1.6 s ring, once (not on the first draw).
 	const ringUntil = new Map();
+
+	// The inbox read marks live in this browser's localStorage only; a storage that cannot be used turns them off.
+	let unreadStore = null;
+	try {
+		localStorage.getItem(UNREAD_KEY);
+		unreadStore = {
+			get: () => localStorage.getItem(UNREAD_KEY),
+			set: (value) => {
+				try {
+					localStorage.setItem(UNREAD_KEY, value);
+				} catch {
+					unreadStore = null;
+				}
+			},
+		};
+	} catch {}
+	// The entry the read marks last recorded as opened (kind:id), so opening it marks it read once.
+	let seenOpen = "";
 
 	const resolveTheme = (mode) => {
 		if (mode === "light" || mode === "dark") return mode;
@@ -2845,17 +3184,19 @@ function boot() {
 		const query = new URLSearchParams(location.search);
 		const view = query.get("view") || "inbox";
 		const layout = query.get("layout") === "list" ? "list" : "";
+		const stale = query.get("stale") === "1";
 		for (const kind of ["card", "task", "item"]) {
 			const id = query.get(kind);
-			if (id) return { view, layout, open: { kind, id } };
+			if (id) return { view, layout, stale, open: { kind, id } };
 		}
-		return { view, layout, open: null };
+		return { view, layout, stale, open: null };
 	};
 	const toUrl = (target) => {
 		const url = new URL(location.href);
-		for (const name of ["view", "layout", "card", "task", "item"]) url.searchParams.delete(name);
+		for (const name of ["view", "layout", "stale", "card", "task", "item"]) url.searchParams.delete(name);
 		if (ui.view !== "inbox") url.searchParams.set("view", ui.view);
 		if (ui.view === "turns" && ui.layout === "list") url.searchParams.set("layout", "list");
+		if (ui.stale && (ui.view === "inbox" || ui.view === "list")) url.searchParams.set("stale", "1");
 		if (target) url.searchParams.set(target.kind, target.id);
 		url.hash = "";
 		return url;
@@ -2968,10 +3309,32 @@ function boot() {
 		}
 	}
 
+	/**
+	 * The read marks for this snapshot: seeds the first visit and prunes old marks (only on a snapshot that reads the
+	 * whole inbox), marks the open entry read when it opens or changes while open, and returns the unread ids.
+	 */
+	function syncUnread(now) {
+		const store = unreadStore;
+		if (!store) return [];
+		const boardArg = boardOn ? board : undefined;
+		seedStore(store, snapshot, boardArg, now);
+		pruneStore(store, snapshot, boardArg, now);
+		const entries = inboxEntries(snapshot, board === null ? undefined : board);
+		const ids = unreadIds(entries, store);
+		const opened = open ? entries.find((entry) => entry.kind === open.kind && entry.id === open.id) : undefined;
+		if (!opened) return ids;
+		const key = opened.kind + ":" + opened.id;
+		if (seenOpen === key && !ids.includes(opened.id)) return ids;
+		markSeen(store, opened, now);
+		seenOpen = key;
+		return ids.filter((id) => id !== opened.id);
+	}
 	/** Redraws the bar, the navigation and the view; keeps the view's scroll, the closed list and the focused row. */
 	function drawMain(top) {
 		if (!snapshot) return;
-		const html = renderDashboardMain(snapshot, board === null ? undefined : board, Date.now(), {
+		const now = Date.now();
+		const unread = syncUnread(now);
+		const html = renderDashboardMain(snapshot, board === null ? undefined : board, now, {
 			view: ui.view,
 			q: ui.q,
 			sort: ui.sort,
@@ -2979,6 +3342,8 @@ function boot() {
 			selected: open ? open.id : "",
 			theme: ui.theme,
 			layout: ui.layout,
+			stale: ui.stale,
+			unread: unread,
 		});
 		if (html === drawnMain) return;
 		const view = document.getElementById("view");
@@ -3374,6 +3739,8 @@ function boot() {
 		else show(null, "push");
 	}
 	function setView(view) {
+		// The 방치 filter follows a move between the inbox and the list; any other view drops it.
+		if (view !== "inbox" && view !== "list") ui.stale = false;
 		ui.view = view;
 		ui.layout = "";
 		if (open) show(null, "none");
@@ -3549,6 +3916,28 @@ function boot() {
 			drawMain(true);
 			search.focus();
 			return;
+		}
+		const staleToggle = target.closest("[data-stale], [data-stale-off]");
+		if (staleToggle) {
+			event.preventDefault();
+			ui.stale = staleToggle.hasAttribute("data-stale") ? !ui.stale : false;
+			history.pushState(history.state, "", toUrl(open));
+			return drawMain(true);
+		}
+		const markRead = target.closest("button[data-mark-read]");
+		if (markRead) {
+			event.preventDefault();
+			const store = unreadStore;
+			const column = document.getElementById("col-" + markRead.getAttribute("data-mark-read"));
+			if (!store || !snapshot || !column) return;
+			// Every card of the column on screen (after the search and the 방치 filter), not the folded 최근 닫힘 rows.
+			const entries = inboxEntries(snapshot, board === null ? undefined : board);
+			const now = Date.now();
+			for (const row of column.querySelectorAll(".card[data-row]")) {
+				const read = entries.find((item) => item.id === row.getAttribute("data-row"));
+				if (read) markSeen(store, read, now);
+			}
+			return drawMain(false);
 		}
 		const entry = target.closest("a[data-card], a[data-task], a[data-item]");
 		if (entry && plain(event)) {
@@ -3768,9 +4157,10 @@ function boot() {
 	});
 	window.addEventListener("popstate", () => {
 		const state = fromUrl();
-		const moved = state.view !== ui.view || state.layout !== ui.layout;
+		const moved = state.view !== ui.view || state.layout !== ui.layout || state.stale !== ui.stale;
 		ui.view = state.view;
 		ui.layout = state.layout;
+		ui.stale = state.stale;
 		show(state.open, "none");
 		if (moved) drawMain(true);
 	});
@@ -3797,6 +4187,7 @@ function boot() {
 	const start = fromUrl();
 	ui.view = start.view;
 	ui.layout = start.layout;
+	ui.stale = start.stale;
 	open = start.open;
 	if (threadOpen()) {
 		traceTurn = /^\\d+$/.test(open.id) ? open.id : null;
@@ -3858,11 +4249,13 @@ export interface DashboardPageOptions {
 	item?: string;
 	/** `?layout=` of the request (`list`: the turns view as a table). */
 	layout?: string;
+	/** `?stale=` of the request (`1`: the inbox and list show 방치 panes only). */
+	stale?: string;
 }
 
 /** The whole page: first render on the server (readable without JavaScript), then the inline script. */
 export function renderDashboardPage(snapshot: DashboardSnapshot, options: DashboardPageOptions = {}): string {
-	const { board, view, card, task, item, layout } = options;
+	const { board, view, card, task, item, layout, stale } = options;
 	const live = board?.ok === true ? board : undefined;
 	const tasks = snapshot.tasks.ok ? snapshot.tasks.items : [];
 	const open =
@@ -3919,6 +4312,7 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 		...(view === undefined ? {} : { view }),
 		...(open === undefined ? {} : { selected: found?.originKey ?? open.id }),
 		...(turnsList ? { layout: "list" } : {}),
+		...(stale === "1" ? { stale: true } : {}),
 	};
 	const signal = tabSignal(snapshot, board, false);
 	return `<!doctype html>

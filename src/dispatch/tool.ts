@@ -9,6 +9,7 @@ import { buildFloorsPrompt } from "../safety/prompt";
 import type { HerdrPromptInput } from "../store/db";
 import { notePrompt, resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
 import { parseTaskSpecInput, TASK_ID_PATTERN } from "../tasks/docs";
+import { applyRiskFloor } from "../tasks/risk-floor";
 import { auditContext } from "./audit";
 import { type BoardLinkResolver, boardCardLink, type HerdrBoardConfig } from "./board";
 import {
@@ -85,7 +86,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 		name: "ompbot_dispatch",
 		label: "Dispatch work",
 		description:
-			'태스크를 실행 계층에 넘긴다. mode=simple(기본)은 단순 작업: `omp -p`로 한 번 실행하고 최종 출력을 돌려준다(10분 상한). mode=herdr는 복잡·장기 작업: herdr 워크스페이스에 omp 에이전트를 띄우고 프롬프트를 넘긴다 — 패널에서 계속 실행되므로 이후 ompbot_dispatch mode=herdr + name 으로 진행을 확인하거나 후속 지시를 보낸다. 판단 기준: 조사·분석·회고·체크처럼 한 번의 답으로 끝나는 일은 세션에서 직접 하거나 simple. 구현은 예상 30분 초과·다단계·새 모듈·스키마 변경 중 하나라도 걸리면 무조건 herdr(+taskSpec) — 세션에서 직접 구현하지 않는다(세션 안 하위 에이전트로 구현하는 것도 직접 구현이다). 직접 구현은 설정값 변경·작은 수선(오너 요청 하나에 src 4개·200줄 이내, 테스트·문서 제외), 세션 컨텍스트 없이는 판단할 수 없는 긴급 디버깅만. 추가 판단: 여러 단계이거나 하루를 넘길 작업이면 taskSpec을 채운다(대상 저장소에 워크트리·4문서(context/spec/PROGRESS/outcome)·상태 파일을 만들고 TASKID로 추적, 수락기준×증거로 ompbot이 Outcome 도달을 판정한다). 단발성 작업은 taskSpec을 비운다. 시작되면 ompbot이 스레드에 접수 카드(맡았습니다·진행 보기 링크·[목표]·[가정])를 올리므로 assumptions에 오너 말을 어떻게 해석했는지 한 줄로 적는다. 막힘·Outcome 알림에 오너가 결정을 답하면 그 원문을 taskSpec:{id}와 task로 넘겨 재개한다. taskSpec 신규는 {title,risk(L0~L4),goal,scope[],exclusions[],acceptance[](1개 이상),repo(대상 호스트의 git 저장소 절대경로),background?}와 task(지시문)를 함께 주고, 재개는 taskSpec:{id:"T-…"}만 준다. taskSpec에는 name을 주지 않는다. 완료 처리·merge는 오너만 한다.',
+			'태스크를 실행 계층에 넘긴다. mode=simple(기본)은 단순 작업: `omp -p`로 한 번 실행하고 최종 출력을 돌려준다(10분 상한). mode=herdr는 복잡·장기 작업: herdr 워크스페이스에 omp 에이전트를 띄우고 프롬프트를 넘긴다 — 패널에서 계속 실행되므로 이후 ompbot_dispatch mode=herdr + name 으로 진행을 확인하거나 후속 지시를 보낸다. 판단 기준: 조사·분석·회고·체크처럼 한 번의 답으로 끝나는 일은 세션에서 직접 하거나 simple. 구현은 예상 30분 초과·다단계·새 모듈·스키마 변경 중 하나라도 걸리면 무조건 herdr(+taskSpec) — 세션에서 직접 구현하지 않는다(세션 안 하위 에이전트로 구현하는 것도 직접 구현이다). 직접 구현은 설정값 변경·작은 수선(오너 요청 하나에 src 4개·200줄 이내, 테스트·문서 제외), 세션 컨텍스트 없이는 판단할 수 없는 긴급 디버깅만. 추가 판단: 여러 단계이거나 하루를 넘길 작업이면 taskSpec을 채운다(대상 저장소에 워크트리·4문서(context/spec/PROGRESS/outcome)·상태 파일을 만들고 TASKID로 추적, 수락기준×증거로 ompbot이 Outcome 도달을 판정한다). 단발성 작업은 taskSpec을 비운다. 시작되면 ompbot이 스레드에 접수 카드(맡았습니다·진행 보기 링크·[목표]·[가정])를 올리므로 assumptions에 오너 말을 어떻게 해석했는지 한 줄로 적는다. 막힘·Outcome 알림에 오너가 결정을 답하면 그 원문을 taskSpec:{id}와 task로 넘겨 재개한다. taskSpec 신규는 {title,risk(L0~L4),goal,scope[],exclusions[],acceptance[](1개 이상),repo(대상 호스트의 git 저장소 절대경로),background?}와 task(지시문)를 함께 주고, 재개는 taskSpec:{id:"T-…"}만 준다. taskSpec에는 name을 주지 않는다. 워커가 글로 질문하고 멈추면 스레드에 ❓ 카드가 오고, 오너 답은 봇이 워커에게 넘긴다. 완료 처리·merge는 오너만 한다.',
 		parameters: {
 			type: "object",
 			properties: {
@@ -138,15 +139,19 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			additionalProperties: false,
 		},
 		async execute(params, context) {
-			const frozen = deps.frozen?.();
-			if (frozen !== undefined) {
-				deps.log.warn("dispatch_refused_frozen", { origin: deps.originKey });
-				throw new Error(frozenMessage(frozen));
-			}
+			refuseIfFrozen();
 			return auditContext.run({ origin: deps.originKey }, () => executeDispatch(params, context.signal));
 		},
 	};
 	return herdrOn ? tool : { ...tool, description: SIMPLE_ONLY_DESCRIPTION, parameters: SIMPLE_ONLY_PARAMETERS };
+
+	/** Throws when the bot is frozen: checked on entry and again after an owner card, which can outlast a freeze. */
+	function refuseIfFrozen(): void {
+		const frozen = deps.frozen?.();
+		if (frozen === undefined) return;
+		deps.log.warn("dispatch_refused_frozen", { origin: deps.originKey });
+		throw new Error(frozenMessage(frozen));
+	}
 
 	/**
 	 * The one gate every work-sending branch passes: the handoff risk scan of its brief (no brief → nothing to scan).
@@ -188,6 +193,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				? "no_approver"
 				: await deps.approve("herdr 위임 지시문에 고위험 명령이 있습니다", detail, signal);
 		if (answer === "approved") {
+			refuseIfFrozen();
 			deps.log.info("dispatch_risk_approved", { origin, rules });
 			return { suffix: `\n위험 검사: high_risk 승인됨 (${rules.join(", ")})`, approved: true };
 		}
@@ -237,16 +243,21 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			}
 			// Exclusions and acceptance are forbidding/checking sentences by design; they are not scanned.
 			const { spec } = input;
-			const brief = [
-				task,
+			const topics = [
 				spec.title,
 				spec.goal,
 				...spec.scope,
 				...(spec.background === undefined ? [] : [spec.background]),
 			];
-			const gate = await gateWork(briefed ? brief.join("\n") : undefined, signal);
-			const raised = gate.approved && ["L0", "L1", "L2"].includes(spec.risk) ? { ...spec, risk: "L3" as const } : spec;
-			return redact(await startTask(taskDeps, { spec: raised, task, host: host ?? null })) + gate.suffix;
+			const gate = await gateWork(briefed ? [task, ...topics].join("\n") : undefined, signal);
+			const approvedRisk = gate.approved && ["L0", "L1", "L2"].includes(spec.risk) ? "L3" : spec.risk;
+			// Topic keywords put a floor under the class (raise only); `task` is the how, not the topic.
+			const floored = applyRiskFloor(approvedRisk, topics);
+			if (floored.note !== undefined) {
+				deps.log.info("dispatch_risk_floor_raised", { origin: deps.originKey, from: approvedRisk, to: floored.risk });
+			}
+			const started = await startTask(taskDeps, { spec: { ...spec, risk: floored.risk }, task, host: host ?? null });
+			return redact(started) + (floored.note === undefined ? "" : `\n${floored.note}`) + gate.suffix;
 		}
 		const herdrOptions = {
 			cwd: deps.workspaceDir,
@@ -379,10 +390,19 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			task,
 			cwd: deps.workspaceDir,
 			...(deps.run === undefined ? {} : { run: deps.run }),
-			systemPromptAppendix: buildFloorsPrompt(join(deps.homeDir, "secrets"), deps.originKey, herdrOn),
+			systemPromptAppendix: buildFloorsPrompt(
+				join(deps.homeDir, "secrets"),
+				deps.originKey,
+				false,
+				false,
+				false,
+				{},
+				false,
+			),
 			ompBin: deps.ompExecutable,
 			...(deps.ompProfile === undefined ? {} : { ompProfile: deps.ompProfile }),
 			inheritedEnv: process.env,
+			signal,
 		});
 		deps.log.info("dispatch_simple_done", { ok: result.ok });
 		return redact(result.output) + gate.suffix;

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { ChannelRegistry } from "../src/channel/registry";
+import type { LaneModelTiers } from "../src/config";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import {
@@ -13,7 +15,7 @@ import {
 	LaneManager,
 	PROGRESS_INTERVAL_MS,
 } from "../src/lanes/manager";
-import { buildLaneTools } from "../src/lanes/tools";
+import { buildLaneTools, buildWorkStartTool } from "../src/lanes/tools";
 import { buildLanePrompt, buildLaneTodos, isReopenCommand, parseLaneTrigger } from "../src/lanes/trigger";
 import { type VerifyResult, verifyClaim } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
@@ -76,6 +78,9 @@ function harness(
 		maxLanes?: number;
 		verify?: (e: never, cwd: string, baseSha?: string, baseBranch?: string) => Promise<VerifyResult>;
 		frozen?: () => { since: string; reason: string; by: string } | undefined;
+		/** The manager's channel registry; default: the harness transport's Slack channel. */
+		channels?: ChannelRegistry;
+		laneModels?: LaneModelTiers;
 	} = {},
 ): Harness {
 	let now = START;
@@ -104,7 +109,7 @@ function harness(
 	const manager = new LaneManager({
 		timezone: "Asia/Seoul",
 		store,
-		channels: registryOf(new SlackChannel(transport)),
+		channels: options.channels ?? registryOf(new SlackChannel(transport)),
 		clock,
 		log,
 		sessionsRoot,
@@ -129,9 +134,11 @@ function harness(
 			return run;
 		},
 		sessionDirFor: (origin) => sessionDirFor(sessionsRoot, origin, 1),
+		session: router.sessionOps(),
 		...(options.maxLanes === undefined ? {} : { maxLanes: options.maxLanes }),
 		...(options.frozen === undefined ? {} : { frozen: options.frozen }),
 		...(options.verify === undefined ? {} : { verify: options.verify as never }),
+		...(options.laneModels === undefined ? {} : { laneModels: () => options.laneModels }),
 	});
 	return {
 		manager,
@@ -216,6 +223,16 @@ describe("verifyClaim (real git)", () => {
 		if (result.ok) return;
 		expect(result.reasons.join("\n")).toContain("uncommitted changes");
 		expect(result.reasons.join("\n")).toContain("README.md");
+		expect(result.reasons.join("\n")).toContain("new.txt");
+	});
+
+	test("an untracked file is dirty even when the repo config hides untracked files (qa-i #124)", async () => {
+		const repo = makeRepo(repos);
+		git(repo, "config", "status.showUntrackedFiles", "no");
+		writeFileSync(join(repo, "new.txt"), "x\n");
+		const result = await verifyClaim({ repo, commit: "HEAD", summary: "s" }, repo);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
 		expect(result.reasons.join("\n")).toContain("new.txt");
 	});
 
@@ -389,6 +406,46 @@ describe("lane start and registry", () => {
 		h.close();
 	});
 
+	test("a model tier sets the lane origin's model before its first turn; the first child opens on it", async () => {
+		const h = harness({ laneModels: { high: "fake/beta" } });
+		const lane = await h.manager.start({ title: "Demo task", cwd: cwdOf(), channel: "D1", model: "high" });
+		await h.settle();
+		expect(h.store.getOrigin(lane.originKey)?.model).toBe("fake/beta");
+		const calls = h.drivers.get(lane.originKey)?.calls ?? [];
+		const set = calls.indexOf("setModel:fake/beta");
+		expect(set).toBeGreaterThanOrEqual(0);
+		expect(set).toBeLessThan(calls.findIndex((call) => call.startsWith("prompt:")));
+		h.close();
+	});
+
+	test("an unconfigured or unknown tier is refused before any thread or row", async () => {
+		const none = harness();
+		await expect(none.manager.start({ title: "t", cwd: cwdOf(), channel: "D1", model: "high" })).rejects.toThrow(
+			/lanes\.models/,
+		);
+		expect(none.store.listLanes()).toHaveLength(0);
+		none.close();
+		const h = harness({ laneModels: { low: "fake/alpha" } });
+		await expect(h.manager.start({ title: "t", cwd: cwdOf(), channel: "D1", model: "high" })).rejects.toThrow(
+			/low 중 하나/,
+		);
+		expect(h.transport.posts(() => true)).toHaveLength(0);
+		expect(h.store.listLanes()).toHaveLength(0);
+		h.close();
+	});
+
+	test("a prototype key as the tier is refused like an unknown tier, before any thread or row (qa-i #54 #119)", async () => {
+		const h = harness({ laneModels: { low: "fake/alpha" } });
+		for (const tier of ["constructor", "toString", "__proto__"]) {
+			await expect(h.manager.start({ title: "t", cwd: cwdOf(), channel: "D1", model: tier })).rejects.toThrow(
+				/low 중 하나/,
+			);
+		}
+		expect(h.transport.posts(() => true)).toHaveLength(0);
+		expect(h.store.listLanes()).toHaveLength(0);
+		h.close();
+	});
+
 	test("two lanes get separate origins and session dirs; equal titles get a numbered name", async () => {
 		const h = harness();
 		const a = await h.manager.start({ title: "same", cwd: makeRepo(repos), channel: "D1" });
@@ -397,6 +454,47 @@ describe("lane start and registry", () => {
 		expect([a.name, b.name]).toEqual(["same", "same-2"]);
 		expect(a.sessionDir).not.toBe(b.sessionDir);
 		expect(a.threadRef).not.toBe(b.threadRef);
+		h.close();
+	});
+
+	test("risk floor: a payment title raises L1 to L3 and the start reply says so", async () => {
+		const h = harness();
+		const start = buildWorkStartTool(h.manager, "D1");
+		const reply = await start.execute(
+			{ title: "결제 웹훅", cwd: makeRepo(repos), risk: "L1" },
+			{ signal: new AbortController().signal },
+		);
+		await h.settle();
+		expect(h.store.listLanes()[0]?.meta.risk).toBe("L3");
+		expect(reply).toContain("위험등급을 L1→L3으로 올렸습니다(키워드: 결제).");
+		expect(h.logs.some((line) => line.includes("lane_risk_floor_raised"))).toBe(true);
+		h.close();
+	});
+
+	test("risk floor: no keyword keeps the given risk and adds no line", async () => {
+		const h = harness();
+		const lane = await h.manager.start({ title: "readme", cwd: makeRepo(repos), risk: "L1", channel: "D1" });
+		await h.settle();
+		expect(lane.meta.risk).toBe("L1");
+		expect(lane.startNote).toBeUndefined();
+		h.close();
+	});
+
+	test("a brief over the cap is cut with a marker for the review and the start reply says so", async () => {
+		const h = harness();
+		const start = buildWorkStartTool(h.manager, "D1");
+		const brief = `${"가".repeat(16_000)}끝부분`;
+		const reply = await start.execute(
+			{ title: "long spec", cwd: makeRepo(repos), brief },
+			{ signal: new AbortController().signal },
+		);
+		await h.settle();
+		const kept = h.store.listLanes()[0]?.meta.brief ?? "";
+		expect(kept.startsWith("가".repeat(16_000))).toBe(true);
+		expect(kept).not.toContain("끝부분");
+		expect(kept).toContain("[브리프 16003자 중 앞 16000자만 남김");
+		expect(reply).toContain("브리프 16003자 중 앞 16000자만 독립 리뷰에 남겼습니다.");
+		expect(h.logs.some((line) => line.includes("lane_brief_cut"))).toBe(true);
 		h.close();
 	});
 
@@ -935,6 +1033,57 @@ describe("status message cadence", () => {
 	});
 });
 
+describe("lanes on an unregistered channel (E-01)", () => {
+	/** A closed lane whose root edit failed, so a tick still owes it a draw ("🔄 off" shown, "🔍 off" due). */
+	async function closedLaneOwingADraw(): Promise<string> {
+		const repo = makeRepo(repos);
+		const first = harness();
+		const lane = await first.manager.start({ title: "off", cwd: repo, channel: "D1" });
+		await first.settle();
+		first.transport.failNext.updateMessage = [new Error("slack down")];
+		commitMore(lane.cwd);
+		await first.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "HEAD", summary: "s" });
+		await first.settle();
+		expect(first.store.getLane(lane.name)?.meta.renderedRoot).toBe("🔄 off");
+		first.close();
+		return lane.name;
+	}
+
+	test("a tick skips the lane quietly: no lane_render_failed, one lane_render_skipped per lane", async () => {
+		const name = await closedLaneOwingADraw();
+		const h = harness({ channels: new ChannelRegistry() });
+		await h.manager.tick();
+		await h.manager.tick();
+		await h.manager.tick();
+		expect(h.logs.filter((line) => line.includes("lane_render_failed"))).toEqual([]);
+		const skipped = h.logs.filter((line) => line.includes("lane_render_skipped"));
+		expect(skipped).toHaveLength(1);
+		expect(skipped[0]).toContain(`lane=${name}`);
+		expect(skipped[0]).toContain("reason=channel_unregistered");
+		expect(skipped[0]).toContain("channel=D1");
+		h.close();
+	});
+
+	test("the row is left alone while unregistered and drawn by the first tick after the channel registers", async () => {
+		const name = await closedLaneOwingADraw();
+		const channels = new ChannelRegistry();
+		const h = harness({ channels });
+		const before = h.store.getLane(name)?.meta;
+		await h.manager.tick();
+		await h.manager.tick();
+		const during = h.store.getLane(name)?.meta;
+		expect(during?.renderedRoot).toBe(before?.renderedRoot);
+		expect(during?.renderedStatus).toBe(before?.renderedStatus);
+		expect(h.transport.calls.filter((call) => call.method === "updateMessage")).toEqual([]);
+
+		channels.register(new SlackChannel(h.transport));
+		await h.manager.tick();
+		expect(h.store.getLane(name)?.meta.renderedRoot).toBe("🔍 off");
+		expect(h.logs.filter((line) => line.includes("lane_render_failed"))).toEqual([]);
+		h.close();
+	});
+});
+
 describe("lanes inside the daemon", () => {
 	let daemons: Daemon[];
 	let drivers: Map<string, FakeOmpDriver>;
@@ -1021,6 +1170,8 @@ describe("lanes inside the daemon", () => {
 			"ompbot_request_approval",
 			"ompbot_lane_progress",
 			"ompbot_claim_done",
+			"ompbot_board_post",
+			"ompbot_board_read",
 		]);
 		expect(daemon.hostToolsFor("slack/dm/D1").map((tool) => tool.name)).toContain("ompbot_work_start");
 		expect(laneTools).not.toContain("ompbot_work_start");
@@ -1316,6 +1467,22 @@ describe("lane completion nudges", () => {
 		const second = nudgePrompts(h, lane.originKey)[1] ?? "";
 		expect(second).toContain("[자동 재촉 2/2]");
 		expect(second).toContain("worktree 상태 확인 실패:");
+		h.close();
+	});
+
+	test("a freeze that starts while the nudge reads git holds the nudge (qa-i #56 #125)", async () => {
+		let logs: string[] = [];
+		// Frozen only once the nudge was counted: the pre-await check saw an unfrozen bot, the post-await one must not.
+		const frozen = () =>
+			logs.some((line) => /event=lane_nudge(\s|$)/.test(line))
+				? { since: "2026-11-14T01:00:00.000Z", reason: "점검", by: "cli" }
+				: undefined;
+		const h = laneHarness(home.dir, { completionNudges: () => 2, frozen });
+		logs = h.logs;
+		const lane = await startLane(h, "freeze-nudge");
+		await endTurn(h, h.drivers.get(lane.originKey));
+		expect(nudgePrompts(h, lane.originKey)).toHaveLength(0);
+		expect(h.logs.some((line) => line.includes("lane_nudge_skipped") && line.includes("reason=frozen"))).toBe(true);
 		h.close();
 	});
 

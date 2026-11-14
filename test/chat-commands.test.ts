@@ -130,6 +130,22 @@ describe("command parsing", () => {
 		expect(parseCommand("undo 해줘")).toBeUndefined();
 	});
 
+	test("!stop and /stop-ompbot parse as the stop command and take no argument", () => {
+		expect(parseCommand("!stop")).toEqual({ kind: "stop", arg: "" });
+		expect(parseCommand("/stop-ompbot")).toEqual({ kind: "stop", arg: "" });
+		expect(parseCommand("  !stop  ")).toEqual({ kind: "stop", arg: "" });
+		// No argument: anything after the word is a prompt, not this command.
+		expect(parseCommand("!stop 지금")).toBeUndefined();
+		expect(parseCommand("멈춰 !stop")).toBeUndefined();
+	});
+
+	test("!restart and /restart-ompbot parse as the restart command and take no argument", () => {
+		expect(parseCommand("!restart")).toEqual({ kind: "restart", arg: "" });
+		expect(parseCommand("/restart-ompbot")).toEqual({ kind: "restart", arg: "" });
+		expect(parseCommand("!restart 지금")).toBeUndefined();
+		expect(parseCommand("!restart now")).toBeUndefined();
+	});
+
 	test("!brief, /brief-ompbot and !브리핑 parse as the brief command and take no argument", () => {
 		expect(parseCommand("!brief")).toEqual({ kind: "brief", arg: "" });
 		expect(parseCommand("/brief-ompbot")).toEqual({ kind: "brief", arg: "" });
@@ -405,6 +421,12 @@ describe("⑤ omp compatibility check", () => {
 		for (const name of REQUIRED_RPC_METHODS) Object.defineProperty(Full.prototype, name, { value: () => undefined });
 		expect(missingRpcMethods(Full)).toEqual([]);
 		expect(missingRpcMethods(undefined)).toEqual([...REQUIRED_RPC_METHODS]);
+	});
+
+	test("the todo and side-question calls are checked at start too, not at the first /btw or lane todo", () => {
+		expect(missingRpcMethods(class {})).toEqual(
+			expect.arrayContaining(["setTodos", "btw", "cancelBtw", "onBtwRecord"]),
+		);
 	});
 });
 

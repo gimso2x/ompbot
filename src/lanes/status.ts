@@ -87,6 +87,8 @@ export interface LaneReview {
 	notes: string;
 	/** Why the review is `inconclusive` (timed out, exit code, no or several VERDICT lines, no diff). */
 	reason?: string;
+	/** The reviewer's `CONFIDENCE` (0–1) in its verdict; absent when it wrote none or a malformed one (older receipts). */
+	confidence?: number;
 }
 
 /**
@@ -141,6 +143,7 @@ export interface LaneMeta {
 	worktree?: string;
 	branch?: string;
 	baseBranch?: string;
+	/** The risk the starter named (or a keyword floor raised it to); absent = unrated, compared as `DEFAULT_LANE_RISK`. */
 	risk?: TaskRisk;
 	/** Acceptance criteria as given at the start; a trailing `[check: …]` is re-run by the core before closing. */
 	acceptance?: AcceptanceItem[];
@@ -164,8 +167,8 @@ export interface LaneMeta {
 	pausedFrom?: Exclude<LaneStatus, "paused" | "closed">;
 	/** When the pause began; the key that keeps the held-work warning and the held-message notice to one each. */
 	pausedAt?: number;
-	/** How the pause was asked: an owner message in the lane thread or the ⏸ button. */
-	pausedBy?: "owner-message" | "button";
+	/** How the pause was asked: an owner message in the lane thread, the ⏸ button, or a terminal attach. */
+	pausedBy?: "owner-message" | "button" | "attach";
 	/**
 	 * Automatic nudges after turns that ended with no done claim (`lanes.completionNudges`), counted since the owner
 	 * last wrote in the thread or `!reopen` (only those reset it — a nudge never does). `warned`: the cap's one thread
@@ -173,6 +176,30 @@ export interface LaneMeta {
 	 * that turn ends).
 	 */
 	nudges?: { sent: number; warned?: boolean; ownerAsked?: boolean };
+	/** The lane's session is handed to a terminal omp (`ompbot lanes attach`); absent otherwise. */
+	attach?: LaneAttach;
+	/**
+	 * A terminal hand-back left new session files: the files the owner picks the one to continue from (index 0 is the
+	 * attached file, already pinned) and whether the pick resumes the lane. Cleared by the pick or a resume.
+	 */
+	sessionChoices?: { files: string[]; resume: boolean };
+}
+
+/** A lane session handed to a terminal omp: who holds it and what to compare the hand-back with. */
+export interface LaneAttach {
+	/** The `ompbot lanes attach` process; when it is gone the lane is taken back (`LaneManager.tick`). */
+	pid: number;
+	at: number;
+	/** The file the lane's child had open (else the one it would resume): the terminal omp resumes exactly this. */
+	sessionFile: string;
+	/** Its size at the hand-over: what the terminal appended starts here. */
+	size: number;
+	/** The worktree HEAD at the hand-over (absent when git could not say): the summary counts files changed since. */
+	head?: string;
+	/** The lane was paused already: the hand-back leaves it paused. */
+	wasPaused: boolean;
+	/** `--keep-paused`: the hand-back leaves the lane paused. */
+	keepPaused: boolean;
 }
 
 /** Inbound ids of messages the core itself steers into a lane (first prompt, not-done, nudge): never the owner's. */

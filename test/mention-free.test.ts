@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../src/log";
@@ -12,23 +12,27 @@ const OWNER = "UOWNER";
 const BOT = "UBOT";
 const CHANNEL = "C0123456789";
 
+/** Media roots made by `makeAdapter`; removed after each test so a failing assertion leaks none. */
+const mediaRoots: string[] = [];
+
+afterEach(() => {
+	for (const dir of mediaRoots.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 function makeAdapter(channel: string): {
 	adapter: SlackAdapter;
 	transport: FakeSlackTransport;
 	recorded: string[];
 	origins: string[];
 	mediaRoot: string;
-	mutes: Set<string>;
 	knownThreads: Set<string>;
 } {
 	const transport = new FakeSlackTransport(BOT);
 	const recorded: string[] = [];
 	const origins: string[] = [];
-	const mutes = new Set<string>();
 	const knownThreads = new Set<string>();
-	/** Stand-in for the daemon's ledger KV markers (`mute:<platformMessageId>`). */
-	const handledMuteCommands = new Set<string>();
 	const mediaRoot = mkdtempSync(join(tmpdir(), "ompbot-mention-free-"));
+	mediaRoots.push(mediaRoot);
 	const adapter = new SlackAdapter({
 		transport,
 		core: {
@@ -40,13 +44,6 @@ function makeAdapter(channel: string): {
 			onCommand: () => "",
 			onAction: () => undefined,
 			knowsThread: (threadRef) => knownThreads.has(threadRef),
-			isThreadMuted: (threadRef) => mutes.has(threadRef),
-			setThreadMute: (threadRef, muted) => {
-				if (muted) mutes.add(threadRef);
-				else mutes.delete(threadRef);
-			},
-			seenMuteCommand: (platformMessageId) => handledMuteCommands.has(platformMessageId),
-			rememberMuteCommand: (platformMessageId) => handledMuteCommands.add(platformMessageId),
 		},
 		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined, defer: () => undefined },
 		ownerUserId: OWNER,
@@ -56,7 +53,7 @@ function makeAdapter(channel: string): {
 		mentionFreeChannels: [channel],
 	});
 	void adapter.start();
-	return { adapter, transport, recorded, origins, mediaRoot, mutes, knownThreads };
+	return { adapter, transport, recorded, origins, mediaRoot, knownThreads };
 }
 
 function channelMessage(text: string, user = OWNER): SlackMessageEvent {
@@ -102,164 +99,6 @@ describe("mention-free channels", () => {
 		const outcome = await adapter.ingestRecovered(event);
 		expect(outcome).toBe("recorded");
 		expect(recorded[0]).toContain("[첨부:");
-	});
-});
-
-describe("thread mutes (!shutup / !unshutup)", () => {
-	test("!shutup in a mention-free channel thread mutes only that thread, confirms in-thread and takes no turn", async () => {
-		const { adapter, transport, recorded, mutes } = makeAdapter(CHANNEL);
-		const outcome = await adapter.ingestRecovered({ ...channelMessage("!shutup"), thread_ts: "1000.000200" });
-		expect(outcome).toBe("recorded");
-		expect(recorded).toEqual([]);
-		expect(mutes.has(`${CHANNEL}:1000.000200`)).toBe(true);
-		expect(transport.calls.find((c) => c.method === "postMessage")).toMatchObject({
-			channel: CHANNEL,
-			threadTs: "1000.000200",
-		});
-	});
-
-	test("messages in the muted thread are dropped; other threads of the same channel still answer", async () => {
-		const { adapter, recorded } = makeAdapter(CHANNEL);
-		await adapter.ingestRecovered({ ...channelMessage("!shutup"), thread_ts: "1000.000200" });
-		expect(
-			await adapter.ingestRecovered({ ...channelMessage("메모"), thread_ts: "1000.000200", ts: "1000.000300" }),
-		).toBe("dropped");
-		expect(recorded).toEqual([]);
-		expect(
-			await adapter.ingestRecovered({ ...channelMessage("다른 스레드"), thread_ts: "1000.000900", ts: "1000.000901" }),
-		).toBe("recorded");
-		expect(recorded).toEqual(["다른 스레드"]);
-	});
-
-	test("a top-level !shutup mutes its own thread, so replies under it are quiet", async () => {
-		const { adapter, recorded, mutes } = makeAdapter(CHANNEL);
-		await adapter.ingestRecovered({ ...channelMessage("!shutup"), ts: "1000.000400" });
-		expect(mutes.has(`${CHANNEL}:1000.000400`)).toBe(true);
-		expect(
-			await adapter.ingestRecovered({
-				...channelMessage("이어지는 메모"),
-				thread_ts: "1000.000400",
-				ts: "1000.000500",
-			}),
-		).toBe("dropped");
-		expect(recorded).toEqual([]);
-	});
-
-	test("mentioning the bot in the muted thread releases the mute and the message becomes a normal turn", async () => {
-		const { adapter, recorded, mutes } = makeAdapter(CHANNEL);
-		await adapter.ingestRecovered({ ...channelMessage("!shutup"), thread_ts: "1000.000200" });
-		const outcome = await adapter.ingestRecovered({
-			...channelMessage(`<@${BOT}> 이제 다시 말해줘`),
-			thread_ts: "1000.000200",
-			ts: "1000.000600",
-		});
-		expect(outcome).toBe("recorded");
-		expect(recorded).toEqual(["이제 다시 말해줘"]);
-		expect(mutes.has(`${CHANNEL}:1000.000200`)).toBe(false);
-	});
-
-	test("!unshutup works from inside the muted thread", async () => {
-		const { adapter, transport, recorded, mutes } = makeAdapter(CHANNEL);
-		await adapter.ingestRecovered({ ...channelMessage("!shutup"), thread_ts: "1000.000200" });
-		expect(
-			await adapter.ingestRecovered({ ...channelMessage("!unshutup"), thread_ts: "1000.000200", ts: "1000.000700" }),
-		).toBe("recorded");
-		expect(mutes.has(`${CHANNEL}:1000.000200`)).toBe(false);
-		const notices = transport.calls.filter((c) => c.method === "postMessage");
-		expect(notices.at(-1)).toMatchObject({ channel: CHANNEL, threadTs: "1000.000200" });
-		expect(notices.at(-1)?.text).toContain("해제");
-		expect(
-			await adapter.ingestRecovered({ ...channelMessage("돌아왔나"), thread_ts: "1000.000200", ts: "1000.000800" }),
-		).toBe("recorded");
-		expect(recorded).toEqual(["돌아왔나"]);
-	});
-
-	test("!unshutup on a thread that is not muted only says so", async () => {
-		const { adapter, transport, mutes } = makeAdapter(CHANNEL);
-		expect(await adapter.ingestRecovered({ ...channelMessage("!unshutup"), thread_ts: "1000.000200" })).toBe(
-			"recorded",
-		);
-		expect(mutes.size).toBe(0);
-		expect(transport.calls.find((c) => c.method === "postMessage")?.text).toContain("뮤트되어 있지 않습니다");
-	});
-
-	test("a non-owner cannot mute: !shutup from another user is dropped", async () => {
-		const { adapter, recorded, mutes, transport } = makeAdapter(CHANNEL);
-		const outcome = await adapter.ingestRecovered({
-			...channelMessage("!shutup", "UINTRUDER"),
-			thread_ts: "1000.000200",
-		});
-		expect(outcome).toBe("dropped");
-		expect(mutes.size).toBe(0);
-		expect(recorded).toEqual([]);
-		expect(transport.count("postMessage")).toBe(0);
-	});
-
-	test("a bot-participated thread in a regular (non mention-free) channel can be muted too", async () => {
-		const { adapter, recorded, mutes, knownThreads } = makeAdapter(CHANNEL);
-		knownThreads.add("COTHER:1000.000800");
-		const reply = (text: string, ts: string): SlackMessageEvent => ({
-			type: "message",
-			channel: "COTHER",
-			channel_type: "channel",
-			user: OWNER,
-			text,
-			ts,
-			thread_ts: "1000.000800",
-		});
-		expect(await adapter.ingestRecovered(reply("!shutup", "1000.000801"))).toBe("recorded");
-		expect(mutes.has("COTHER:1000.000800")).toBe(true);
-		expect(await adapter.ingestRecovered(reply("계속 작업", "1000.000802"))).toBe("dropped");
-		expect(recorded).toEqual([]);
-	});
-
-	test("!shutup in an unaddressed thread of a regular channel stays ignored (no mute, no reply)", async () => {
-		const { adapter, recorded, mutes, transport } = makeAdapter(CHANNEL);
-		const outcome = await adapter.ingestRecovered({
-			...channelMessage("!shutup"),
-			channel: "COTHER",
-			thread_ts: "1000.000800",
-		});
-		expect(outcome).toBe("dropped");
-		expect(mutes.size).toBe(0);
-		expect(recorded).toEqual([]);
-		expect(transport.count("postMessage")).toBe(0);
-	});
-
-	test("!shutup with trailing words is an ordinary prompt, not a command", async () => {
-		const { adapter, recorded, mutes } = makeAdapter(CHANNEL);
-		const outcome = await adapter.ingestRecovered({ ...channelMessage("!shutup 지금 당장"), thread_ts: "1000.000200" });
-		expect(outcome).toBe("recorded");
-		expect(recorded).toEqual(["!shutup 지금 당장"]);
-		expect(mutes.size).toBe(0);
-	});
-
-	test("a backfill replay of the same !shutup event posts the notice exactly once", async () => {
-		const { adapter, transport, mutes } = makeAdapter(CHANNEL);
-		const event = { ...channelMessage("!shutup"), thread_ts: "1000.000200" };
-		expect(await adapter.ingestRecovered(event)).toBe("recorded");
-		expect(await adapter.ingestRecovered({ ...event })).toBe("duplicate");
-		expect(mutes.has(`${CHANNEL}:1000.000200`)).toBe(true);
-		expect(transport.count("postMessage")).toBe(1);
-	});
-
-	test("!shutup in the DM gets a hint instead of a mute", async () => {
-		const { adapter, transport, recorded, mutes } = makeAdapter(CHANNEL);
-		const outcome = await adapter.ingestRecovered({
-			type: "message",
-			channel: "D1",
-			channel_type: "im",
-			user: OWNER,
-			text: "!shutup",
-			ts: "1000.000700",
-		});
-		expect(outcome).toBe("recorded");
-		expect(recorded).toEqual([]);
-		expect(mutes.size).toBe(0);
-		expect(transport.calls.find((c) => c.method === "postMessage")).toMatchObject({
-			channel: "D1",
-			threadTs: "1000.000700",
-		});
 	});
 });
 

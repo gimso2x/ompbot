@@ -488,13 +488,23 @@ export class RpcClient {
 	}
 
 	async steer(_message: string): Promise<void> {}
-	async abort(): Promise<void> {}
+	// Command types sent, as omp's RpcClient frames them (\`{ type }\`), for the abort calls.
+	sentTypes: string[] = [];
+	async abort(): Promise<void> {
+		this.sentTypes.push("abort");
+	}
+	async abortAndRestoreQueue(): Promise<unknown> {
+		this.sentTypes.push("abort_and_restore_queue");
+		return { steering: [{ text: "steered" }], followUp: [] };
+	}
 	async newSession(): Promise<{ cancelled: boolean }> {
 		return { cancelled: false };
 	}
 	async openSession(_sessionDir: string): Promise<{ cancelled: boolean; resumed: boolean; sessionId: string }> {
 		return { cancelled: false, resumed: false, sessionId: "fake-session" };
 	}
+	// Merged into get_state's answer (e.g. a contextUsage).
+	stateExtra: Record<string, unknown> = {};
 	async getState(): Promise<Record<string, unknown>> {
 		return {
 			sessionId: "fake-session",
@@ -503,6 +513,7 @@ export class RpcClient {
 			isSettled: true,
 			queuedMessageCount: 0,
 			messageCount: 0,
+			...this.stateExtra,
 		};
 	}
 	async getEntries(_since?: string): Promise<Record<string, unknown>> {
@@ -527,12 +538,24 @@ export class RpcClient {
 	async compact(_customInstructions?: string): Promise<{ summary: string; tokensBefore: number }> {
 		return { summary: "", tokensBefore: 0 };
 	}
+	async setTodos(_phases: unknown): Promise<void> {}
+	async btw(_question: string): Promise<unknown> {
+		return { id: "btw-1", status: "running" };
+	}
+	async cancelBtw(_recordId?: string): Promise<boolean> {
+		return true;
+	}
+	onBtwRecord(_listener: Listener): () => void {
+		return () => undefined;
+	}
 }
 `;
 
 interface FakeRpcClient {
 	autoResolvePrompts: boolean;
 	stopCalls: number;
+	sentTypes: string[];
+	stateExtra: Record<string, unknown>;
 	emitSessionEvent(event: unknown): void;
 	emitPromptResult(frame: unknown): void;
 	resolvePrompt(opRef: string): void;
@@ -716,6 +739,56 @@ test("missingRpcMethods names onSessionEvent when the RpcClient class lacks it",
 	expect(missingRpcMethods(Old)).toEqual(["onSessionEvent"]);
 });
 
+/** A started driver over the non-spawning fake package and its fake RpcClient. */
+async function startFakeClientDriver(): Promise<{ driver: RpcOmpDriver; client: FakeRpcClient }> {
+	const dir = tempDir("ompbot-fakeomp-");
+	const tree = fakeOmpPackage(dir);
+	const driver = new RpcOmpDriver({
+		ompExecutable: tree.ompExecutable,
+		cwd: dir,
+		sessionDir: join(dir, "s"),
+		bunExecutable: process.execPath,
+	});
+	await driver.start();
+	// The fixture module is written to a temp dir at run time: no static import can name it.
+	const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
+	const client = fixture.RpcClient.instances.at(-1);
+	if (!client) throw new Error("fake RpcClient was not constructed");
+	return { driver, client };
+}
+
+test("RpcOmpDriver.abortAndClearQueue sends abort_and_restore_queue (not a plain abort) and drops the returned queue", async () => {
+	const { driver, client } = await startFakeClientDriver();
+	try {
+		expect(await driver.abortAndClearQueue()).toBeUndefined();
+		expect(client.sentTypes).toEqual(["abort_and_restore_queue"]);
+	} finally {
+		await driver.stop();
+	}
+});
+
+test("RpcOmpDriver.state() moves contextUsage into context and never makes up a 0", async () => {
+	const { driver, client } = await startFakeClientDriver();
+	try {
+		client.stateExtra = { contextUsage: { tokens: 123000, contextWindow: 1000000, percent: 12.3 } };
+		expect((await driver.state()).context).toEqual({ tokens: 123000, window: 1000000, percent: 12.3 });
+
+		client.stateExtra = {};
+		expect("context" in (await driver.state())).toBe(false);
+
+		client.stateExtra = { contextUsage: { tokens: null, contextWindow: 1000000, percent: null } };
+		expect((await driver.state()).context).toEqual({ tokens: null, window: 1000000, percent: null });
+
+		client.stateExtra = { contextUsage: { tokens: "123000", contextWindow: 1000000, percent: 12.3 } };
+		expect((await driver.state()).context).toEqual({ tokens: null, window: 1000000, percent: null });
+
+		client.stateExtra = { contextUsage: { tokens: 0, contextWindow: 0, percent: 0 } };
+		expect("context" in (await driver.state())).toBe(false);
+	} finally {
+		await driver.stop();
+	}
+});
+
 /** A driver over the spawning fake package, its fake RpcClient, a raw stdout writer and the warn logs. */
 async function startStreamDriver(): Promise<{
 	driver: RpcOmpDriver;
@@ -803,6 +876,50 @@ test("an unreadable line with no prompt running is only logged (#88)", async () 
 		expect(finals).toEqual([]);
 		expect(client.stopCalls).toBe(0);
 		expect(warns.filter((line) => line.includes("omp_stream_unreadable"))).toHaveLength(1);
+	} finally {
+		await driver.stop();
+	}
+});
+
+const frameLine = (frame: Record<string, unknown>): string => `${JSON.stringify(frame)}\n`;
+
+test("qa-h n79: a local slash command (agentInvoked:false) ends with its command_output, not the last assistant text", async () => {
+	const { driver, client, push, finals, readAll } = await startStreamDriver();
+	try {
+		// Admitted first: omp writes the output, then answers the prompt; no prompt_result follows.
+		const opRef = await driver.prompt("/usage");
+		push(frameLine({ type: "command_output", text: "Usage: 12 requests" }));
+		push(frameLine({ type: "command_output", text: "Cost: $0.10" }));
+		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true, data: { agentInvoked: false } }));
+		await until(() => finals.length > 0, 1000);
+		expect(finals).toEqual([{ opRef, status: "completed", text: "Usage: 12 requests\nCost: $0.10" }]);
+
+		// Read before prompt() resolves: held until admission, like a prompt_result. No output → "".
+		client.autoResolvePrompts = false;
+		const second = driver.prompt("/clear-todos");
+		push(frameLine({ id: "op-2", type: "response", command: "prompt", success: true, data: { agentInvoked: false } }));
+		await readAll();
+		expect(finals).toHaveLength(1);
+		client.resolvePrompt("op-2");
+		expect(await second).toBe("op-2");
+		await until(() => finals.length > 1, 1000);
+		expect(finals[1]).toEqual({ opRef: "op-2", status: "completed", text: "" });
+	} finally {
+		await driver.stop();
+	}
+});
+
+test("qa-h n79: an ordinary prompt response (no agentInvoked:false) still waits for its prompt_result", async () => {
+	const { driver, client, push, finals, readAll } = await startStreamDriver();
+	try {
+		const opRef = await driver.prompt("hi");
+		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true }));
+		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true, data: { agentInvoked: true } }));
+		await readAll();
+		expect(finals).toEqual([]);
+		client.emitPromptResult({ id: opRef, status: "completed" });
+		await until(() => finals.length > 0, 1000);
+		expect(finals).toEqual([{ opRef, status: "completed", text: "fake assistant text" }]);
 	} finally {
 		await driver.stop();
 	}

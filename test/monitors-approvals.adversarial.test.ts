@@ -63,6 +63,7 @@ beforeEach(() => {
 		log,
 		scriptsRoot: scriptsRoot(),
 		workspaceDir: join(dir, "workspace"),
+		homeDir: dir,
 	});
 	scheduler.start();
 });
@@ -813,7 +814,7 @@ describe("ApprovalBroker races", () => {
 		expect(await done).toBe("approved");
 	});
 
-	test("DEFECT: a ledger that cannot record the decision makes request() reject instead of returning the owner's click", async () => {
+	test("a ledger that cannot record the decision never rejects request(): approve fails closed, deny still lands", async () => {
 		const real = store as unknown as ApprovalStore;
 		const flaky: ApprovalStore = {
 			createApproval: (input) => real.createApproval(input),
@@ -826,10 +827,10 @@ describe("ApprovalBroker races", () => {
 			expirePendingApprovals: (now, due) => real.expirePendingApprovals(now, due),
 		};
 		const { broker, done, ts } = await start({ store: flaky });
-		expect(broker.handleAction(click("approve", ts))).toBe(true);
-		// createApproval's failure is caught and logged, decideApproval's is not: the owner's real answer is lost to an
-		// exception that the caller cannot tell apart from a transport failure.
-		await expect(done).resolves.toBe("approved");
+		// An approval the ledger could not confirm grants nothing (fable IMP-11); the request stays open for the owner.
+		expect(broker.handleAction(click("approve", ts))).toBe(false);
+		expect(broker.handleAction(click("deny", ts))).toBe(true);
+		await expect(done).resolves.toBe("denied");
 	});
 
 	test("DEFECT (minor): the 2500-char summary cut can split a surrogate pair and post a malformed string to Slack", async () => {

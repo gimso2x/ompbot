@@ -1,5 +1,6 @@
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { oneLine } from "../channel/text";
 import { loadConfig, type OmpbotConfig } from "../config";
 import {
 	describeMonitorTrigger,
@@ -16,7 +17,7 @@ import { webhookUrl } from "../monitors/webhook";
 import { readFreeze } from "../ops/freeze";
 import { formatLocal, hostTimezone } from "../time";
 
-export const MONITORS_USAGE = `  monitors add --json <spec>     create a monitor ({name, trigger (cron|at|script|watcher|webhook), instruction, overlap?, enabled?, channel?, copyChannel?, model?, thinking?, deliver?, procedureFiles? (<=5 files in the workspace or scripts dir, re-read on every fire)}; trigger webhook needs "webhook" in config.json
+export const MONITORS_USAGE = `  monitors add --json <spec>     create a monitor ({name, trigger (cron|at|script|watcher|webhook; a cron with command [+timeoutMs] runs that script per slot and needs deliver "verbatim"), instruction, overlap?, enabled?, channel?, copyChannel?, model?, thinking?, deliver?, procedureFiles? (<=5 files in the workspace or scripts dir, re-read on every fire)}; trigger webhook needs "webhook" in config.json
   monitors list [--json]         monitors with effective time zone and next fire
   monitors update <id|name> --json <patch>   change fields (a new trigger restarts its schedule)
   monitors show <id|name>        one monitor as JSON; a webhook monitor also prints its URL and bearer token
@@ -53,9 +54,14 @@ function describe(row: MonitorRow, schedule: Schedule): string {
 		schedule.nextFireAt === null
 			? "-"
 			: `${formatLocal(Date.parse(schedule.nextFireAt), schedule.effectiveTimezone)} ${schedule.effectiveTimezone}`;
+	// The last script check or watch error, with how many came in a row (cleared by the next good check).
+	const checkError =
+		row.lastCheckError === null || row.lastCheckErrorAt === null
+			? ""
+			: `  checkError(x${row.checkErrorStreak})=${oneLine(row.lastCheckError, 120)} @ ${formatLocal(row.lastCheckErrorAt, schedule.effectiveTimezone)} ${schedule.effectiveTimezone}`;
 	// The CLI keeps an `at` trigger's stored ISO string raw and separates fields with two spaces; the trigger text and
 	// option suffixes come from the shared ledger helpers (the host tool uses the same rules with its own parameters).
-	return `${row.id}  ${row.enabled ? "on " : "off"}  ${row.name}  [${describeMonitorTrigger(row, (at) => at)}]  overlap=${row.overlap}${monitorOptionSuffixes(row, "  ")}${row.deliver === "verbatim" ? "  deliver=verbatim" : ""}  next=${next}`;
+	return `${row.id}  ${row.enabled ? "on " : "off"}  ${row.name}  [${describeMonitorTrigger(row, (at) => at)}]  overlap=${row.overlap}${monitorOptionSuffixes(row, "  ")}${row.deliver === "verbatim" ? "  deliver=verbatim" : ""}  next=${next}${checkError}`;
 }
 
 /** A row for output without the webhook bearer token (only `add` and `show` print it). */
@@ -114,6 +120,7 @@ function portableCommand(sub: "export" | "apply", args: string[], homeDir: strin
 			prune: values.prune === true,
 			dryRun: values["dry-run"] === true,
 		});
+		for (const warning of result.warnings) process.stderr.write(`monitors apply: warning: ${warning}\n`);
 		process.stdout.write(
 			`added=${result.added} updated=${result.updated} unchanged=${result.unchanged} removed=${result.removed}\n`,
 		);
@@ -210,7 +217,12 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 		}
 		let payload: string | undefined;
 		if (row.trigger.kind === "script") {
-			const result = await runScript(row.trigger.command, { scriptsRoot, cwd: workspaceDir, monitorId: row.id });
+			const result = await runScript(row.trigger.command, {
+				scriptsRoot,
+				cwd: workspaceDir,
+				monitorId: row.id,
+				homeDir,
+			});
 			if (!result.fired) {
 				out({
 					fired: false,

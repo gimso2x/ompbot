@@ -16,6 +16,7 @@ import { DiscordRest } from "../discord/rest";
 import { DEFAULT_COMPLETION_NUDGES } from "../lanes/manager";
 import { buildChildEnv, withOmpProfile } from "../omp/env";
 import { checkOmpRuntime } from "../omp/runtime-check";
+import { CODE_ROLLBACK_JOURNAL, type CodeRollbackJournal, readCodeRollbackJournal } from "../ops/apply";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
 import { readVersion } from "./tools";
@@ -100,6 +101,10 @@ export function secretProblem(path: string, prefix: string): string | undefined 
 	return undefined;
 }
 
+/** `\uXXXX` for every control and format character, so a value read from a file cannot start a new doctor line. */
+export const escapeControl = (text: string): string =>
+	text.replace(/[\p{Cc}\p{Cf}]/gu, (c) => `\\u${(c.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`);
+
 const modeOf = (path: string): number => statSync(path).mode & 0o777;
 const octal = (mode: number): string => `0${mode.toString(8)}`;
 
@@ -168,10 +173,39 @@ export function checkBackupBundle(homeDir: string, report: Report, warn: (name: 
 }
 
 /**
- * Prints one `ok`/`fail` line per check (`warn` lines never count as failures). Only paths, modes, token *prefixes* and public ids are printed; token values
- * never leave `readSlackTokens`. Returns 0 when every check passed.
+ * The `code rollback` line: a `detach` code rollback left the checkout on head.last-good (journal in the absolute git
+ * dir), so the owner learns how to come back. Nothing when there is no journal or `repoDir` is not a git checkout.
  */
-export async function runDoctor(homeDir: string, write: (line: string) => void): Promise<number> {
+export function checkCodeRollbackJournal(repoDir: string, warn: (name: string, detail: string) => void): void {
+	const gitDir = Bun.spawnSync(["git", "-C", repoDir, "rev-parse", "--absolute-git-dir"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (gitDir.exitCode !== 0) return;
+	const path = join(gitDir.stdout.toString().trim(), CODE_ROLLBACK_JOURNAL);
+	let journal: CodeRollbackJournal | undefined;
+	try {
+		journal = readCodeRollbackJournal(gitDir.stdout.toString().trim());
+	} catch (error) {
+		warn(
+			"code rollback",
+			`${path} unreadable (${error instanceof Error ? error.message : String(error)}): check the checkout, then bun src/main.ts apply --clear-rollback`,
+		);
+		return;
+	}
+	if (journal === undefined) return;
+	warn(
+		"code rollback",
+		`${escapeControl(journal.lastGood.slice(0, 7))}로 되돌린 상태(원인 ${escapeControl(journal.head.slice(0, 7))}, apply ${escapeControl(journal.stamp)}), 복귀: git checkout main && git pull --ff-only && bun src/main.ts apply`,
+	);
+}
+
+/**
+ * Prints one `ok`/`fail` line per check (`warn` lines never count as failures). Only paths, modes, token *prefixes* and public ids are printed; token values
+ * never leave `readSlackTokens`. Returns 0 when every check passed. With `repoDir` (the checkout the daemon runs),
+ * a code rollback journal there is a warning.
+ */
+export async function runDoctor(homeDir: string, write: (line: string) => void, repoDir?: string): Promise<number> {
 	let failures = 0;
 	const report = (ok: boolean, name: string, detail: string): void => {
 		if (!ok) failures += 1;
@@ -181,8 +215,12 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 
 	let config: OmpbotConfig | undefined;
 	try {
-		const homeMode = modeOf(homeDir);
-		report(homeMode === HOME_MODE, "home", `${homeDir} mode=${octal(homeMode)} expected=${octal(HOME_MODE)}`);
+		if (!statSync(homeDir).isDirectory()) {
+			report(false, "home", `${homeDir} is not a directory`);
+		} else {
+			const homeMode = modeOf(homeDir);
+			report(homeMode === HOME_MODE, "home", `${homeDir} mode=${octal(homeMode)} expected=${octal(HOME_MODE)}`);
+		}
 	} catch {
 		report(false, "home", `${homeDir} missing`);
 	}
@@ -344,6 +382,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void):
 	);
 
 	checkBackupBundle(homeDir, report, warn);
+	if (repoDir !== undefined) checkCodeRollbackJournal(repoDir, warn);
 
 	if (config && !tokensOk) {
 		report(false, "slack auth.test", "skipped: fix the secret lines above first");

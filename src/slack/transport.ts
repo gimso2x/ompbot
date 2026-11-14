@@ -33,16 +33,6 @@ export interface SlackMessageEvent {
 	files?: ReadonlyArray<SlackInboundFile> | undefined;
 }
 
-/** `reaction_added` / `reaction_removed` (Events API); the adapter reads only reactions on messages. */
-export interface SlackReactionEvent {
-	type: "reaction_added" | "reaction_removed";
-	user?: string | undefined;
-	/** Emoji name without colons; a skin tone rides as `::skin-tone-N`. */
-	reaction: string;
-	item: { type: string; channel?: string | undefined; ts?: string | undefined };
-	event_ts: string;
-}
-
 export interface SlackSlashPayload {
 	command: string;
 	user_id: string;
@@ -64,7 +54,6 @@ export interface SlashAck {
 
 export interface SlackHandlers {
 	message(event: SlackMessageEvent): Promise<void>;
-	reaction(event: SlackReactionEvent): Promise<void>;
 	/** `undefined` acks with no message: the command's answer arrives as a post of its own. */
 	slash(payload: SlackSlashPayload): Promise<SlashAck | undefined>;
 	blockAction(payload: SlackBlockActionPayload): Promise<void>;

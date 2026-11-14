@@ -79,7 +79,11 @@ export function subtext(text: string): string {
 		.join("\n");
 }
 
-const codeBlock = (text: string): string => `\`\`\`\n${text}\n\`\`\``;
+/** `text` in a fence one backtick longer than its longest run (at least 3), so a ``` inside cannot close it. */
+const codeBlock = (text: string): string => {
+	const fence = "`".repeat(Math.max(2, ...(text.match(/`+/g) ?? []).map((run) => run.length)) + 1);
+	return `${fence}\n${text}\n${fence}`;
+};
 
 /** One card child as description lines; fields and the first image go to the embed itself. */
 function childLines(child: CardChild, embed: { fields: DiscordEmbedField[]; image?: { url: string } }): string[] {

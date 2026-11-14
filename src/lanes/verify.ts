@@ -158,7 +158,7 @@ export async function verifyClaim(
 	}
 	const reasons: string[] = [];
 
-	const status = await git(["-C", top, "status", "--porcelain"]);
+	const status = await git(["-C", top, "status", "--porcelain", "--untracked-files=all"]);
 	if (status.code !== 0) {
 		reasons.push(`git status failed in ${top}: ${status.stderr.trim().split("\n")[0] || `exit ${status.code}`}`);
 	} else if (status.stdout.trim() !== "") {

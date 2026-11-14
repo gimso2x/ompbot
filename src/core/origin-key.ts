@@ -1,27 +1,26 @@
 // The one place that reads chat origin keys. Keys are built with `chatOriginKey` and otherwise treated as opaque
 // strings; anything that needs the platform, conversation or thread of a key asks `parseChatOrigin`.
 
-export type ChatPlatform = "slack" | "telegram" | "discord" | "teams";
+export type ChatPlatform = "slack" | "discord" | "teams";
 
 export interface ChatOriginRef {
 	platform: ChatPlatform;
 	/** `dm`: a direct conversation with the owner; `ch`: a channel or group. */
 	kind: "dm" | "ch";
 	conversationId: string;
-	/** Thread inside the conversation (Slack root ts, Telegram forum topic, Discord thread). */
+	/** Thread inside the conversation (Slack root ts, Discord thread). */
 	threadId?: string;
 }
 
 /**
  * Exact id grammar per platform, the only definition of it. Slack ids start with an upper-case letter (`C…`, `D…`,
- * `G…`, `U…`) and run on alphanumeric, with `<sec>.<usec>` thread ts; Telegram group chat ids are negative
- * (`-100…`); Discord ids are snowflakes (digits only), so a Slack id and a Discord id never look alike. A Teams
- * conversation id (`19:…@thread.v2`, `a:…`) cannot sit in a key or thread ref, so the ledger stands in an alias for it:
- * `t` + 16 lower-case hex (`teams_conversations`); its thread is the original Activity id, kept as it is.
+ * `G…`, `U…`) and run on alphanumeric, with `<sec>.<usec>` thread ts; Discord ids are snowflakes (digits only), so a
+ * Slack id and a Discord id never look alike. A Teams conversation id (`19:…@thread.v2`, `a:…`) cannot sit in a key or
+ * thread ref, so the ledger stands in an alias for it: `t` + 16 lower-case hex (`teams_conversations`); its thread is
+ * the original Activity id, kept as it is.
  */
 export const GRAMMAR: Readonly<Record<ChatPlatform, { readonly conversation: RegExp; readonly thread: RegExp }>> = {
 	slack: { conversation: /^[A-Z][A-Z0-9]+$/, thread: /^[0-9.]+$/ },
-	telegram: { conversation: /^-?[0-9]+$/, thread: /^[0-9]+$/ },
 	discord: { conversation: /^[0-9]+$/, thread: /^[0-9]+$/ },
 	teams: { conversation: /^t[0-9a-f]{16}$/, thread: /^[^\s/]+$/ },
 };
@@ -30,23 +29,16 @@ const isChatPlatform = (value: string | undefined): value is ChatPlatform =>
 	value !== undefined && Object.hasOwn(GRAMMAR, value);
 
 /**
- * Platforms a bare conversation id tells apart. Telegram is left out: its private chat ids are digits like Discord's,
- * so it will need an explicit platform on the ledger rows instead.
- */
-export type IdPlatform = "slack" | "discord" | "teams";
-const ID_PLATFORMS: readonly IdPlatform[] = ["slack", "discord", "teams"];
-
-/**
  * Platform of a conversation id met without an origin key (a delivery's thread ref, an approval card's channel), read
  * with GRAMMAR's own conversation pattern so it never disagrees with `parseChatOrigin`; `undefined` when no platform's
  * grammar accepts it.
  */
-export function platformOfConversationId(id: string): IdPlatform | undefined {
-	return ID_PLATFORMS.find((platform) => GRAMMAR[platform].conversation.test(id));
+export function platformOfConversationId(id: string): ChatPlatform | undefined {
+	return (Object.keys(GRAMMAR) as ChatPlatform[]).find((platform) => GRAMMAR[platform].conversation.test(id));
 }
 
 /**
- * Platform whose namespace `key` lives in (`slack/…`, `telegram/…`, `discord/…`), whether or not the rest is
+ * Platform whose namespace `key` lives in (`slack/…`, `discord/…`, `teams/…`), whether or not the rest is
  * well-formed; `undefined` for every other namespace. For "is this a chat surface" checks that must not depend on
  * the exact id grammar.
  */

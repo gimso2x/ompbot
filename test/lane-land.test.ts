@@ -6,7 +6,14 @@ import { parseThreadRef } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
 import { buildLaneOutcomeCard } from "../src/lanes/card";
 import type { IntegrityRefusal } from "../src/lanes/integrity";
-import { createLaneLander, type LandLane, type LandRequest, laneLandBlockers } from "../src/lanes/land";
+import {
+	createLaneLander,
+	type LandLane,
+	type LandRequest,
+	laneLandBlockers,
+	REVIEW_BLOCK,
+	REVIEW_MISSING,
+} from "../src/lanes/land";
 import { CLAIM_GRACE_MS } from "../src/lanes/manager";
 import { INCONCLUSIVE_APPROVED, type LaneChanges, type LaneRow } from "../src/lanes/status";
 import { classifyClosedLaneMessage } from "../src/lanes/trigger";
@@ -292,88 +299,314 @@ describe("landLane: the live checkout is left alone or refuses (AC-2)", () => {
 });
 
 describe("landLane: the base branch moved ahead (AC-3)", () => {
-	test("not ff-able: base and remote unchanged, closed → working with a rebase steer; the re-claim runs the checks again; the second refusal is blocked", async () => {
+	test("not ff-able: base and remote unchanged; the core rebases the lane and runs the checks again; the second refusal is blocked", async () => {
 		const { repo, bare, base } = repoWithOrigin();
 		const ops = countingOps();
 		const h = laneHarness(home.dir, { hostOps: ops.ops });
-		const { lane } = await closeLane(h, repo);
+		const { lane, sha } = await closeLane(h, repo);
 		expect(ops.checks()).toBe(1);
 		const ahead = commitIn(repo, "elsewhere.txt");
 		const remoteBefore = headOf(bare, `refs/heads/${base}`);
 
-		await h.manager.requestLand(lane.name, "owner");
+		const outcome = await h.manager.requestLand(lane.name, "owner");
 		await h.settle();
-		const working = requireLane(h, lane.name);
-		expect(working.status).toBe("working");
-		expect(working.meta.land).toMatchObject({ attempts: 1 });
-		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
-		expect(headOf(bare, `refs/heads/${base}`)).toBe(remoteBefore);
-		expect(existsSync(lane.meta.worktree ?? "")).toBe(true);
-		const steers = h.steers(lane.originKey);
-		expect(steers).toHaveLength(1);
-		expect(steers[0]).toContain("rebase");
-		expect(steers[0]).toContain(base);
-		expect(steers[0]).toContain("ompbot_claim_done");
-		expect(rootUpdates(h.transport, lane).at(-1)).toBe("🔄 land");
-
-		// The lane rebases and claims again: the claim goes through the checks once more.
-		git(lane.cwd, "rebase", "-q", base);
-		expect(
-			await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "HEAD", summary: "rebase 후 a.txt" }),
-		).toContain("검증 통과");
-		await h.settle();
+		expect(outcome.text).toContain("코어가");
+		const rebased = headOf(lane.cwd);
+		expect(rebased).not.toBe(sha);
+		expect(headOf(lane.cwd, "HEAD~1")).toBe(ahead);
+		expect(h.steers(lane.originKey)).toHaveLength(0);
 		expect(ops.checks()).toBe(2);
 		const reclaimed = requireLane(h, lane.name);
 		expect(reclaimed.status).toBe("closed");
+		expect(reclaimed.meta.sha).toBe(rebased);
+		expect(reclaimed.meta.claim?.summary).toBe(`a.txt 추가 (코어 rebase ${sha.slice(0, 12)}→${rebased.slice(0, 12)})`);
 		expect(reclaimed.meta.land).toMatchObject({ state: "pending", attempts: 1 });
+		expect(reclaimed.history.find((entry) => entry.event === "core_rebased")?.detail).toBe(
+			`${sha.slice(0, 12)}→${rebased.slice(0, 12)}`,
+		);
+		// The owner's request does not land by itself: the base and the remote wait for the next 머지.
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(remoteBefore);
 
-		// The base moved again before this landing: the second refusal goes to the owner instead of the lane.
+		// The base moved again before this landing: the second refusal goes to the owner instead of the core or the lane.
 		const aheadAgain = commitIn(repo, "elsewhere-2.txt");
 		await h.manager.requestLand(lane.name, "owner");
 		await h.settle();
 		const blocked = requireLane(h, lane.name);
 		expect(blocked.status).toBe("closed");
 		expect(blocked.meta.land).toMatchObject({ state: "blocked", attempts: 2 });
+		expect(headOf(lane.cwd)).toBe(rebased);
 		expect(headOf(repo, `refs/heads/${base}`)).toBe(aheadAgain);
 		expect(headOf(bare, `refs/heads/${base}`)).toBe(remoteBefore);
-		expect(h.steers(lane.originKey)).toHaveLength(1);
+		expect(h.steers(lane.originKey)).toHaveLength(0);
 		h.close();
 	});
 
-	test("frozen: the owner's not-ff landing sends the lane back to work but holds the rebase steer (qa50b M-2)", async () => {
+	test("frozen: the owner's not-ff landing sends the lane back to work, the core does not rebase and the steer is held (qa50b M-2)", async () => {
 		const { repo } = repoWithOrigin();
 		let frozen = false;
 		const h = laneHarness(home.dir, {
 			frozen: () => (frozen ? { since: "2027-01-15T00:00:00.000Z", reason: "", by: "test" } : undefined),
 		});
-		const { lane } = await closeLane(h, repo);
+		const { lane, sha } = await closeLane(h, repo);
 		commitIn(repo, "elsewhere.txt");
 		frozen = true;
 		const outcome = await h.manager.requestLand(lane.name, "owner");
 		await h.settle();
-		expect(requireLane(h, lane.name).status).toBe("working");
+		const working = requireLane(h, lane.name);
+		expect(working.status).toBe("working");
+		expect(working.history.some((entry) => entry.event === "core_rebased")).toBe(false);
+		expect(headOf(lane.cwd)).toBe(sha);
 		expect(h.steers(lane.originKey)).toHaveLength(0);
 		expect(h.logs.some((line) => line.includes("event=lane_send_held_frozen"))).toBe(true);
 		expect(outcome.text).toContain("동결");
 		h.close();
 	});
+});
 
-	test("after one rebase the lane lands", async () => {
+/** Commits `file` in `dir` with content of its own: a lane that added `file` too conflicts with it on a rebase. */
+function conflictIn(dir: string, file = "a.txt"): string {
+	writeFileSync(join(dir, file), "written on the base branch\n");
+	git(dir, "add", "--", file);
+	git(dir, "commit", "-q", "-m", `conflicting ${file}`);
+	return headOf(dir);
+}
+
+/** Rejects after `ms` unless `promise` settles first (an event a test waits for). */
+function within<T>(promise: Promise<T>, ms = 10_000): Promise<T> {
+	let timer: Timer | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`not within ${ms}ms`)), ms);
+	});
+	return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** The lane worktree is back where it was: on its branch at `sha`, clean, and no rebase in progress. */
+function expectRestored(lane: LaneRow, sha: string): void {
+	const worktree = lane.meta.worktree ?? "";
+	expect(headOf(worktree)).toBe(sha);
+	expect(git(worktree, "symbolic-ref", "HEAD")).toBe(`refs/heads/${lane.meta.branch}`);
+	expect(git(worktree, "status", "--porcelain")).toBe("");
+	for (const dir of ["rebase-merge", "rebase-apply"]) {
+		expect(existsSync(git(worktree, "rev-parse", "--path-format=absolute", "--git-path", dir))).toBe(false);
+	}
+}
+
+/** The rebase steer went to the lane exactly once. */
+function expectSteered(h: LaneHarness, lane: LaneRow, base: string): void {
+	const steers = h.steers(lane.originKey);
+	expect(steers).toHaveLength(1);
+	expect(steers[0]).toContain("rebase");
+	expect(steers[0]).toContain(base);
+	expect(steers[0]).toContain("ompbot_claim_done");
+	expect(requireLane(h, lane.name).status).toBe("working");
+	expect(requireLane(h, lane.name).history.some((entry) => entry.event === "core_rebased")).toBe(false);
+}
+
+describe("the core rebases a not-ff lane first (doc/plans/lane-core-rebase.md)", () => {
+	test("AC-1: no conflict under an auto-merge policy: no rebase prompt, the core-rebased commit is judged with its checks again, closed and merged", async () => {
 		const { repo, bare, base } = repoWithOrigin();
+		const ops = countingOps();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			hostOps: ops.ops,
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+		});
+		const started = await h.manager.start({
+			title: "core rebase",
+			cwd: repo,
+			channel: "D1",
+			acceptance: [CHECK_A],
+			risk: "L2",
+		});
+		await h.settle();
+		const sha = commitIn(started.cwd, "a.txt");
+		// Another landing moved the base branch while this lane worked.
+		const ahead = commitIn(repo, "elsewhere.txt");
+		expect(
+			await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" }),
+		).toContain("검증 통과");
+		await h.settle();
+
+		const landed = requireLane(h, started.name);
+		expect(h.steers(started.originKey)).toHaveLength(0);
+		expect(counted.calls).toHaveLength(2);
+		expect(ops.checks()).toBe(2);
+		expect(landed.status).toBe("closed");
+		expect(landed.meta.land).toMatchObject({ state: "landed", attempts: 1, pushed: `origin/${base}` });
+		const rebased = landed.meta.sha ?? "";
+		expect(rebased).not.toBe(sha);
+		expect(counted.calls[1]?.sha).toBe(rebased);
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(rebased);
+		expect(headOf(repo, `${rebased}~1`)).toBe(ahead);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(rebased);
+		expect(existsSync(join(repo, "a.txt"))).toBe(true);
+		expect(existsSync(join(repo, "elsewhere.txt"))).toBe(true);
+		expect(landed.history.map((entry) => entry.event)).toEqual(
+			expect.arrayContaining(["land_not_ff", "core_rebased", "claim", "closed", "landed"]),
+		);
+		expect(h.logs.some((line) => line.includes("event=lane_core_rebased"))).toBe(true);
+		h.close();
+	});
+
+	test("AC-2: a conflict: the worktree is back at the claim (clean, no rebase in progress) and the lane gets the rebase prompt", async () => {
+		const { repo, base } = repoWithOrigin();
 		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		const ahead = conflictIn(repo);
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expectRestored(lane, sha);
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("코어 rebase 안 함: 충돌");
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
+		expect(h.manager.isCoreRebasing(lane.originKey)).toBe(false);
+		h.close();
+	});
+
+	test("AC-3: the lane's turn started before the rebase: the core leaves the worktree alone and prompts the lane", async () => {
+		const { repo, base } = repoWithOrigin();
+		let busy = false;
+		const real = realLander();
+		const h = laneHarness(home.dir, {
+			laneBusy: () => busy,
+			// The landing ran idle; a message starts a lane turn right as it returns not-ff.
+			land: async (request, hooks) => {
+				const result = await real(request, hooks);
+				busy = true;
+				return result;
+			},
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		commitIn(repo, "elsewhere.txt");
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expectRestored(lane, sha);
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("레인 턴 진행 중");
+		h.close();
+	});
+
+	test("AC-3: a detached HEAD in the lane worktree: the core does not rebase and prompts the lane", async () => {
+		const { repo, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		const worktree = lane.meta.worktree ?? "";
+		git(worktree, "checkout", "-q", "--detach");
+		commitIn(repo, "elsewhere.txt");
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(headOf(worktree)).toBe(sha);
+		expect(headOf(repo, `refs/heads/${lane.meta.branch}`)).toBe(sha);
+		expect(() => git(worktree, "symbolic-ref", "-q", "HEAD")).toThrow();
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("detached HEAD");
+		h.close();
+	});
+
+	test("AC-4: every lane commit is already in the base branch: the worktree is reset to oldSha and the lane is prompted", async () => {
+		const { repo, base } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		// The same patch reached the base branch as another commit: a rebase drops the lane's commit.
+		commitIn(repo, "elsewhere.txt");
+		git(repo, "cherry-pick", sha);
+		const ahead = headOf(repo);
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expectRestored(lane, sha);
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("빈 rebase");
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
+		h.close();
+	});
+
+	test("AC-4b: the rebase call throws (git timed out): the lane is prompted and isCoreRebasing is cleared", async () => {
+		const { repo, base } = repoWithOrigin();
+		const h = laneHarness(home.dir, {
+			rebaseGit: (args) =>
+				args.includes("rebase") && !args.includes("--abort")
+					? Promise.reject(new Error("git timed out"))
+					: defaultGit(args),
+		});
+		const { lane, sha } = await closeLane(h, repo);
+		commitIn(repo, "elsewhere.txt");
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expectRestored(lane, sha);
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("git 오류");
+		expect(h.manager.isCoreRebasing(lane.originKey)).toBe(false);
+		h.close();
+	});
+
+	test("AC-4b: the rebase stops on a conflict, then throws, and the abort throws: the lane is still prompted and the card warns", async () => {
+		const { repo, base } = repoWithOrigin();
+		const h = laneHarness(home.dir, {
+			rebaseGit: async (args) => {
+				if (args.includes("--abort")) throw new Error("git spawn failed");
+				if (!args.includes("rebase")) return defaultGit(args);
+				await defaultGit(["-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+				throw new Error("git timed out");
+			},
+		});
+		const { lane } = await closeLane(h, repo);
+		conflictIn(repo);
+
+		const outcome = await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expectSteered(h, lane, base);
+		expect(outcome.text).toContain("되돌리기 실패");
+		expect(h.logs.some((line) => line.includes("event=lane_core_rebase_abort_failed"))).toBe(true);
+		expect(h.manager.isCoreRebasing(lane.originKey)).toBe(false);
+		h.close();
+	});
+
+	test("AC-4c: while the core rebases the origin is held (a message stays pending); after it, not held and the message is dispatched", async () => {
+		const { repo } = repoWithOrigin();
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const h = laneHarness(home.dir, {
+			rebaseGit: async (args) => {
+				if (args.includes("rebase") && !args.includes("--abort")) {
+					entered.resolve();
+					await gate.promise;
+				}
+				// The harness default's throwaway identity: the rebase commits, and a bare HOME has no git config.
+				return defaultGit(["-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+			},
+		});
 		const { lane } = await closeLane(h, repo);
 		commitIn(repo, "elsewhere.txt");
-		await h.manager.requestLand(lane.name, "owner");
+
+		const landing = h.manager.requestLand(lane.name, "owner");
+		await within(entered.promise);
+		expect(h.manager.isCoreRebasing(lane.originKey)).toBe(true);
+		const text = "rebase 중에 보낸 오너 메시지";
+		await h.route({
+			platformMessageId: "owner-during-rebase",
+			originKey: lane.originKey,
+			ownerVerified: true,
+			text,
+			threadRef: lane.threadRef,
+		});
+		const delivered = () => h.drivers.get(lane.originKey)?.calls.some((call) => call.includes(text)) ?? false;
+		expect(delivered()).toBe(false);
+		expect(h.store.listInbound({ originKey: lane.originKey, state: "pending" }).map((row) => row.textRef)).toContain(
+			text,
+		);
+
+		gate.resolve();
+		expect((await landing).text).toContain("코어가");
 		await h.settle();
-		git(lane.cwd, "rebase", "-q", base);
-		const rebased = headOf(lane.cwd);
-		await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "HEAD", summary: "rebase 후 a.txt" });
-		await h.settle();
-		await h.manager.requestLand(lane.name, "owner");
-		await h.settle();
-		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
-		expect(headOf(repo)).toBe(rebased);
-		expect(headOf(bare, `refs/heads/${base}`)).toBe(rebased);
+		expect(h.manager.isCoreRebasing(lane.originKey)).toBe(false);
+		expect(delivered()).toBe(true);
 		h.close();
 	});
 });
@@ -575,8 +808,12 @@ describe("landLane: push policy, refusal, serial landings, resume (AC-4)", () =>
 		expect(cleanup).toBeGreaterThan(Math.max(...first));
 		expect(cleanup).toBeLessThan(Math.min(...second));
 		expect(requireLane(h, a.lane.name).meta.land?.state).toBe("landed");
-		// The second lane started from the same commit: after the first landed it is no longer ff-able.
-		expect(requireLane(h, b.lane.name).status).toBe("working");
+		// The second lane started from the same commit: after the first landed it is no longer ff-able, and the core
+		// rebased it onto the first and judged it again.
+		const rebased = requireLane(h, b.lane.name);
+		expect(rebased.status).toBe("closed");
+		expect(rebased.meta.land).toMatchObject({ state: "pending", attempts: 1 });
+		expect(headOf(repo, `${rebased.meta.sha}~1`)).toBe(a.sha);
 		expect(headOf(repo, `refs/heads/${base}`)).toBe(a.sha);
 		h.close();
 	});
@@ -1115,6 +1352,38 @@ describe("closed → Outcome card and auto-merge (AC-5)", () => {
 		h.close();
 	});
 
+	// T-20261113-08 AC-5: an apply code rollback's autoland.hold asks instead of merging; the owner's request still lands.
+	test("autoland.hold: asked with the hold as the reason, task_autoland_held logged, the owner's request lands", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+			autoLandHold: () => "코드 롤백(apply 20261113-070000): revert 1234567",
+		});
+		const started = await h.manager.start({
+			title: "land",
+			cwd: repo,
+			channel: "D1",
+			acceptance: [CHECK_A],
+			risk: "L2",
+		});
+		await h.settle();
+		commitIn(started.cwd, "a.txt");
+		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" });
+		await h.settle();
+		const lane = requireLane(h, started.name);
+		expect(lane.status).toBe("closed");
+		expectAsked(h, lane, counted.calls, "autoland.hold: 코드 롤백(apply 20261113-070000): revert 1234567");
+		expect(h.logs.some((line) => line.includes("task_autoland_held") && line.includes(lane.name))).toBe(true);
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(counted.calls).toHaveLength(1);
+		expect(requireLane(h, lane.name).meta.land?.state).toBe("landed");
+		h.close();
+	});
+
 	test("a failed re-run check on record: asked (the card is posted by the tick after a failed first post)", async () => {
 		const { repo } = repoWithOrigin();
 		const counted = countingLand();
@@ -1281,6 +1550,83 @@ describe("closed → Outcome card and auto-merge (AC-5)", () => {
 		expect(card.buttons?.map((button) => button.label)).toEqual(["머지", "폐기"]);
 		h.close();
 	});
+
+	test("review confidence AC-5: the confident band {L3, 0.85} lets an explicit L3 lane through on CLEAR 0.90 only", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo, { risk: "L3" });
+		const review = { model: "m", timeoutMs: 1000 };
+		const policy = {
+			repos: [repo],
+			maxRisk: "L2" as const,
+			review: { ...review, confident: { maxRisk: "L3" as const, minConfidence: 0.85 } },
+		};
+		const receipt = { sha, verdict: "CLEAR" as const, model: "m", at: 0, notes: "" };
+		const withReview = (row: LaneRow, over: Partial<NonNullable<LaneRow["meta"]["review"]>> | undefined) => ({
+			...row,
+			meta: { ...row.meta, review: over === undefined ? undefined : { ...receipt, ...over } },
+		});
+		expect(laneLandBlockers(withReview(lane, { confidence: 0.9 }), policy, true, false)).toEqual([]);
+		expect(laneLandBlockers(withReview(lane, { confidence: 0.85 }), policy, true, false)).toEqual([]);
+		expect(laneLandBlockers(withReview(lane, { confidence: 0.8 }), policy, true, false)).toEqual([
+			"독립 리뷰 CLEAR(확신도 0.80 < 0.85, 위험 L3)",
+		]);
+		expect(laneLandBlockers(withReview(lane, {}), policy, true, false)).toEqual([
+			"독립 리뷰 CLEAR(확신도 없음, 위험 L3)",
+		]);
+		expect(laneLandBlockers(withReview(lane, { verdict: "BLOCK", confidence: 0.95 }), policy, true, false)).toEqual([
+			REVIEW_BLOCK,
+		]);
+		expect(laneLandBlockers(withReview(lane, undefined), policy, true, false)).toEqual([REVIEW_MISSING]);
+		expect(
+			laneLandBlockers(withReview(lane, { verdict: "inconclusive", reason: "시간 초과" }), policy, true, false),
+		).toEqual(["독립 리뷰 확인 불가(시간 초과)"]);
+		// A lane without a risk (DEFAULT_LANE_RISK L3) and an L4 lane are outside the band: the risk only, no review reason.
+		const unrated = { ...lane, meta: { ...withReview(lane, { confidence: 0.99 }).meta, risk: undefined } };
+		expect(laneLandBlockers(unrated, policy, true, false)).toEqual(["위험 L3 > L2"]);
+		const l4 = { ...lane, meta: { ...lane.meta, risk: "L4" as const, review: undefined } };
+		expect(laneLandBlockers(l4, policy, true, false)).toEqual(["위험 L4 > L2"]);
+		expect(laneLandBlockers({ ...unrated, meta: { ...unrated.meta, review: undefined } }, policy, true, false)).toEqual(
+			["위험 L3 > L2"],
+		);
+		// Without confident an explicit L3 lane is held by its risk only, whatever its review says.
+		expect(laneLandBlockers(withReview(lane, { confidence: 0.99 }), { ...policy, review }, true, false)).toEqual([
+			"위험 L3 > L2",
+		]);
+		expect(laneLandBlockers(withReview(lane, undefined), { ...policy, review }, true, false)).toEqual(["위험 L3 > L2"]);
+		// At or below maxRisk the band plays no part: a plain CLEAR without a confidence lets it through.
+		const l2 = { ...withReview(lane, {}), meta: { ...withReview(lane, {}).meta, risk: "L2" as const } };
+		expect(laneLandBlockers(l2, policy, true, false)).toEqual([]);
+		h.close();
+	});
+
+	test("review confidence AC-7·D: the auto card shows the CLEAR confidence with two decimals", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo);
+		const shown = (confidence?: number) =>
+			buildLaneOutcomeCard(
+				{
+					...lane,
+					meta: {
+						...lane.meta,
+						review: {
+							sha,
+							verdict: "CLEAR",
+							model: "m/x",
+							at: 0,
+							notes: "",
+							...(confidence === undefined ? {} : { confidence }),
+						},
+					},
+				},
+				{ kind: "auto" },
+			).text;
+		expect(shown(0.9)).toContain("🔎 독립 리뷰 CLEAR 0.90 · m/x");
+		// An older receipt without a confidence reads as before.
+		expect(shown()).toContain("🔎 독립 리뷰 CLEAR · m/x");
+		h.close();
+	});
 });
 
 describe("Outcome card: the claim commit's changes and overlaps (doc/plans/lane-card-changes.md)", () => {
@@ -1422,7 +1768,8 @@ describe("Outcome card: the claim commit's changes and overlaps (doc/plans/lane-
 		const other = repoWithOrigin();
 		const closed = await closeLane(h, other.repo, { title: "notff" });
 		expect(requireLane(h, closed.lane.name).meta.changes).toBeDefined();
-		commitIn(other.repo, "elsewhere.txt");
+		// A conflict: the core leaves the rebase to the lane.
+		conflictIn(other.repo);
 		await h.manager.requestLand(closed.lane.name, "owner");
 		await h.settle();
 		const working = requireLane(h, closed.lane.name);

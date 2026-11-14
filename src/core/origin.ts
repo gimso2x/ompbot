@@ -1,10 +1,11 @@
 import { join } from "node:path";
+import type { LaneSessionOps } from "../lanes/manager";
 import type { Logger } from "../log";
-import type { TodoPhase } from "../omp/driver";
+import type { OmpState, TodoPhase } from "../omp/driver";
 import { redact } from "../redact";
 import { openStore, type Store } from "../store/db";
 import type { LiveView } from "./live-turn";
-import { type DriverFactory, type MailboxDeps, OriginMailbox } from "./mailbox";
+import { type BoardNotice, type DriverFactory, type MailboxDeps, OriginMailbox } from "./mailbox";
 import { isThreadOrigin } from "./normalize";
 import { chatOriginKey } from "./origin-key";
 import type { InboundRecord, MailboxClock, StatusProvider } from "./types";
@@ -40,6 +41,8 @@ export interface OriginRouterDeps {
 	distillProvider?: MailboxDeps["distillProvider"];
 	/** Passed to every mailbox: whether a turn prompt may carry channel-scoped recall; see `MailboxDeps`. */
 	recallEnabled?: MailboxDeps["recallEnabled"];
+	/** Passed to every mailbox: whether a child gets ompbot host tools; see `MailboxDeps.hostTools`. */
+	hostTools?: MailboxDeps["hostTools"];
 	/** Passed to every mailbox: live `costCap` for the per-turn brake; see `MailboxDeps.costCap`. */
 	costCap?: MailboxDeps["costCap"];
 	/** Passed to every mailbox: the `!budget` answer; see `MailboxDeps.budgetProvider`. */
@@ -53,14 +56,9 @@ export interface OriginRouterDeps {
 	/** Root of pre-heal session backups; passed to every mailbox (`MailboxDeps.sessionBackupsRoot`). */
 	sessionBackupsRoot?: string;
 	idleStopMs?: number;
-	stallMs?: number;
 	/** Passed to every mailbox: consecutive failed turns that escalate to the owner; see `MailboxDeps`. */
 	escalateAfter?: number;
 	onStall?: MailboxDeps["onStall"];
-	stallReleaseMs?: MailboxDeps["stallReleaseMs"];
-	stallNotifyCount?: MailboxDeps["stallNotifyCount"];
-	stallNotifyMs?: MailboxDeps["stallNotifyMs"];
-	monitorStallAbortMs?: MailboxDeps["monitorStallAbortMs"];
 	/** Owner escalation of a stalled turn (DM once per turn); see `MailboxDeps`. */
 	onStallEscalate?: MailboxDeps["onStallEscalate"];
 	onProgress?: MailboxDeps["onProgress"];
@@ -81,14 +79,20 @@ export interface OriginRouterDeps {
 	turnUndo?: MailboxDeps["turnUndo"];
 	/** `!brief` renderer; passed to every mailbox (`MailboxDeps.briefingProvider`). */
 	briefingProvider?: MailboxDeps["briefingProvider"];
+	/** `!restart` launcher; passed to every mailbox (`MailboxDeps.restartProvider`). */
+	restartProvider?: MailboxDeps["restartProvider"];
 	/** Whether an origin's work is held (a paused lane); passed per mailbox (`MailboxDeps.isHeld`). */
 	isHeld?: (originKey: string) => boolean;
 	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */
 	onHeldWork?: MailboxDeps["onHeldWork"];
 	/** Task-list phases a fresh session of an origin starts with; passed per mailbox (`MailboxDeps.initialTodos`). */
 	initialTodos?: (originKey: string) => TodoPhase[] | undefined;
+	/** The lane board's new-post line of an origin's next turn prompt; passed per mailbox (`MailboxDeps.boardNotice`). */
+	boardNotice?: (originKey: string) => BoardNotice | undefined;
 	/** Every turn that ended through the final path; passed to every mailbox (`MailboxDeps.onTurnSettled`). */
 	onTurnSettled?: MailboxDeps["onTurnSettled"];
+	/** Whether an origin's session is handed to a terminal omp; passed per mailbox (`MailboxDeps.isAttached`). */
+	isAttached?: (originKey: string) => boolean;
 }
 
 /** Owns one `OriginMailbox` per origin key. */
@@ -107,7 +111,7 @@ export class OriginRouter {
 	mailbox(originKey: string): OriginMailbox {
 		let mailbox = this.#mailboxes.get(originKey);
 		if (!mailbox) {
-			const { sessionsRoot, isHeld, onHeldWork, initialTodos, ...rest } = this.#deps;
+			const { sessionsRoot, isHeld, onHeldWork, initialTodos, isAttached, boardNotice, ...rest } = this.#deps;
 			mailbox = new OriginMailbox({
 				...rest,
 				originKey,
@@ -116,6 +120,8 @@ export class OriginRouter {
 				...(isHeld === undefined ? {} : { isHeld: () => isHeld(originKey) }),
 				...(onHeldWork === undefined ? {} : { onHeldWork }),
 				...(initialTodos === undefined ? {} : { initialTodos: () => initialTodos(originKey) }),
+				...(isAttached === undefined ? {} : { isAttached: () => isAttached(originKey) }),
+				...(boardNotice === undefined ? {} : { boardNotice: () => boardNotice(originKey) }),
 			});
 			if (this.#dispatchStopped) mailbox.stopDispatching();
 			this.#mailboxes.set(originKey, mailbox);
@@ -165,6 +171,21 @@ export class OriginRouter {
 		return this.#mailboxes.get(originKey)?.openSessionFile() ?? Promise.resolve(undefined);
 	}
 
+	/** The origin's live child state (`!status` context line); undefined without a mailbox or child (never creates one). */
+	driverState(originKey: string): Promise<OmpState | undefined> {
+		return this.#mailboxes.get(originKey)?.driverState() ?? Promise.resolve(undefined);
+	}
+
+	/** The mailbox calls the terminal hand-over of a lane uses (`LaneManagerDeps.session`). */
+	sessionOps(): LaneSessionOps {
+		return {
+			openFile: (originKey) => this.openSessionFile(originKey),
+			whenTurnEnds: (originKey) => this.mailbox(originKey).whenTurnEnds(),
+			release: (originKey) => this.mailbox(originKey).close(),
+			childRunning: (originKey) => this.#mailboxes.get(originKey)?.state.driverRunning ?? false,
+		};
+	}
+
 	/** Origins with a running turn. */
 	busyTurns(): number {
 		return [...this.#mailboxes.values()].filter((mailbox) => mailbox.state.busy).length;
@@ -195,12 +216,12 @@ export class OriginRouter {
 	 * Returns the origins still busy when the bound expired (empty when everything settled); reading `state.busy`
 	 * from outside the mailboxes' actor chains can never deadlock them.
 	 */
-	async drainRunning(boundMs: number, pollMs = 50): Promise<string[]> {
+	async drainRunning(boundMs: number): Promise<string[]> {
 		const deadline = Date.now() + boundMs;
 		for (;;) {
 			const busy = this.busyOrigins();
 			if (busy.length === 0 || Date.now() >= deadline) return busy;
-			await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
 		}
 	}
 

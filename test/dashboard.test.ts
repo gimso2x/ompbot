@@ -15,6 +15,7 @@ import {
 	type SnapshotDeps,
 	type TaskInfo,
 	type TurnInfo,
+	taskDurationSamples,
 } from "../src/dashboard/snapshot";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { openStore } from "../src/store/db";
@@ -153,6 +154,7 @@ const OUTCOME = `# T-20261104-01 Outcome 증거
 
 /** Task docs of T-20261104-01 only; every other task reads as missing files. */
 const fakeHostOps = (): TaskHostOps => ({
+	readBytes: async () => ({ ok: true, value: undefined }),
 	async readFile(path) {
 		const docs: Record<string, string> = {
 			[`${WORKTREE}/docs/tasks/T-20261104-01/spec.md`]: SPEC,
@@ -933,5 +935,62 @@ describe("dashboard review fixes", () => {
 			() => 0,
 		) as typeof renderDashboardMain;
 		expect(clientRender(snapshot, undefined, NOW, { view: "turns" })).toBe(html);
+	});
+});
+
+describe("TASK duration samples", () => {
+	const MIN = 60_000;
+	const DAY = 86_400_000;
+	const move = (db: Database, id: string, from: string, to: string, at: number): void => {
+		db.run(
+			"INSERT INTO task_transitions (task_id, from_status, to_status, actor, reason, at) VALUES (?, ?, ?, 'bot', '', ?)",
+			[id, from, to, at],
+		);
+	};
+
+	test("AC-4: registration to the first working → review move of the last 30 days, newest first", () => {
+		const db = new Database(dbPath, { strict: true });
+		// Registered NOW − 1 h: 01 went to review twice (the first counts), 03 once.
+		move(db, "T-20261104-01", "working", "review", NOW - 30 * MIN);
+		move(db, "T-20261104-01", "review", "working", NOW - 25 * MIN);
+		move(db, "T-20261104-01", "working", "review", NOW - 10 * MIN);
+		move(db, "T-20261104-03", "working", "review", NOW - 20 * MIN);
+		// No working → review move: blocked, and review entered from blocked.
+		move(db, "T-20261104-02", "working", "blocked", NOW - 5 * MIN);
+		move(db, "T-20261103-01", "blocked", "review", NOW - 15 * MIN);
+		// Its review move is 31 days old.
+		db.run("UPDATE tasks SET created_at = ? WHERE task_id = 'T-20261020-01'", [NOW - 40 * DAY]);
+		move(db, "T-20261020-01", "working", "review", NOW - 31 * DAY);
+		db.close();
+		const ro = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			expect(taskDurationSamples(ro, NOW)).toEqual([40 * MIN, 30 * MIN]);
+		} finally {
+			ro.close();
+		}
+	});
+
+	test("AC-4: at most 200 samples, the newest ones", () => {
+		const db = new Database(dbPath, { strict: true });
+		for (let i = 0; i < 205; i++) {
+			const id = `T-2026110${String(i).padStart(3, "0")}`;
+			db.run(
+				`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, repo, worktree, branch, agent, status,
+					acceptance_json, created_at, updated_at)
+				 VALUES (?, 't', 'L1', 'slack/dm/U1', ?, '/r', ?, ?, ?, 'review', '[]', ?, ?)`,
+				[id, `C1:${id}`, `/r/${id}`, `task/${id}`, id.toLowerCase(), NOW - DAY, NOW - DAY],
+			);
+			move(db, id, "working", "review", NOW - DAY + (i + 1) * MIN);
+		}
+		db.close();
+		const ro = new Database(dbPath, { readonly: true, strict: true });
+		try {
+			const samples = taskDurationSamples(ro, NOW);
+			expect(samples.length).toBe(200);
+			expect(samples[0]).toBe(205 * MIN);
+			expect(samples[199]).toBe(6 * MIN);
+		} finally {
+			ro.close();
+		}
 	});
 });

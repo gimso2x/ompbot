@@ -1,5 +1,5 @@
 import { parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
-import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
+import { type ChatPlatform, platformOfConversationId } from "../core/origin-key";
 import { redact } from "../redact";
 import type { ChannelPort, OutboundMessage, PostTarget } from "./port";
 
@@ -34,7 +34,6 @@ function redacting(port: ChannelPort): ChannelPort {
 	const openThread = port.openThread?.bind(port);
 	return {
 		platform: port.platform,
-		capabilities: port.capabilities,
 		post: (target, msg) => port.post(target, redactMessage(msg)),
 		edit: (ref, msg) => port.edit(ref, redactMessage(msg)),
 		react: (ref, name, on) => port.react(ref, name, on),
@@ -92,19 +91,5 @@ export class ChannelRegistry {
 		const route = this.forConversation(conversationId);
 		if (route === undefined) throw new Error(`no channel registered for conversation ${conversationId}`);
 		return route.port;
-	}
-
-	/** Port and post target of a chat origin key; `undefined` for non-chat origins and unregistered platforms. */
-	forOrigin(originKey: string): { port: ChannelPort; target: PostTarget } | undefined {
-		const ref = parseChatOrigin(originKey);
-		const port = ref === undefined ? undefined : this.#ports.get(ref.platform);
-		if (ref === undefined || port === undefined) return undefined;
-		return {
-			port,
-			target: {
-				conversationId: ref.conversationId,
-				...(ref.threadId === undefined ? {} : { threadId: ref.threadId }),
-			},
-		};
 	}
 }

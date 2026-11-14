@@ -19,18 +19,35 @@ function item(deliveryId: number, extra: Partial<DeliveryItem> = {}): DeliveryIt
 }
 
 /** One shared call log across the fake source and sender, so the order of their calls is visible. */
-function harness(items: DeliveryItem[], results: Map<number, DeliverySendResult>) {
+function harness(
+	items: DeliveryItem[],
+	results: Map<number, DeliverySendResult>,
+	/** `gaveUp`: definitive failures the ledger expires (retries spent); `expired`: rows the ledger swept meanwhile. */
+	ledger: { gaveUp?: ReadonlySet<number>; expired?: DeliveryItem[] } = {},
+) {
 	const calls: string[] = [];
 	const lines: string[] = [];
 	let blocked = false;
+	const { expired } = ledger;
 	const source: DeliverySource = {
 		claimDue: () => {
 			calls.push("claimDue");
 			return items;
 		},
 		confirm: (id) => void calls.push(`confirm:${id}`),
-		fail: (id, error, outcome) => void calls.push(`fail:${id}:${error}:${outcome}`),
+		fail: (id, error, outcome) => {
+			calls.push(`fail:${id}:${error}:${outcome}`);
+			return ledger.gaveUp?.has(id) === true;
+		},
 		defer: (id, error, retry: DeliveryRetry) => void calls.push(`defer:${id}:${error}:${JSON.stringify(retry)}`),
+		...(expired === undefined
+			? {}
+			: {
+					takeExpired: () => {
+						calls.push("takeExpired");
+						return expired.splice(0);
+					},
+				}),
 	};
 	const sender: DeliverySender = {
 		isBlocked: () => blocked,
@@ -43,6 +60,7 @@ function harness(items: DeliveryItem[], results: Map<number, DeliverySendResult>
 			return result;
 		},
 		afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+		afterUndelivered: async (d) => void calls.push(`undelivered:${d.deliveryId}`),
 	};
 	const pump = new DeliveryPump({
 		source,
@@ -95,8 +113,44 @@ describe("DeliveryPump", () => {
 			"fail:3:channel_not_found:definitive",
 			"send:4",
 			"fail:4:socket hang up:ambiguous",
+			"undelivered:4",
 		]);
 		expect(lines.filter((line) => line.includes("event=delivery_failed"))).toHaveLength(2);
+	});
+
+	test("an ambiguous fail and a definitive fail that spent its retries finish the status as undelivered; a retried fail and a defer do not", async () => {
+		const retry = { at: NOW + 5_000, sentParts: 0 };
+		const { pump, calls } = harness(
+			[item(3), item(4), item(5), item(6)],
+			new Map<number, DeliverySendResult>([
+				[3, { kind: "failed", error: "channel_not_found", outcome: "definitive", sentParts: 0 }],
+				[4, { kind: "failed", error: "socket hang up", outcome: "ambiguous", sentParts: 1 }],
+				[5, { kind: "failed", error: "channel_not_found", outcome: "definitive", sentParts: 0 }],
+				[6, { kind: "deferred", error: new Error("ratelimited"), retry }],
+			]),
+			{ gaveUp: new Set([5]) },
+		);
+		expect(await pump.pump()).toBe(0);
+		expect(calls).toEqual([
+			"claimDue",
+			"send:3",
+			"fail:3:channel_not_found:definitive",
+			"send:4",
+			"fail:4:socket hang up:ambiguous",
+			"undelivered:4",
+			"send:5",
+			"fail:5:channel_not_found:definitive",
+			"undelivered:5",
+			"send:6",
+			`defer:6:ratelimited:${JSON.stringify(retry)}`,
+		]);
+	});
+
+	test("rows the ledger expired meanwhile are finished as undelivered, even while posting is blocked", async () => {
+		const { pump, calls, block } = harness([item(7)], new Map(), { expired: [item(8), item(9)] });
+		block();
+		expect(await pump.pump()).toBe(0);
+		expect(calls).toEqual(["takeExpired", "undelivered:8", "undelivered:9"]);
 	});
 
 	test("a send that throws is failed as ambiguous and the batch goes on; nothing stays claimed", async () => {
@@ -123,6 +177,7 @@ describe("DeliveryPump", () => {
 					return { kind: "sent", parts: 1 };
 				},
 				afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+				afterUndelivered: async (d) => void calls.push(`undelivered:${d.deliveryId}`),
 			},
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
@@ -132,6 +187,7 @@ describe("DeliveryPump", () => {
 			"claimDue",
 			"send:11",
 			"fail:11:render boom:ambiguous",
+			"undelivered:11",
 			"send:12",
 			"confirm:12",
 			"afterSent:12",
@@ -163,6 +219,7 @@ describe("DeliveryPump", () => {
 					calls.push(`afterSent:${d.deliveryId}`);
 					if (d.deliveryId === 13) throw new Error("status boom");
 				},
+				afterUndelivered: async (d) => void calls.push(`undelivered:${d.deliveryId}`),
 			},
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
@@ -203,6 +260,7 @@ describe("DeliveryPump", () => {
 					return { kind: "sent", parts: 1 };
 				},
 				afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+				afterUndelivered: async (d) => void calls.push(`undelivered:${d.deliveryId}`),
 			},
 			clock,
 			log: createLogger({ sink: () => undefined, clock, redact }),
@@ -265,6 +323,7 @@ describe("qa50b K-13: a throwing ledger call", () => {
 					return results.get(d.deliveryId) ?? { kind: "sent", parts: 1 };
 				},
 				afterSent: async (d) => void calls.push(`afterSent:${d.deliveryId}`),
+				afterUndelivered: async (d) => void calls.push(`undelivered:${d.deliveryId}`),
 			},
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),

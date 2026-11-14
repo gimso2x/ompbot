@@ -6,11 +6,20 @@ import { join } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
 import { MAX_INBOUND_FILES, saveInboundAttachment } from "../channel/attachments";
 import { renderMentions } from "../channel/port";
-import { DeliveryPump, type DeliverySender, type DeliverySendResult } from "../channel/pump";
 import {
+	answerFooter,
+	DeliveryPump,
+	type DeliverySendResult,
+	deliverySender,
+	finishDeliveryStatus,
+} from "../channel/pump";
+import { RetryAfterGate } from "../channel/retry";
+import {
+	errorText,
 	FINAL_MARKS,
 	type FinalOutcome,
 	formatElapsed,
+	formatFooter,
 	oneLine,
 	runningStatusText,
 	STATUS_MIN_INTERVAL_MS,
@@ -39,9 +48,9 @@ import { TeamsCallError, type TeamsConnector, TeamsRateLimitedError } from "./tr
 import { type TeamsActivity, type TeamsAttachment, teamsAlias } from "./types";
 
 /** A turn running longer than this gets its `⏳ 작업 중` line. */
-export const LONG_TURN_MS = 60_000;
+const LONG_TURN_MS = 60_000;
 
-export interface TeamsAdapterOptions {
+interface TeamsAdapterOptions {
 	channel: TeamsChannel;
 	conversations: TeamsConversations;
 	core: CoreSink;
@@ -57,7 +66,6 @@ export interface TeamsAdapterOptions {
 	/** The endpoint to serve; absent: no listener (Activities only through `handleActivity`). */
 	listen?: { hostname: string; port: number; auth: TeamsAuth } | undefined;
 	longTurnMs?: number | undefined;
-	statusIntervalMs?: number | undefined;
 	/** Directory for downloaded inbound attachments (`<home>/media`); without it attachments are skipped with a note. */
 	mediaRoot?: string | undefined;
 	/** Fetch for attachment downloads (tests point it at a fake Microsoft); default the global `fetch`. */
@@ -85,10 +93,6 @@ interface OwnerMessage {
 	files?: readonly TeamsAttachment[];
 }
 
-function errorText(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
-
 export class TeamsAdapter implements ChannelAdapter {
 	readonly platform = "teams" as const;
 	readonly #port: TeamsChannel;
@@ -104,7 +108,6 @@ export class TeamsAdapter implements ChannelAdapter {
 	readonly #log: Logger;
 	readonly #listen: TeamsAdapterOptions["listen"];
 	readonly #longTurnMs: number;
-	readonly #statusIntervalMs: number;
 	readonly #mediaRoot: string | undefined;
 	readonly #attachmentFetch: typeof fetch | undefined;
 	readonly #statuses = new Map<string, StatusEntry>();
@@ -114,7 +117,7 @@ export class TeamsAdapter implements ChannelAdapter {
 	#server: TeamsServer | undefined;
 	#boundPort: number | undefined;
 	#upSince: number | undefined;
-	#postBlockedUntil = 0;
+	readonly #gate: RetryAfterGate;
 
 	constructor(options: TeamsAdapterOptions) {
 		this.#port = options.channel;
@@ -130,12 +133,21 @@ export class TeamsAdapter implements ChannelAdapter {
 		this.#log = options.log;
 		this.#listen = options.listen;
 		this.#longTurnMs = options.longTurnMs ?? LONG_TURN_MS;
-		this.#statusIntervalMs = options.statusIntervalMs ?? STATUS_MIN_INTERVAL_MS;
 		this.#mediaRoot = options.mediaRoot;
 		this.#attachmentFetch = options.attachmentFetch;
+		this.#gate = new RetryAfterGate({
+			clock: options.clock,
+			park: (_key, retryAfterMs) => options.log.warn("teams_rate_limited", { retry_after_ms: retryAfterMs }),
+		});
 		this.#pump = new DeliveryPump({
 			source: options.deliveries,
-			sender: this.#sender(),
+			sender: deliverySender({
+				gate: this.#gate,
+				key: "post",
+				blockedReason: "teams sendActivity",
+				send: (delivery) => this.#send(delivery),
+				finish: (delivery, result) => this.#finishDelivered(delivery, result),
+			}),
 			clock: options.clock,
 			log: options.log,
 		});
@@ -452,7 +464,7 @@ export class TeamsAdapter implements ChannelAdapter {
 		for (const [threadRef, entry] of [...this.#statuses]) {
 			if (entry.statusId === undefined) {
 				if (now - entry.startedAt >= this.#longTurnMs) await this.#postStatus(threadRef, entry);
-			} else if (now - entry.lastUpdateAt >= this.#statusIntervalMs) {
+			} else if (now - entry.lastUpdateAt >= STATUS_MIN_INTERVAL_MS) {
 				await this.#editStatus(
 					threadRef,
 					entry,
@@ -535,16 +547,6 @@ export class TeamsAdapter implements ChannelAdapter {
 		return this.#pump.pump();
 	}
 
-	#sender(): DeliverySender {
-		return {
-			isBlocked: () => this.#clock.now() < this.#postBlockedUntil,
-			blockedUntil: () => Math.max(this.#postBlockedUntil, this.#clock.now()),
-			blockedReason: () => "teams sendActivity",
-			send: (delivery) => this.#send(delivery),
-			afterSent: (delivery) => this.#finishDelivered(delivery),
-		};
-	}
-
 	async #send(delivery: DeliveryItem): Promise<DeliverySendResult> {
 		const target = parseThreadRef(delivery.threadRef);
 		let conversation: TeamsConversation;
@@ -555,38 +557,28 @@ export class TeamsAdapter implements ChannelAdapter {
 			return { kind: "failed", error: errorText(err), outcome: "definitive", sentParts: 0 };
 		}
 		const replyToId = target.threadTs === TOP_LEVEL_TS ? undefined : target.threadTs;
-		const outcome = delivery.body.startsWith("[turn failed]") ? "failed" : "done";
-		const cancelled = new Set(delivery.cancelThreadRefs ?? []);
-		const footer =
-			delivery.keepStatus || cancelled.has(delivery.threadRef)
-				? undefined
-				: this.#footerOf(delivery.threadRef, outcome);
+		const footer = answerFooter(delivery, (threadRef, outcome) => this.#footerOf(threadRef, outcome));
 		const parts = renderTeamsParts(renderMentions(delivery.body, this.#port), delivery.redelivered, footer);
 		let sent = Math.min(delivery.sentParts ?? 0, parts.length);
 		try {
 			for (const text of parts.slice(sent)) {
-				const posted = await this.#connector.sendActivity(conversation.serviceUrl, conversation.conversationId, {
+				await this.#connector.sendActivity(conversation.serviceUrl, conversation.conversationId, {
 					type: "message",
 					text,
 					textFormat: "markdown",
 					...(replyToId === undefined ? {} : { replyToId }),
 				});
-				if (posted.id !== undefined) {
-					await this.#recordPost({
-						channel: conversation.alias,
-						ts: posted.id,
-						deliveryId: delivery.deliveryId,
-						part: sent,
-					});
-				}
 				sent += 1;
 			}
 			return { kind: "sent", parts: parts.length };
 		} catch (err) {
 			if (err instanceof TeamsRateLimitedError) {
-				this.#postBlockedUntil = this.#clock.now() + err.retryAfterMs;
-				this.#log.warn("teams_rate_limited", { retry_after_ms: err.retryAfterMs });
-				return { kind: "deferred", error: err, retry: { at: this.#postBlockedUntil, sentParts: sent } };
+				this.#gate.park("post", err.retryAfterMs);
+				return {
+					kind: "deferred",
+					error: err,
+					retry: { at: this.#gate.untilOf("post") ?? this.#clock.now(), sentParts: sent },
+				};
 			}
 			const definitive = sent === 0 && err instanceof TeamsCallError && err.kind === "definitive";
 			return {
@@ -598,29 +590,17 @@ export class TeamsAdapter implements ChannelAdapter {
 		}
 	}
 
-	async #finishDelivered(delivery: DeliveryItem): Promise<void> {
-		if (delivery.keepStatus) return;
-		const outcome = delivery.body.startsWith("[turn failed]") ? "failed" : "done";
-		const cancelled = new Set(delivery.cancelThreadRefs ?? []);
-		for (const threadRef of new Set([delivery.threadRef, ...(delivery.finishThreadRefs ?? [])])) {
-			await this.finishStatus(threadRef, cancelled.has(threadRef) ? "cancelled" : outcome);
-		}
-	}
-
-	async #recordPost(post: { channel: string; ts: string; deliveryId: number; part: number }): Promise<void> {
-		try {
-			await this.#deliveries.recordPost?.(post);
-		} catch (err) {
-			this.#log.warn("delivery_post_record_failed", { id: post.deliveryId, part: post.part, error: errorText(err) });
-		}
+	/** After the confirm or once the answer is given up: the shared status finish (Teams keeps no untracked marks). */
+	#finishDelivered(delivery: DeliveryItem, result: "sent" | "undelivered"): Promise<void> {
+		return finishDeliveryStatus(delivery, result, {
+			finishStatus: (threadRef, outcome) => this.finishStatus(threadRef, outcome),
+		});
 	}
 
 	/** `✅ 00:42 · 도구 6회` under an answer whose turn had no `⏳` line (a posted line shows the result itself). */
 	#footerOf(threadRef: string, outcome: "done" | "failed"): string | undefined {
 		const entry = this.#statuses.get(threadRef);
 		if (entry === undefined || entry.statusId !== undefined) return undefined;
-		const mark = FINAL_MARKS[outcome].label.split(" ")[0];
-		const tools = entry.progress?.tools ?? 0;
-		return `${mark} ${formatElapsed(this.#clock.now() - entry.startedAt)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
+		return formatFooter(outcome, this.#clock.now() - entry.startedAt, entry.progress?.tools ?? 0);
 	}
 }

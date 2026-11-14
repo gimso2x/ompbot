@@ -134,3 +134,35 @@ describe("ledger reads by platform", () => {
 		expect(store.ownerChannel()).toBe("D1");
 	});
 });
+
+describe("expired rows go back to their platform's adapter", () => {
+	const DAY = 24 * 60 * 60_000;
+	const bodies = (rows: Array<{ body: string }>) => rows.map((row) => row.body);
+
+	test("a row the sweep expired is handed once to the adapter of its platform, whichever adapter swept", () => {
+		answer("slack/dm/D1", "D1:1.1", "D1:1.1", "slack answer");
+		answer(
+			`discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`,
+			`${DISCORD_CH}:${DISCORD_THREAD}`,
+			`${DISCORD_CH}:${DISCORD_THREAD}`,
+			"discord answer",
+		);
+		now += DAY;
+		expect(store.claimDue(20, "slack")).toEqual([]);
+		expect(store.listDeliveries().map((row) => row.state)).toEqual(["expired", "expired"]);
+		expect(bodies(store.takeExpired("slack"))).toEqual(["slack answer"]);
+		expect(store.takeExpired("slack")).toEqual([]);
+		expect(bodies(store.takeExpired("discord"))).toEqual(["discord answer"]);
+		expect(store.takeExpired("discord")).toEqual([]);
+	});
+
+	test("a failed send that expires is not handed over again: the pump already finished it", () => {
+		answer("slack/dm/D1", "D1:1.1", "D1:1.1", "slack answer");
+		const [claimed] = store.claimDue(20, "slack");
+		if (claimed === undefined) throw new Error("nothing claimed");
+		now += DAY;
+		expect(store.failDelivery(claimed.deliveryId, "channel_not_found").state).toBe("expired");
+		expect(store.claimDue(20, "slack")).toEqual([]);
+		expect(store.takeExpired("slack")).toEqual([]);
+	});
+});

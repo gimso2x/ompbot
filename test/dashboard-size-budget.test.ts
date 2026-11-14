@@ -23,7 +23,6 @@ const EMPTY: DashboardSnapshot = {
 		monitors: { count: 0, next: null },
 		openGates: [],
 	},
-	feedback: off,
 	turns: off,
 	tasks: { ok: true, items: [] },
 	lanes: off,

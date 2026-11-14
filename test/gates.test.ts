@@ -5,11 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GatesCommandDeps, gatesCommand } from "../src/cli/index";
 import { readSweepHeartbeat, SweepHeartbeatWriter } from "../src/daemon/heartbeat";
+import { readStatusFromDb } from "../src/daemon/status";
+import { gateText } from "../src/dashboard/html";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { STAMP_FILE } from "../src/ops/backup";
 import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import {
 	collectGates,
+	gateOptionsFromConfig,
 	INBOUND_STARVATION_MS,
 	MONITOR_OVERDUE_MS,
 	ORIGIN_SILENT_MS,
@@ -334,6 +337,50 @@ describe("collectGates", () => {
 		// Within the clock tolerance it is still the ordinary "just went down" closed state.
 		writeFields(`socket=down socket_since=${new Date(now + 1_000).toISOString()} draining=0`);
 		expect(gateState("slack_disconnected").state).toBe("closed");
+	});
+
+	test("discord_disconnected (UX-22): only with channels.discord; no discord field is unknown, 10 minutes down opens, a future since opens", () => {
+		const discordGate = (discordConfigured?: boolean) =>
+			collectGates({ homeDir: home, now, ...(discordConfigured === undefined ? {} : { discordConfigured }) }).find(
+				(g) => g.name === "discord_disconnected",
+			);
+		const down = (sinceMs: number) =>
+			writeFields(
+				`socket=up socket_since=${new Date(now).toISOString()} discord=down discord_since=${new Date(sinceMs).toISOString()} draining=0`,
+			);
+		down(now - 3 * SOCKET_DOWN_MS);
+		expect(discordGate()).toBeUndefined();
+		expect(discordGate(false)).toBeUndefined();
+		expect(discordGate(true)).toEqual({
+			name: "discord_disconnected",
+			state: "open",
+			detail: "discord=down minutes=30",
+		});
+		down(now - SOCKET_DOWN_MS);
+		expect(discordGate(true)).toEqual({
+			name: "discord_disconnected",
+			state: "open",
+			detail: "discord=down minutes=10",
+		});
+		down(now - SOCKET_DOWN_MS + 1);
+		expect(discordGate(true)?.state).toBe("closed");
+		down(now + 2 * 60 * 60_000);
+		expect(discordGate(true)).toEqual({
+			name: "discord_disconnected",
+			state: "open",
+			detail: "discord=down ts_in_future",
+		});
+		writeFields(`discord=up discord_since=${new Date(now - 3 * SOCKET_DOWN_MS).toISOString()} draining=0`);
+		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "closed", detail: "discord=up" });
+		// A stamp without the discord field: the gateway never reported, nothing to judge.
+		writeFields(`socket=up socket_since=${new Date(now).toISOString()} draining=0`);
+		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "unknown", detail: "discord=missing" });
+		rmSync(join(home, "sweep-heartbeat"));
+		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "unknown", detail: "stamp=missing" });
+		expect(gateText("discord_disconnected")).toEqual({
+			label: "Discord 게이트웨이가 10분 넘게 끊김",
+			todo: "네트워크·Discord 토큰과 데몬 로그 확인",
+		});
 	});
 
 	describe("monitors_stalled", () => {
@@ -856,5 +903,34 @@ describe("herdr_unreachable (herdr-health stamp)", () => {
 		// exit 0 without a running line still counts as a failure
 		answers.push({ code: 0, stdout: "status: stopped\n", timedOut: false });
 		expect((await restarted.check()).fails).toBe(1);
+	});
+});
+
+describe("gateOptionsFromConfig: the sweep, /status, `ompbot status` and the dashboard judge the same gates", () => {
+	test("maps the config to the omp, offsite and cost-cap options; none without a config", () => {
+		const ompExecutable = join(home, "no-such-omp");
+		expect(gateOptionsFromConfig({ timezone: "Asia/Seoul", ompExecutable, costCap: { dailyUsd: 5 } })).toEqual({
+			ompExecutable,
+			offsiteConfigured: false,
+			discordConfigured: false,
+			dailyCap: { usd: 5, timezone: "Asia/Seoul" },
+		});
+		expect(
+			gateOptionsFromConfig({
+				timezone: "Asia/Seoul",
+				ompExecutable,
+				agent: "claude",
+				ompProfile: "work",
+				offsite: { ssh: "backup", remoteDir: "/b" },
+				channels: { discord: { guildIds: ["1"] } },
+			}),
+		).toEqual({ ompProfile: "work", offsiteConfigured: true, discordConfigured: true });
+		expect(gateOptionsFromConfig(undefined)).toEqual({});
+	});
+
+	test("an omp_runtime gate the sweep opens is listed by the status fallback too", () => {
+		const options = gateOptionsFromConfig({ timezone: "Asia/Seoul", ompExecutable: join(home, "no-such-omp") });
+		const report = readStatusFromDb(join(home, "ompbot.db"), "omp-test 0", "Asia/Seoul", options, IDLE_HOST_LOAD);
+		expect(report.openGates.map((gate) => gate.name)).toContain("omp_runtime");
 	});
 });

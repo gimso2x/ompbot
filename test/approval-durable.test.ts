@@ -338,6 +338,19 @@ describe("durable approvals", () => {
 		}
 	});
 
+	test("a ledger that throws on the click fails closed: approve is refused, deny still settles", async () => {
+		const transport = new CardTransport();
+		const broker = makeBroker(transport, new ManualTimers(), () => 1_000);
+		const done = broker.request("D1", "git push --force");
+		const { ts } = await transport.shown.promise;
+		store.decideApproval = () => {
+			throw new Error("database is locked");
+		};
+		expect(broker.handleAction({ actionId: `ompbot:approval:approve:D1:${ts}`, userId: OWNER })).toBe(false);
+		expect(broker.handleAction({ actionId: `ompbot:approval:deny:D1:${ts}`, userId: OWNER })).toBe(true);
+		expect(await done).toBe("denied");
+	});
+
 	test("the buttons show the default 30-minute deadline in the owner's time zone", async () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();

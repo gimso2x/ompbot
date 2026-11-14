@@ -75,6 +75,7 @@ describe("taskSpec input", () => {
 		["shell in repo", { ...spec, repo: "/a/b;rm -rf /" }],
 		["dotdot repo", { ...spec, repo: "/a/../b" }],
 		["blank goal", { ...spec, goal: "  " }],
+		["slash-only repo (qa-i #58)", { ...spec, repo: "//" }],
 	])("rejects %s", (_name, raw) => {
 		expect(() => parseTaskSpecInput(raw)).toThrow(TaskSpecError);
 	});

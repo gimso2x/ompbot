@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ChannelRegistry } from "../channel/registry";
 import { dispatchEnv, HERDR_INTERRUPT_WAIT_MS, type HerdrAgentStatusResult, type ProcessRunner } from "../dispatch/omp";
+import { type LastAnswer, questionOf } from "../omp/session-tail";
 import type { FreezeState } from "../ops/freeze";
 import type { TaskJudgement } from "./checker";
 import { digest, summarizeJudgement } from "./checker";
@@ -9,6 +10,7 @@ import { type TaskLedger, type TaskRow, type TaskTransitionRow, taskPausedAt } f
 import {
 	type AutoLandPolicy,
 	autoLandBlockers,
+	buildAgentQuestionCard,
 	buildAgentWaitingCard,
 	buildAutoLandCard,
 	buildBlockedCard,
@@ -174,6 +176,12 @@ export interface TaskSweepDeps {
 	agentStatus(row: TaskRow): Promise<HerdrAgentStatusResult>;
 	/** The agent's screen tail (`herdr agent read`), read only for a wait notice that is about to be posted. */
 	readAgent(row: TaskRow): Promise<{ ok: boolean; output?: string; error?: string }>;
+	/**
+	 * The last assistant answer in the agent's omp session file (herdr's `sessionPath`), asked only while herdr says
+	 * idle or done, once per task per sweep: `undefined` when none is within the byte cap; throws when the file cannot
+	 * be read. Absent = no question check.
+	 */
+	lastAnswer?(row: TaskRow, sessionPath: string): Promise<LastAnswer | undefined>;
 	channels: ChannelRegistry;
 	/** The task's herdr board card link for the reached/blocked/stale notices; absent → no board footer. */
 	boardLink?(row: TaskRow): Promise<string | undefined>;
@@ -188,6 +196,8 @@ export interface TaskSweepDeps {
 	changedPaths?(row: TaskRow): Promise<string[] | undefined>;
 	/** Puts "머지해" into the task thread as the owner; true = it went in. */
 	autoLand?(row: TaskRow): Promise<boolean>;
+	/** Why auto-merge is held after an apply code rollback (`<home>/autoland.hold`); undefined = not held. */
+	autoLandHold?(): string | undefined;
 	ownerUserId: string;
 	now(): number;
 	log: TaskSlackLog & { info(event: string, fields?: Record<string, unknown>): void };
@@ -231,6 +241,10 @@ export class TaskSweeper {
 	readonly #prompted = new Set<string>();
 	/** herdr status read for each task in the current sweep, shared by the reminder and the overlap prompt. */
 	readonly #sweepAgents = new Map<string, HerdrAgentStatusResult>();
+	/** The prose question each task's idle/done agent stopped on in the current sweep (no entry: none, or unknown). */
+	readonly #sweepQuestions = new Map<string, string>();
+	/** Tasks whose last session read failed (in memory): one `task_question_read_failed` per run of failures. */
+	readonly #questionReadFailing = new Set<string>();
 
 	constructor(deps: TaskSweepDeps) {
 		this.#deps = deps;
@@ -245,6 +259,7 @@ export class TaskSweeper {
 		const judged = new Set<string>();
 		this.#prompted.clear();
 		this.#sweepAgents.clear();
+		this.#sweepQuestions.clear();
 		for (const row of this.#deps.ledger.listActive()) {
 			judged.add(row.taskId);
 			try {
@@ -463,9 +478,13 @@ export class TaskSweeper {
 		}
 		// A remote task's repo path means nothing to the local git, so it is never looked up.
 		const repoMatched = row.host === null && (await this.#repoMatches(row, policy.repos));
+		// After an apply reverted the code, the commit that broke the daemon must not be merged again unasked.
+		const hold = this.#deps.autoLandHold?.();
+		if (hold !== undefined) log.info("task_autoland_held", { task: row.taskId, reason: hold });
 		// A freeze stops every autonomous action, and merging unasked is one: the owner is asked instead. So does an
 		// owner pause of this one task.
 		const blockers = [
+			...(hold === undefined ? [] : [`autoland.hold: ${hold}`]),
 			...(this.#deps.frozen?.() === undefined ? [] : ["동결 중"]),
 			// Re-read: the owner may have paused it while this sweep judged (the checks can take minutes).
 			...(this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId)) ? ["멈춤 중"] : []),
@@ -600,6 +619,25 @@ export class TaskSweeper {
 			);
 			actions.push("working-while-paused notice");
 		}
+		// A worker that ended its turn on a question in prose waits for the owner, not for a prompt: the owner hears it
+		// once per question (frozen or paused alike), recorded only after the card went out.
+		const question = status === "idle" || status === "done" ? await this.#question(row, agent) : undefined;
+		if (question !== undefined) {
+			this.#sweepQuestions.set(row.taskId, question);
+			const key = `question:${digest(question)}`;
+			if (!(key in ledger.require(row.taskId).notices)) {
+				const card = buildAgentQuestionCard(row, question, this.#deps.ownerUserId, await this.#boardLink(row));
+				if (await this.#post(row, card)) {
+					ledger.recordNotice(row.taskId, key);
+					actions.push("question notice");
+				} else {
+					this.#deps.log.warn("task_question_post_failed", {
+						task: row.taskId,
+						error: "post failed (see task_post_failed)",
+					});
+				}
+			}
+		}
 		const stale = age >= STALE_REMIND_MS && (fresh.remindedAt === null || now - fresh.remindedAt >= STALE_REMIND_MS);
 		const due = !held && stale;
 		if (!frozen) this.#remindHeld.delete(row.taskId);
@@ -614,8 +652,10 @@ export class TaskSweeper {
 		// An agent that ended its turn short of the outcome hears why at once, once per distinct set of unmet conditions.
 		// It takes the place of the 30-minute reminder in that sweep: at most one prompt per sweep reaches the agent.
 		const unmetKey = `unmet:${digest(judgement.problems)}`;
-		const wantsNudge =
+		const unmetPending =
 			(status === "idle" || status === "done") && judgement.problems.length > 0 && !(unmetKey in fresh.notices);
+		// A question holds the nudge back (not counted either): the owner's answer comes first.
+		const wantsNudge = unmetPending && question === undefined;
 		// At most NUDGE_MAX nudges since the last resume (or registration); past that the owner hears it once, even frozen.
 		const capped = wantsNudge && nudgesSince(fresh) >= NUDGE_MAX;
 		if (capped && ledger.recordNotice(row.taskId, `nudgecap:${nudgeBase(fresh)}`)) {
@@ -632,6 +672,9 @@ export class TaskSweeper {
 				ledger.markReminded(row.taskId, now);
 				actions.push("unmet nudge to agent");
 			}
+		} else if (question !== undefined && (due || (unmetPending && !held))) {
+			this.#deps.log.info("task_remind_deferred", { task: row.taskId, agentStatus: "question" });
+			actions.push("reminder deferred (question)");
 		} else if (due && (status === "working" || status === "blocked")) {
 			// A busy or waiting agent is not interrupted; the next sweep judges again, so the reminder follows idle.
 			this.#deps.log.info("task_remind_deferred", { task: row.taskId, agentStatus: status });
@@ -648,7 +691,9 @@ export class TaskSweeper {
 			}
 		}
 		if (pausedAt === undefined && age >= STALE_NOTICE_MS && ledger.recordNotice(row.taskId, `stale2h:${base}`)) {
-			await this.#post(row, formatStaleNotice(row, Math.floor(age / 60_000), await this.#boardLink(row)));
+			// A question left unanswered must not sink with the stale notice: the owner is mentioned then.
+			const asked = question === undefined ? undefined : this.#deps.ownerUserId;
+			await this.#post(row, formatStaleNotice(row, Math.floor(age / 60_000), await this.#boardLink(row), asked));
 			actions.push("stale notice");
 		}
 	}
@@ -728,6 +773,7 @@ export class TaskSweeper {
 		if (this.#deps.frozen?.() !== undefined) return "frozen";
 		if (this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId))) return "paused";
 		if (this.#prompted.has(row.taskId)) return "prompted";
+		if (this.#sweepQuestions.has(row.taskId)) return "question";
 		const agent = this.#sweepAgents.get(row.taskId) ?? (await this.#agentStatus(row));
 		this.#sweepAgents.set(row.taskId, agent);
 		const status = agent.ok ? agent.status : undefined;
@@ -761,6 +807,31 @@ export class TaskSweeper {
 		} catch (error) {
 			return { ok: false, error: error instanceof Error ? error.message : String(error) };
 		}
+	}
+
+	/**
+	 * The prose question the agent stopped on (see `questionOf`), from its session file. An unknown answer — no
+	 * reader, no session path, nothing within the byte cap, a failed read — is no question, and the flow stays as it
+	 * was; a failed read is logged once per run of failures.
+	 */
+	async #question(row: TaskRow, agent: HerdrAgentStatusResult): Promise<string | undefined> {
+		const read = this.#deps.lastAnswer;
+		if (read === undefined || !agent.ok || agent.sessionPath === undefined) return undefined;
+		let answer: LastAnswer | undefined;
+		try {
+			answer = await read(row, agent.sessionPath);
+		} catch (error) {
+			if (!this.#questionReadFailing.has(row.taskId)) {
+				this.#questionReadFailing.add(row.taskId);
+				this.#deps.log.warn("task_question_read_failed", {
+					task: row.taskId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return undefined;
+		}
+		this.#questionReadFailing.delete(row.taskId);
+		return answer === undefined ? undefined : questionOf(answer);
 	}
 
 	/** herdr's view of the task's agent; a failed or throwing lookup is logged and leaves the reminder as before. */

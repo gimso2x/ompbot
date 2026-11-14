@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import type { OmpEvent } from "../omp/driver";
 
 /** Machine prefix of a stuck-loop failure reason; a human sentence follows. */
-export const STUCK_CODE = "stuck-loop";
+const STUCK_CODE = "stuck-loop";
 /** Same fingerprint this many times in a turn: one steer asking for another approach. */
 export const STUCK_STEER_AT = 3;
 /** Same fingerprint this many times in a turn: the turn is aborted. */
@@ -45,7 +45,7 @@ function resultText(result: unknown): string {
 }
 
 /** An error result whose text looks like a transient failure (timeout, rate limit, 5xx, connection reset). */
-export function isTransientError(result: unknown, isError: boolean): boolean {
+function isTransientError(result: unknown, isError: boolean): boolean {
 	return isError && TRANSIENT.test(resultText(result));
 }
 
@@ -94,7 +94,7 @@ const POLLING_READ = /^(proc|agent):\/\//;
  * (`BUILTIN_TOOL_NAMES`; it has `wait`, no `await`) and ompbot's host tools: `wait`, `ompbot_request_approval`, and
  * `read` of a `proc://` / `agent://` path.
  */
-export function isStuckExempt(toolName: string, args: unknown): boolean {
+function isStuckExempt(toolName: string, args: unknown): boolean {
 	if (toolName === "wait" || toolName === "ompbot_request_approval") return true;
 	if (toolName !== "read" || args === null || typeof args !== "object") return false;
 	return "path" in args && typeof args.path === "string" && POLLING_READ.test(args.path);

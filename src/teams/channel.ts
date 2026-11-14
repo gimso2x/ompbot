@@ -16,7 +16,6 @@ export interface TeamsConversations {
 
 export class TeamsChannel implements ChannelPort {
 	readonly platform = "teams" as const;
-	readonly capabilities = { permalink: false, reactions: false };
 	readonly connector: TeamsConnector;
 	#conversations: TeamsConversations | undefined;
 

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openBotStore } from "../src/core/origin";
+import { composeTurnPrompt } from "../src/core/types";
 import {
 	CONTINUE_NOTICE,
 	CONTINUE_PROMPT,
@@ -19,6 +20,7 @@ import { INTERIM_CLOSING } from "../src/omp/answers";
 import { OmpDriverError, type OmpFinal, type OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore, type FakeTurnMessage } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
+import { peerTouchedTurnNotice } from "../src/safety/prompt";
 import type { Store } from "../src/store/db";
 
 const ORIGIN = "slack/dm/D1";
@@ -220,6 +222,14 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([`ECHO ${prompt}`]);
 	});
 
+	test("a turn led by the peer-taint notice block is answered", async () => {
+		const prompt = composeTurnPrompt([peerTouchedTurnNotice(ORIGIN)], "피어 뒤 질문");
+		await dispatchedTurn("m1", "피어 뒤 질문", { finish: true, prompt });
+		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
+		expect(result).toEqual({ answered: 1, interrupted: 0, continued: 0 });
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([`ECHO ${prompt}`]);
+	});
+
 	test("a context-block prompt for another request, or an unfinished one, is interrupted", async () => {
 		await dispatchedTurn("m1", "백업 경로 뭐였지", {
 			finish: true,
@@ -374,6 +384,24 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 
 		expect(resumeRows().map((row) => row.platformMessageId)).toEqual(["cut-m0"]);
 		expect(bodies()).toEqual([INTERRUPTED_NOTICE, INTERRUPTED_NOTICE, INTERRUPTED_NOTICE]);
+	});
+
+	test("a cut row of a command op (lane:, task:, /compact) is never resumed: it keeps the interrupted notice", async () => {
+		for (const [id, opRef] of [
+			["l1", "lane:work:1"],
+			["t1", "task:T-1"],
+			["c1", "compact:c1"],
+		] as const) {
+			store.recordInbound({ originKey: ORIGIN, platformMessageId: id, textRef: "x", threadRef: `D1:${id}` });
+			store.markDispatched(id, { opRef, entryCursor: null });
+		}
+		writeCut([
+			{ originKey: ORIGIN, opRef: "lane:work:1" },
+			{ originKey: ORIGIN, opRef: "task:T-1" },
+			{ originKey: ORIGIN, opRef: "compact:c1" },
+		]);
+		expect(await recover()).toEqual({ answered: 0, interrupted: 3, continued: 0 });
+		expect(resumeRows()).toEqual([]);
 	});
 
 	test("a cut turn whose final answer is already in the session is answered, not resumed (AC-4)", async () => {

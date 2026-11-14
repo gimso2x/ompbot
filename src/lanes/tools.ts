@@ -1,3 +1,4 @@
+import { LANE_MODEL_TIERS } from "../config";
 import type { HostToolDef } from "../safety/host-tools";
 import { TASK_RISKS } from "../tasks/docs";
 import type { LaneManager } from "./manager";
@@ -35,6 +36,12 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 					enum: [...TASK_RISKS],
 					description: "Risk class L0 (trivial) .. L4 (dangerous); default L3",
 				},
+				model: {
+					type: "string",
+					enum: [...LANE_MODEL_TIERS],
+					description:
+						"Model tier of the lane session (owner config `lanes.models`): high for design, debugging or wide changes; middle for ordinary implementation; low for mechanical edits. Omit to use the bot's default model.",
+				},
 			},
 			required: ["title", "cwd"],
 			additionalProperties: false,
@@ -48,10 +55,12 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 				channel,
 				acceptance: params.acceptance,
 				risk: params.risk,
+				model: params.model,
 			});
 			const link = await manager.threadLink(lane);
 			const started = `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;
-			return link === undefined ? started : `${started}; tell the owner the lane thread link: ${link}`;
+			const reply = link === undefined ? started : `${started}; tell the owner the lane thread link: ${link}`;
+			return lane.startNote === undefined ? reply : `${reply}\n${lane.startNote}`;
 		},
 	};
 }
@@ -88,7 +97,11 @@ export function buildLaneTools(manager: LaneManager, originKey: string): HostToo
 				properties: {
 					repo: { type: "string", description: "Absolute path of the git repository" },
 					commit: { type: "string", description: "Sha of the commit that contains the work" },
-					summary: { type: "string", description: "What was done" },
+					summary: {
+						type: "string",
+						description:
+							"Five lines: 결과 (done/partial/blocked + gist), 변경 (files, behavior), 증거 (exact commands actually run, results, criteria shown), 미확인 (unrun checks, risks, or 없음), 인계 (remaining work or owner decisions, or 없음)",
+					},
 				},
 				required: ["repo", "commit", "summary"],
 				additionalProperties: false,

@@ -166,7 +166,13 @@ describe("dashboard alerts & system snapshot", () => {
 			expect(snapshot).toHaveProperty(key);
 		}
 		expect(seen).toEqual([
-			{ homeDir: home.dir, now: NOW, ompExecutable: home.config.ompExecutable, offsiteConfigured: false },
+			{
+				homeDir: home.dir,
+				now: NOW,
+				ompExecutable: home.config.ompExecutable,
+				offsiteConfigured: false,
+				discordConfigured: false,
+			},
 		]);
 		if (!snapshot.gates.ok) throw new Error(snapshot.gates.error);
 		expect(snapshot.gates.items).toHaveLength(13);

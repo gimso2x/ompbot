@@ -2,7 +2,9 @@ import { readdirSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { TurnSettledInfo } from "../../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor } from "../../src/core/origin";
+import type { InboundRecord } from "../../src/core/types";
 import { LaneManager, type LaneManagerDeps } from "../../src/lanes/manager";
+import { defaultGit } from "../../src/lanes/verify";
 import { createLogger } from "../../src/log";
 import type { OmpSessionDriver } from "../../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../../src/omp/fake-driver";
@@ -33,6 +35,8 @@ export interface LaneHarness {
 	advance(ms: number): void;
 	/** Resolves once every mailbox call, background verdict and other background work of the manager has been handled. */
 	settle(): Promise<void>;
+	/** Hands an inbound row to the origin's mailbox like the daemon does (an owner message in the lane's thread). */
+	route(record: InboundRecord): Promise<void>;
 	/** `steer:` calls the lane's omp child received. */
 	steers(originKey: string): string[];
 	/** `prompt:` calls the lane's omp child received. */
@@ -56,6 +60,7 @@ export type LaneHarnessExtra = Partial<
 		| "maxLanes"
 		| "land"
 		| "autoLandPolicy"
+		| "autoLandHold"
 		| "repoMatches"
 		| "integrity"
 		| "approvals"
@@ -63,7 +68,9 @@ export type LaneHarnessExtra = Partial<
 		| "laneBusy"
 		| "reviewer"
 		| "changesGit"
+		| "rebaseGit"
 		| "completionNudges"
+		| "pidAlive"
 	>
 > & { driver?: LaneDriverFactory };
 
@@ -89,8 +96,10 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 		log,
 		sessionsRoot,
 		statusProvider: () => "",
-		// The registry is the single source of the hold (like the daemon): a restart keeps it.
-		isHeld: (originKey) => store.getLaneByOrigin(originKey)?.status === "paused",
+		// The registry is the single source of the hold (like the daemon): a restart keeps it; so is the core's rebase.
+		isHeld: (originKey) =>
+			store.getLaneByOrigin(originKey)?.status === "paused" || manager?.isCoreRebasing(originKey) === true,
+		isAttached: (originKey) => store.getLaneByOrigin(originKey)?.meta.attach !== undefined,
 		onHeldWork: (info) => manager?.onHeldWork(info.originKey),
 		// Like the daemon: a new lane session gets its todos, a lane turn end may nudge (off unless a test sets it).
 		initialTodos: (originKey) => manager?.initialTodos(originKey),
@@ -136,6 +145,9 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 		},
 		sessionDirFor: (origin) => sessionDirFor(sessionsRoot, origin, 1),
 		completionNudges: () => 0,
+		session: router.sessionOps(),
+		// The core's rebase commits: a throwaway identity, like the fixtures' git (no global git config needed).
+		rebaseGit: (args) => defaultGit(["-c", "user.name=t", "-c", "user.email=t@example.com", ...args]),
 		...managerExtra,
 	});
 	const callsOf = (originKey: string, prefix: string) =>
@@ -158,6 +170,11 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 				await manager.settledInBackground();
 				await manager.idle();
 			}
+		},
+		route: (record) => {
+			const run = router.route(record);
+			pending.push(run);
+			return run;
 		},
 		steers: (originKey) => callsOf(originKey, "steer:"),
 		turnSettled: () => new Promise((resolve) => settledWaiters.push(resolve)),

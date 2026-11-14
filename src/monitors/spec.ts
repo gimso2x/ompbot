@@ -9,6 +9,8 @@ export const MIN_SCRIPT_INTERVAL_MS = 60_000;
 /** One leap year: past it a next fire time soon leaves what a `Date` can hold. */
 export const MAX_SCRIPT_INTERVAL_MS = 366 * 24 * 60 * 60 * 1000;
 export const SCRIPT_TIMEOUT_MS = 60_000;
+export const MIN_COMMAND_TIMEOUT_MS = 1000;
+export const MAX_COMMAND_TIMEOUT_MS = 30 * 60_000;
 export const MIN_WATCHER_DEBOUNCE_MS = 100;
 export const MAX_WATCHER_DEBOUNCE_MS = 60_000;
 export const DEFAULT_WATCHER_DEBOUNCE_MS = 1000;
@@ -21,7 +23,11 @@ export type ScriptFire = "edge" | "every";
 export type MonitorOverlap = "skip" | "queue";
 
 export type MonitorTrigger =
-	| { kind: "cron"; schedule: string; timezone: string }
+	/**
+	 * With `command` (a script under the scripts root, `deliver: "verbatim"` only) every slot runs it once and posts its
+	 * stdout without a turn; `timeoutMs` bounds that run (default `SCRIPT_TIMEOUT_MS`).
+	 */
+	| { kind: "cron"; schedule: string; timezone: string; command?: string[]; timeoutMs?: number }
 	/** `at` is the normalized UTC ISO instant. */
 	| { kind: "at"; at: string }
 	/**
@@ -65,8 +71,9 @@ export interface MonitorSpec {
 	/** omp thinking level this monitor's session is pinned to; absent = the global default / origin choice. */
 	thinking?: MonitorThinking;
 	/**
-	 * `turn` (default): every fire runs an omp turn. `verbatim` (script triggers only): the fired payload is posted as
-	 * the answer without a turn; `instruction`, `model` and `thinking` are kept but unused. Absent = `turn`.
+	 * `turn` (default): every fire runs an omp turn. `verbatim` (script triggers and cron triggers with a command, which
+	 * require it): the fired payload or the command's stdout is posted as the answer without a turn; `instruction`,
+	 * `model` and `thinking` are kept but unused. Absent = `turn`.
 	 */
 	deliver?: MonitorDeliver;
 	/**
@@ -273,21 +280,58 @@ function parseProcedureFiles(value: unknown, ctx: SpecContext): string[] {
 	return value as string[];
 }
 
+/** A trigger's argv: one string reads as a command without arguments. */
+function commandOf(raw: unknown): string[] {
+	const command = typeof raw === "string" ? [raw] : raw;
+	if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string")) {
+		throw new MonitorSpecError("trigger.command must be a non-empty array of strings");
+	}
+	if ((command as string[]).some((part) => part.includes("\0"))) {
+		throw new MonitorSpecError("trigger.command arguments must not contain NUL bytes");
+	}
+	return command as string[];
+}
+
 function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): MonitorTrigger {
 	const obj = record(raw, "trigger");
 	const kind = obj.kind ?? base?.kind;
 	if (kind === "cron") {
-		rejectUnknown(obj, ["kind", "schedule", "timezone"], "trigger");
+		rejectUnknown(obj, ["kind", "schedule", "timezone", "command", "timeoutMs"], "trigger");
 		const prev = base?.kind === "cron" ? base : undefined;
 		const schedule = obj.schedule ?? prev?.schedule;
 		// Filled at parse time, so every stored cron row names its zone and a later config change leaves it alone.
 		const timezone = obj.timezone ?? prev?.timezone ?? ctx.defaultTimezone;
 		if (typeof schedule !== "string") throw new MonitorSpecError("trigger.schedule must be a string");
 		if (typeof timezone !== "string") throw new MonitorSpecError("trigger.timezone must be a string");
+		// `command: null` turns it back into a plain cron and drops the command's timeout with it.
+		const rawCommand = obj.command === null ? undefined : (obj.command ?? prev?.command);
+		const command = rawCommand === undefined ? undefined : commandOf(rawCommand);
+		if (command !== undefined) resolveScript(command, ctx.scriptsRoot);
+		const timeoutMs =
+			obj.timeoutMs === null ? undefined : (obj.timeoutMs ?? (obj.command === null ? undefined : prev?.timeoutMs));
+		if (timeoutMs !== undefined) {
+			if (command === undefined) throw new MonitorSpecError("trigger.timeoutMs needs trigger.command");
+			if (
+				typeof timeoutMs !== "number" ||
+				!Number.isInteger(timeoutMs) ||
+				timeoutMs < MIN_COMMAND_TIMEOUT_MS ||
+				timeoutMs > MAX_COMMAND_TIMEOUT_MS
+			) {
+				throw new MonitorSpecError(
+					`trigger.timeoutMs must be an integer between ${MIN_COMMAND_TIMEOUT_MS} and ${MAX_COMMAND_TIMEOUT_MS}`,
+				);
+			}
+		}
 		try {
 			const parsed = parseCron(schedule);
 			assertTimezone(timezone);
-			return { kind: "cron", schedule: parsed.source, timezone };
+			return {
+				kind: "cron",
+				schedule: parsed.source,
+				timezone,
+				...(command === undefined ? {} : { command }),
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+			};
 		} catch (error) {
 			if (error instanceof CronError) throw new MonitorSpecError(`trigger: ${error.message}`);
 			throw error;
@@ -308,11 +352,7 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 	if (kind === "script") {
 		rejectUnknown(obj, ["kind", "command", "intervalMs", "fire", "once", "suppressUnchanged"], "trigger");
 		const prev = base?.kind === "script" ? base : undefined;
-		const rawCommand = obj.command ?? prev?.command;
-		const command = typeof rawCommand === "string" ? [rawCommand] : rawCommand;
-		if (!Array.isArray(command) || command.length === 0 || command.some((part) => typeof part !== "string")) {
-			throw new MonitorSpecError("trigger.command must be a non-empty array of strings");
-		}
+		const command = commandOf(obj.command ?? prev?.command);
 		const intervalMs = obj.intervalMs ?? prev?.intervalMs;
 		if (
 			typeof intervalMs !== "number" ||
@@ -324,7 +364,7 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 				`trigger.intervalMs must be an integer between ${MIN_SCRIPT_INTERVAL_MS} and ${MAX_SCRIPT_INTERVAL_MS}`,
 			);
 		}
-		resolveScript(command as string[], ctx.scriptsRoot);
+		resolveScript(command, ctx.scriptsRoot);
 		const fire = obj.fire ?? prev?.fire ?? "edge";
 		if (fire !== "edge" && fire !== "every") throw new MonitorSpecError('trigger.fire must be "edge" or "every"');
 		const once = obj.once ?? prev?.once ?? false;
@@ -333,7 +373,7 @@ function parseTrigger(raw: unknown, ctx: SpecContext, base?: MonitorTrigger): Mo
 		if (typeof suppressUnchanged !== "boolean") {
 			throw new MonitorSpecError("trigger.suppressUnchanged must be true or false");
 		}
-		return { kind: "script", command: command as string[], intervalMs, fire, once, suppressUnchanged };
+		return { kind: "script", command, intervalMs, fire, once, suppressUnchanged };
 	}
 	if (kind === "watcher") {
 		rejectUnknown(obj, ["kind", "root", "debounceMs"], "trigger");
@@ -427,8 +467,13 @@ export function mergeMonitorSpec(current: MonitorSpec | undefined, patch: unknow
 		obj.trigger === undefined ? (current as MonitorSpec).trigger : parseTrigger(obj.trigger, ctx, current?.trigger);
 	const deliver = obj.deliver ?? current?.deliver ?? "turn";
 	if (deliver !== "turn" && deliver !== "verbatim") throw new MonitorSpecError('deliver must be "turn" or "verbatim"');
-	if (deliver === "verbatim" && trigger.kind !== "script") {
-		throw new MonitorSpecError('deliver "verbatim" needs a script trigger');
+	const cronCommand = trigger.kind === "cron" && trigger.command !== undefined;
+	if (deliver === "verbatim" && trigger.kind !== "script" && !cronCommand) {
+		throw new MonitorSpecError('deliver "verbatim" needs a script trigger or a cron trigger with a command');
+	}
+	// A command's output is posted as is, never handed to a turn.
+	if (cronCommand && deliver !== "verbatim") {
+		throw new MonitorSpecError('a cron trigger with a command needs deliver "verbatim"');
 	}
 	// `procedureFiles: null` (or an empty list) detaches them all.
 	// Only a supplied list is checked: an unrelated edit must not fail because a kept file has since moved.

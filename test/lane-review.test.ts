@@ -3,12 +3,15 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { join } from "node:path";
 import { parseThreadRef } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
+import { GUEST_OVERLAY_YAML } from "../src/daemon/guest";
 import type { ProcessRunner, RunProcessOptions, RunProcessResult } from "../src/dispatch/omp";
 import { createLaneLander, type LandLane, type LandRequest, laneLandBlockers } from "../src/lanes/land";
 import {
 	buildReviewPrompt,
+	parseReviewVerdict,
 	REVIEW_DIFF_PROMPT_MAX,
 	REVIEW_DISABLED_DISCOVERY,
+	REVIEW_OVERLAY_YAML,
 	REVIEW_SECTIONS,
 	reviewIsolationPaths,
 	reviewLane,
@@ -589,6 +592,8 @@ describe("reviewLane: the prompt and the diff file (AC-8)", () => {
 			mcp: { enableProjectConfig: false },
 			autolearn: { enabled: false },
 			memory: { backend: "off" },
+			// review confidence AC-4: the reviewer answers with its --model only.
+			retry: { modelFallback: false },
 		});
 		expect(seen[0]?.config).toHaveProperty("disabledProviders", [...REVIEW_DISABLED_DISCOVERY]);
 	});
@@ -653,6 +658,53 @@ describe("reviewLane: the prompt and the diff file (AC-8)", () => {
 	});
 });
 
+describe("review confidence (doc/plans/lane-review-confidence.md)", () => {
+	test.each([
+		["present", "지적 하나\nCONFIDENCE: 0.92\nVERDICT: CLEAR", "CLEAR", 0.92, "지적 하나"],
+		["present after a blank line", "지적\nCONFIDENCE: 0.9 \n\nVERDICT: BLOCK\n", "BLOCK", 0.9, "지적"],
+		["1", "CONFIDENCE: 1\nVERDICT: CLEAR", "CLEAR", 1, ""],
+		["1.00", "CONFIDENCE:1.00\nVERDICT: CLEAR", "CLEAR", 1, ""],
+		["0", "CONFIDENCE: 0\nVERDICT: BLOCK", "BLOCK", 0, ""],
+		["absent", "지적 하나\nVERDICT: BLOCK", "BLOCK", undefined, "지적 하나"],
+		["a percentage", "지적\nCONFIDENCE: 92%\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+		["above 1", "지적\nCONFIDENCE: 1.5\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+		["no leading digit", "지적\nCONFIDENCE: .9\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+		["a word", "지적\nCONFIDENCE: high\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+		["two lines", "CONFIDENCE: 0.5\n지적\nCONFIDENCE: 0.9\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+		["not right above VERDICT", "CONFIDENCE: 0.9\n지적\nVERDICT: CLEAR", "CLEAR", undefined, "지적"],
+	] as const)("AC-3: CONFIDENCE %s", (_name, output, verdict, confidence, notes) => {
+		const parsed = parseReviewVerdict(output);
+		expect(parsed).toEqual({ verdict, notes, ...(confidence === undefined ? {} : { confidence }) });
+	});
+
+	test("AC-3: a malformed CONFIDENCE never makes the verdict inconclusive, and VERDICT rules stay", () => {
+		expect(parseReviewVerdict("CONFIDENCE: 0.9\nVERDICT: CLEAR\nCONFIDENCE: 0.9")).toEqual({ reason: "VERDICT 없음" });
+		expect(parseReviewVerdict("CONFIDENCE: x\nCONFIDENCE: y\nVERDICT: BLOCK")).toEqual({ verdict: "BLOCK", notes: "" });
+	});
+
+	test("AC-3: the prompt asks for the CONFIDENCE line; the receipt keeps its value and notes drop the line", async () => {
+		const repo = makeRepo(repos);
+		const fake = says("지적 없음\nCONFIDENCE: 0.8\nVERDICT: BLOCK");
+		const h = harness(fake.run, { repos: [repo], maxRisk: "L2", review: REVIEW });
+		const { lane, sha } = await closeLane(h, repo);
+		expect(fake.calls[0]?.cmd.at(-1)).toContain("마지막 줄 바로 위에는 `CONFIDENCE: <0.00~1.00>` 한 줄을 쓴다.");
+		const after = requireLane(h, lane.name);
+		expect(after.meta.review).toMatchObject({ sha, verdict: "BLOCK", confidence: 0.8, notes: "지적 없음" });
+		expect(after.history.some((entry) => entry.event === "review" && entry.detail === `BLOCK 0.80 · ${MODEL}`)).toBe(
+			true,
+		);
+		h.close();
+	});
+
+	test("AC-4: only the reviewer's overlay turns the model fallback off; the guest/qa overlay keeps it", () => {
+		expect(Bun.YAML.parse(REVIEW_OVERLAY_YAML)).toMatchObject({ retry: { modelFallback: false } });
+		expect(REVIEW_OVERLAY_YAML).toContain("modelFallback: false");
+		expect(GUEST_OVERLAY_YAML).not.toContain("modelFallback");
+		expect(Bun.YAML.parse(GUEST_OVERLAY_YAML)).not.toHaveProperty("retry");
+		expect(REVIEW_OVERLAY_YAML.startsWith(GUEST_OVERLAY_YAML)).toBe(true);
+	});
+});
+
 describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the lanes (AC-12)", () => {
 	test("the configured model and the default timeout reach the reviewer", async () => {
 		const repo = makeRepo(repos);
@@ -701,5 +753,79 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 			verdict: "CLEAR",
 			model: "daemon/model",
 		});
+	});
+
+	test("review confidence AC-7: review.confident reaches the lanes — explicit L3 is reviewed and auto-merged on CLEAR 0.90; no risk and L4 ask unreviewed", async () => {
+		const repo = makeRepo(repos);
+		const transport = new WaitingTransport();
+		const fake = fakeRunner(() => ({ code: 0, stdout: "확인함\nCONFIDENCE: 0.90\nVERDICT: CLEAR", timedOut: false }));
+		const sessions = new FakeSessionStore();
+		const clock = { now: () => Date.now() };
+		const landed: string[] = [];
+		const daemon = new Daemon({
+			config: {
+				...home.config,
+				taskAutoLand: {
+					repos: [repo],
+					review: { model: "daemon/model", confident: { maxRisk: "L3", minConfidence: 0.85 } },
+				},
+			},
+			channels: [new SlackBinding(new SlackChannel(transport))],
+			log: createLogger({ sink: () => {}, clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			landLane: async (request) => {
+				landed.push(request.branch);
+				return { state: "landed", preSha: "unknown" };
+			},
+			laneReviewRun: fake.run,
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		daemons.push(daemon);
+		await daemon.start();
+		const signal = new AbortController().signal;
+		const start = daemon.hostToolsFor("slack/dm/D1").find((tool) => tool.name === "ompbot_work_start");
+		const closeWith = async (title: string, risk: string | undefined): Promise<LaneRow> => {
+			await start?.execute(
+				{ title, cwd: repo, brief: `${title} 브리프`, acceptance: [CHECK_A], ...(risk === undefined ? {} : { risk }) },
+				{ signal },
+			);
+			const lane = daemon.store.getLane(title);
+			if (lane === undefined) throw new Error(`no lane ${title}`);
+			commitIn(lane.cwd, "a.txt");
+			const claim = daemon.hostToolsFor(lane.originKey).find((tool) => tool.name === "ompbot_claim_done");
+			expect(await claim?.execute({ repo: lane.cwd, commit: "HEAD", summary: "a.txt 추가" }, { signal })).toContain(
+				"검증 통과",
+			);
+			return lane;
+		};
+
+		const unrated = await closeWith("confident-none", undefined);
+		expect(unrated.meta.risk).toBeUndefined();
+		await transport.waitForPosts((text) => text.includes("머지 대기 · confident-none"));
+		const l4 = await closeWith("confident-l4", "L4");
+		await transport.waitForPosts((text) => text.includes("머지 대기 · confident-l4"));
+		expect(fake.calls).toHaveLength(0);
+		for (const [title, risk] of [
+			["confident-none", "L3"],
+			["confident-l4", "L4"],
+		] as const) {
+			const [card] = transport.posts((text) => text.includes(`머지 대기 · ${title}`));
+			expect(card?.text).toContain(`자동 머지 안 함: 위험 ${risk} > L2`);
+			expect(card?.text).not.toContain("독립 리뷰");
+			expect(daemon.store.getLane(title)?.meta.review).toBeUndefined();
+		}
+		expect(l4.meta.risk).toBe("L4");
+
+		await closeWith("confident-l3", "L3");
+		await transport.waitForPosts((text) => text.includes("자동 머지 · confident-l3"));
+		expect(fake.calls).toHaveLength(1);
+		expect(argOf(fake.calls[0]?.cmd ?? [], "--model")).toBe("daemon/model");
+		expect(fake.calls[0]?.cmd.at(-1)).toContain("confident-l3 브리프");
+		const [auto] = transport.posts((text) => text.includes("자동 머지 · confident-l3"));
+		expect(auto?.text).toContain("🔎 독립 리뷰 CLEAR 0.90 · daemon/model");
+		expect(daemon.store.getLane("confident-l3")?.meta.review).toMatchObject({ verdict: "CLEAR", confidence: 0.9 });
+		expect(transport.posts((text) => text.includes("머지 대기 · confident-l3"))).toHaveLength(0);
+		expect(fake.calls).toHaveLength(1);
 	});
 });

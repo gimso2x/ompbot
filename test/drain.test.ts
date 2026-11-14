@@ -17,7 +17,7 @@ import {
 	RESTART_NOTICE_TEXT,
 	writeRestartMarker,
 } from "../src/daemon/restart-notice";
-import { renderStatusText } from "../src/daemon/status";
+import { renderContextLine, renderStatusText } from "../src/daemon/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
@@ -25,7 +25,7 @@ import { RESTART_CUT_CARD_TEXT } from "../src/safety/approval";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
-import { killSpawned, runMain } from "./helpers/daemon-process";
+import { killSpawned, runCliCapture, runMain } from "./helpers/daemon-process";
 
 const DM = "D1";
 const ORIGIN = `slack/dm/${DM}`;
@@ -109,6 +109,7 @@ describe("ompbot drain", () => {
 		await started;
 
 		const draining = untilLog("drain_started");
+		// Smoke: a real `bun src/main.ts drain` process over the socket; the other drain calls run in-process.
 		const cli = runMain(home.dir, ["drain", "--wait", "--timeout", "1"]);
 		await draining;
 
@@ -150,13 +151,13 @@ describe("ompbot drain", () => {
 		const started = untilLog("turn_start");
 		await ownerMessage("1700.000001", "first");
 		await started;
-		expect((await runMain(home.dir, ["drain"])).code).toBe(0);
+		expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 		const deferred = untilLog("drain_deferred");
 		await ownerMessage("1700.000002", "second");
 		await deferred;
 
 		const steered = untilLog("steer_delivered");
-		const timedOut = await runMain(home.dir, ["drain", "--wait", "--timeout", "0"]);
+		const timedOut = await runCliCapture(home.dir, ["drain", "--wait", "--timeout", "0"]);
 		expect(timedOut.code).toBe(1);
 		expect(timedOut.stderr).toContain("timed out after 0 min, drain cancelled turns=1");
 		await steered;
@@ -166,13 +167,13 @@ describe("ompbot drain", () => {
 
 	test("--cancel ends the drain and the waiting message starts its turn", async () => {
 		daemon = await boot(false);
-		expect((await runMain(home.dir, ["drain"])).code).toBe(0);
+		expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 		const deferred = untilLog("drain_deferred");
 		await ownerMessage("1700.000001", "hello");
 		await deferred;
 		expect(inboundState("1700.000001")).toBe("pending");
 
-		const cancelled = await runMain(home.dir, ["drain", "--cancel"]);
+		const cancelled = await runCliCapture(home.dir, ["drain", "--cancel"]);
 		expect(cancelled.code).toBe(0);
 		expect(cancelled.stdout).toContain("drain cancelled");
 		await transport.waitForPosts((text) => text.includes("ECHO hello"));
@@ -187,7 +188,7 @@ describe("ompbot drain", () => {
 			await ownerMessage("1700.000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
 
-			expect((await runMain(home.dir, ["drain"])).code).toBe(0);
+			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			await transport.waitForPosts((text) => text === RESTART_NOTICE_TEXT.draining);
 			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual([`${DM}:1700.000001`]);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(true);
@@ -204,8 +205,8 @@ describe("ompbot drain", () => {
 			daemon = await boot(false);
 			await ownerMessage("1700.000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
-			expect((await runMain(home.dir, ["drain"])).code).toBe(0);
-			expect((await runMain(home.dir, ["drain", "--cancel"])).code).toBe(0);
+			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
+			expect((await runCliCapture(home.dir, ["drain", "--cancel"])).code).toBe(0);
 			await transport.waitForPosts((text) => text === RESTART_NOTICE_TEXT.cancelled);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(false);
 
@@ -221,7 +222,7 @@ describe("ompbot drain", () => {
 			daemon = await boot(false);
 			await ownerMessage("1700.000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
-			expect((await runMain(home.dir, ["drain"])).code).toBe(0);
+			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual([]);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(false);
 
@@ -238,7 +239,7 @@ describe("ompbot drain", () => {
 		test("with restartNotice=false an owner message held by the drain is still told once per thread", async () => {
 			home.config.restartNotice = false;
 			daemon = await boot(false);
-			expect((await runMain(home.dir, ["drain"])).code).toBe(0);
+			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			const first = untilLog("drain_deferred");
 			await ownerMessage("1700.000001", "hello");
 			await first;
@@ -271,7 +272,8 @@ describe("ompbot drain", () => {
 		expect(ack).toEqual({ response_type: "ephemeral", text: DRAIN_DEFERRED_COMMAND_TEXT });
 		expect(slashRows()).toEqual([["/new-ompbot", "pending"]]);
 		const status = await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: DM });
-		expect(status?.text).toBe(renderStatusText(daemon.status()));
+		// No turn ran in the DM yet: its context line says the session is idle, then the daemon-wide text.
+		expect(status?.text).toBe(`${renderContextLine("idle")}\n${renderStatusText(daemon.status())}`);
 		expect(slashRows()).toHaveLength(1);
 		daemon.setDraining(false);
 		expect(await transport.emitSlash({ command: "/usage-ompbot", user_id: OWNER, channel_id: DM })).toBeUndefined();
@@ -291,7 +293,7 @@ describe("ompbot drain", () => {
 			hostTools: 1,
 			approvals: 1,
 		});
-		expect((await runMain(home.dir, ["drain", "--wait", "--timeout", "0"])).code).toBe(1);
+		expect((await runCliCapture(home.dir, ["drain", "--wait", "--timeout", "0"])).code).toBe(1);
 		expect(await callDaemon(socket, { op: "drain_status" })).toMatchObject({ draining: false });
 	});
 });
@@ -383,6 +385,25 @@ describe("drain_cut", () => {
 		expect(await callDaemon(socket, { op: "drain_status" })).toMatchObject({ draining: true });
 	});
 
+	test("a dispatched command-op row (lane:, task:, /compact) is not recorded as a cut turn", async () => {
+		await busyWithApprovals([]);
+		for (const [id, opRef] of [
+			["L1", "lane:work:1"],
+			["T1", "task:T-1"],
+			["C1", "compact:C1"],
+		] as const) {
+			daemon.store.recordInbound({ originKey: ORIGIN, platformMessageId: id, textRef: "x", threadRef: `${DM}:${id}` });
+			daemon.store.markDispatched(id, { opRef, entryCursor: null });
+		}
+		const socket = join(home.dir, "ompbot.sock");
+		await callDaemon(socket, { op: "drain" });
+		expect(await callDaemon(socket, { op: "drain_cut", applyStamp: STAMP })).toMatchObject({ ok: true, opRefs: 1 });
+		const record = JSON.parse(readFileSync(join(home.dir, RESTART_CUT_FILE), "utf8")) as RestartCut;
+		expect(record.opRefs.map((entry) => entry.opRef)).toEqual([
+			daemon.store.getInbound(`${DM}:1700.000001`)?.opRef ?? "missing",
+		]);
+	});
+
 	test("the next process resumes the cut turn once in the same thread instead of the interrupted notice", async () => {
 		await busyWithApprovals([]);
 		const socket = join(home.dir, "ompbot.sock");
@@ -417,5 +438,13 @@ describe("drain_cut", () => {
 		expect(readdirSync(home.dir).filter((name) => name.startsWith(`${RESTART_CUT_FILE}.tmp-`))).toEqual([]);
 		expect(logs.filter((line) => line.includes("event=drain_cut_failed"))).toHaveLength(1);
 		expect(daemon.status().drain?.approvals).toBe(1);
+	});
+});
+
+describe("daemon /status gates", () => {
+	test("an omp install the omp_runtime gate opens on is listed by the daemon's own status", async () => {
+		home.config.ompExecutable = join(home.dir, "no-such-omp");
+		daemon = await boot(false);
+		expect(daemon.status().openGates.map((gate) => gate.name)).toContain("omp_runtime");
 	});
 });

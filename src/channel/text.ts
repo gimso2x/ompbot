@@ -1,6 +1,7 @@
 // Platform-neutral text helpers every adapter shares: message chunking, the redelivery mark, the running status line
 // and the final marks a finished turn leaves.
 import type { TurnProgress } from "../core/mailbox";
+import { typicalNote } from "../store/turn-duration";
 
 export const CHUNK_LIMIT = 3900;
 export const REDELIVERED_PREFIX = "(중복 가능: 재전송)";
@@ -116,7 +117,7 @@ export function chunkText(
 		let out = open > 0 ? `${mark}\n${chunk}` : chunk;
 		for (const line of chunk.split("\n")) {
 			if (lineHead) {
-				const close = /^ {0,3}(`+)[ \t]*$/.exec(line);
+				const close = /^ {0,3}(`+)[ \t]*\r?$/.exec(line);
 				if (close !== null && (close[1]?.length ?? 0) >= open) {
 					open = 0;
 					lineHead = false;
@@ -145,15 +146,34 @@ function fenceRun(line: string): number | undefined {
 	return run !== undefined && run <= MAX_FENCE_RUN ? run : undefined;
 }
 
-/** How a thread's ⏳ status message and 👀 reaction end: normal close, failure, or a cancelled wait. */
-export type FinalOutcome = "done" | "failed" | "cancelled";
+/**
+ * How a thread's ⏳ status message and 👀 reaction end: normal close, failure, a cancelled wait, or an answer the
+ * delivery ledger gave up on (ambiguous send, retries spent, expired).
+ */
+export type FinalOutcome = "done" | "failed" | "cancelled" | "undelivered";
 
 /** One place deciding how each final outcome reads in the status line and which reaction mark it leaves. */
 export const FINAL_MARKS: Record<FinalOutcome, { label: string; mark: string }> = {
 	done: { label: "✅ 완료", mark: "white_check_mark" },
 	cancelled: { label: "🚫 취소됨", mark: "x" },
 	failed: { label: "⚠️ 실패", mark: "warning" },
+	undelivered: { label: "⚠️ 답을 보내지 못했습니다", mark: "warning" },
 };
+
+/**
+ * The footer an answer carries when it takes the place of the thread's deleted `⏳` status: `✅ 00:42 · 도구 6회`
+ * (the outcome's mark and elapsed time, then the tool count when the turn ran any). Slack, Discord and Teams share
+ * the string; each decides from its own status entry whether the answer gets one at all.
+ */
+export function formatFooter(outcome: "done" | "failed", elapsedMs: number, tools: number): string {
+	const mark = FINAL_MARKS[outcome].label.split(" ")[0];
+	return `${mark} ${formatElapsed(elapsedMs)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
+}
+
+/** A thrown value as one log field: its message, or the value itself when it is not an Error. */
+export function errorText(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
 
 /** Collapses control characters and line separators so untrusted text cannot start a new prompt line. */
 export function oneLine(text: string, max: number): string {
@@ -182,15 +202,8 @@ export function progressLine(text: string): string {
  */
 export function runningStatusText(stalled: boolean, elapsedMs: number, progress: TurnProgress | undefined): string {
 	const tools = progress?.tools ?? 0;
-	const typical = progress?.typical;
-	let usual = "";
-	if (typical !== undefined) {
-		// A median-to-p90 range, so a turn already past the median does not read as late until it passes p90.
-		const low = Math.max(1, Math.ceil(typical.medianMs / 60_000));
-		const high = Math.max(low, Math.ceil(typical.p90Ms / 60_000));
-		const range = low === high ? `~${low}분` : `${low}~${high}분`;
-		usual = elapsedMs > typical.p90Ms ? ` · 평소보다 길어짐(보통 ${range})` : ` · 보통 ${range}`;
-	}
+	const note = typicalNote(elapsedMs, progress?.typical);
+	const usual = note === undefined ? "" : ` · ${note}`;
 	const head = stalled
 		? `${STALL_STATUS_TEXT} · ${formatElapsed(elapsedMs)}`
 		: `⏳ 작업 중 · ${formatElapsed(elapsedMs)}${tools > 0 ? ` · 도구 ${tools}회` : ""}${usual}`;
@@ -232,4 +245,69 @@ export function displayWidth(text: string): number {
 		width += wide ? 2 : 1;
 	}
 	return width;
+}
+
+/** Splits one GFM table row into trimmed cells; `\|` is a literal pipe inside a cell. */
+export function splitRowCells(line: string): string[] {
+	let trimmed = line.trim();
+	if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+	if (trimmed.endsWith("|") && !trimmed.endsWith("\\|")) trimmed = trimmed.slice(0, -1);
+	const cells: string[] = [];
+	let cell = "";
+	for (let i = 0; i < trimmed.length; i++) {
+		const ch = trimmed[i];
+		if (ch === "\\" && trimmed[i + 1] === "|") {
+			cell += "|";
+			i++;
+			continue;
+		}
+		if (ch === "|") {
+			cells.push(cell.trim());
+			cell = "";
+			continue;
+		}
+		cell += ch;
+	}
+	cells.push(cell.trim());
+	return cells;
+}
+
+/**
+ * When a GFM table starts at line `i`, the index of the first line after it: a row of 2+ cells, a delimiter row of the
+ * same count (hyphens, at least `minDashes` per cell, optional colons) and the rows after it holding an unescaped pipe.
+ */
+export function tableEndAt(lines: readonly string[], i: number, minDashes = 1): number | undefined {
+	const header = splitRowCells(lines[i] ?? "");
+	const delimiter = i + 1 < lines.length ? splitRowCells(lines[i + 1] ?? "") : undefined;
+	if (delimiter === undefined || header.length < 2 || header.length !== delimiter.length) return undefined;
+	const rule = new RegExp(`^\\s*:?-{${minDashes},}:?\\s*$`);
+	if (!delimiter.every((cell) => rule.test(cell))) return undefined;
+	let j = i + 2;
+	while (j < lines.length && /(?<!\\)\|/.test(lines[j] ?? "")) j++;
+	return j;
+}
+
+/** `[start, end)` character spans of the GFM tables outside code fences: a chunk cut must not fall inside one. */
+export function tableSpans(text: string): Array<readonly [number, number]> {
+	const lines = text.split("\n");
+	const starts: number[] = [];
+	let offset = 0;
+	for (const line of lines) {
+		starts.push(offset);
+		offset += line.length + 1;
+	}
+	const spans: Array<readonly [number, number]> = [];
+	let inFence = false;
+	let i = 0;
+	while (i < lines.length) {
+		const end = inFence ? undefined : tableEndAt(lines, i);
+		if (end !== undefined) {
+			spans.push([starts[i] ?? 0, (starts[end - 1] ?? 0) + (lines[end - 1] ?? "").length]);
+			i = end;
+			continue;
+		}
+		if (((lines[i] ?? "").match(/```/g) ?? []).length % 2 === 1) inFence = !inFence;
+		i++;
+	}
+	return spans;
 }

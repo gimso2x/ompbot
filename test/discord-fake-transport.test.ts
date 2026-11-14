@@ -3,14 +3,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { fromDiscordEmoji, toDiscordEmoji, UnknownEmojiError } from "../src/discord/emoji";
+import { toDiscordEmoji, UnknownEmojiError } from "../src/discord/emoji";
 import { FileFakeDiscordTransport } from "../src/discord/test-transport";
-import type {
-	DiscordHandlers,
-	DiscordInteraction,
-	DiscordMessageEvent,
-	DiscordReactionEvent,
-} from "../src/discord/transport";
+import type { DiscordHandlers, DiscordInteraction, DiscordMessageEvent } from "../src/discord/transport";
 import { DiscordCallError } from "../src/discord/transport";
 import { STATUS_REACTIONS } from "../src/tasks/notify";
 import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
@@ -20,22 +15,16 @@ const CHANNEL = "111111111111111111";
 function recordingHandlers(): {
 	handlers: DiscordHandlers;
 	messages: DiscordMessageEvent[];
-	reactions: DiscordReactionEvent[];
 	interactions: DiscordInteraction[];
 } {
 	const messages: DiscordMessageEvent[] = [];
-	const reactions: DiscordReactionEvent[] = [];
 	const interactions: DiscordInteraction[] = [];
 	return {
 		messages,
-		reactions,
 		interactions,
 		handlers: {
 			message: async (event) => {
 				messages.push(event);
-			},
-			reaction: async (event) => {
-				reactions.push(event);
 			},
 			interaction: async (interaction) => {
 				interactions.push(interaction);
@@ -74,8 +63,6 @@ describe("FakeDiscordTransport contract", () => {
 		await fake.uploadFile({ channelId: thread.id, filePath: "/tmp/report.md", content: "보고서" });
 		await fake.deleteMessage({ channelId: CHANNEL, messageId: posted.id });
 		await fake.respondInteraction({ interactionId: "1", token: "tok", response: { type: 6 } });
-		await fake.editInteractionResponse({ token: "tok", content: "done" });
-		await fake.deleteInteractionResponse({ token: "tok" });
 
 		expect(fake.calls.map((call) => call.method)).toEqual([
 			"createMessage",
@@ -86,8 +73,6 @@ describe("FakeDiscordTransport contract", () => {
 			"uploadFile",
 			"deleteMessage",
 			"respondInteraction",
-			"editInteractionResponse",
-			"deleteInteractionResponse",
 		]);
 		expect(fake.calls[0]).toMatchObject({
 			method: "createMessage",
@@ -148,7 +133,7 @@ describe("FakeDiscordTransport contract", () => {
 		expect(rest.map((m) => m.id)).toEqual(["1000"]);
 	});
 
-	test("emitMessage, emitReaction and emitInteraction reach the handlers registered at start", async () => {
+	test("emitMessage and emitInteraction reach the handlers registered at start", async () => {
 		const fake = new FakeDiscordTransport();
 		const rec = recordingHandlers();
 		await fake.start(rec.handlers);
@@ -159,13 +144,6 @@ describe("FakeDiscordTransport contract", () => {
 			content: "안녕",
 			type: 0,
 		};
-		const reaction: DiscordReactionEvent = {
-			type: "add",
-			user_id: "800000000000000001",
-			channel_id: CHANNEL,
-			message_id: "700000000000000001",
-			emoji: { id: null, name: "👍" },
-		};
 		const interaction: DiscordInteraction = {
 			id: "1",
 			application_id: "2",
@@ -175,10 +153,8 @@ describe("FakeDiscordTransport contract", () => {
 			data: { custom_id: "ompbot:approval:approve:C:1", component_type: 2 },
 		};
 		await fake.emitMessage(message);
-		await fake.emitReaction(reaction);
 		await fake.emitInteraction(interaction);
 		expect(rec.messages).toEqual([message]);
-		expect(rec.reactions).toEqual([reaction]);
 		expect(rec.interactions).toEqual([interaction]);
 		await fake.stop();
 		await fake.emitMessage(message);
@@ -239,15 +215,5 @@ describe("emoji table", () => {
 	test("a name missing from the table is an error, not a silent skip", () => {
 		expect(() => toDiscordEmoji("tada")).toThrow(UnknownEmojiError);
 		expect(() => toDiscordEmoji("")).toThrow(UnknownEmojiError);
-	});
-
-	test("inbound reaction emoji map back to Slack names; 👍/👎 (any skin tone) become +1/-1", () => {
-		expect(fromDiscordEmoji("👍")).toBe("+1");
-		expect(fromDiscordEmoji("👎")).toBe("-1");
-		expect(fromDiscordEmoji("👍🏽")).toBe("+1");
-		expect(fromDiscordEmoji("⚠️")).toBe("warning");
-		expect(fromDiscordEmoji("⚠")).toBe("warning");
-		expect(fromDiscordEmoji("🦀")).toBeUndefined();
-		expect(fromDiscordEmoji(null)).toBeUndefined();
 	});
 });

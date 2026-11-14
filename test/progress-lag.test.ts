@@ -94,9 +94,10 @@ describe("progressLag, local, real temp git repo", () => {
 		write("src/x.ts", "1");
 		commit("feat", "src/x.ts");
 		write(PROGRESS, "S1");
+		// Untracked files are listed one by one (--untracked-files=all), so the new PROGRESS.md is seen as itself.
 		expect(await lag()).toEqual({
 			ok: true,
-			value: { progressCommit: "", codeCommitsSince: 0, progressDirty: false, otherDirty: 1 },
+			value: { progressCommit: "", codeCommitsSince: 0, progressDirty: true, otherDirty: 0 },
 		});
 	});
 
@@ -113,7 +114,7 @@ describe("progressLag over ssh", () => {
 		const commands: string[][] = [];
 		const run: ProcessRunner = async (cmd) => {
 			commands.push(cmd);
-			const args = cmd.slice(cmd.indexOf("--") + 1);
+			const args = cmd.slice(cmd.indexOf("--") + 2);
 			if (args[3] === "log") return { code: 0, stdout: "abc1234\n", timedOut: false };
 			if (args[3] === "rev-list") return { code: 0, stdout: "3\n", timedOut: false };
 			return { code: 0, stdout: ` M ${PROGRESS}\n?? x.ts\n`, timedOut: false };
@@ -123,11 +124,11 @@ describe("progressLag over ssh", () => {
 			ok: true,
 			value: { progressCommit: "abc1234", codeCommitsSince: 3, progressDirty: true, otherDirty: 1 },
 		});
-		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--", "git", "-C", "/r/wt"];
+		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl", "git", "-C", "/r/wt"];
 		expect(commands).toEqual([
 			[...ssh, "log", "-1", "--format=%h", "--", PROGRESS, "2>&1"],
 			[...ssh, "rev-list", "--count", "abc1234..HEAD", "--", ".", ":!docs/tasks", "2>&1"],
-			[...ssh, "status", "--porcelain", "2>&1"],
+			[...ssh, "status", "--porcelain", "--untracked-files=all", "2>&1"],
 		]);
 
 		const down = createTaskHostOps({

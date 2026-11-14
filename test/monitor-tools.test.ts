@@ -164,6 +164,21 @@ describe("ompbot_monitor_add / list / remove", () => {
 		);
 	});
 
+	test("add takes a cron command with timeoutMs and deliver verbatim; list shows the command", async () => {
+		const { add, list } = tools();
+		const script = join(home.dir, "scripts", "brief.sh");
+		writeFileSync(script, "#!/bin/sh\necho brief\n");
+		chmodSync(script, 0o755);
+		const cron = { kind: "cron" as const, schedule: "0 8 * * *", command: [script], timeoutMs: 900_000 };
+		await expect(add({ name: "turned", trigger: cron, instruction: "x" })).rejects.toThrow(/needs deliver "verbatim"/);
+		await add({ name: "brief", trigger: cron, instruction: "x", deliver: "verbatim" });
+		const row = ledger.getMonitor("brief");
+		expect([row?.trigger, row?.deliver]).toEqual([{ ...cron, timezone: "Asia/Seoul" }, "verbatim"]);
+		const line = (await list({})).split("\n").find((text) => text.includes('"brief"'));
+		expect(line).toContain(`[cron "0 8 * * *" Asia/Seoul command=${script} timeout=900s]`);
+		expect(line).toContain(" deliver=verbatim ");
+	});
+
 	test("list shows each monitor with its next fire; remove works by id or by name", async () => {
 		const { add, list, remove } = tools();
 		expect(await list({})).toBe("no monitors");
@@ -258,9 +273,11 @@ describe("who gets the tools", () => {
 			for (const name of monitorNames) expect(names(discordThread)).not.toContain(name);
 			// The Slack lists as main 627d14a built them.
 			const withLaneStart = ["ompbot_dispatch", "slack_send_file", "ompbot_request_approval", "ompbot_work_start"];
-			expect(names(ORIGIN)).toEqual([...withLaneStart, ...monitorNames]);
+			// Every Slack and Discord conversation also gets the lane board (doc/plans/lane-board.md).
+			const boardNames = ["ompbot_board_post", "ompbot_board_read"];
+			expect(names(ORIGIN)).toEqual([...withLaneStart, ...monitorNames, ...boardNames]);
 			for (const origin of ["slack/ch/C1", "slack/ch/C1/t/1.2", "slack/dm/D1/t/1.2"]) {
-				expect(names(origin)).toEqual(withLaneStart);
+				expect(names(origin)).toEqual([...withLaneStart, ...boardNames]);
 			}
 		} finally {
 			await daemon.stop();

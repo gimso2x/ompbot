@@ -80,6 +80,20 @@ describe("cron: America/New_York DST", () => {
 		]);
 	});
 
+	test("spring forward: a weekly 00:30 right after the 23-hour day is not skipped", () => {
+		const cron = parseCron("30 0 * * 1");
+		// 2026-03-02 00:30 EST is a Monday slot; the next one sits just past the 2026-03-08 change day.
+		expect(iso(nextFire(cron, "America/New_York", utc("2026-03-02T05:30:00Z")))).toBe("2026-03-09T04:30:00.000Z");
+	});
+
+	test("a zone whose local midnight does not exist still moves past the change day", () => {
+		// Chile springs forward at 24:00 on 2026-09-05, so 2026-09-06 starts at 01:00.
+		const cron = parseCron("0 12 * * 0");
+		expect(
+			formatLocal(nextFire(cron, "America/Santiago", utc("2026-08-31T12:00:00Z")) as number, "America/Santiago"),
+		).toBe("2026-09-06 12:00:00");
+	});
+
 	test("an `at` wall time inside the spring-forward gap resolves to just after the gap", () => {
 		const at = zonedToUtc({ year: 2026, month: 3, day: 8, hour: 2, minute: 30, second: 0, ms: 0 }, "America/New_York");
 		expect(formatLocal(at, "America/New_York")).toMatch(/^2026-03-08 03:/);

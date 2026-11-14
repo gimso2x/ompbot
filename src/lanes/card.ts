@@ -4,6 +4,7 @@ import { redact } from "../redact";
 import type { TaskCard } from "../tasks/notify";
 import { CHECK_TIMEOUT_MS } from "../tasks/signals";
 import { REVIEW_BLOCK } from "./land";
+import { formatConfidence } from "./review";
 import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneChanges, type LaneRow } from "./status";
 
 /**
@@ -16,6 +17,8 @@ const LANE_MERGE_ACTION_PREFIX = "ompbot:lane:merge:";
 const LANE_DISCARD_ACTION_PREFIX = "ompbot:lane:discard:";
 const LANE_PAUSE_ACTION_PREFIX = "ompbot:lane:pause:";
 const LANE_RESUME_ACTION_PREFIX = "ompbot:lane:resume:";
+/** `ompbot:lane:session:<name>:<n>`: the owner picks which session file a lane continues after a terminal hand-back. */
+const LANE_SESSION_ACTION_PREFIX = "ompbot:lane:session:";
 /** Lane names are slugs (`slugify` in the manager) with an optional `-n` suffix. */
 const LANE_NAME = /^[a-z0-9가-힣-]{1,64}$/;
 const SUMMARY_MAX = 300;
@@ -26,11 +29,22 @@ export const laneMergeActionId = (name: string): string => `${LANE_MERGE_ACTION_
 export const laneDiscardActionId = (name: string): string => `${LANE_DISCARD_ACTION_PREFIX}${name}`;
 export const lanePauseActionId = (name: string): string => `${LANE_PAUSE_ACTION_PREFIX}${name}`;
 export const laneResumeActionId = (name: string): string => `${LANE_RESUME_ACTION_PREFIX}${name}`;
+export const laneSessionActionId = (name: string, index: number): string =>
+	`${LANE_SESSION_ACTION_PREFIX}${name}:${index}`;
 
 /** What a lane card/status button click does to the lane; `undefined` for any other action id. */
-export type LaneAction = { kind: "merge" | "discard" | "pause" | "resume"; name: string };
+export type LaneAction =
+	| { kind: "merge" | "discard" | "pause" | "resume"; name: string }
+	| { kind: "session"; name: string; index: number };
 
 export function parseLaneActionId(actionId: string): LaneAction | undefined {
+	if (actionId.startsWith(LANE_SESSION_ACTION_PREFIX)) {
+		const match = /^(.+):(\d{1,3})$/.exec(actionId.slice(LANE_SESSION_ACTION_PREFIX.length));
+		const name = match?.[1];
+		return match === null || name === undefined || !LANE_NAME.test(name)
+			? undefined
+			: { kind: "session", name, index: Number(match[2]) };
+	}
 	for (const [prefix, kind] of [
 		[LANE_MERGE_ACTION_PREFIX, "merge"],
 		[LANE_DISCARD_ACTION_PREFIX, "discard"],
@@ -189,7 +203,11 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 	if (view.kind === "auto") {
 		return card(`🚚 자동 머지 · ${lane.title}`, [
 			`레인 완료 · 재실행 검사 ${passed}/${checks.length} 통과 — 개인 저장소라 바로 머지합니다(ff 머지 → push origin/${base} → worktree 정리).`,
-			...(review?.verdict === "CLEAR" ? [`🔎 독립 리뷰 CLEAR · ${review.model}`] : []),
+			...(review?.verdict === "CLEAR"
+				? [
+						`🔎 독립 리뷰 CLEAR${review.confidence === undefined ? "" : ` ${formatConfidence(review.confidence)}`} · ${review.model}`,
+					]
+				: []),
 			...summary,
 		]);
 	}

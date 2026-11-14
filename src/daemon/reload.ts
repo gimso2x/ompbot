@@ -22,12 +22,19 @@ export const LIVE_FIELDS = [
 	"peerBots",
 	"requireMention",
 	"peerHopLimit",
+	// The peer silence sweep and the call recording read it after every reload.
+	"peerSilenceAlert",
 	"turnSnapshot",
 	"costCap",
 	// The lane manager reads `lanes.completionNudges` at every lane turn end.
 	"lanes",
 	// The briefing renderer reads it on every `!brief` (a moved chromium applies without a restart).
 	"briefing",
+	// The candidate pass reads it on every sweep.
+	"candidates",
+	// `!brief` reads `dashboard.opsStatus` for its host-check card on every call; the `ompbot dashboard` service still
+	// reads port/bind/herdrWebUrl only when it starts (`systemctl --user restart ompbot-dashboard`).
+	"dashboard",
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /** Bound when the daemon starts (tokens, socket, omp children, scheduler). */
@@ -55,10 +62,10 @@ export const RESTART_FIELDS = [
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /**
- * Never read by the daemon: `ompbot gc` / `ompbot backup` load config.json themselves on every run, and the
- * `ompbot dashboard` service reads `dashboard` when it starts (`systemctl --user restart ompbot-dashboard`).
+ * Never read by the daemon: `ompbot gc` / `ompbot backup` load config.json themselves on every run, and
+ * `ompbot apply` reads `apply` on every run.
  */
-export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "dashboard"] as const satisfies ReadonlyArray<
+export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "apply"] as const satisfies ReadonlyArray<
 	keyof OmpbotConfig
 >;
 

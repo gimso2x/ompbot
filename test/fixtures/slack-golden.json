@@ -766,12 +766,12 @@
 				{
 					"method": "postMessage",
 					"channel": "D1",
-					"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
+					"text": "이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha\nompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
 					"threadTs": "1700000000.000600",
 					"blocks": [
 						{
 							"type": "markdown",
-							"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
+							"text": "이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha\nompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
 						}
 					],
 					"ts": "1800000000.000019"
@@ -791,7 +791,7 @@
 			],
 			"result": {
 				"response_type": "ephemeral",
-				"text": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/7/0/0\n입수 pending=0 dispatched=0 answered=7 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
+				"text": "이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha\nompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/7/0/0\n입수 pending=0 dispatched=0 answered=7 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음"
 			}
 		},
 		{
@@ -1000,10 +1000,6 @@
 			"result": "uploaded report.txt to the conversation thread (file id F000029)"
 		},
 		{
-			"step": "⑩ thumbs up",
-			"calls": []
-		},
-		{
 			"step": "⑪ rate limit",
 			"calls": [
 				{
@@ -1183,7 +1179,7 @@
 			"opRef": "status:D1:1700000000.000600",
 			"part": 0,
 			"threadRef": "D1:1700000000.000600",
-			"body": "ompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
+			"body": "이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha\nompbot · omp omp-test 0 · 데몬 실행 중 · origin 4개\n• slack/dm/D1 epoch=1 omp_pid=- 대기\n• slack/ch/C1 × 3스레드\n장부 p/i/c/a/e: 0/0/6/0/0\n입수 pending=0 dispatched=1 answered=6 failed=0 discarded=0\n모니터 0개\n자가진단 게이트 이상 없음",
 			"state": "confirmed",
 			"attempts": 0,
 			"redelivered": false,
@@ -1274,16 +1270,6 @@
 			"lastError": "slack rate limited, retry after 30000ms",
 			"sentParts": 0,
 			"replyTs": null
-		}
-	],
-	"feedback": [
-		{
-			"channel": "D1",
-			"ts": "1800000000.000002",
-			"delivery_id": 1,
-			"origin_key": "slack/dm/D1",
-			"verdict": "up",
-			"last_event_ts": "1800000100.000001"
 		}
 	]
 }

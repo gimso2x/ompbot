@@ -1,21 +1,12 @@
 import { Database } from "bun:sqlite";
-import {
-	closeSync,
-	type Dirent,
-	existsSync,
-	fstatSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	readSync,
-	statSync,
-} from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { OmpbotConfig } from "../config";
 import { QUOTED_HEADER, TOP_LEVEL_TS } from "../core/normalize";
 import { parseChatOrigin } from "../core/origin-key";
 import { COMMAND_TEXT, parseCommand } from "../core/types";
 import { readSweepHeartbeat } from "../daemon/heartbeat";
+import { pidAlive } from "../daemon/lock";
 import {
 	type DrainCounts,
 	type MonitorsStatus,
@@ -41,21 +32,31 @@ import {
 	toMonitor,
 } from "../monitors/ledger";
 import type { MonitorDeliver, MonitorOverlap, MonitorTrigger } from "../monitors/spec";
+import { type AssistantTail, pendingToolCall, readLastAssistant, sessionPathOf } from "../omp/session-tail";
 import { isRecord } from "../omp/type-guards";
 import { readLockStartedAt } from "../ops/apply";
 import { readStamp } from "../ops/backup";
 import type { FreezeState } from "../ops/freeze";
-import { collectGates, type Gate, type GateState, type GatesOptions, INBOUND_STARVATION_MS } from "../ops/gates";
+import {
+	collectGates,
+	type Gate,
+	type GateState,
+	type GatesOptions,
+	gateOptionsFromConfig,
+	INBOUND_STARVATION_MS,
+} from "../ops/gates";
 import { OFFSITE_STAMP_FILE } from "../ops/offsite";
 import { redact } from "../redact";
 import { INJECTION_WARNING_HEAD } from "../safety/injection";
-import { type FeedbackVerdict, readTurnVerdicts } from "../store/feedback";
+import { TURN_SAMPLE_LIMIT, TURN_SAMPLE_WINDOW_MS } from "../store/db";
+import { type TypicalDuration, typicalDuration } from "../store/turn-duration";
 import type { TaskRisk } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import type { TaskHostOps } from "../tasks/host";
 import { parseTaskJson, type TaskRow, type TaskStatus } from "../tasks/ledger";
 import { formatLocal, localIso } from "../time";
 import { type BoardPromptRef, type BoardState, type BoardSummary, type BoardTaskRef, summarizeBoard } from "./board";
+import { type HostChecksInfo, readHostChecks } from "./host-checks";
 import { createSessionModelReader, type SessionModel, type SessionModelOrigin } from "./session-model";
 
 /** A snapshot is reused this long: IPC, herdr, ssh and git are not asked again inside it. */
@@ -216,6 +217,10 @@ export interface TaskInfo {
 	link?: string;
 	/** Why the task documents could not be judged, and/or which JSON column of the row is damaged (`… 손상`). */
 	error?: string;
+	/** Registration to first review of past TASKs ({@link taskDurationSamples}); `working` TASKs with enough samples only. */
+	typical?: TypicalDuration;
+	/** Since registration; set together with `typical`. */
+	elapsedMs?: number;
 }
 
 /** Threads in the flow view: a TASK registered in this window, or any open TASK. */
@@ -234,6 +239,9 @@ export interface FlowStepInfo {
 	closedAt?: string;
 	acTotal: number;
 	stage: TaskStage;
+	/** As on {@link TaskInfo}: `working` TASKs with enough samples only. */
+	typical?: TypicalDuration;
+	elapsedMs?: number;
 }
 
 /** One request thread: its request line and its TASKs in registration order. */
@@ -257,6 +265,8 @@ export interface FlowChainInfo {
 
 export interface LaneInfo {
 	name: string;
+	/** The lane session's origin: a conversation of the turn board with this key is the lane's. */
+	originKey: string;
 	title: string;
 	status: string;
 	cwd: string;
@@ -554,7 +564,9 @@ function monitorFiles(row: MonitorRow): MonitorFile[] {
 	return files.slice(0, MONITOR_FILES);
 }
 
-/** A channel as the owner knows it: the DM, the config's Slack or Discord log or escalation channel, else its id. */
+/**
+ * A channel as the owner knows it: the DM, the config's Slack or Discord log or escalation channel, else its id.
+ */
 function channelName(channel: string | null, config: DashboardConfig | undefined): string {
 	if (channel === null) return "오너 DM";
 	if (channel === config?.logChannel || channel === config?.channels?.discord?.logChannelId) return "로그 채널";
@@ -635,32 +647,6 @@ export interface JobInfo {
 	health: JobHealth;
 }
 
-/** Days the dashboard's feedback counts cover, and the 👎 turns it lists. */
-export const FEEDBACK_DAYS = 7;
-const FEEDBACK_RECENT = 20;
-
-/** One turn whose current verdict is 👎. */
-export interface FeedbackTurn {
-	/** The turn's first inbound row (opens its waterfall); null when the row is gone. */
-	inboundId: number | null;
-	originKey: string;
-	/** When the verdict was set (in the bot's zone). */
-	at: string;
-	/** The request in one masked line of at most {@link PREVIEW_CHARS} chars; null for monitor turns or no row. */
-	preview: string | null;
-}
-
-/** The owner's 👍/👎 per turn (a turn with reactions on several parts counts once) over the last `days`. */
-export interface FeedbackInfo {
-	days: number;
-	up: number;
-	down: number;
-	/** 👎 turns, newest verdict first. */
-	recentDown: FeedbackTurn[];
-	/** Verdict by inbound id (as text) for every row of a judged turn: the turn board's and waterfall's badges. */
-	verdicts: Record<string, FeedbackVerdict>;
-}
-
 export interface DashboardSnapshot {
 	/** Build time as an ISO string with the offset of `timezone`, like every other time in the snapshot. */
 	generatedAt: string;
@@ -668,7 +654,6 @@ export interface DashboardSnapshot {
 	timezone: string;
 	daemon: Section<DaemonInfo>;
 	turns: Section<{ items: TurnInfo[]; threads: ThreadInfo[] }>;
-	feedback: Section<FeedbackInfo>;
 	tasks: Section<{ items: TaskInfo[] }>;
 	/** Always built; optional only so snapshots made before the flow view still type. */
 	flows?: Section<{ items: FlowChainInfo[] }>;
@@ -692,6 +677,11 @@ export interface DashboardSnapshot {
 	 * it. Always built; optional only so hand-made snapshots still type.
 	 */
 	slackTeam?: string | null;
+	/**
+	 * How a terminal runs this checkout's CLI, word by word (`bun`, `<repoDir>/src/main.ts`): the 터미널에서 보기 panels
+	 * show commands with it for the owner to paste — the dashboard never runs them. Optional like `slackTeam`.
+	 */
+	ompbotCli?: string[];
 	/** Config without `channels.slack`: the Slack card says 꺼짐 instead of waiting for a socket. Optional like `slackTeam`. */
 	slackOff?: boolean;
 	/**
@@ -699,6 +689,10 @@ export interface DashboardSnapshot {
 	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `slackTeam`.
 	 */
 	discordGuild?: string | null;
+	/** The "호스트 점검" card: only with config `dashboard.opsStatus` (absent otherwise, and in hand-made snapshots). */
+	hostChecks?: Section<HostChecksInfo>;
+	/** Config `dashboard.opsStatus.url`: the card head links it. */
+	hostChecksUrl?: string;
 }
 
 export type DashboardConfig = Partial<
@@ -713,6 +707,7 @@ export type DashboardConfig = Partial<
 		| "herdrBoard"
 		| "costCap"
 		| "peerBots"
+		| "dashboard"
 	>
 > &
 	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
@@ -720,7 +715,7 @@ export type DashboardConfig = Partial<
 		slack?: { teamId?: string };
 		/**
 		 * Only the server ids are read, for the Discord links of the turn panels, the Discord peer bots, for the flow's
-		 * review node, and the Discord log and escalation channels, for the monitor channel labels; `slack` only for
+		 * review node, and the Discord log, escalation and board channels, for the monitor channel labels; `slack` only for
 		 * whether Slack is on.
 		 */
 		channels?: {
@@ -756,7 +751,7 @@ export interface SnapshotDeps {
 	board?: () => BoardState | undefined;
 	/** The health gates; default {@link collectGates}. */
 	collectGates?: (options: GatesOptions) => Gate[];
-	/** Whether a job's `pid` still runs; default {@link processAlive}. */
+	/** Whether a job's `pid` still runs; default {@link pidAlive}. */
 	isAlive?: (pid: number) => boolean;
 	/** A board thread's session model; default one {@link createSessionModelReader} shared by every snapshot. */
 	sessionModel?: (origin: SessionModelOrigin) => SessionModel | undefined;
@@ -821,6 +816,21 @@ function approvalDetail(json: string | null): ApprovalInfo["detail"] {
 		if (typeof value === "string" && value.trim() !== "") detail[key] = redact(value);
 	}
 	return Object.keys(detail).length === 0 ? null : detail;
+}
+
+/**
+ * Registration to first `working → review` move (ms) of every TASK that made one in the last 30 days (by that move),
+ * newest move first, at most 200: the window and cap of chat turn samples. TASKs never sent to review are not samples.
+ */
+export function taskDurationSamples(db: Database, now: number): number[] {
+	return rows<{ ms: number }>(
+		db,
+		`SELECT MIN(tr.at) - t.created_at AS ms FROM task_transitions tr JOIN tasks t ON t.task_id = tr.task_id
+		WHERE tr.from_status = 'working' AND tr.to_status = 'review'
+		GROUP BY tr.task_id HAVING MIN(tr.at) >= ? ORDER BY MIN(tr.at) DESC LIMIT ?`,
+		now - TURN_SAMPLE_WINDOW_MS,
+		TURN_SAMPLE_LIMIT,
+	).map((row) => row.ms);
 }
 
 /** The approvals settled since `now − APPROVAL_STATS_DAYS` (by `decided_at`, else `created_at`), by outcome. */
@@ -1020,17 +1030,6 @@ async function listHerdrAgents(target: HerdrTarget, run: ProcessRunner): Promise
 	};
 }
 
-/** herdr's `agent_session` (outside-controlled JSON): `{kind: "path", value}` with an absolute `.jsonl` path, else none. */
-function sessionPathOf(value: unknown): string | undefined {
-	if (value === null || typeof value !== "object") return undefined;
-	const session = value as { kind?: unknown; value?: unknown };
-	if (session.kind !== "path" || typeof session.value !== "string") return undefined;
-	return isAbsolute(session.value) && session.value.endsWith(".jsonl") ? session.value : undefined;
-}
-
-/** A session file is read back from its end this much at a time, and no further back than {@link SAY_MAX_BYTES}. */
-const SAY_CHUNK_BYTES = 256 * 1024;
-const SAY_MAX_BYTES = 4 * 1024 * 1024;
 /** At most this many panes' files are read per snapshot, all of them within {@link SAY_READ_BUDGET_MS}. */
 const SAY_PANES = 12;
 const SAY_READ_BUDGET_MS = 1_500;
@@ -1042,69 +1041,6 @@ const SAY_CACHE_LIMIT = 64;
 
 /** Per session file: what it said at that mtime and size, so an unchanged file is not read again. */
 const sayCache = new Map<string, { mtimeMs: number; size: number; status: PaneSay["status"]; say: PaneSay }>();
-
-type JsonRecord = Record<string, unknown>;
-
-function parseLine(line: Buffer): JsonRecord | undefined {
-	try {
-		const value: unknown = JSON.parse(line.toString("utf8"));
-		return isRecord(value) ? value : undefined;
-	} catch {
-		return undefined; // a broken or half-written line is skipped
-	}
-}
-
-/** The chat message a session line carries (`{type: "message", message: {role, …}}`), if any. */
-function messageOf(line: JsonRecord | undefined): JsonRecord | undefined {
-	return line?.type === "message" && isRecord(line.message) ? line.message : undefined;
-}
-
-function splitLines(data: Buffer): Buffer[] {
-	const parts: Buffer[] = [];
-	let start = 0;
-	for (let at = data.indexOf(0x0a); at >= 0; at = data.indexOf(0x0a, start)) {
-		parts.push(data.subarray(start, at));
-		start = at + 1;
-	}
-	parts.push(data.subarray(start));
-	return parts;
-}
-
-/**
- * The last assistant message of a session file and the lines after it (file order), read backwards line by line
- * {@link SAY_CHUNK_BYTES} at a time: a line cut by a chunk start waits for the earlier bytes, so lines are decoded
- * whole (UTF-8 safe). Undefined when no assistant message is within the last {@link SAY_MAX_BYTES}. Throws when the
- * file cannot be opened or read.
- */
-function readLastAssistant(path: string): { message: JsonRecord; after: JsonRecord[] } | undefined {
-	const fd = openSync(path, "r");
-	try {
-		let pos = fstatSync(fd).size;
-		let consumed = 0;
-		let head: Buffer = Buffer.alloc(0); // the front of a line whose start is still unread
-		let after: JsonRecord[] = [];
-		while (pos > 0 && consumed < SAY_MAX_BYTES) {
-			const step = Math.min(SAY_CHUNK_BYTES, SAY_MAX_BYTES - consumed, pos);
-			pos -= step;
-			consumed += step;
-			const chunk = Buffer.alloc(step);
-			readSync(fd, chunk, 0, step, pos);
-			const parts = splitLines(head.length === 0 ? chunk : Buffer.concat([chunk, head]));
-			head = pos > 0 ? (parts.shift() ?? Buffer.alloc(0)) : Buffer.alloc(0);
-			const lines = parts.filter((line) => line.length > 0).map(parseLine);
-			for (let i = lines.length - 1; i >= 0; i--) {
-				const message = messageOf(lines[i]);
-				if (message?.role === "assistant") {
-					return { message, after: [...(lines.slice(i + 1).filter(isRecord) as JsonRecord[]), ...after] };
-				}
-			}
-			after = [...(lines.filter(isRecord) as JsonRecord[]), ...after];
-		}
-		return undefined;
-	} finally {
-		closeSync(fd);
-	}
-}
 
 /** Masked, whitespace folded, cut to `limit` characters (the last one `…` when cut). */
 function sayText(text: string, limit: number): string {
@@ -1137,22 +1073,14 @@ function asksOf(args: unknown): AskInfo[] {
  * gives its questions, any other tool `도구 실행 승인 대기: <name>` — else an error end `프로바이더 오류: <first line>`.
  * Done: the first sentence of its text.
  */
-function sayOf(found: { message: JsonRecord; after: JsonRecord[] }, status: PaneSay["status"]): PaneSay {
-	const content = Array.isArray(found.message.content) ? found.message.content.filter(isRecord) : [];
+function sayOf(found: AssistantTail, status: PaneSay["status"]): PaneSay {
 	if (status === "done") {
+		const content = Array.isArray(found.message.content) ? found.message.content.filter(isRecord) : [];
 		const text = content.find((block) => block.type === "text" && typeof block.text === "string" && block.text.trim());
 		const lastSay = text === undefined ? "" : firstSentence(text.text as string);
 		return lastSay === "" ? { status } : { status, lastSay };
 	}
-	const answered = new Set(
-		found.after
-			.map(messageOf)
-			.filter((message) => message?.role === "toolResult" && typeof message.toolCallId === "string")
-			.map((message) => message?.toolCallId as string),
-	);
-	const pending = content.find(
-		(block) => block.type === "toolCall" && !(typeof block.id === "string" && answered.has(block.id)),
-	);
+	const pending = pendingToolCall(found);
 	if (pending !== undefined) {
 		const asks = pending.name === "ask" ? asksOf(pending.arguments) : [];
 		const [first] = asks;
@@ -1256,57 +1184,6 @@ export function previewLine(text: string, fallback?: string, limit = PREVIEW_CHA
 	}
 	const chars = Array.from(line);
 	return chars.length > limit ? `${chars.slice(0, limit - 1).join("")}…` : line;
-}
-
-/**
- * Turn feedback of the last `days` through a read-only handle: up/down turn counts, the 👎 turns (newest first, at
- * most `limit`) with their masked request line, and the verdict of every inbound row of any judged turn (not cut to
- * `days`: a recent-turn line must badge like the waterfall it opens).
- */
-export function readFeedbackSummary(
-	db: Database,
-	now: number,
-	window: { days: number; limit?: number },
-	timezone: string,
-): FeedbackInfo {
-	const since = now - window.days * 24 * 3_600_000;
-	const judged = readTurnVerdicts(db, 0);
-	const turns = judged.filter((turn) => turn.at >= since);
-	const rowsOf = db.query<{ inbound_id: number }, [string, string]>(
-		"SELECT inbound_id FROM inbound WHERE origin_key = ? AND op_ref = ?",
-	);
-	const textOf = db.query<{ text_ref: string }, [number]>("SELECT text_ref FROM inbound WHERE inbound_id = ?");
-	const verdicts: Record<string, FeedbackVerdict> = {};
-	for (const turn of judged) {
-		for (const row of rowsOf.all(turn.originKey, turn.opRef)) verdicts[String(row.inbound_id)] = turn.verdict;
-	}
-	const down = turns.filter((turn) => turn.verdict === "down");
-	return {
-		days: window.days,
-		up: turns.length - down.length,
-		down: down.length,
-		recentDown: down.slice(0, window.limit).map((turn) => {
-			const text =
-				turn.inboundId === null || turn.originKey.startsWith(MONITOR_ORIGIN_PREFIX) ? null : textOf.get(turn.inboundId);
-			return {
-				inboundId: turn.inboundId,
-				originKey: turn.originKey,
-				at: localIso(turn.at, timezone),
-				preview: text === null ? null : previewLine(text.text_ref),
-			};
-		}),
-		verdicts,
-	};
-}
-
-/** `kill(pid, 0)`: no such process (ESRCH) is dead; any other answer (EPERM: someone else's process) is alive. */
-export function processAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
-	}
 }
 
 /** Masked and cut to `limit` chars (the last one `…` when cut); undefined for a missing or blank value. */
@@ -1446,6 +1323,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			return db;
 		};
 
+		const opsStatus = config?.dashboard?.opsStatus;
+		const hostChecks = opsStatus === undefined ? undefined : readHostChecks(opsStatus.command, deps.run, deps.now);
+
 		const targets = herdrTargets(config);
 		// Run on first use only: with a live board and no open TASK on a host, that host's `herdr agent list` is not needed.
 		const listings = new Map<string, Promise<HerdrListing>>();
@@ -1473,13 +1353,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}
 			if (report === undefined) {
 				needDb();
-				report = readStatusFromDb(
-					dbPath,
-					await deps.ompVersion(),
-					timezone,
-					config?.offsite !== undefined,
-					config?.costCap?.dailyUsd,
-				);
+				report = readStatusFromDb(dbPath, await deps.ompVersion(), timezone, gateOptionsFromConfig(config, timezone));
 			}
 			const info: DaemonInfo = summarizeStatus(report);
 			const beat = readSweepHeartbeat(deps.homeDir);
@@ -1715,8 +1589,17 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			return boardCardLink(board, row.host, paneId, { fetch: machinesFetch });
 		};
 
+		let taskTypical: { value: TypicalDuration | undefined } | undefined;
+		/** `typical` and `elapsedMs` of a `working` TASK; neither for another status or under 10 samples. */
+		const durationOf = (row: TaskRow): { typical?: TypicalDuration; elapsedMs?: number } => {
+			if (row.status !== "working") return {};
+			taskTypical ??= { value: typicalDuration(taskDurationSamples(needDb(), now)) };
+			const typical = taskTypical.value;
+			return typical === undefined ? {} : { typical, elapsedMs: Math.max(0, now - row.createdAt) };
+		};
+
 		const describeOpen = async ({ row, broken }: ReadTask): Promise<TaskInfo> => {
-			const info = baseTask({ row, broken }, timezone);
+			const info: TaskInfo = { ...baseTask({ row, broken }, timezone), ...durationOf(row) };
 			const [evaluation, herdr, link] = await Promise.all([
 				withTimeout(
 					(async () => evaluateTask(row, deps.hostOps(row.host)))(),
@@ -1798,6 +1681,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						...(row.closedAt === null ? {} : { closedAt: iso(row.closedAt) }),
 						acTotal: row.acceptance.length,
 						stage: { ...stage, msg: redact(stage.msg) },
+						...durationOf(row),
 					};
 				});
 				const open = list.filter((row) => row.status !== "done" && row.status !== "cancelled");
@@ -1846,11 +1730,19 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 		});
 
 		const lanes = section(() => ({
-			items: rows<{ name: string; title: string; status: string; cwd: string; updated_at: number }>(
+			items: rows<{
+				name: string;
+				origin_key: string;
+				title: string;
+				status: string;
+				cwd: string;
+				updated_at: number;
+			}>(
 				needDb(),
-				"SELECT name, title, status, cwd, updated_at FROM lanes WHERE status != 'closed' ORDER BY updated_at DESC",
+				"SELECT name, origin_key, title, status, cwd, updated_at FROM lanes WHERE status != 'closed' ORDER BY updated_at DESC",
 			).map((r) => ({
 				name: r.name,
+				originKey: r.origin_key,
 				title: redact(r.title),
 				status: r.status,
 				cwd: r.cwd,
@@ -2057,12 +1949,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			items: (deps.collectGates ?? collectGates)({
 				homeDir: deps.homeDir,
 				now,
-				...((config?.agent ?? "omp") === "omp" && config?.ompExecutable !== undefined
-					? { ompExecutable: config.ompExecutable }
-					: {}),
-				...(config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
-				offsiteConfigured: config?.offsite !== undefined,
-				...(config?.costCap?.dailyUsd === undefined ? {} : { dailyCap: { usd: config.costCap.dailyUsd, timezone } }),
+				...gateOptionsFromConfig(config, timezone),
 			}).map((gate) => ({ ...gate, detail: redact(gate.detail) })),
 		}));
 
@@ -2107,11 +1994,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
-		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? processAlive, timezone) }));
+		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? pidAlive, timezone) }));
 
-		const feedback = section(() =>
-			readFeedbackSummary(needDb(), now, { days: FEEDBACK_DAYS, limit: FEEDBACK_RECENT }, timezone),
-		);
 		const guildIds = deps.config?.channels?.discord?.guildIds;
 
 		return {
@@ -2119,7 +2003,6 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			timezone,
 			daemon: await daemon,
 			turns: await turns,
-			feedback: await feedback,
 			tasks: await tasks,
 			flows: await flows,
 			lanes: await lanes,
@@ -2131,11 +2014,14 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			backup: await backup,
 			jobs: await jobs,
 			slackTeam: deps.config?.slack?.teamId ?? null,
+			ompbotCli: ["bun", join(deps.repoDir, "src", "main.ts")],
 			slackOff:
 				deps.config?.channels !== undefined &&
 				deps.config.channels.slack === undefined &&
 				deps.config.slack === undefined,
 			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
+			...(hostChecks === undefined ? {} : { hostChecks: await hostChecks }),
+			...(opsStatus?.url === undefined ? {} : { hostChecksUrl: opsStatus.url }),
 		};
 	} finally {
 		db?.close();

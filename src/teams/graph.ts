@@ -15,17 +15,17 @@ export const GRAPH_SCOPE = "offline_access Chat.Read User.Read";
 export const DEFAULT_LOGIN_BASE = "https://login.microsoftonline.com";
 export const DEFAULT_GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 /** An access token is renewed this long before Entra says it expires. */
-export const ACCESS_RENEW_BEFORE_MS = 5 * 60_000;
+const ACCESS_RENEW_BEFORE_MS = 5 * 60_000;
 /** At most one `invalid_grant` owner notice per this window. */
-export const RELOGIN_NOTICE_EVERY_MS = 24 * 60 * 60_000;
+const RELOGIN_NOTICE_EVERY_MS = 24 * 60 * 60_000;
 /** A `Retry-After` longer than this is cut to it (the tool call is waiting). */
 const MAX_RETRY_AFTER_MS = 60_000;
 /** Messages `teams_read_chat` returns without `limit`, and the most it ever returns. */
-export const READ_DEFAULT_LIMIT = 50;
-export const READ_MAX_LIMIT = 200;
+const READ_DEFAULT_LIMIT = 50;
+const READ_MAX_LIMIT = 200;
 /** Chats `teams_list_chats` returns without `limit`, and the most it ever returns. */
-export const LIST_DEFAULT_LIMIT = 20;
-export const LIST_MAX_LIMIT = 50;
+const LIST_DEFAULT_LIMIT = 20;
+const LIST_MAX_LIMIT = 50;
 /** Pages of `/me/chats` a list call walks at most (a `query` filters client-side). */
 const LIST_MAX_PAGES = 5;
 
@@ -33,11 +33,11 @@ const LIST_MAX_PAGES = 5;
 export const RELOGIN_TEXT =
 	"Teams Graph 로그인이 만료됐거나 취소됐습니다. 오너가 `ompbot teams login`을 다시 해야 합니다. The Teams Graph login expired or was revoked: the owner must run `ompbot teams login` again.";
 /** The tool result when nobody has logged in yet. */
-export const NOT_LOGGED_IN_TEXT =
+const NOT_LOGGED_IN_TEXT =
 	"Teams Graph 로그인이 아직 없습니다. 오너가 `ompbot teams login`을 먼저 해야 합니다. No Teams Graph login yet: the owner must run `ompbot teams login` first.";
 
 /** What `teams login` writes (JSON, mode 0600). */
-export interface StoredGraphToken {
+interface StoredGraphToken {
 	refresh_token: string;
 	scope: string;
 	/** ISO time the refresh token was obtained. */
@@ -86,7 +86,7 @@ export function readGraphTokenFile(path: string): StoredGraphToken | undefined {
 }
 
 /** The stored login cannot be used any more (`invalid_grant`, or no token file): the owner must log in again. */
-export class GraphReloginRequired extends Error {
+class GraphReloginRequired extends Error {
 	readonly reason: "invalid_grant" | "not_logged_in";
 	constructor(reason: "invalid_grant" | "not_logged_in") {
 		super(reason === "invalid_grant" ? RELOGIN_TEXT : NOT_LOGGED_IN_TEXT);
@@ -96,7 +96,7 @@ export class GraphReloginRequired extends Error {
 }
 
 /** A Graph (or token endpoint) answer that is not a success: its status and Graph/OAuth error code, never a body. */
-export class GraphRequestError extends Error {
+class GraphRequestError extends Error {
 	readonly status: number;
 	readonly code: string;
 	constructor(status: number, code: string) {
@@ -107,7 +107,7 @@ export class GraphRequestError extends Error {
 	}
 }
 
-export interface TeamsGraphOptions {
+interface TeamsGraphOptions {
 	tenantId: string;
 	/** The app registration's client id (`channels.teams.appId`), a public client for the delegated flow. */
 	clientId: string;
@@ -168,7 +168,7 @@ async function errorCode(response: Response): Promise<string> {
 }
 
 /** One chat as `teams_list_chats` shows it. */
-export interface ChatSummary {
+interface ChatSummary {
 	id: string;
 	chatType: string;
 	/** The topic, or for a chat without one (a 1:1) the other members' names. */
@@ -178,7 +178,7 @@ export interface ChatSummary {
 }
 
 /** One message as `teams_read_chat` shows it. */
-export interface ChatMessageView {
+interface ChatMessageView {
 	at: string;
 	from: string;
 	text: string;

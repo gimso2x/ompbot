@@ -44,6 +44,8 @@ let approvals: ApprovalCard[];
 let cardWaiter: (() => void) | undefined;
 let deliveries: DeliveryRow[];
 let deliveryWaiter: (() => void) | undefined;
+/** Sees every log line; a test waits on `event=turn_snapshot` for a turn's ledger row. */
+let logWaiter: ((line: string) => void) | undefined;
 
 /** Counts every git call and can fail them all or one repository, so "no git when off" and "a failed snapshot" are visible. */
 const countingGit =
@@ -81,7 +83,7 @@ function buildRouter(): OriginRouter {
 		store,
 		clock,
 		sessionsRoot: join(home, "sessions"),
-		log: createLogger({ sink: () => undefined, clock, redact }),
+		log: createLogger({ sink: (line) => logWaiter?.(line), clock, redact }),
 		statusProvider: () => "status: ok",
 		turnUndo,
 		driverFactory: (_origin, sessionDir) => {
@@ -99,6 +101,7 @@ beforeEach(() => {
 	clock = new FakeClock();
 	deliveries = [];
 	deliveryWaiter = undefined;
+	logWaiter = undefined;
 	cardWaiter = undefined;
 	store = openStore({
 		timezone: "Asia/Seoul",
@@ -188,6 +191,17 @@ async function runTurn(text: string): Promise<void> {
 	if (driver === undefined) return;
 	if (driverOptions.holdTurns === true) driver.release();
 	await mailbox.sweepIdle();
+}
+
+/** `runTurn` that also waits for the turn's ledger row: it is written after the answer, past the turn's own settle. */
+async function runRecordedTurn(text: string): Promise<void> {
+	const recorded = Promise.withResolvers<void>();
+	logWaiter = (line) => {
+		if (line.includes("event=turn_snapshot ")) recorded.resolve();
+	};
+	await runTurn(text);
+	await recorded.promise;
+	logWaiter = undefined;
 }
 
 describe("turn snapshots around a turn (AC-3)", () => {
@@ -371,6 +385,63 @@ describe("!undo of a turn that moved a nested repository or failed midway (#46)"
 		expect(existsSync(join(repo, "a.txt"))).toBe(false);
 		expect(readFileSync(join(repo, "b.txt"), "utf8")).toBe("two\n");
 		expect(store.listTurnSnapshots({ originKey: ORIGIN }).every((row) => row.revertedAt === null)).toBe(true);
+	});
+});
+
+describe("!undo never pins the ledger to a turn it cannot revert (qa-i #22)", () => {
+	test("a turn that turned a file into a directory is reverted and closed; the next !undo goes to the turn before", async () => {
+		const repo = makeRepo(repos);
+		writeFileSync(join(repo, "pkg"), "module\n");
+		git(repo, "add", "pkg");
+		git(repo, "commit", "-q", "-m", "pkg");
+		// One driver serves both turns (its options are read once), so the reply depends on the prompt.
+		driverOptions = {
+			respond: (text) => {
+				if (text.includes("첫 일")) {
+					writeFileSync(join(repo, "first.txt"), "first\n");
+					return "첫 턴";
+				}
+				rmSync(join(repo, "pkg"));
+				mkdirSync(join(repo, "pkg"));
+				writeFileSync(join(repo, "pkg", "inner.txt"), "inner\n");
+				return "둘째 턴";
+			},
+		};
+		await runRecordedTurn("첫 일");
+		await runRecordedTurn("둘째 일");
+		const second = await (await undoStart()).settle("approved");
+		expect(second.body).toContain(`되돌림: ${repo} 파일 2개, 충돌 0개, 겹침 0개`);
+		expect(second.body).not.toContain("ENOTDIR");
+		expect(readFileSync(join(repo, "pkg"), "utf8")).toBe("module\n");
+		const run = await undoStart();
+		expect(run.card.summary).toContain("revert: first.txt");
+		const start = deliveries.length;
+		run.card.settle("approved");
+		expect((await undoReply(start)).body).toContain(`되돌림: ${repo} 파일 1개`);
+		expect(existsSync(join(repo, "first.txt"))).toBe(false);
+	});
+
+	test("a newest turn left with nothing to revert is closed, and the same !undo offers the turn before it", async () => {
+		const repo = makeRepo(repos);
+		driverOptions = {
+			respond: (text) => {
+				const name = text.includes("첫 일") ? "first.txt" : "second.txt";
+				writeFileSync(join(repo, name), `${name}\n`);
+				return "고쳤습니다";
+			},
+		};
+		await runRecordedTurn("첫 일");
+		await runRecordedTurn("둘째 일");
+		// A hand edit after the second turn: its only file is a conflict, so that turn can never be reverted.
+		writeFileSync(join(repo, "second.txt"), "hand edited\n");
+		const run = await undoStart();
+		expect(run.card.summary).toContain("revert: first.txt");
+		expect(run.card.summary).toContain("되돌릴 파일이 없어 닫은 턴");
+		const answer = await run.settle("approved");
+		expect(answer.body).toContain(`되돌림: ${repo} 파일 1개`);
+		expect(existsSync(join(repo, "first.txt"))).toBe(false);
+		expect(readFileSync(join(repo, "second.txt"), "utf8")).toBe("hand edited\n");
+		expect(store.listTurnSnapshots({ originKey: ORIGIN }).every((row) => row.revertedAt !== null)).toBe(true);
 	});
 });
 

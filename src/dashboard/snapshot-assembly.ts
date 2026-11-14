@@ -50,8 +50,8 @@ export interface SnapshotAssemblyOptions {
 }
 
 /**
- * The one place `buildSnapshot`'s dependencies are assembled (`doc/plans/briefing-image.md` §D): the dashboard CLI,
- * `ompbot briefing` and the daemon's `!brief` all describe the same status, so they must not each wire their own. The
+ * The one place `buildSnapshot`'s dependencies are assembled (`doc/plans/briefing-image.md` §D): the dashboard CLI
+ * and the daemon's `!brief` both describe the same status, so they must not each wire their own. The
  * daemon passes `callDaemon` that answers with its own state instead of the socket, and keeps its board out of it.
  */
 export function assembleSnapshotDeps(options: SnapshotAssemblyOptions): SnapshotDeps {

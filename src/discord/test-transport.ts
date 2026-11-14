@@ -5,11 +5,9 @@ import type {
 	DiscordHandlers,
 	DiscordMessageEvent,
 	DiscordTransport,
-	EditInteractionResponseArgs,
 	EditMessageArgs,
 	MessageTarget,
 	ReactionArgs,
-	RegisterCommandsArgs,
 	RespondInteractionArgs,
 	StartThreadArgs,
 	UploadFileArgs,
@@ -108,18 +106,6 @@ export class FileFakeDiscordTransport implements DiscordTransport {
 
 	async respondInteraction(args: RespondInteractionArgs): Promise<void> {
 		this.#log({ method: "respondInteraction", ...args });
-	}
-
-	async editInteractionResponse(args: EditInteractionResponseArgs): Promise<void> {
-		this.#log({ method: "editInteractionResponse", ...args });
-	}
-
-	async deleteInteractionResponse(args: { token: string }): Promise<void> {
-		this.#log({ method: "deleteInteractionResponse", ...args });
-	}
-
-	async registerCommands(args: RegisterCommandsArgs): Promise<void> {
-		this.#log({ method: "registerCommands", ...args });
 	}
 
 	async triggerTyping(channelId: string): Promise<void> {

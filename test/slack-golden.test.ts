@@ -1,7 +1,6 @@
 // Slack behaviour pinned byte for byte before the platform split (doc/plans/discord-channel.md §15): one daemon on a
 // FakeSlackTransport runs scenarios ①–⑪ and the call log plus the delivery ledger must equal the frozen JSON. The JSON
 // was written once from the code before the split; a change here is a Slack behaviour change, never a fixture refresh.
-import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, expect, type Mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -397,19 +396,6 @@ test("Slack scenarios ①–⑪ produce the frozen call log and delivery ledger"
 	);
 	record("⑨ slack_send_file", uploaded);
 
-	// ⑩ 👍 on the bot's answer from ① records turn feedback; no Slack call.
-	const firstAnswer = transport.posts((text) => text.startsWith("ECHO 안녕"))[0];
-	if (firstAnswer === undefined) throw new Error("no first answer");
-	await transport.emitReaction({
-		type: "reaction_added",
-		user: OWNER,
-		reaction: "+1",
-		item: { type: "message", channel: DM, ts: firstAnswer.ts },
-		event_ts: "1800000100.000001",
-	});
-	await settle();
-	record("⑩ thumbs up");
-
 	// ⑪ A 429 on the answer defers it (nothing counted against attempts); after Retry-After it goes out.
 	await ownerMessage(DM, "1700000000.001100", "레이트 리밋 시험");
 	const limited = await nextTurn();
@@ -424,11 +410,6 @@ test("Slack scenarios ①–⑪ produce the frozen call log and delivery ledger"
 	await settle();
 	record("⑪ rate limit", { deferred });
 
-	const db = new Database(join(home.dir, "ompbot.db"), { readonly: true, strict: true });
-	const feedback = db
-		.query("SELECT channel, ts, delivery_id, origin_key, verdict, last_event_ts FROM turn_feedback ORDER BY rowid")
-		.all();
-	db.close();
 	const actual = normalize({
 		steps,
 		deliveries: daemon.store.listDeliveries().map((row) => ({
@@ -445,7 +426,6 @@ test("Slack scenarios ①–⑪ produce the frozen call log and delivery ledger"
 			sentParts: row.sentParts,
 			replyTs: row.replyTs,
 		})),
-		feedback,
 	});
 	expect(actual).toEqual(JSON.parse(readFileSync(FIXTURE, "utf8")));
 });

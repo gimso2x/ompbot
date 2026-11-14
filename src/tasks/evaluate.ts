@@ -34,8 +34,8 @@ export async function runWorktreeChecks(
 	const io = {
 		runCheck: (argv: string[]) =>
 			ops.runCheck({ worktree, argv, timeoutMs: CHECK_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }),
-		readFile: async (path: string) => {
-			const read = await ops.readFile(`${worktree}/${path}`);
+		readBytes: async (path: string) => {
+			const read = await ops.readBytes(`${worktree}/${path}`);
 			if (!read.ok) throw new Error(`cannot read ${path}: ${read.error}`);
 			return read.value;
 		},

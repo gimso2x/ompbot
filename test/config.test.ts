@@ -4,14 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	ConfigError,
+	codeRollbackMode,
 	defaultHomeDir,
 	isOffsiteDir,
 	loadConfig,
+	PEER_SILENCE_DEFAULT_MINUTES,
+	peerSilenceMinutes,
 	readDiscordToken,
 	readSlackTokens,
 } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
-import { LIVE_FIELDS, RESTART_FIELDS } from "../src/daemon/reload";
+import { CLI_FIELDS, LIVE_FIELDS, RESTART_FIELDS } from "../src/daemon/reload";
 import { channelBindings } from "../src/daemon/run";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
@@ -270,6 +273,13 @@ describe("loadConfig", () => {
 		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 1.5 } })],
 		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3 } })],
 		["peerHopLimit.extra", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 30, extra: 1 } })],
+		["peerSilenceAlert", baseConfig({ peerSilenceAlert: 10 })],
+		["peerSilenceAlert.minutes", baseConfig({ peerSilenceAlert: {} })],
+		["peerSilenceAlert.minutes", baseConfig({ peerSilenceAlert: { minutes: -1 } })],
+		["peerSilenceAlert.minutes", baseConfig({ peerSilenceAlert: { minutes: 1441 } })],
+		["peerSilenceAlert.minutes", baseConfig({ peerSilenceAlert: { minutes: 2.5 } })],
+		["peerSilenceAlert.minutes", baseConfig({ peerSilenceAlert: { minutes: "10" } })],
+		["peerSilenceAlert.channel", baseConfig({ peerSilenceAlert: { minutes: 10, channel: "x" } })],
 		["costCap", baseConfig({ costCap: 20 })],
 		["costCap.turnUsd", baseConfig({ costCap: { turnUsd: 0 } })],
 		["costCap.turnUsd", baseConfig({ costCap: { turnUsd: -1 } })],
@@ -281,6 +291,9 @@ describe("loadConfig", () => {
 		["lanes.completionNudges", baseConfig({ lanes: { completionNudges: 1.5 } })],
 		["lanes.completionNudges", baseConfig({ lanes: { completionNudges: "2" } })],
 		["lanes.maxNudges", baseConfig({ lanes: { maxNudges: 2 } })],
+		["lanes.models", baseConfig({ lanes: { models: "high" } })],
+		["lanes.models.top", baseConfig({ lanes: { models: { top: "a/b" } } })],
+		["lanes.models.high", baseConfig({ lanes: { models: { high: "opus" } } })],
 	])("invalid field %s is reported by name", (field, cfg) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
@@ -327,6 +340,20 @@ describe("loadConfig", () => {
 		});
 	});
 
+	test("peerSilenceAlert AC-5: default 10 minutes, 0 and 1440 accepted, a live field", () => {
+		const loaded = loadConfig(home);
+		expect(loaded.peerSilenceAlert).toBeUndefined();
+		expect(PEER_SILENCE_DEFAULT_MINUTES).toBe(10);
+		expect(peerSilenceMinutes(loaded)).toBe(10);
+		writeConfig(baseConfig({ peerSilenceAlert: { minutes: 0 } }));
+		expect(loadConfig(home).peerSilenceAlert).toEqual({ minutes: 0 });
+		expect(peerSilenceMinutes(loadConfig(home))).toBe(0);
+		writeConfig(baseConfig({ peerSilenceAlert: { minutes: 1440 } }));
+		expect(peerSilenceMinutes(loadConfig(home))).toBe(1440);
+		expect(LIVE_FIELDS as readonly string[]).toContain("peerSilenceAlert");
+		expect(RESTART_FIELDS as readonly string[]).not.toContain("peerSilenceAlert");
+	});
+
 	test("costCap is optional, keeps only the ceilings given, and reload treats it as live", () => {
 		expect(loadConfig(home).costCap).toBeUndefined();
 		writeConfig(baseConfig({ costCap: { turnUsd: 20 } }));
@@ -342,6 +369,10 @@ describe("loadConfig", () => {
 		writeConfig(baseConfig({ lanes: { completionNudges: 3 } }));
 		expect(loadConfig(home).lanes).toEqual({ completionNudges: 3 });
 		expect(LIVE_FIELDS).toContain("lanes");
+		writeConfig(baseConfig({ lanes: { models: { high: "anthropic/claude-opus-5-5", low: "zai/glm-5.3-flash" } } }));
+		expect(loadConfig(home).lanes).toEqual({
+			models: { high: "anthropic/claude-opus-5-5", low: "zai/glm-5.3-flash" },
+		});
 	});
 
 	test("mentionFreeChannels is optional and accepts only channel ids", () => {
@@ -474,7 +505,10 @@ describe("channels.discord", () => {
 
 	test("logChannelId and escalationChannelId: snowflakes are taken; a top-level Slack logChannel stays as it was", () => {
 		writeConfig({
-			...withDiscord({ logChannelId: "678901234567890123", escalationChannelId: "789012345678901234" }),
+			...withDiscord({
+				logChannelId: "678901234567890123",
+				escalationChannelId: "789012345678901234",
+			}),
 			logChannel: "C0LOGCHAN01",
 			escalationChannel: "C0ESCALATE1",
 		});
@@ -508,6 +542,8 @@ describe("channels.discord", () => {
 			{ logChannelId: "678901234567890123", mentionFreeChannels: ["456789012345678901", "678901234567890123"] },
 			"channels.discord.logChannelId",
 		],
+		// The Discord forum board is gone: a config that still names its forum does not start.
+		["a leftover boardForumId", { boardForumId: "890123456789012345" }, "channels.discord.boardForumId"],
 	])("%s is config_invalid", (_name, overrides, field) => {
 		writeConfig(withDiscord(overrides));
 		const err = catchError(() => loadConfig(home));
@@ -802,8 +838,94 @@ describe("taskAutoLand", () => {
 		expect(err.message).toContain(field);
 	});
 
+	test("review confidence AC-6: review.confident is kept as written", () => {
+		writeConfig(
+			withHerdr({ repos: ["/srv/a"], review: { model: "m", confident: { maxRisk: "L3", minConfidence: 0.85 } } }),
+		);
+		expect(loadConfig(home).taskAutoLand?.review).toEqual({
+			model: "m",
+			confident: { maxRisk: "L3", minConfidence: 0.85 },
+		});
+		writeConfig(
+			withHerdr({
+				repos: ["/srv/a"],
+				maxRisk: "L1",
+				review: { model: "m", confident: { maxRisk: "L2", minConfidence: 1 } },
+			}),
+		);
+		expect(loadConfig(home).taskAutoLand?.review?.confident).toEqual({ maxRisk: "L2", minConfidence: 1 });
+	});
+
+	const confidentField = "(field=taskAutoLand.review.confident.";
+	test.each([
+		["confident.maxRisk equal to the default maxRisk L2", undefined, { maxRisk: "L2", minConfidence: 0.9 }, "maxRisk)"],
+		["confident.maxRisk below maxRisk", "L3", { maxRisk: "L2", minConfidence: 0.9 }, "maxRisk)"],
+		["confident.maxRisk equal to maxRisk", "L3", { maxRisk: "L3", minConfidence: 0.9 }, "maxRisk)"],
+		["an unknown confident.maxRisk", undefined, { maxRisk: "L9", minConfidence: 0.9 }, "maxRisk)"],
+		["no confident.maxRisk", undefined, { minConfidence: 0.9 }, "maxRisk)"],
+		["minConfidence 0", undefined, { maxRisk: "L3", minConfidence: 0 }, "minConfidence)"],
+		["minConfidence above 1", undefined, { maxRisk: "L3", minConfidence: 1.01 }, "minConfidence)"],
+		["a negative minConfidence", undefined, { maxRisk: "L3", minConfidence: -0.5 }, "minConfidence)"],
+		["a string minConfidence", undefined, { maxRisk: "L3", minConfidence: "0.9" }, "minConfidence)"],
+		["no minConfidence", undefined, { maxRisk: "L3" }, "minConfidence)"],
+		["an unknown confident key", undefined, { maxRisk: "L3", minConfidence: 0.9, floor: 1 }, "floor)"],
+	])("review confidence AC-6: %s is rejected", (_name, maxRisk, confident, field) => {
+		writeConfig(
+			withHerdr({
+				repos: ["/srv/a"],
+				...(maxRisk === undefined ? {} : { maxRisk }),
+				review: { model: "m", confident },
+			}),
+		);
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(`${confidentField}${field}`);
+	});
+
+	test("review confidence AC-6: a non-object confident is rejected", () => {
+		writeConfig(withHerdr({ repos: ["/srv/a"], review: { model: "m", confident: 0.9 } }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("(field=taskAutoLand.review.confident)");
+	});
+
 	test("AC-5: taskAutoLand is a live field (ompbot reload applies it without a restart)", () => {
 		expect(LIVE_FIELDS).toContain("taskAutoLand");
+	});
+});
+
+describe("apply.codeRollback (apply-rollback-mode AC-1, 7c)", () => {
+	test("each mode loads; without the key or the setting the mode is detach", () => {
+		for (const mode of ["push", "detach", "off"] as const) {
+			writeConfig(baseConfig({ apply: { codeRollback: mode } }));
+			expect(codeRollbackMode(loadConfig(home))).toBe(mode);
+		}
+		writeConfig(baseConfig({ apply: {} }));
+		expect(codeRollbackMode(loadConfig(home))).toBe("detach");
+		writeConfig(baseConfig());
+		const config = loadConfig(home);
+		expect(config.apply).toBeUndefined();
+		expect(config.warnings).toBeUndefined();
+		expect(codeRollbackMode(config)).toBe("detach");
+		expect(codeRollbackMode(undefined)).toBe("detach");
+	});
+
+	test.each([
+		[{ codeRollback: "revert" }, "field=apply.codeRollback"],
+		[{ codeRollback: true }, "field=apply.codeRollback"],
+		[{ codeRollback: "push", mode: "x" }, "field=apply.mode"],
+		["detach", "field=apply)"],
+	])("%j is config_invalid naming %s", (apply, field) => {
+		writeConfig(baseConfig({ apply }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("apply is CLI-only: ompbot apply reads it on every run, the daemon never", () => {
+		expect(CLI_FIELDS).toContain("apply");
+		expect(LIVE_FIELDS).not.toContain("apply" as never);
+		expect(RESTART_FIELDS).not.toContain("apply" as never);
 	});
 });
 
@@ -827,6 +949,35 @@ describe("dashboard", () => {
 		[{ port: 7331, herdrWebUrl: 7317 }, "dashboard.herdrWebUrl"],
 		["7331", "field=dashboard"],
 	])("AC-8: %j is a ConfigError naming %s", (dashboard, field) => {
+		writeConfig(baseConfig({ dashboard }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("opsStatus with command and url is accepted", () => {
+		const dashboard = {
+			port: 7331,
+			opsStatus: { command: ["ops-status", "--json"], url: "https://hub.example.test/" },
+		};
+		writeConfig(baseConfig({ dashboard }));
+		expect(loadConfig(home).dashboard).toEqual(dashboard);
+		writeConfig(baseConfig({ dashboard: { port: 7331, opsStatus: { command: ["ops-status"] } } }));
+		expect(loadConfig(home).dashboard?.opsStatus).toEqual({ command: ["ops-status"] });
+	});
+
+	test.each([
+		[{ command: [] }, "field=dashboard.opsStatus.command"],
+		[{ command: ["ops-status", ""] }, "field=dashboard.opsStatus.command"],
+		[{ command: "ops-status --json" }, "field=dashboard.opsStatus.command"],
+		[{ command: ["ops-status", 1] }, "field=dashboard.opsStatus.command"],
+		[{ url: "https://hub.example.test/" }, "field=dashboard.opsStatus.command"],
+		[{ command: ["ops-status"], url: "javascript:alert(1)" }, "field=dashboard.opsStatus.url"],
+		[{ command: ["ops-status"], url: "hub.example.test" }, "field=dashboard.opsStatus.url"],
+		[{ command: ["ops-status"], timeoutMs: 5000 }, "field=dashboard.opsStatus.timeoutMs"],
+		[["ops-status"], "field=dashboard.opsStatus"],
+	])("AC-7: opsStatus %j is a ConfigError naming %s", (opsStatus, field) => {
+		const dashboard = { port: 7331, opsStatus };
 		writeConfig(baseConfig({ dashboard }));
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
@@ -986,6 +1137,8 @@ describe("qa50b lane I", () => {
 		const cfg = loadConfig(home);
 		expect(cfg.warnings).toEqual([{ field: "bogusKey", reason: "unknown_key" }]);
 		writeConfig(baseConfig());
+		expect(loadConfig(home).warnings).toBeUndefined();
+		writeConfig(baseConfig({ timezone: "Asia/Seoul" }));
 		expect(loadConfig(home).warnings).toBeUndefined();
 	});
 

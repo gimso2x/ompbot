@@ -11,8 +11,9 @@ import type {
 import { QUOTED_HEADER } from "../src/core/normalize";
 import { parseCommand } from "../src/core/types";
 import { DiscordAdapter, type DiscordAdapterOptions } from "../src/discord/adapter";
+import { snowflakeTime } from "../src/discord/backfill";
 import { DiscordChannel } from "../src/discord/channel";
-import { DiscordCallError, type DiscordMessageEvent } from "../src/discord/transport";
+import { DiscordCallError, type DiscordMessageEvent, DiscordRateLimitedError } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { PEER_HOP_NOTICE } from "../src/slack/adapter";
@@ -29,7 +30,6 @@ const DM = "123456789012345678";
 let transport: FakeDiscordTransport;
 let inbound: InboundMessage[];
 let logs: string[];
-let muted: Set<string>;
 let failures: number;
 let seq: bigint;
 
@@ -42,7 +42,6 @@ const noDeliveries: DeliverySource = {
 
 function core(): CoreSink {
 	const seen = new Set<string>();
-	const mutes = new Set<string>();
 	return {
 		onInbound: (message) => {
 			if (seen.has(message.platformMessageId)) return { duplicate: true };
@@ -53,10 +52,6 @@ function core(): CoreSink {
 		onCommand: () => undefined,
 		onAction: () => {},
 		knowsThread: (threadRef) => inbound.some((m) => m.threadRef === threadRef),
-		isThreadMuted: (threadRef) => muted.has(threadRef),
-		setThreadMute: (threadRef, on) => void (on ? muted.add(threadRef) : muted.delete(threadRef)),
-		seenMuteCommand: (id) => mutes.has(id),
-		rememberMuteCommand: (id) => void mutes.add(id),
 	};
 }
 
@@ -97,7 +92,6 @@ beforeEach(() => {
 	transport.setChannel({ id: CH, type: 0, guildId: GUILD });
 	inbound = [];
 	logs = [];
-	muted = new Set();
 	failures = 0;
 	seq = 0n;
 });
@@ -162,29 +156,45 @@ describe("owner DM", () => {
 	});
 });
 
-describe("message edits carry no mentions", () => {
-	test("the running status, its final label and a slash command answer are edited with allowedMentions parse []", async () => {
-		const made = await adapter({
-			core: { ...core(), onCommand: () => "@everyone 확인 <@&999>" },
+describe("slash commands are gone", () => {
+	test("a type 2 interaction (a command still registered on the server) is dropped: no response, no inbound, no log line", async () => {
+		let commands = 0;
+		await adapter({
+			core: {
+				...core(),
+				onCommand: () => {
+					commands += 1;
+					return undefined;
+				},
+			},
 		});
-		await made.commandsReady();
-		const dm = message("todo @everyone", { channel_id: DM, guild_id: undefined });
-		await transport.emitMessage(dm);
-		const threadRef = `${DM}:${dm.id}`;
-		await made.setStalled(threadRef, true);
-		await made.finishStatus(threadRef, "done", "update");
+		const before = transport.calls.length;
+		const logCount = logs.length;
 		await transport.emitInteraction({
 			id: "810000000000000001",
 			application_id: "600000000000000000",
 			type: 2,
 			token: "tok-1",
 			channel_id: DM,
-			channel: { id: DM, type: 1 },
 			user: { id: OWNER },
-			data: { name: "status-ompbot" },
 		});
-		const edits = [...calls("editMessage"), ...calls("editInteractionResponse")];
-		expect(edits.map((c) => c.method)).toEqual(["editMessage", "editMessage", "editInteractionResponse"]);
+		expect(transport.calls.slice(before)).toEqual([]);
+		expect(commands).toBe(0);
+		expect(inbound).toHaveLength(0);
+		expect(logs.slice(logCount)).toEqual([]);
+	});
+});
+
+describe("message edits carry no mentions", () => {
+	test("the running status and its final label are edited with allowedMentions parse []", async () => {
+		const made = await adapter();
+		const dm = message("todo @everyone", { channel_id: DM, guild_id: undefined });
+		await transport.emitMessage(dm);
+		const threadRef = `${DM}:${dm.id}`;
+		await made.setStalled(threadRef, true);
+		await made.finishStatus(threadRef, "done", "update");
+		const edits = calls("editMessage");
+		expect(edits).toHaveLength(2);
 		for (const edit of edits) expect(edit.allowedMentions).toEqual({ parse: [] });
 	});
 });
@@ -281,22 +291,6 @@ describe("server channel", () => {
 		expect(calls("createMessage")).toHaveLength(0);
 	});
 
-	test("⑧ !shutup mutes the thread; unmentioned replies stay quiet until a mention releases it", async () => {
-		await adapter();
-		const root = message(`<@${BOT}> 시작`);
-		await transport.emitMessage(root);
-		const ref = `${CH}:${root.id}`;
-		await transport.emitMessage(message("!shutup", { channel_id: root.id }));
-		expect(muted.has(ref)).toBe(true);
-		expect(calls("createMessage").some((c) => c.channelId === root.id && c.content?.startsWith("🤫"))).toBe(true);
-		await transport.emitMessage(message("조용히 해도 이건?", { channel_id: root.id }));
-		expect(inbound).toHaveLength(1);
-		expect(logged("reason=thread_muted")).toBe(true);
-		await transport.emitMessage(message(`<@${BOT}> 다시 말해`, { channel_id: root.id }));
-		expect(muted.has(ref)).toBe(false);
-		expect(inbound.map((m) => m.text)).toEqual(["시작", "다시 말해"]);
-	});
-
 	test("⑨ a refused thread start takes nothing, logs inbound_failed and leaves a notice in the channel", async () => {
 		await adapter();
 		transport.failNext.startThread = [
@@ -346,6 +340,7 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 	let peers: Array<{ message: PeerInboundMessage; hop: { turns: number; windowMs: number } }>;
 	let commands: number;
 	let cardReplies: number;
+	let peerSeen: Array<{ threadRef: string; peerUserId: string; at: number }>;
 
 	/** The recording core with a peer sink whose verdict `verdict` decides (default: recorded). */
 	async function peerAdapter(
@@ -368,6 +363,7 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 					peers.push({ message, hop });
 					return verdict(message);
 				},
+				onPeerSeen: (seen) => void peerSeen.push(seen),
 				knowsThread: (threadRef) =>
 					base.knowsThread?.(threadRef) === true || peers.some((p) => p.message.threadRef === threadRef),
 			},
@@ -381,6 +377,7 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 
 	beforeEach(() => {
 		peers = [];
+		peerSeen = [];
 		commands = 0;
 		cardReplies = 0;
 		transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });
@@ -425,10 +422,8 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		["peer_dm", () => peerMessage(`<@${BOT}> DM`, { channel_id: DM, guild_id: undefined })],
 		["peer_not_mentioned", () => peerMessage("멘션 없음", { channel_id: THREAD })],
 		["subtype", () => peerMessage(`<@${BOT}> 시스템`, { type: 7 })],
-		["thread_muted", () => peerMessage(`<@${BOT}> 뮤트`, { channel_id: THREAD })],
 	])("%s: dropped before onPeerInbound", async (reason, make) => {
 		await peerAdapter(undefined, { mentionFreeChannels: [CH] });
-		muted.add(`${CH}:${THREAD}`);
 		await transport.emitMessage(make());
 		expect(peers).toHaveLength(0);
 		expect(inbound).toHaveLength(0);
@@ -542,6 +537,46 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		expect(peers.map((p) => p.message.platformMessageId)).toEqual([`${CH}:${missed.id}`]);
 		expect(inbound).toHaveLength(0);
 		expect(logged("reason=bot_message")).toBe(true);
+	});
+
+	// doc/plans/peer-silence-alert.md 설계 3 / AC-1: a peer post the bot drops still tells the core the peer is awake.
+	test("onPeerSeen: posts without a mention or over the hop cap are seen and dropped as before", async () => {
+		let verdict: PeerInboundOutcome = {};
+		await peerAdapter(() => verdict);
+		const plain = peerMessage("다 했어", { channel_id: THREAD });
+		await transport.emitMessage(plain);
+		verdict = { dropped: "peer_hop_cap", notice: false };
+		const capped = peerMessage(`<@${BOT}> 한도 넘음`, { channel_id: THREAD });
+		await transport.emitMessage(capped);
+		expect(peerSeen).toEqual(
+			[plain, capped].map((event) => ({
+				threadRef: `${CH}:${THREAD}`,
+				peerUserId: PEER,
+				at: snowflakeTime(event.id),
+			})),
+		);
+		for (const reason of ["peer_not_mentioned", "peer_hop_cap"]) {
+			expect(logged(`reason=${reason}`)).toBe(true);
+		}
+		expect(peers.map((p) => p.message.platformMessageId)).toEqual([`${CH}:${capped.id}`]);
+		expect(inbound).toHaveLength(0);
+	});
+
+	test("onPeerSeen: no call for a DM or #log post; a failed lookup keeps the plain drop", async () => {
+		const LOG = "222222222222222222";
+		const GONE = "722222222222222999";
+		transport.setChannel({ id: LOG, type: 0, guildId: GUILD });
+		await peerAdapter(undefined, { logChannel: LOG });
+		await transport.emitMessage(peerMessage("DM", { channel_id: DM, guild_id: undefined }));
+		await transport.emitMessage(peerMessage("로그", { channel_id: LOG }));
+		await transport.emitMessage(peerMessage(`<@${BOT}> 로그`, { channel_id: LOG }));
+		await transport.emitMessage(peerMessage("사라진 채널", { channel_id: GONE }));
+		expect(peerSeen).toEqual([]);
+		expect(logged("event=peer_seen_lookup_failed")).toBe(true);
+		expect(logs.filter((line) => line.includes("reason=peer_not_mentioned"))).toHaveLength(2);
+		expect(logged("reason=log_channel")).toBe(true);
+		expect(logged("reason=peer_dm")).toBe(true);
+		expect(failures).toBe(0);
 	});
 });
 
@@ -756,17 +791,6 @@ describe("replies to the bot's posts (doc/plans/discord-typing-reply-presence.md
 		expect(inbound).toHaveLength(1);
 	});
 
-	test("in a muted thread a reply to the bot's post is taken and releases the mute", async () => {
-		await adapter();
-		const root = message(`<@${BOT}> 시작`);
-		await transport.emitMessage(root);
-		await transport.emitMessage(message("!shutup", { channel_id: root.id }));
-		expect(muted.has(`${CH}:${root.id}`)).toBe(true);
-		await transport.emitMessage(replyTo(botPost(), "답장으로 깨우기", { channel_id: root.id }));
-		expect(muted.has(`${CH}:${root.id}`)).toBe(false);
-		expect(inbound).toHaveLength(2);
-	});
-
 	test("a reply to someone else's post stays not_addressed", async () => {
 		await adapter();
 		await transport.emitMessage(replyTo({ id: nextId(), author: { id: STRANGER }, content: "남의 글" }, "그렇네"));
@@ -928,5 +952,59 @@ describe("Discord log channel (channels.discord.logChannelId)", () => {
 		await transport.emitMessage(message("그래 진행해", { channel_id: CARD }));
 		expect(replies).toEqual(["그래 진행해"]);
 		expect(dropped()).toHaveLength(0);
+	});
+});
+
+describe("a new turn in a thread whose previous turn is still finishing", () => {
+	let now: number;
+	const noTyping = { set: () => undefined, clear: () => {} };
+	const deleted = () => calls("deleteMessage").map((c) => c.messageId);
+
+	async function threadAdapter(): Promise<{ made: DiscordAdapter; root: DiscordMessageEvent; ref: string }> {
+		now = 1_800_000_000_000;
+		const made = await adapter({ clock: { now: () => now }, typingTimers: noTyping });
+		const root = message(`<@${BOT}> 시작`);
+		await transport.emitMessage(root);
+		return { made, root, ref: `${CH}:${root.id}` };
+	}
+
+	const statusIds = () => calls("createMessage").flatMap((c) => (c.content?.startsWith("⏳") ? [c.id] : []));
+
+	test("IMP-28: the old finish completing after the new message arrived leaves the new turn's status tracked", async () => {
+		const { made, root, ref } = await threadAdapter();
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const deleteMessage = transport.deleteMessage.bind(transport);
+		transport.deleteMessage = async (args) => {
+			reached.resolve();
+			await release.promise;
+			return deleteMessage(args);
+		};
+		const finishing = made.finishStatus(ref, "done", "delete");
+		await reached.promise;
+		const reply = message(`<@${BOT}> 하나 더`, { channel_id: root.id });
+		await transport.emitMessage(reply);
+		release.resolve();
+		await finishing;
+		await made.finishStatus(ref, "done", "delete");
+		expect(deleted()).toEqual(statusIds());
+		expect(statusIds()).toHaveLength(2);
+		expect(calls("removeReaction").map((c) => c.messageId)).toEqual([root.id, reply.id]);
+	});
+
+	test("IMP-105: the old turn's rate-limited ⏳ delete is retried after a new turn took the thread", async () => {
+		const { made, root, ref } = await threadAdapter();
+		transport.failNext.deleteMessage = [new DiscordRateLimitedError(5_000)];
+		await made.finishStatus(ref, "done", "delete");
+		await transport.emitMessage(message(`<@${BOT}> 하나 더`, { channel_id: root.id }));
+		const [oldStatus = "", newStatus = ""] = statusIds();
+		now += 5_000;
+		await made.tick();
+		expect(deleted()).toEqual([oldStatus, oldStatus]);
+		// The new turn is still the thread's running status.
+		await made.finishStatus(ref, "done", "delete");
+		expect(deleted()).toEqual([oldStatus, oldStatus, newStatus]);
+		await made.tick();
+		expect(deleted()).toHaveLength(3);
 	});
 });

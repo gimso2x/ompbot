@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkIpcTimeoutMs, type TasksCommandOptions, tasksCommand } from "../src/cli/tasks";
 import { taskFlowStatus, taskStage } from "../src/flow/task-flow";
-import { type NewTask, openTaskLedger, type TaskActor, type TaskRow, type TaskStatus } from "../src/tasks/ledger";
+import { openTaskLedger, type TaskActor, type TaskRow, type TaskStatus } from "../src/tasks/ledger";
 import { CHECK_TIMEOUT_MS } from "../src/tasks/signals";
 
 const T0 = Date.parse("2026-11-08T00:00:00Z");
@@ -209,132 +208,10 @@ describe("taskStage", () => {
 	});
 });
 
-describe("tasks flow", () => {
-	test("writes viewer.html and status.json from a temporary database without touching it", async () => {
-		const home = mkdtempSync(join(tmpdir(), "task-flow-"));
-		try {
-			const dbPath = join(home, "ompbot.db");
-			const ledger = openTaskLedger(dbPath, "Asia/Seoul", { now: () => T0 });
-			const input: Omit<NewTask, "title"> = {
-				risk: "L1",
-				originKey: "o",
-				threadRef: "t",
-				host: null,
-				repo: "local:/r",
-				acceptance: [],
-			};
-			const a = ledger.register({ ...input, title: "a" });
-			const b = ledger.register({ ...input, title: "b" });
-			ledger.recordNotice(a.taskId, "blocked:1:무결성 diff too large");
-			ledger.transition(a.taskId, "blocked", "bot", "무결성 diff too large");
-			ledger.close();
-			const snapshot = () => ({
-				mtime: statSync(dbPath).mtimeMs,
-				sha: createHash("sha256").update(readFileSync(dbPath)).digest("hex"),
-			});
-			const before = snapshot();
-
-			expect(await tasksCommand(["flow", "--out", join(home, "out")], home)).toBe(0);
-			const status = JSON.parse(readFileSync(join(home, "out", "status.json"), "utf8"));
-			const html = readFileSync(join(home, "out", "viewer.html"), "utf8");
-			const block = (id: string) => JSON.parse(new RegExp(`id="${id}">([\\s\\S]*?)</script>`).exec(html)?.[1] ?? "");
-			expect(block("flow-status")).toEqual(status);
-			expect(status).toContainEqual(expect.objectContaining({ task: a.taskId, node: "integrity", status: "fail" }));
-			const graph = block("flow-data");
-			expect(graph.items.map((i: { id: string; status: string }) => `${i.id} ${i.status}`)).toEqual([
-				`${a.taskId} blocked`,
-				`${b.taskId} working`,
-			]);
-			expect(graph.version).toBe(JSON.parse(readFileSync("package.json", "utf8")).version);
-			expect(snapshot()).toEqual(before);
-		} finally {
-			rmSync(home, { recursive: true, force: true });
-		}
-	});
-
-	// doc/plans/first-install-defaults.md AC-3: the exported graph follows config `peerBots`.
-	test("the exported graph has the 검토 node only when config names peer bots", async () => {
-		const home = mkdtempSync(join(tmpdir(), "task-flow-peers-"));
-		try {
-			const ledger = openTaskLedger(join(home, "ompbot.db"), "Asia/Seoul", { now: () => T0 });
-			ledger.register({
-				title: "a",
-				risk: "L1",
-				originKey: "o",
-				threadRef: "t",
-				host: null,
-				repo: "local:/r",
-				acceptance: [],
-			});
-			ledger.close();
-			const graphOf = async (out: string) => {
-				expect(await tasksCommand(["flow", "--out", join(home, out)], home)).toBe(0);
-				const html = readFileSync(join(home, out, "viewer.html"), "utf8");
-				const block = (id: string) => JSON.parse(new RegExp(`id="${id}">([\\s\\S]*?)</script>`).exec(html)?.[1] ?? "");
-				return { graph: block("flow-data"), status: block("flow-status") as { node: string }[] };
-			};
-
-			const bare = await graphOf("bare");
-			expect(bare.graph.nodes.map((n: { id: string }) => n.id)).not.toContain("review");
-			const edges = bare.graph.edges.map((e: { from: string; to: string }) => `${e.from}>${e.to}`);
-			expect(edges).toContain("spec>dispatch");
-			expect(edges.filter((e: string) => e.includes("review"))).toEqual([]);
-			expect(bare.status.map((s) => s.node)).not.toContain("review");
-
-			writeFileSync(
-				join(home, "config.json"),
-				JSON.stringify({
-					schemaVersion: 1,
-					channels: { slack: { ownerUserId: "UOWNER0001" } },
-					slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
-					ompExecutable: process.execPath,
-					workspaceDir: "workspace",
-					peerBots: [{ userId: "UPEER00001", name: "peer" }],
-				}),
-				{ mode: 0o600 },
-			);
-			const peers = await graphOf("peers");
-			expect(peers.graph.nodes.find((n: { id: string }) => n.id === "review")).toMatchObject({ name: "검토" });
-			expect(peers.status.map((s) => s.node)).toContain("review");
-
-			// A Discord-only bot with `channels.discord.peerBots` has the node too.
-			writeFileSync(
-				join(home, "config.json"),
-				JSON.stringify({
-					schemaVersion: 1,
-					channels: {
-						discord: {
-							ownerUserId: "123456789012345678",
-							botTokenFile: "secrets/discord-bot-token",
-							applicationId: "234567890123456789",
-							peerBots: [{ userId: "345678901234567890", name: "peer" }],
-						},
-					},
-					ompExecutable: process.execPath,
-					workspaceDir: "workspace",
-				}),
-				{ mode: 0o600 },
-			);
-			const discordPeers = await graphOf("discord-peers");
-			expect(discordPeers.graph.nodes.map((n: { id: string }) => n.id)).toContain("review");
-			expect(discordPeers.status.map((s) => s.node)).toContain("review");
-		} finally {
-			rmSync(home, { recursive: true, force: true });
-		}
-	});
-
-	test("the flow code and viewer carry no bot nicknames or provider model ids", () => {
-		for (const file of ["task-flow.ts", "viewer.html"]) {
-			const text = readFileSync(new URL(`../src/flow/${file}`, import.meta.url), "utf8");
-			expect(text).not.toMatch(/떡|쑥|anthropic\/|google-antigravity\//);
-		}
-	});
-
-	test("viewer.html loads nothing from outside", () => {
-		const html = readFileSync(new URL("../src/flow/viewer.html", import.meta.url), "utf8");
-		expect(html).not.toMatch(/\b(?:src|href)\s*=\s*["']?\s*https?:\/\//i);
-		expect(html).not.toMatch(/<link\b|url\(\s*["']?https?:/i);
-		expect(html).not.toMatch(/(?:^|[\s;{}(])import\b/m);
+describe("flow code", () => {
+	test("carries no bot nicknames or provider model ids", () => {
+		const text = readFileSync(new URL("../src/flow/task-flow.ts", import.meta.url), "utf8");
+		expect(text).not.toMatch(/떡|쑥|anthropic\/|google-antigravity\//);
 	});
 });
 

@@ -1,7 +1,7 @@
 // The Bot Framework Activity fields ompbot reads, and the ledger alias a Teams conversation id is kept under.
 import { createHash } from "node:crypto";
 
-export interface TeamsMention {
+interface TeamsMention {
 	type: string;
 	mentioned?: { id?: string; name?: string };
 	text?: string;

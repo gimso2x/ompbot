@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { withOmpProfile } from "../omp/env";
+import { type AssistantTail, lastAssistantProgram, parseLastAssistantOutput, sessionPathOf } from "../omp/session-tail";
+import { redact } from "../redact";
 import { recordProcessCall } from "./audit";
 
 export interface RunProcessResult {
@@ -19,6 +21,8 @@ export interface RunProcessOptions {
 	env?: Record<string, string>;
 	/** Aborting it kills the whole process group like the timeout does (`timedOut` stays false); the run still resolves. */
 	signal?: AbortSignal;
+	/** Written to the child's stdin, which is then closed (absent: stdin is not connected). */
+	stdin?: string;
 }
 
 export type ProcessRunner = (cmd: string[], opts: RunProcessOptions) => Promise<RunProcessResult>;
@@ -45,10 +49,15 @@ const KILL_GRACE_MS = 2_000;
 const spawnProcess: ProcessRunner = (cmd, opts) => {
 	const child = spawn(cmd[0] as string, cmd.slice(1), {
 		cwd: opts.cwd,
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: [opts.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		detached: true,
 		env: opts.env,
 	});
+	if (opts.stdin !== undefined) {
+		// A child that exits before reading all of it closes the pipe: that is its exit to report, not a crash here.
+		child.stdin?.on("error", () => {});
+		child.stdin?.end(opts.stdin);
+	}
 	let stdout = "";
 	let timedOut = false;
 	const stdoutCap = opts.stdoutCap ?? DEFAULT_STDOUT_CAP;
@@ -181,7 +190,8 @@ export async function runOmpPrint(options: OmpPrintOptions): Promise<OmpPrintRes
 		},
 	);
 	const suffix = result.timedOut ? "\n\n[시간 초과로 중단됨 — 출력 일부만 수집]" : "";
-	const output = `${result.stdout.trim().slice(0, maxChars)}${suffix}`.trim();
+	// Masked before the cap: a secret straddling the cap would otherwise leave a fragment the shapes no longer match.
+	const output = `${redact(result.stdout.trim()).slice(0, maxChars)}${suffix}`.trim();
 	return {
 		ok: !result.timedOut && result.code === 0,
 		output: output === "" ? "(빈 출력)" : output,
@@ -213,7 +223,7 @@ export function herdrSshArgv(sshTarget: string, bin: string, args: string[]): st
 	args.forEach((arg, index) => {
 		remote.push(arg === "~" && args[index - 1] === "--cwd" ? arg : remoteShellQuote(arg));
 	});
-	return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", sshTarget, "--", ...remote];
+	return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", sshTarget, ...remote];
 }
 
 /** Local herdr binary (config `herdr.bin`); restart-bound, so the daemon sets it once at start. */
@@ -230,6 +240,7 @@ async function herdrRun(args: string[], options: HerdrRunnerOptions): Promise<Ru
 	return (options.run ?? realProcessRunner)(cmd, {
 		timeoutMs: options.timeoutMs ?? 120_000,
 		cwd: options.cwd,
+		env: dispatchEnv(process.env),
 	});
 }
 
@@ -238,7 +249,7 @@ export const OWNER_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 /** Shapes of herdr's JSON outputs (outside-controlled data, read at one boundary). */
 type HerdrAgentList = {
-	result?: { agents?: Array<{ name?: string; pane_id?: string; agent_status?: string }> };
+	result?: { agents?: Array<{ name?: string; pane_id?: string; agent_status?: string; agent_session?: unknown }> };
 };
 type HerdrWorkspaceList = { result?: { workspaces?: Array<{ workspace_id?: string; label?: string }> } };
 type HerdrWorkspaceCreated = {
@@ -461,7 +472,10 @@ export async function herdrAgentPane(name: string, options: HerdrRunnerOptions =
 /** herdr's `agent_status` values (`herdr agent wait --until`), plus `gone` for a name the list does not have. */
 export type HerdrAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown" | "gone";
 
-export type HerdrAgentStatusResult = { ok: true; status: HerdrAgentStatus } | { ok: false; error: string };
+/** `sessionPath`: the agent's omp session jsonl (`agent_session` kind `path`, absolute, `.jsonl`), when herdr names one. */
+export type HerdrAgentStatusResult =
+	| { ok: true; status: HerdrAgentStatus; sessionPath?: string }
+	| { ok: false; error: string };
 
 const HERDR_REPORTED_STATUSES: Record<Exclude<HerdrAgentStatus, "gone">, true> = {
 	idle: true,
@@ -485,7 +499,33 @@ export async function herdrAgentStatus(
 	if (parsed === undefined) return { ok: false, error: "agent list output is not JSON" };
 	const agent = parsed.result?.agents?.find((entry) => entry.name === name);
 	if (agent === undefined) return { ok: true, status: "gone" };
-	return { ok: true, status: isReportedStatus(agent.agent_status) ? agent.agent_status : "unknown" };
+	const status = isReportedStatus(agent.agent_status) ? agent.agent_status : "unknown";
+	const sessionPath = sessionPathOf(agent.agent_session);
+	return sessionPath === undefined ? { ok: true, status } : { ok: true, status, sessionPath };
+}
+
+/** A remote session tail read: at most this long, and this much stdout kept (an assistant line reaches 1.5MB). */
+export const SESSION_TAIL_TIMEOUT_MS = 20_000;
+export const SESSION_TAIL_STDOUT_CAP = 5_000_000;
+
+/**
+ * {@link readLastAssistant} on a `dispatchHosts` machine: one ssh running `python3 -` with the reader program (and
+ * the path inside it) on stdin. Undefined when no assistant message is within the byte cap; throws when ssh or the
+ * read fails.
+ */
+export async function readRemoteLastAssistant(
+	sshTarget: string,
+	path: string,
+	run: ProcessRunner = realProcessRunner,
+): Promise<AssistantTail | undefined> {
+	const result = await run(herdrSshArgv(sshTarget, "python3", ["-"]), {
+		stdin: lastAssistantProgram(path),
+		stdoutCap: SESSION_TAIL_STDOUT_CAP,
+		timeoutMs: SESSION_TAIL_TIMEOUT_MS,
+	});
+	if (result.timedOut) throw new Error("session read timed out");
+	if (result.code !== 0) throw new Error(`session read failed: ${herdrFailure(result, 120)}`);
+	return parseLastAssistantOutput(result.stdout);
 }
 
 /** How long an interrupt waits for herdr to see the agent stop after the Esc. */
@@ -610,6 +650,6 @@ export async function herdrReadAgent(
 ): Promise<{ ok: boolean; output?: string; error?: string }> {
 	const result = await herdrRun(["agent", "read", name], options);
 	return result.code === 0
-		? { ok: true, output: result.stdout.trim().slice(-4_000) }
+		? { ok: true, output: redact(result.stdout.trim()).slice(-4_000) }
 		: { ok: false, error: herdrFailure(result) };
 }

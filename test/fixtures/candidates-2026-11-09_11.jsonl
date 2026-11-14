@@ -1,0 +1,11 @@
+{"v":1,"ts":"2026-11-09T14:40:00Z","key":"rate-limit-429","event":"seen","day":"2026-11-09","kind":"fix","evidence":"reflections/2026-11-09.md#문제1","summary":"Anthropic 계정 429 rate_limit 하루 10건, TASK 수 시간 정지"}
+{"v":1,"ts":"2026-11-09T14:40:00Z","key":"backfill-dead-origin","event":"seen","day":"2026-11-09","kind":"fix","evidence":"reflections/2026-11-09.md#문제2","summary":"죽은 origin 백필 실패 40건 재등장"}
+{"v":1,"ts":"2026-11-09T14:40:00Z","key":"agent-prompt-stalled","event":"seen","day":"2026-11-09","kind":"fix","evidence":"reflections/2026-11-09.md#문제3","summary":"agent_prompt_stalled 2건"}
+{"v":1,"ts":"2026-11-10T14:40:00Z","key":"backfill-dead-origin","event":"seen","day":"2026-11-10","kind":"fix","evidence":"reflections/2026-11-10.md#문제1","summary":"죽은 origin 백필 실패 이틀 연속 재발 64건"}
+{"v":1,"ts":"2026-11-10T14:40:00Z","key":"live-checkout-wip-blocks-landing","event":"seen","day":"2026-11-10","kind":"rule","evidence":"reflections/2026-11-10.md#문제2","summary":"라이브 체크아웃 미커밋 WIP가 apply 재시작을 6시간 막음"}
+{"v":1,"ts":"2026-11-10T14:40:00Z","key":"approval-card-expired","event":"seen","day":"2026-11-10","kind":"fix","evidence":"reflections/2026-11-10.md#문제3","summary":"승인 만료 2건(저녁 시간대)"}
+{"v":1,"ts":"2026-11-11T01:00:00Z","key":"backfill-dead-origin","event":"seen","day":"2026-11-11","kind":"fix","evidence":"reflections/2026-11-11.md#문제1","summary":"죽은 origin 커서 백필 실패 60건, 사흘째"}
+{"v":1,"ts":"2026-11-11T01:00:00Z","key":"approval-card-expired","event":"seen","day":"2026-11-11","kind":"fix","evidence":"reflections/2026-11-11.md#문제2","summary":"승인 만료 3건 + 오너 수동 재요청 2건"}
+{"v":1,"ts":"2026-11-11T01:00:00Z","key":"live-checkout-wip-blocks-landing","event":"seen","day":"2026-11-11","kind":"rule","evidence":"reflections/2026-11-11.md#문제3","summary":"레인 ff 불가·미커밋 WIP로 랜딩 지연 이틀 연속"}
+{"v":1,"ts":"2026-11-11T14:40:00Z","key":"receiptless-restart-cuts-turn","event":"seen","day":"2026-11-11","kind":"fix","evidence":"reflections/2026-11-11.md#23:30 문제1","summary":"영수증 없는 재시작이 진행 중 턴을 끊음"}
+{"v":1,"ts":"2026-11-11T14:40:00Z","key":"unregistered-ops-change","event":"seen","day":"2026-11-11","kind":"rule","evidence":"reflections/2026-11-11.md#23:30 문제2","summary":"미등록 운영 변경 이틀 연속"}

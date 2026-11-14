@@ -72,7 +72,6 @@ const SNAPSHOT: DashboardSnapshot = {
 	generatedAt: "2026-11-04T10:00:00+09:00",
 	timezone: "Asia/Seoul",
 	daemon: { ok: false, error: "no daemon" },
-	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	turns: {
 		ok: true,
 		items: [

@@ -10,10 +10,10 @@ import { mrkdwnToDiscord, outsideCode } from "../discord/format";
  * Characters per Teams message. Teams refuses an Activity near 28 KB; 7000 UTF-16 units stay under it even when every
  * one is a 3-byte character. Not measured against the live service (doc/plans/teams-channel.md 확인 필요).
  */
-export const TEAMS_TEXT_LIMIT = 7000;
+const TEAMS_TEXT_LIMIT = 7000;
 
 /** Slack mrkdwn → Teams markdown; Slack emoji codes the core writes (`:white_check_mark:`) become the emoji itself. */
-export function teamsMarkdown(text: string): string {
+function teamsMarkdown(text: string): string {
 	return outsideCode(mrkdwnToDiscord(text), (plain) =>
 		plain.replace(/:([a-z0-9_+-]+):/g, (code, name: string) => unicodeOfSlackName(name) ?? code),
 	);

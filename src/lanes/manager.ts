@@ -3,12 +3,15 @@ import { isAbsolute, join } from "node:path";
 import type { ActionButton, MessageRef } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { escapeMrkdwn, formatElapsed } from "../channel/text";
-import type { PauseCheck, TurnSettledInfo } from "../core/mailbox";
+import { LANE_MODEL_TIERS, type LaneModelTier, type LaneModelTiers } from "../config";
+import { type PauseCheck, sessionToResume, type TurnSettledInfo } from "../core/mailbox";
 import { parseThreadRef, platformOfThreadRef } from "../core/normalize";
-import type { IdPlatform } from "../core/origin-key";
+import type { ChatPlatform } from "../core/origin-key";
 import type { InboundRecord, MailboxClock } from "../core/types";
+import { pidAlive } from "../daemon/lock";
 import type { Logger } from "../log";
 import type { TodoPhase } from "../omp/driver";
+import { endsWithQuestion } from "../omp/session-tail";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { Store } from "../store/db";
@@ -18,9 +21,17 @@ import { runWorktreeChecks } from "../tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../tasks/host";
 import { type AutoLandPolicy, cardMessage } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
+import { applyRiskFloor } from "../tasks/risk-floor";
 import { CHECK_TIMEOUT_MS, type SignalCheck } from "../tasks/signals";
 import { localDay } from "../time";
-import { buildLaneOutcomeCard, type LaneCardView, lanePauseActionId, laneResumeActionId } from "./card";
+import { changedFilesSince, fileSize, headOf, sessionDelta } from "./attach";
+import {
+	buildLaneOutcomeCard,
+	type LaneCardView,
+	lanePauseActionId,
+	laneResumeActionId,
+	laneSessionActionId,
+} from "./card";
 import { computeLaneChanges } from "./changes";
 import {
 	classifyLaneCompletion,
@@ -31,12 +42,22 @@ import {
 	LaneDiffUnavailable,
 	laneDiffUnavailableRefusal,
 } from "./integrity";
-import { createLaneLander, externallyLanded, type LandLane, type LandResult, laneLandBlockers } from "./land";
-import { type LaneReviewDeps, reviewLane } from "./review";
+import {
+	type CoreRebaseResult,
+	confidentBand,
+	coreRebase,
+	createLaneLander,
+	externallyLanded,
+	type LandLane,
+	type LandResult,
+	laneLandBlockers,
+} from "./land";
+import { formatConfidence, type LaneReviewDeps, reviewLane } from "./review";
 import {
 	INCONCLUSIVE_APPROVED,
 	INTEGRITY_APPROVED,
 	isCoreSteerId,
+	type LaneAttach,
 	type LaneChanges,
 	type LaneChecksInconclusive,
 	type LaneClaim,
@@ -180,6 +201,10 @@ export interface LaneManagerDeps {
 	pauseTurn(originKey: string): Promise<PauseCheck>;
 	/** Dispatches the rows that piled up while the lane was held (the owner resumed it). */
 	resumePending(originKey: string): Promise<void>;
+	/** The lane child as the terminal hand-over (`ompbot lanes attach`) needs it. */
+	session: LaneSessionOps;
+	/** Whether the attaching CLI process still lives (test seam; default signal 0 on this machine). */
+	pidAlive?: (pid: number) => boolean;
 	maxLanes?: number;
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state no lane starts. */
 	frozen?: () => FreezeState | undefined;
@@ -197,12 +222,14 @@ export interface LaneManagerDeps {
 	sessionDirFor: (originKey: string) => string;
 	/** `taskAutoLand`, read at each close (a live setting); `undefined` → every closed lane waits for the owner. */
 	autoLandPolicy?: () => AutoLandPolicy | undefined;
+	/** Why auto-merge is held after an apply code rollback (`<home>/autoland.hold`); undefined = not held. */
+	autoLandHold?: () => string | undefined;
 	/** Whether the repository at `path` is one of `repos` (test seam; default the git common-directory comparison). */
 	repoMatches?: (path: string, repos: readonly string[]) => Promise<boolean>;
 	/** Lands a closed lane (test seam; default `createLaneLander` over real git and `hostOps.removeWorktree`). */
 	land?: LandLane;
 	/** Mentioned on cards that need the owner's decision: one id, or the owner's id on the lane's platform. */
-	ownerUserId?: string | ((platform: IdPlatform) => string | undefined);
+	ownerUserId?: string | ((platform: ChatPlatform) => string | undefined);
 	/**
 	 * Whether the lane's session is in a turn right now (the one that made the claim still writes its closing report).
 	 * A landing or discard removes the worktree that turn runs in, so it waits for the turn to end. Default: never busy.
@@ -215,11 +242,39 @@ export interface LaneManagerDeps {
 	reviewer?: Omit<LaneReviewDeps, "headOf" | "now">;
 	/** Git for the Outcome card's change summary (test seam; default 10 seconds per call, `computeLaneChanges`). */
 	changesGit?: GitRunner;
+	/** Git for the core's rebase of a lane whose landing was not fast-forward (test seam; default `defaultGit`). */
+	rebaseGit?: GitRunner;
 	/**
 	 * `lanes.completionNudges`, read at each turn end (a live setting): nudges after claim-less turns per owner message;
 	 * 0 turns them off. Absent → `DEFAULT_COMPLETION_NUDGES`.
 	 */
 	completionNudges?: () => number;
+	/** `lanes.models`, read at each start (a live setting): the tiers `start({model})` may pick. */
+	laneModels?: () => LaneModelTiers | undefined;
+}
+
+/** The mailbox of a lane's origin, seen by the terminal hand-over. */
+export interface LaneSessionOps {
+	/** The file the running child has open; undefined without a child (never starts one). */
+	openFile(originKey: string): Promise<string | undefined>;
+	/** Resolves once no turn runs. */
+	whenTurnEnds(originKey: string): Promise<void>;
+	/** Stops the child (the lane is held and its turn is over). */
+	release(originKey: string): Promise<void>;
+	/** Whether a child runs now. */
+	childRunning(originKey: string): boolean;
+}
+
+/** What `ompbot lanes attach` gets: the file the terminal omp resumes, in the lane's cwd and session dir. */
+export type LaneAttachOutcome =
+	| { ok: true; sessionFile: string; cwd: string; sessionDir: string }
+	| { ok: false; error: string };
+
+/** One owner line in the lane's thread for a terminal hand-back; the cost is the terminal's own (outside the lane cap). */
+function detachSummary(turns: number, changed: number | undefined, costUsd: number, orphan: boolean): string {
+	const files = changed === undefined ? "바뀐 파일 수 확인 못 함" : `바뀐 파일 ${changed}개`;
+	const by = orphan ? " (attach 프로세스가 끝나 코어가 되찾음)" : "";
+	return `🖥 터미널 omp에서 레인을 돌려받았습니다${by} — TUI에서 ${turns}턴, ${files}, TUI 비용 $${costUsd.toFixed(2)}`;
 }
 
 function slugify(title: string): string {
@@ -243,6 +298,8 @@ export class LaneManager {
 	#starting = 0;
 	/** Lane ids of starts that picked an id but have no registry row yet (two starts never take the same id). */
 	readonly #reservedLaneIds = new Set<string>();
+	/** Lanes whose terminal hand-over is running (the orphan check and a second attach leave them alone). */
+	readonly #attaching = new Set<string>();
 	/** Lane names a start picked before its row exists (the status message is posted in between). */
 	readonly #reservedNames = new Set<string>();
 	readonly #settling = new Set<string>();
@@ -269,6 +326,10 @@ export class LaneManager {
 	readonly #reviewing = new Set<string>();
 	/** One review at a time across all lanes: the tail of the queue for the review slot. */
 	#reviewSlotTail: Promise<void> = Promise.resolve();
+	/** Lanes whose channel was found unregistered by a draw: the skip is logged once per lane per process. */
+	readonly #unroutableWarned = new Set<string>();
+	/** Origins whose lane worktree the core is rebasing: their mailbox holds its rows (`isCoreRebasing`). */
+	readonly #coreRebasing = new Set<string>();
 
 	constructor(deps: LaneManagerDeps) {
 		this.#deps = deps;
@@ -281,6 +342,14 @@ export class LaneManager {
 	/** Resolves once the background work started so far (Outcome cards, auto-merges) has finished. */
 	async idle(): Promise<void> {
 		while (this.#background.size > 0) await Promise.all([...this.#background]);
+	}
+
+	/**
+	 * Whether the core is rebasing the worktree of this origin's lane right now: the origin's mailbox holds its rows so
+	 * no lane turn runs in the worktree meanwhile (the daemon's `isHeld`).
+	 */
+	isCoreRebasing(originKey: string): boolean {
+		return this.#coreRebasing.has(originKey);
 	}
 
 	/** Tests only: resolves once the verdicts running in the background (and those they started) have ended. */
@@ -368,7 +437,9 @@ export class LaneManager {
 		channel: string;
 		acceptance?: unknown;
 		risk?: unknown;
-	}): Promise<LaneRow> {
+		/** A `lanes.models` tier; absent: the bot's default model. */
+		model?: unknown;
+	}): Promise<LaneRow & { startNote?: string }> {
 		const { store, channels, clock, log } = this.#deps;
 		const frozen = this.#deps.frozen?.();
 		if (frozen !== undefined) {
@@ -381,8 +452,16 @@ export class LaneManager {
 		if (!risk.ok) throw new LaneInputError(risk.problem);
 		const acceptance = parseLaneAcceptance(input.acceptance);
 		if (!acceptance.ok) throw new LaneInputError(acceptance.problem);
-		// Kept for the independent review: the spec it reads first.
-		const brief = redact(input.brief?.trim() ?? "").slice(0, MAX_BRIEF_CHARS);
+		const model = this.#laneModel(input.model);
+		// Kept for the independent review: the spec it reads first. A cut one says so inside, so the review knows the
+		// rest is missing; the lane itself gets the whole brief.
+		const fullBrief = redact(input.brief?.trim() ?? "");
+		const briefCut = fullBrief.length > MAX_BRIEF_CHARS;
+		const brief = briefCut
+			? `${fullBrief.slice(0, MAX_BRIEF_CHARS)}\n[브리프 ${fullBrief.length}자 중 앞 ${MAX_BRIEF_CHARS}자만 남김: 뒷부분은 이 리뷰에 없다]`
+			: fullBrief;
+		// Topic keywords put a floor under the class (raise only); `startNote` tells the starter.
+		const floored = applyRiskFloor(risk.value, [title, brief]);
 		if (!isAbsolute(input.cwd)) throw new LaneInputError(`프로젝트 경로는 절대경로여야 합니다: ${input.cwd}`);
 		let cwd: string;
 		try {
@@ -462,7 +541,9 @@ export class LaneManager {
 					worktree,
 					branch,
 					baseBranch,
-					risk: risk.value,
+					// A lane nobody rated (and no keyword raised) keeps no risk: it counts as DEFAULT_LANE_RISK, and the
+					// confident band (`taskAutoLand.review.confident`) is for explicit risks only.
+					...(input.risk === undefined && floored.risk === risk.value ? {} : { risk: floored.risk }),
 					acceptance: acceptance.value,
 					...(brief === "" ? {} : { brief }),
 				},
@@ -485,7 +566,15 @@ export class LaneManager {
 			this.#reservedLaneIds.delete(laneId);
 			if (reservedName !== undefined) this.#reservedNames.delete(reservedName);
 		}
-		log.info("lane_started", { lane: lane.name, origin: lane.originKey, cwd: lane.cwd, branch });
+		if (model !== undefined) {
+			// The lane's first child applies origin settings when it opens (`#applySettings`), like a thread `!model`.
+			store.ensureOrigin(lane.originKey, lane.sessionDir);
+			store.setOriginSettings(lane.originKey, { model });
+		}
+		log.info("lane_started", { lane: lane.name, origin: lane.originKey, cwd: lane.cwd, branch, model });
+		if (floored.note !== undefined) {
+			log.info("lane_risk_floor_raised", { lane: lane.name, from: risk.value, to: floored.risk });
+		}
 		// The first turn runs in the background: the owner's reply must not wait for omp to start.
 		this.#send(
 			lane.name,
@@ -498,9 +587,35 @@ export class LaneManager {
 				branch,
 				baseBranch,
 				acceptance: acceptance.value,
+				sameRepoLanes: store
+					.listLanes()
+					.filter((other) => other.name !== lane.name && other.status !== "closed" && other.meta.repo === repo),
 			}),
 		);
-		return lane;
+		if (briefCut) log.warn("lane_brief_cut", { lane: lane.name, chars: fullBrief.length, kept: MAX_BRIEF_CHARS });
+		const notes = [
+			...(floored.note === undefined ? [] : [floored.note]),
+			...(briefCut
+				? [
+						`브리프 ${fullBrief.length}자 중 앞 ${MAX_BRIEF_CHARS}자만 독립 리뷰에 남겼습니다. 긴 스펙은 파일로 두고 브리프에는 경로를 적으세요.`,
+					]
+				: []),
+		];
+		return notes.length === 0 ? lane : { ...lane, startNote: notes.join("\n") };
+	}
+
+	/** The `provider/id` of a configured tier; undefined when none was asked for. */
+	#laneModel(tier: unknown): string | undefined {
+		if (tier === undefined) return undefined;
+		const tiers = this.#deps.laneModels?.() ?? {};
+		const configured = LANE_MODEL_TIERS.filter((name) => tiers[name] !== undefined);
+		const model = typeof tier === "string" && Object.hasOwn(tiers, tier) ? tiers[tier as LaneModelTier] : undefined;
+		if (model !== undefined) return model;
+		throw new LaneInputError(
+			configured.length === 0
+				? "레인 모델 등급이 설정돼 있지 않습니다(config lanes.models). model 없이 시작하세요."
+				: `레인 모델 등급은 ${configured.join("·")} 중 하나입니다: ${String(tier)}`,
+		);
 	}
 
 	#uniqueName(base: string): string {
@@ -654,11 +769,18 @@ export class LaneManager {
 	 * where it was (`not-done` as `working`), a resumed claim gets its grace anew, what piled up while held is
 	 * dispatched now, and the answer rests only on the re-read registry.
 	 */
-	async resume(name: string, by: "owner-message" | "button"): Promise<LaneRequestOutcome> {
+	async resume(name: string, by: "owner-message" | "button" | "attach"): Promise<LaneRequestOutcome> {
 		const { store, clock, log } = this.#deps;
 		const lane = store.getLane(name);
 		if (lane?.status !== "paused") {
 			return { handled: false, text: `멈춘 레인이 아닙니다 (${lane?.status ?? "레인 없음"}).` };
+		}
+		// A terminal omp writes the session now: a child started beside it would tangle the file.
+		if (lane.meta.attach !== undefined) {
+			return {
+				handled: false,
+				text: `터미널 omp가 이 레인 세션을 쓰는 중입니다 (pid ${lane.meta.attach.pid}) — 터미널을 끝내면 돌아옵니다.`,
+			};
 		}
 		// An owner message held under the pause answers a pending claim exactly like one sent while it was pending
 		// (`onOwnerMessage`): the lane comes back working and the claim no longer closes it.
@@ -666,7 +788,12 @@ export class LaneManager {
 			.listInbound({ originKey: lane.originKey, state: "pending" })
 			.some((row) => !isCoreSteerId(row.platformMessageId));
 		const back: LaneStatus = lane.meta.pausedFrom === "done-claimed" && !answered ? "done-claimed" : "working";
-		const patch: Partial<LaneMeta> = { pausedFrom: undefined, pausedAt: undefined, pausedBy: undefined };
+		const patch: Partial<LaneMeta> = {
+			pausedFrom: undefined,
+			pausedAt: undefined,
+			pausedBy: undefined,
+			sessionChoices: undefined,
+		};
 		if (back === "done-claimed" && lane.meta.claim !== undefined) {
 			patch.claim = { ...lane.meta.claim, claimedAt: clock.now() };
 		} else if (lane.meta.pausedFrom === "done-claimed") {
@@ -676,10 +803,11 @@ export class LaneManager {
 		log.info("lane_resumed", { lane: name, to: back, by });
 		await this.#sync(resumed, "transition");
 		await this.#deps.resumePending(lane.originKey);
-		// The resume word itself follows the held messages; a freeze holds it like any other steer.
+		// The resume word itself follows the held messages; a freeze holds it like any other steer. A terminal hand-back
+		// sends none: the owner's terminal turns are already in the session, and the next message starts the next turn.
 		const frozen = this.#deps.frozen?.() !== undefined;
 		if (frozen) log.warn("lane_send_held_frozen", { lane: name });
-		else this.#send(name, "resume", "[ompbot] 오너가 재개했습니다. 멈추기 전 작업을 이어 하세요.");
+		else if (by !== "attach") this.#send(name, "resume", "[ompbot] 오너가 재개했습니다. 멈추기 전 작업을 이어 하세요.");
 		if (store.getLane(name)?.status === "paused") {
 			return { handled: true, text: "⚠️ 재개하지 못했습니다: 레인이 여전히 paused입니다." };
 		}
@@ -687,6 +815,156 @@ export class LaneManager {
 			handled: true,
 			text: `▶ 재개했습니다${frozen ? " — 동결 중이라 재개 안내는 보내지 않았습니다. 동결이 풀린 뒤 이 스레드에 지시를 쓰세요" : ""}`,
 		};
+	}
+
+	/**
+	 * `ompbot lanes attach`: hands the lane's session to a terminal omp. The file is read first — the one the running
+	 * child has open, else the one the next child would resume — then the lane is held (`paused`, registry `attach`, so no
+	 * child starts and thread messages wait), its turn is aborted (`wait`: awaited instead) and the child stopped. The
+	 * caller resumes exactly that file; `detach` (or the orphan check of `tick`) gives the lane back.
+	 */
+	async attach(name: string, request: { pid: number; wait: boolean; keepPaused: boolean }): Promise<LaneAttachOutcome> {
+		const { store, clock, log, session } = this.#deps;
+		const lane = store.getLane(name);
+		if (lane === undefined) return { ok: false, error: `no lane named ${name}` };
+		if (lane.status === "closed") return { ok: false, error: `lane ${name} is closed; nothing runs to hand over` };
+		if (lane.meta.attach !== undefined || this.#attaching.has(name)) {
+			return { ok: false, error: `lane ${name} is already attached (pid ${lane.meta.attach?.pid ?? "?"})` };
+		}
+		const origin = store.getOrigin(lane.originKey);
+		const sessionFile =
+			(await session.openFile(lane.originKey)) ?? (origin === undefined ? undefined : sessionToResume(origin));
+		if (sessionFile === undefined) return { ok: false, error: `lane ${name} has no session file yet` };
+		this.#attaching.add(name);
+		try {
+			const head = await headOf(this.#deps.changesGit ?? defaultGit, lane.cwd);
+			const now = clock.now();
+			const attach: LaneAttach = {
+				pid: request.pid,
+				at: now,
+				sessionFile,
+				size: fileSize(sessionFile),
+				...(head === undefined ? {} : { head }),
+				wasPaused: lane.status === "paused",
+				keepPaused: request.keepPaused,
+			};
+			// Held before the child stops: a message arriving in between waits, and no child starts for a command.
+			const held =
+				lane.status === "paused"
+					? store.patchLane(
+							name,
+							{ event: "attached", detail: String(request.pid) },
+							{ attach, sessionChoices: undefined },
+						)
+					: store.transitionLane(
+							name,
+							"paused",
+							{ event: "attached", detail: String(request.pid) },
+							{ pausedFrom: lane.status, pausedAt: now, pausedBy: "attach", attach, sessionChoices: undefined },
+						);
+			if (request.wait) await session.whenTurnEnds(lane.originKey);
+			else await this.#deps.pauseTurn(lane.originKey);
+			await session.release(lane.originKey);
+			if (session.childRunning(lane.originKey)) {
+				log.warn("lane_attach_child_running", { lane: name });
+				return {
+					ok: false,
+					error: `lane ${name}'s omp child did not stop; the core takes the lane back within a minute`,
+				};
+			}
+			// What the stopped turn still wrote belongs to the lane, not to the terminal's summary.
+			store.patchLane(name, undefined, { attach: { ...attach, size: fileSize(sessionFile) } });
+			log.info("lane_attached", { lane: name, pid: request.pid, wait: request.wait, file: sessionFile });
+			await this.#sync(store.getLane(name) ?? held, "transition");
+			await this.#postInThread(
+				held,
+				"🖥 오너가 터미널 omp에서 이 레인을 넘겨받았습니다 — 이 스레드 메시지는 터미널을 끝낸 뒤 전달합니다.",
+			);
+			return { ok: true, sessionFile, cwd: lane.cwd, sessionDir: lane.sessionDir };
+		} finally {
+			this.#attaching.delete(name);
+		}
+	}
+
+	/**
+	 * The terminal omp ended (`by: "cli"`) or its `ompbot lanes attach` process is gone (`"orphan"`): the attached file is
+	 * pinned as the file the next child resumes — no new epoch, no child started here (the next message starts it
+	 * through the mailbox) — and the lane is resumed unless it was paused before, `--keep-paused` was given, or the
+	 * terminal left new session files (`newFiles`, listed by the CLI): then it stays paused and the owner picks the file.
+	 */
+	async detach(
+		name: string,
+		request: { sessionFile: string; newFiles: readonly string[]; by: "cli" | "orphan" },
+	): Promise<LaneRequestOutcome> {
+		const { store, log } = this.#deps;
+		const lane = store.getLane(name);
+		const attach = lane?.meta.attach;
+		if (lane === undefined || attach === undefined) return { handled: false, text: `lane ${name} is not attached` };
+		if (this.#attaching.has(name)) return { handled: false, text: `lane ${name} is still being handed over` };
+		if (request.sessionFile !== attach.sessionFile) {
+			return {
+				handled: false,
+				text: `lane ${name} was handed over as ${attach.sessionFile}, not ${request.sessionFile}`,
+			};
+		}
+		store.pinSessionFile(lane.originKey, attach.sessionFile);
+		const newFiles = request.newFiles.filter((file) => file !== attach.sessionFile);
+		const stay = newFiles.length > 0 || attach.keepPaused || attach.wasPaused;
+		const choices =
+			newFiles.length > 0
+				? { files: [attach.sessionFile, ...newFiles], resume: !attach.keepPaused && !attach.wasPaused }
+				: undefined;
+		const back = store.patchLane(
+			name,
+			{ event: "detached", detail: request.by },
+			{ attach: undefined, ...(choices === undefined ? {} : { sessionChoices: choices }) },
+		);
+		log.info("lane_detached", { lane: name, by: request.by, newFiles: newFiles.length, stay });
+		const delta = sessionDelta(attach.sessionFile, attach.size);
+		const changed = await changedFilesSince(this.#deps.changesGit ?? defaultGit, lane.cwd, attach.head);
+		const summary = detachSummary(delta.turns, changed, delta.costUsd, request.by === "orphan");
+		if (choices !== undefined) {
+			await this.#sync(back, "transition");
+			const buttons = choices.files.map((_file, index) => ({
+				actionId: laneSessionActionId(name, index),
+				label: index === 0 ? "원래 파일" : `새 파일 ${index}`,
+				value: name,
+			}));
+			const list = choices.files
+				.map((file, index) => `${index === 0 ? "원래" : `새 ${index}`}: \`${file}\``)
+				.join("\n");
+			await this.#postInThreadWith(back, {
+				text: `${summary}\n터미널에서 새 세션 파일이 생겼습니다. 레인은 멈춘 채 원래 파일에 고정했습니다 — 이어 쓸 파일을 고르세요.\n${list}`,
+				buttons,
+			});
+			return { handled: true, text: summary };
+		}
+		if (stay) {
+			await this.#sync(back, "transition");
+			await this.#postInThread(back, `${summary}\n레인은 멈춘 채로 두었습니다 — \`계속\`이나 ▶ 재개로 다시 맡깁니다.`);
+			return { handled: true, text: summary };
+		}
+		const resumed = await this.resume(name, "attach");
+		await this.#postInThread(back, `${summary}\n${resumed.text} — 다음 메시지부터 같은 세션 파일을 이어 씁니다.`);
+		return { handled: true, text: summary };
+	}
+
+	/** The owner picked the session file a lane continues after a terminal hand-back that left new files. */
+	async pickSession(name: string, index: number): Promise<LaneRequestOutcome> {
+		const { store, log } = this.#deps;
+		const lane = store.getLane(name);
+		const choices = lane?.meta.sessionChoices;
+		const file = choices?.files[index];
+		if (lane === undefined || choices === undefined || file === undefined) {
+			return { handled: false, text: "고를 세션 파일이 없습니다 (이미 골랐거나 재개됨)." };
+		}
+		store.pinSessionFile(lane.originKey, file);
+		store.patchLane(name, { event: "session_picked", detail: file }, { sessionChoices: undefined });
+		log.info("lane_session_picked", { lane: name, file });
+		if (!choices.resume)
+			return { handled: true, text: `이어 쓸 파일을 \`${file}\`로 정했습니다 — 레인은 멈춘 채입니다.` };
+		const resumed = await this.resume(name, "attach");
+		return { handled: true, text: `이어 쓸 파일을 \`${file}\`로 정했습니다. ${resumed.text}` };
 	}
 
 	/**
@@ -761,6 +1039,11 @@ export class LaneManager {
 					log.info("lane_nudge_skipped", { lane: lane.name, reason: "status" });
 					return;
 				}
+				// A freeze that began during the git reads holds the nudge like any other autonomous steer.
+				if (this.#deps.frozen?.() !== undefined) {
+					log.info("lane_nudge_skipped", { lane: lane.name, reason: "frozen" });
+					return;
+				}
 				const notDone =
 					current.status === "not-done" ? current.history.findLast((e) => e.event === "not_done")?.detail : undefined;
 				this.#send(lane.name, "nudge", buildNudgePrompt({ n, max, worktree, notDone }));
@@ -778,11 +1061,7 @@ export class LaneManager {
 		if (info.error !== undefined) return "turn_failed";
 		if (info.openDialogs > 0) return "open_dialog";
 		if (ownerAsked) return "needs_owner";
-		const last = info.text
-			.split("\n")
-			.map((line) => line.trim())
-			.findLast((line) => line !== "");
-		if (last !== undefined && /[?？]$/.test(last)) return "question_text";
+		if (endsWithQuestion(info.text)) return "question_text";
 		// A queued message (the owner's, or the core's own) is the next turn already.
 		if (this.#deps.store.listInbound({ originKey: lane.originKey, state: "pending" }).length > 0) return "pending";
 		if (this.#deps.frozen?.() !== undefined) return "frozen";
@@ -792,7 +1071,7 @@ export class LaneManager {
 	/** Uncommitted paths and commits since the lane's start, read in its worktree; the reason when git could not. */
 	async #worktreeState(lane: LaneRow): Promise<LaneWorktreeState> {
 		try {
-			const status = await defaultGit(["-C", lane.cwd, "status", "--porcelain"]);
+			const status = await defaultGit(["-C", lane.cwd, "status", "--porcelain", "--untracked-files=all"]);
 			if (status.code !== 0) return { error: status.stderr.trim() || `git status exit ${status.code}` };
 			const uncommitted = status.stdout.split("\n").filter((line) => line !== "").length;
 			const base = lane.meta.baseSha;
@@ -802,6 +1081,17 @@ export class LaneManager {
 			return { uncommitted, commits: Number(count.stdout.trim()) };
 		} catch (error) {
 			return { error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	/** A message with buttons in the lane's thread; a failure is logged, never thrown. */
+	async #postInThreadWith(lane: LaneRow, message: { text: string; buttons: readonly ActionButton[] }): Promise<void> {
+		const route = this.#deps.channels.forThreadRef(lane.threadRef);
+		if (route === undefined) return;
+		try {
+			await route.port.post(route.target, message);
+		} catch (error) {
+			this.#deps.log.warn("lane_thread_post_failed", { lane: lane.name, error: String(error) });
 		}
 	}
 
@@ -1170,6 +1460,14 @@ export class LaneManager {
 		};
 	}
 
+	/** `[reason]` while an apply code rollback holds auto-merge (`autoland.hold`, logged `task_autoland_held`); `[]` otherwise. */
+	#autoLandHeld(name: string): string[] {
+		const hold = this.#deps.autoLandHold?.();
+		if (hold === undefined) return [];
+		this.#deps.log.info("task_autoland_held", { lane: name, reason: hold });
+		return [`autoland.hold: ${hold}`];
+	}
+
 	/**
 	 * The Outcome card of a closed lane whose landing nobody asked for yet. With `taskAutoLand` and no blocker the card
 	 * is news and the core lands the lane at once; otherwise the card asks (`머지`·`폐기`), naming why it was not
@@ -1194,19 +1492,24 @@ export class LaneManager {
 			if (policy !== undefined) {
 				const matched = await this.#repoMatches(lane.meta.repo ?? lane.cwd, policy.repos);
 				const frozen = this.#deps.frozen?.() !== undefined;
+				const held = this.#autoLandHeld(name);
 				const { review, ...withoutReview } = policy;
+				// A lane in the confident band is held back by its risk only until its review: judge it at that band's top.
+				const band = confidentBand(lane, policy);
+				const gate = band === undefined ? withoutReview : { ...withoutReview, maxRisk: band.maxRisk };
 				// Only a lane the review alone holds back is reviewed, and one commit only once (a restart keeps the receipt).
 				if (
 					review !== undefined &&
+					held.length === 0 &&
 					lane.meta.review?.sha !== lane.meta.sha &&
-					laneLandBlockers(lane, withoutReview, matched, frozen).length === 0
+					laneLandBlockers(lane, gate, matched, frozen).length === 0
 				) {
 					// Up to 30 minutes: in the background, so the tick that announces never waits for it.
 					this.#reviewing.add(name);
 					this.#spawn(name, () => this.#review(name, review));
 					return;
 				}
-				skipped = laneLandBlockers(lane, policy, matched, frozen);
+				skipped = [...held, ...laneLandBlockers(lane, policy, matched, frozen)];
 			}
 			const auto = skipped !== undefined && skipped.length === 0;
 			// Once per claim commit (a restart keeps it): the row returned by the patch is what the first card shows.
@@ -1307,9 +1610,10 @@ export class LaneManager {
 				return;
 			}
 			const label = receipt.verdict === "inconclusive" ? "확인 불가" : receipt.verdict;
+			const scored = receipt.confidence === undefined ? label : `${label} ${formatConfidence(receipt.confidence)}`;
 			const row = store.patchLane(
 				name,
-				{ event: "review", detail: `${label} · ${receipt.model}`, sha: receipt.sha },
+				{ event: "review", detail: `${scored} · ${receipt.model}`, sha: receipt.sha },
 				{ review: receipt },
 			);
 			log.info("lane_reviewed", {
@@ -1317,6 +1621,7 @@ export class LaneManager {
 				sha: receipt.sha,
 				verdict: receipt.verdict,
 				reason: receipt.reason ?? "",
+				...(receipt.confidence === undefined ? {} : { confidence: receipt.confidence }),
 			});
 			// The owner merged or discarded it while the review ran: that landing's cleanup may have come first.
 			const state = row.meta.land?.state;
@@ -1453,7 +1758,10 @@ export class LaneManager {
 		// An auto-merge is judged once more right before git runs (the receipt, a hold or a freeze may have changed);
 		// the owner's request is not — the owner is the reviewer then.
 		if (by === "auto" && policy !== undefined) {
-			const blockers = laneLandBlockers(lane, policy, matched, this.#deps.frozen?.() !== undefined);
+			const blockers = [
+				...this.#autoLandHeld(name),
+				...laneLandBlockers(lane, policy, matched, this.#deps.frozen?.() !== undefined),
+			];
 			if (blockers.length > 0) {
 				const row = this.#patchLand(
 					name,
@@ -1546,13 +1854,16 @@ export class LaneManager {
 	}
 
 	/**
-	 * The base branch moved ahead of the claim: only the lane can rebase and resolve conflicts, so it goes back to
-	 * `working` with that instruction. Its next claim runs the whole verdict (checks included) again.
+	 * The base branch moved ahead of the claim. Unless frozen, the core rebases the lane's branch onto it first
+	 * (`#coreRebase`): a clean rebase is the lane's new claim and the whole verdict (checks included) runs again without
+	 * the lane. Otherwise — a conflict, a detached HEAD, a rebase that left nothing, a git failure, a running lane turn —
+	 * the lane stays `working` with the rebase instruction, and its next claim runs the verdict again.
 	 */
 	async #backToWork(lane: LaneRow, attempts: number, reason: string): Promise<string> {
 		const { store, clock, log } = this.#deps;
 		const now = clock.now();
 		const cardTs = lane.meta.land?.cardTs;
+		const base = lane.meta.baseBranch ?? "";
 		const working = store.transitionLane(
 			lane.name,
 			"working",
@@ -1568,27 +1879,89 @@ export class LaneManager {
 			},
 		);
 		log.info("lane_land_not_ff", { lane: lane.name, attempts });
-		await this.#sync(working, "transition");
 		// Frozen (only the owner's landing gets here then): no autonomous re-prompt into the lane, like resume.
 		const frozen = this.#deps.frozen?.() !== undefined;
+		const rebase = frozen ? undefined : await this.#coreRebase(lane);
+		if (rebase?.state === "rebased") {
+			const claimed = store.getLane(lane.name) ?? working;
+			await this.#sync(claimed, "transition");
+			if (cardTs !== undefined) {
+				await this.#editCard(claimed, cardTs, {
+					kind: "rework",
+					reason: `${reason} — 코어가 \`${base}\` 위로 rebase해 검사를 다시 돌립니다.`,
+				});
+			}
+			// Started after the claim is recorded; the landing that got here ends before the verdict can land it again.
+			this.#settleInBackground(lane.name, false);
+			return `🔄 머지하지 못했습니다: ${reason}. 코어가 \`${base}\` 위로 rebase해(${rebase.oldSha.slice(0, 12)}→${rebase.newSha.slice(0, 12)}) 검사를 다시 돌립니다 — 통과하면 Outcome 카드로 다시 알립니다.`;
+		}
+		await this.#sync(working, "transition");
+		const missed =
+			rebase === undefined
+				? ""
+				: ` (코어 rebase 안 함: ${rebase.why}${rebase.abortFailed === undefined ? "" : " — ⚠️ 되돌리기 실패, worktree가 rebase 중일 수 있습니다"})`;
 		if (cardTs !== undefined) {
 			await this.#editCard(working, cardTs, {
 				kind: "rework",
 				reason: frozen
 					? `${reason} — 동결 중이라 레인에 rebase 안내를 보내지 않았습니다.`
-					: `${reason} — 레인이 \`${lane.meta.baseBranch}\` 위로 rebase하고 있습니다.`,
+					: `${reason} — 레인이 \`${base}\` 위로 rebase하고 있습니다${missed}.`,
 			});
 		}
 		if (frozen) {
 			log.warn("lane_send_held_frozen", { lane: lane.name });
 			return `🔄 머지하지 못했습니다: ${reason}. 동결 중이라 rebase 안내는 보내지 않았습니다 — 동결이 풀린 뒤 이 스레드에 rebase를 지시하세요.`;
 		}
-		this.#send(
-			lane.name,
-			"rebase",
-			buildRebasePrompt({ branch: lane.meta.branch ?? "", baseBranch: lane.meta.baseBranch ?? "" }),
-		);
-		return `🔄 머지하지 못했습니다: ${reason}. 레인이 rebase한 뒤 다시 완료를 주장합니다.`;
+		this.#send(lane.name, "rebase", buildRebasePrompt({ branch: lane.meta.branch ?? "", baseBranch: base }));
+		return `🔄 머지하지 못했습니다: ${reason}${missed}. 레인이 rebase한 뒤 다시 완료를 주장합니다.`;
+	}
+
+	/**
+	 * The core's own rebase of a not-ff lane (`lane` as it was before going back to `working`). While it runs the
+	 * lane's mailbox holds its rows (`isCoreRebasing`), so no lane turn works in the worktree; they are dispatched
+	 * after it, whatever happened. A clean rebase is recorded as the lane's claim (`done-claimed`) before that.
+	 */
+	async #coreRebase(lane: LaneRow): Promise<CoreRebaseResult> {
+		const { store, clock, log } = this.#deps;
+		const { worktree = lane.cwd, branch = "", baseBranch = "" } = lane.meta;
+		// The landing waited for the lane's turn, but a message may have started one since.
+		if (this.#deps.laneBusy?.(lane.originKey) === true) {
+			log.info("lane_core_rebase_skipped", { lane: lane.name, why: "lane_turn_running" });
+			return { state: "missed", why: "레인 턴 진행 중", detail: "lane turn running" };
+		}
+		this.#coreRebasing.add(lane.originKey);
+		try {
+			const result = await coreRebase(this.#deps.rebaseGit ?? defaultGit, { worktree, branch, baseBranch });
+			if (result.state === "missed") {
+				log.info("lane_core_rebase_missed", { lane: lane.name, why: result.why, detail: result.detail });
+				if (result.abortFailed !== undefined) {
+					log.warn("lane_core_rebase_abort_failed", { lane: lane.name, worktree, error: result.abortFailed });
+				}
+				return result;
+			}
+			const moved = `${result.oldSha.slice(0, 12)}→${result.newSha.slice(0, 12)}`;
+			const previous = lane.meta.claim;
+			const claim: LaneClaim = {
+				repo: previous?.repo ?? worktree,
+				commit: result.newSha,
+				summary: `${previous?.summary ?? lane.title} (코어 rebase ${moved})`,
+				claimedAt: clock.now(),
+			};
+			store.patchLane(lane.name, { event: "core_rebased", detail: moved, sha: result.newSha }, {});
+			store.transitionLane(
+				lane.name,
+				"done-claimed",
+				{ event: "claim", detail: `${claim.repo}@${claim.commit}: ${claim.summary}` },
+				{ claim },
+			);
+			log.info("lane_core_rebased", { lane: lane.name, from: result.oldSha, to: result.newSha });
+			return result;
+		} finally {
+			this.#coreRebasing.delete(lane.originKey);
+			await this.#deps
+				.resumePending(lane.originKey)
+				.catch((error: unknown) => log.error("lane_resume_failed", { lane: lane.name, error: String(error) }));
+		}
 	}
 
 	/**
@@ -1756,6 +2129,7 @@ export class LaneManager {
 	 * is left alone this tick: its verdict draws its own transition, and the next tick reconciles the rest.
 	 */
 	async tick(): Promise<void> {
+		await this.#takeBackOrphans();
 		const now = this.#deps.clock.now();
 		for (const lane of this.#deps.store.listLanes()) {
 			try {
@@ -1785,6 +2159,21 @@ export class LaneManager {
 				if (lane.status === "not-done") await this.#closeIfLandedOutside(lane.name);
 			} catch (error) {
 				this.#deps.log.error("lane_tick_failed", { lane: lane.name, error: String(error) });
+			}
+		}
+	}
+
+	/** An attached lane whose `ompbot lanes attach` process is gone (killed terminal, restart of this host) is taken back. */
+	async #takeBackOrphans(): Promise<void> {
+		const alive = this.#deps.pidAlive ?? pidAlive;
+		for (const lane of this.#deps.store.listLanes()) {
+			const attach = lane.meta.attach;
+			if (attach === undefined || this.#attaching.has(lane.name) || alive(attach.pid)) continue;
+			try {
+				this.#deps.log.warn("lane_attach_orphaned", { lane: lane.name, pid: attach.pid });
+				await this.detach(lane.name, { sessionFile: attach.sessionFile, newFiles: [], by: "orphan" });
+			} catch (error) {
+				this.#deps.log.error("lane_attach_orphan_failed", { lane: lane.name, error: String(error) });
 			}
 		}
 	}
@@ -1896,6 +2285,15 @@ export class LaneManager {
 		const parsed = parseThreadRef(lane.threadRef);
 		if (parsed === undefined) return lane;
 		const { channel, threadTs: rootTs } = parsed;
+		// Its platform is off (e.g. Slack disabled): nothing to draw on. The row keeps what was last shown, so the first
+		// draw after the channel registers again brings it up to date.
+		if (channels.forConversation(channel) === undefined) {
+			if (!this.#unroutableWarned.has(name)) {
+				this.#unroutableWarned.add(name);
+				log.info("lane_render_skipped", { lane: name, reason: "channel_unregistered", channel });
+			}
+			return lane;
+		}
 		const closed = lane.status === "closed";
 		const paused = lane.status === "paused";
 		const now = clock.now();
@@ -1906,18 +2304,23 @@ export class LaneManager {
 		const rootText = `${mark} ${title}`;
 		const milestone = lane.meta.milestone === undefined ? "" : `\n↳ ${escapeMrkdwn(lane.meta.milestone)}`;
 		// Paused pins its status (no elapsed clock) and is drawn at the transition, never on the 15-minute tick.
+		const attached = lane.meta.attach !== undefined;
 		const statusText = closed
 			? `${mark} ${title}${waiting === "" ? "" : ` · ${waiting}`}`
-			: paused
-				? `⏸ ${title} · 멈춤`
-				: `⏳ ${title} · ${formatElapsed(now - lane.meta.startedAt)}${milestone}`;
+			: attached
+				? `🖥 ${title} · 터미널에서 작업 중`
+				: paused
+					? `⏸ ${title} · 멈춤`
+					: `⏳ ${title} · ${formatElapsed(now - lane.meta.startedAt)}${milestone}`;
 		const statusDue = closed
 			? lane.meta.renderedStatus !== statusText
 			: paused
 				? lane.meta.renderedStatus !== statusText // drawn once; a tick only retries a draw that failed
 				: reason !== "tick" || now - lane.meta.lastProgressAt >= PROGRESS_INTERVAL_MS;
 		// The owner holds or resumes the lane from the status message itself (closed lanes have their Outcome card).
-		const statusButtons: readonly ActionButton[] = closed ? [] : [paused ? resumeButton(name) : pauseButton(name)];
+		// Attached: the terminal hands the lane back, so no button would do anything.
+		const statusButtons: readonly ActionButton[] =
+			closed || attached ? [] : [paused ? resumeButton(name) : pauseButton(name)];
 		const patch: Partial<LaneMeta> = {};
 		try {
 			const port = channels.portFor(channel);

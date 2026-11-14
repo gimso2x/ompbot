@@ -105,6 +105,11 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 				process.stderr.write(
 					`dashboard snapshot_failed: ${redact(error instanceof Error ? error.message : String(error))}\n`,
 				),
+			// Usage count only: the kind and a view name, never the origin, id or card of the request.
+			onRequest: (kind, view) =>
+				process.stderr.write(
+					`dashboard_request kind=${kind}${view === undefined ? "" : ` view=${/^[a-z_-]{1,32}$/.test(view) ? view : "other"}`}\n`,
+				),
 			...(board === undefined
 				? {}
 				: {

@@ -6,7 +6,6 @@ import type {
 	SlackBlockActionPayload,
 	SlackHandlers,
 	SlackMessageEvent,
-	SlackReactionEvent,
 	SlackReply,
 	SlackSlashPayload,
 	SlackTransport,
@@ -201,10 +200,6 @@ export class FakeSlackTransport implements SlackTransport {
 
 	async emitMessage(event: SlackMessageEvent): Promise<void> {
 		await this.handlers?.message(event);
-	}
-
-	async emitReaction(event: SlackReactionEvent): Promise<void> {
-		await this.handlers?.reaction(event);
 	}
 
 	async emitSlash(payload: SlackSlashPayload): Promise<SlashAck | undefined> {

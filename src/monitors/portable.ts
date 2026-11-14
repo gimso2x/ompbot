@@ -5,6 +5,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -19,8 +20,8 @@ import { type MonitorSpec, MonitorSpecError, parseMonitorSpec, type SpecContext 
  * same file applies on a home with other paths. Webhook triggers carry no id or token; ids, cursors, state and
  * timestamps stay in the database.
  */
-export const SCRIPTS_PLACEHOLDER = "@SCRIPTS@";
-export const WORKSPACE_PLACEHOLDER = "@WORKSPACE@";
+const SCRIPTS_PLACEHOLDER = "@SCRIPTS@";
+const WORKSPACE_PLACEHOLDER = "@WORKSPACE@";
 
 /** The spec context of one home; export and apply need the workspace to map paths against. */
 export type PortableContext = SpecContext & { workspaceDir: string };
@@ -59,11 +60,11 @@ function rootsOf(ctx: PortableContext): PlaceholderRoot[] {
  * An absolute path inside a placeholder root as `{placeholder, rest}` (`rest` empty for the root itself), judged after
  * `..` and `.` are resolved: `<scripts>/../../x` is outside, whatever its spelling starts with.
  */
-function underRoot(path: string, roots: readonly PlaceholderRoot[]): { placeholder: string; rest: string } | undefined {
+function underRoot(path: string, roots: readonly PlaceholderRoot[]): (PlaceholderRoot & { rest: string }) | undefined {
 	const normal = resolve(path);
 	for (const { root, placeholder } of roots) {
 		const rest = relative(root, normal);
-		if (!isOutside(rest)) return { placeholder, rest };
+		if (!isOutside(rest)) return { root, placeholder, rest };
 	}
 	return undefined;
 }
@@ -77,7 +78,7 @@ function isOutside(rest: string): boolean {
  * The portable spec with a fixed key order (stable diffs). `onOutside` hears about absolute paths outside both roots,
  * which are kept as they are.
  */
-export function portableSpec(
+function portableSpec(
 	spec: MonitorSpec,
 	ctx: PortableContext,
 	onOutside: (path: string) => void = () => {},
@@ -95,7 +96,13 @@ export function portableSpec(
 	const { trigger } = spec;
 	let portableTrigger: Record<string, unknown>;
 	if (trigger.kind === "cron") {
-		portableTrigger = { kind: "cron", schedule: trigger.schedule, timezone: trigger.timezone };
+		portableTrigger = {
+			kind: "cron",
+			schedule: trigger.schedule,
+			timezone: trigger.timezone,
+			...(trigger.command === undefined ? {} : { command: trigger.command.map(toPortable) }),
+			...(trigger.timeoutMs === undefined ? {} : { timeoutMs: trigger.timeoutMs }),
+		};
 	} else if (trigger.kind === "at") {
 		portableTrigger = { kind: "at", at: trigger.at };
 	} else if (trigger.kind === "script") {
@@ -156,7 +163,8 @@ export function exportMonitors(
 	}
 	const warnings: string[] = [];
 	const written = new Set<string>();
-	const copies = new Map<string, string>();
+	/** Source path → where it lands, the monitor naming it first and the placeholder root it was found under. */
+	const copies = new Map<string, { target: string; name: string; root: string }>();
 	const roots = rootsOf(ctx);
 	const filesRoots: Record<string, string> = {
 		[SCRIPTS_PLACEHOLDER]: join(dir, "files", "scripts"),
@@ -177,7 +185,7 @@ export function exportMonitors(
 		writeFileSync(join(dir, file), `${JSON.stringify(portable, null, 2)}\n`);
 		if (!options.withFiles) continue;
 		const referenced = [
-			...(spec.trigger.kind === "script" ? spec.trigger.command : []),
+			...(spec.trigger.kind === "script" || spec.trigger.kind === "cron" ? (spec.trigger.command ?? []) : []),
 			...(spec.procedureFiles ?? []).map((path) => resolve(ctx.workspaceDir, path)),
 		];
 		for (const path of referenced) {
@@ -189,22 +197,36 @@ export function exportMonitors(
 				warnings.push(`${row.name}: referenced file would land outside ${filesRoot}, not copied: ${path}`);
 				continue;
 			}
-			copies.set(path, target);
+			if (!copies.has(path)) copies.set(path, { target, name: row.name, root: inside.root });
 		}
 	}
-	for (const [source, target] of copies) {
+	for (const [source, { target, name, root }] of copies) {
+		// The path is under its root as spelled; a symlink on the way may still lead out (`<workspace>/p.md -> /etc/…`),
+		// so the copy goes by where it really leads. A dangling link reads as not found.
+		let real: string;
 		let mode: number;
 		try {
-			const stat = statSync(source);
+			real = realpathSync(source);
+			if (isOutside(relative(realpathSync(root), real))) {
+				warnings.push(`${name}: referenced file resolves outside ${root}, not copied: ${source}`);
+				continue;
+			}
+			const stat = statSync(real);
 			if (!stat.isFile()) continue;
 			mode = stat.mode & 0o7777;
 		} catch {
 			warnings.push(`referenced file not found, not copied: ${source}`);
 			continue;
 		}
-		mkdirSync(dirname(target), { recursive: true });
-		copyFileSync(source, target);
-		chmodSync(target, mode);
+		try {
+			mkdirSync(dirname(target), { recursive: true });
+			copyFileSync(real, target);
+			chmodSync(target, mode);
+		} catch (error) {
+			warnings.push(
+				`${name}: referenced file not copied: ${source} (${error instanceof Error ? error.message : String(error)})`,
+			);
+		}
 	}
 	let removed = 0;
 	for (const file of readdirSync(dir)) {
@@ -237,6 +259,8 @@ export interface ApplyResult {
 	updated: number;
 	unchanged: number;
 	removed: number;
+	/** `*.json` entries that are not regular files and were skipped. */
+	warnings: string[];
 }
 
 /** Replaces `@SCRIPTS@`/`@WORKSPACE@` in the path fields of a parsed file; anything malformed is left to validation. */
@@ -275,10 +299,19 @@ export function applyMonitors(
 	options: { prune?: boolean; dryRun?: boolean } = {},
 ): ApplyResult {
 	let files: string[];
+	const warnings: string[] = [];
 	try {
 		files = readdirSync(dir)
 			.filter((file) => file.endsWith(".json"))
-			.sort();
+			.sort()
+			.filter((file) => {
+				// Reading a FIFO blocks forever and a directory fails the whole apply: only regular files are specs.
+				// A dangling link stays in so its read error is reported.
+				const stat = statSync(join(dir, file), { throwIfNoEntry: false });
+				if (stat === undefined || stat.isFile()) return true;
+				warnings.push(`${file}: not a regular file, skipped`);
+				return false;
+			});
 	} catch (error) {
 		throw new PortableApplyError([`${dir}: ${error instanceof Error ? error.message : String(error)}`]);
 	}
@@ -328,5 +361,5 @@ export function applyMonitors(
 		for (const { id, spec } of updates) ledger.updateMonitor(id, spec);
 		for (const row of removals) ledger.removeMonitor(row.id);
 	}
-	return { added: adds.length, updated: updates.length, unchanged, removed: removals.length };
+	return { added: adds.length, updated: updates.length, unchanged, removed: removals.length, warnings };
 }

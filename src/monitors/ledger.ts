@@ -83,6 +83,11 @@ export interface MonitorRow {
 	lastScriptState: ScriptState | null;
 	/** Script monitors: sha256 of the last met check's stdout — `suppressUnchanged` compares against it. */
 	lastOutputHash: string | null;
+	/** Script and watcher monitors: the last check (or watch) error, cleared by the next good one. */
+	lastCheckError: string | null;
+	lastCheckErrorAt: number | null;
+	/** Check errors in a row; the owner is told once when it reaches `CHECK_ERROR_ALERT_STREAK`. */
+	checkErrorStreak: number;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -126,6 +131,9 @@ CREATE TABLE IF NOT EXISTS monitors (
 	procedure_files TEXT,
 	cursor_at INTEGER NOT NULL,
 	last_script_state TEXT CHECK (last_script_state IN ('met','unmet')),
+	last_check_error TEXT,
+	last_check_error_at INTEGER,
+	check_error_streak INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL
 );
@@ -157,6 +165,7 @@ CREATE TABLE IF NOT EXISTS monitor_events (
 );
 CREATE INDEX IF NOT EXISTS monitor_events_monitor_stage ON monitor_events(monitor_id, stage);
 CREATE INDEX IF NOT EXISTS monitor_events_stage ON monitor_events(stage);
+CREATE INDEX IF NOT EXISTS monitor_events_monitor_event ON monitor_events(monitor_id, event_id);
 CREATE TABLE IF NOT EXISTS monitor_incidents (
 	incident_id INTEGER PRIMARY KEY AUTOINCREMENT,
 	monitor_id TEXT NOT NULL,
@@ -205,6 +214,15 @@ export function migrateMonitorSchema(db: Database): void {
 	if (!columns.some((column) => column.name === "procedure_files")) {
 		db.run("ALTER TABLE monitors ADD COLUMN procedure_files TEXT");
 	}
+	if (!columns.some((column) => column.name === "last_check_error")) {
+		db.run("ALTER TABLE monitors ADD COLUMN last_check_error TEXT");
+	}
+	if (!columns.some((column) => column.name === "last_check_error_at")) {
+		db.run("ALTER TABLE monitors ADD COLUMN last_check_error_at INTEGER");
+	}
+	if (!columns.some((column) => column.name === "check_error_streak")) {
+		db.run("ALTER TABLE monitors ADD COLUMN check_error_streak INTEGER NOT NULL DEFAULT 0");
+	}
 }
 
 export interface MonitorSql {
@@ -224,6 +242,9 @@ export interface MonitorSql {
 	created_at: number;
 	last_script_state: ScriptState | null;
 	last_output_hash: string | null;
+	last_check_error: string | null;
+	last_check_error_at: number | null;
+	check_error_streak: number;
 	updated_at: number;
 }
 
@@ -261,6 +282,9 @@ export const toMonitor = (r: MonitorSql): MonitorRow => ({
 	cursorAt: r.cursor_at,
 	lastScriptState: r.last_script_state,
 	lastOutputHash: r.last_output_hash,
+	lastCheckError: r.last_check_error,
+	lastCheckErrorAt: r.last_check_error_at,
+	checkErrorStreak: r.check_error_streak,
 	createdAt: r.created_at,
 	updatedAt: r.updated_at,
 });
@@ -306,7 +330,13 @@ export function nextFireOf(row: MonitorRow): number | null {
  */
 export function describeMonitorTrigger(row: MonitorRow, formatAt: (at: string) => string): string {
 	const { trigger } = row;
-	if (trigger.kind === "cron") return `cron "${trigger.schedule}" ${trigger.timezone}`;
+	if (trigger.kind === "cron") {
+		const command =
+			trigger.command === undefined
+				? ""
+				: ` command=${trigger.command.join(" ")}${trigger.timeoutMs === undefined ? "" : ` timeout=${trigger.timeoutMs / 1000}s`}`;
+		return `cron "${trigger.schedule}" ${trigger.timezone}${command}`;
+	}
 	if (trigger.kind === "at") return `at ${formatAt(trigger.at)}`;
 	if (trigger.kind === "watcher") return `watcher ${trigger.root} debounce=${trigger.debounceMs}ms`;
 	if (trigger.kind === "webhook") return `webhook /hook/${trigger.id}`;
@@ -338,6 +368,20 @@ export interface SettleFailure {
 	terminal: boolean;
 }
 
+/** Check errors in a row that tell the owner (once per streak; a good check ends the streak). */
+export const CHECK_ERROR_ALERT_STREAK = 3;
+
+/** A script check or watch that kept failing (`CHECK_ERROR_ALERT_STREAK` in a row). */
+export interface CheckErrorAlert {
+	monitorId: string;
+	monitorName: string;
+	/** The latest error, redacted. */
+	error: string;
+	streak: number;
+	/** How often this incident alerted (>1: it came back after its repeat window). */
+	count: number;
+}
+
 export interface SettleAnswer {
 	event: MonitorEventRow;
 	monitorName: string;
@@ -355,11 +399,21 @@ export class MonitorLedger {
 	readonly #redact: (text: string) => string;
 	readonly #listeners = new Set<(event: MonitorEventRow) => void>();
 	readonly #cronCache = new Map<string, CronSchedule>();
+	readonly #onCheckErrorAlert: ((alert: CheckErrorAlert) => void) | undefined;
 
-	constructor(db: Database, options: { clock: MonitorClock; redact?: (text: string) => string }) {
+	constructor(
+		db: Database,
+		options: {
+			clock: MonitorClock;
+			redact?: (text: string) => string;
+			/** Called inside the recording transaction when a check error streak should reach the owner. */
+			onCheckErrorAlert?: (alert: CheckErrorAlert) => void;
+		},
+	) {
 		this.#db = db;
 		this.#clock = options.clock;
 		this.#redact = options.redact ?? ((text) => text);
+		this.#onCheckErrorAlert = options.onCheckErrorAlert;
 		migrateMonitorSchema(db);
 	}
 
@@ -463,8 +517,15 @@ export class MonitorLedger {
 				now,
 				id,
 			);
-		// A disabled monitor's open incidents are over: re-enabled, the same failure alerts again.
-		if (!spec.enabled) resolveIncidents(this.#db, "monitor_incidents", id);
+		// A disabled monitor's open incidents and check error streak are over: re-enabled, the same failure alerts again.
+		if (!spec.enabled) {
+			this.#closeIncidents(id);
+			// Fires already queued for an owner-disabled monitor must not run later (one-shot disables go through setEnabled).
+			const queued = this.#db
+				.query("SELECT event_id FROM monitor_events WHERE monitor_id = ? AND stage IN ('admitted','failed')")
+				.all(id) as Array<{ event_id: number }>;
+			for (const { event_id } of queued) this.skipEvent(event_id, "disabled");
+		}
 		return this.requireMonitor(id);
 	}
 
@@ -488,7 +549,16 @@ export class MonitorLedger {
 			.query("UPDATE monitors SET enabled = ?, updated_at = ? WHERE id = ?")
 			.run(enabled ? 1 : 0, this.#clock.now(), id);
 		// Like `updateMonitor`: disabling closes the monitor's open incidents.
-		if (!enabled) resolveIncidents(this.#db, "monitor_incidents", id);
+		if (!enabled) this.#closeIncidents(id);
+	}
+
+	#closeIncidents(id: string): void {
+		this.#db
+			.query(
+				"UPDATE monitors SET last_check_error = NULL, last_check_error_at = NULL, check_error_streak = 0 WHERE id = ?",
+			)
+			.run(id);
+		resolveIncidents(this.#db, "monitor_incidents", id);
 	}
 
 	private requireMonitor(id: string): MonitorRow {
@@ -557,11 +627,14 @@ export class MonitorLedger {
 	/**
 	 * Applies one finished script check. The state change, the fire (a claimed slot with its event) and the `once`
 	 * disable are one transaction, so a crash can neither refire a met condition nor lose the fire. `error` (timeout,
-	 * spawn or path failure) says nothing about the condition and leaves the state alone. Returns the claim when it fired.
+	 * spawn or path failure) says nothing about the condition and leaves the state alone; it only counts in the check
+	 * error streak (`recordCheckError`), which a definitive check ends. Returns the claim when it fired.
 	 */
 	recordScriptCheck(input: {
 		monitorId: string;
 		outcome: ScriptState | "error";
+		/** Why an `error` check could not decide (spawn failure, timeout, killed). */
+		error?: string | undefined;
 		slotAt: number;
 		payload?: string | undefined;
 		/** sha256 of the met check's stdout; persisted and compared for `suppressUnchanged`. */
@@ -569,10 +642,14 @@ export class MonitorLedger {
 		/** A fired check that must not wake the agent (`wake_gate` from the script itself, or `no_change`). */
 		suppressReason?: string | undefined;
 	}): ClaimResult | undefined {
-		if (input.outcome === "error") return undefined;
+		if (input.outcome === "error") {
+			this.recordCheckError(input.monitorId, input.error ?? "script check failed");
+			return undefined;
+		}
 		return this.#db.transaction((): ClaimResult | undefined => {
 			const monitor = this.getMonitor(input.monitorId);
 			if (monitor?.trigger.kind !== "script" || !monitor.enabled) return undefined;
+			this.clearCheckError(monitor.id);
 			const { fire = "edge", once = false } = monitor.trigger;
 			const suppressUnchanged = monitor.trigger.kind === "script" && monitor.trigger.suppressUnchanged === true;
 			let suppressReason = input.suppressReason;
@@ -626,6 +703,47 @@ export class MonitorLedger {
 	): { notify: boolean; count: number } {
 		const { notify, count } = countIncident(this.#db, "monitor_incidents", monitorId, error, now, repeatMs);
 		return { notify, count };
+	}
+
+	/**
+	 * One script check or watch that failed: the error and its time are kept and the streak grows. The moment the streak
+	 * reaches `CHECK_ERROR_ALERT_STREAK` it counts as a monitor incident, and an incident that alerts goes to the owner
+	 * through `onCheckErrorAlert` in the same transaction; later errors of the same streak stay quiet. Returns the streak.
+	 */
+	recordCheckError(monitorId: string, error: string): number {
+		return this.#db.transaction((): number => {
+			const now = this.#clock.now();
+			const text = this.#redact(error);
+			const row = this.#db
+				.query(
+					"UPDATE monitors SET last_check_error = ?, last_check_error_at = ?, check_error_streak = check_error_streak + 1 WHERE id = ? RETURNING name, check_error_streak",
+				)
+				.get(text, now, monitorId) as { name: string; check_error_streak: number } | null;
+			if (row === null) return 0;
+			if (row.check_error_streak === CHECK_ERROR_ALERT_STREAK) {
+				const incident = this.recordMonitorIncident(monitorId, `check_error: ${text}`, now);
+				if (incident.notify) {
+					this.#onCheckErrorAlert?.({
+						monitorId,
+						monitorName: row.name,
+						error: text,
+						streak: row.check_error_streak,
+						count: incident.count,
+					});
+				}
+			}
+			return row.check_error_streak;
+		})();
+	}
+
+	/** A good check or a started watch: an error streak ends (columns cleared) and the monitor's open incidents resolve. */
+	clearCheckError(monitorId: string): void {
+		const cleared = this.#db
+			.query(
+				"UPDATE monitors SET last_check_error = NULL, last_check_error_at = NULL, check_error_streak = 0 WHERE id = ? AND check_error_streak > 0",
+			)
+			.run(monitorId).changes;
+		if (cleared > 0) this.resolveMonitorIncidents(monitorId);
 	}
 
 	/** A successful run (delivered or deliberately silent) resolves the monitor's open incidents. */
@@ -752,20 +870,27 @@ export class MonitorLedger {
 
 	/**
 	 * admitted|failed -> authored, the stored payload being the answer, for a `verbatim` monitor (no turn, no marker
-	 * parsing); an empty payload goes to `no_report`. `opRef` is kept as this attempt's id. Returns `undefined` when the
-	 * event is gone or not waiting to run.
+	 * parsing); an empty payload goes to `no_report`. `opRef` is kept as this attempt's id. With `output` (a cron
+	 * command's stdout) the event must instead be `dispatched` under `opRef`, and `output` becomes its payload and answer.
+	 * Returns `undefined` when the event is gone or not waiting to run.
 	 */
-	settleVerbatim(eventId: number, opRef: string): SettleAnswer | undefined {
+	settleVerbatim(eventId: number, opRef: string, output?: string): SettleAnswer | undefined {
 		const settled = this.#db.transaction((): SettleAnswer | undefined => {
 			const event = this.getEvent(eventId);
-			if (!event || (event.stage !== "admitted" && event.stage !== "failed")) return undefined;
-			const payload = event.payload ?? "";
+			if (!event) return undefined;
+			if (
+				output === undefined
+					? event.stage !== "admitted" && event.stage !== "failed"
+					: event.stage !== "dispatched" || event.inboundId !== opRef
+			)
+				return undefined;
+			const payload = output === undefined ? (event.payload ?? "") : this.#redact(output);
 			const report = payload.trim() !== "";
 			this.#db
 				.query(
-					"UPDATE monitor_events SET stage = ?, inbound_id = ?, next_attempt_at = NULL, answer = ?, error = NULL, updated_at = ? WHERE event_id = ?",
+					"UPDATE monitor_events SET stage = ?, inbound_id = ?, next_attempt_at = NULL, payload = ?, answer = ?, error = NULL, updated_at = ? WHERE event_id = ?",
 				)
-				.run(report ? "authored" : "no_report", opRef, payload, this.#clock.now(), eventId);
+				.run(report ? "authored" : "no_report", opRef, payload, payload, this.#clock.now(), eventId);
 			const monitor = this.getMonitor(event.monitorId);
 			return { event: this.requireEvent(eventId), monitorName: monitor?.name ?? event.monitorId, report };
 		})();
@@ -773,14 +898,17 @@ export class MonitorLedger {
 		return settled;
 	}
 
-	/** dispatched -> failed (retry after the backoff) or failed_no_retry once the retries are spent. */
-	settleFailed(eventId: number, error: string): SettleFailure | undefined {
+	/**
+	 * dispatched -> failed (retry after the backoff) or failed_no_retry once the retries are spent; `retry: false` (a
+	 * cron command) ends it as failed_no_retry on the first failure.
+	 */
+	settleFailed(eventId: number, error: string, options: { retry?: boolean } = {}): SettleFailure | undefined {
 		const settled = this.#db.transaction((): SettleFailure | undefined => {
 			const event = this.getEvent(eventId);
 			if (event?.stage !== "dispatched") return undefined;
 			const now = this.#clock.now();
 			const attempts = event.attempts + 1;
-			const backoff = RETRY_BACKOFF_MS[attempts - 1];
+			const backoff = options.retry === false ? undefined : RETRY_BACKOFF_MS[attempts - 1];
 			this.#db
 				.query(
 					"UPDATE monitor_events SET stage = ?, attempts = ?, next_attempt_at = ?, error = ?, updated_at = ? WHERE event_id = ?",

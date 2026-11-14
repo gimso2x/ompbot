@@ -97,7 +97,6 @@
 				"im:write",
 				"mpim:history",
 				"mpim:read",
-				"reactions:read",
 				"reactions:write",
 				"files:read",
 				"files:write",
@@ -107,14 +106,7 @@
 	},
 	"settings": {
 		"event_subscriptions": {
-			"bot_events": [
-				"message.channels",
-				"message.groups",
-				"message.im",
-				"message.mpim",
-				"reaction_added",
-				"reaction_removed"
-			]
+			"bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"]
 		},
 		"interactivity": {
 			"is_enabled": true

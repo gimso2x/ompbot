@@ -1,12 +1,25 @@
 // AC-2 of T-20261111-01: the chromium capture — two stages with the designed arguments, the height read from
 // `<title>` (clamped 400..4000, non-numeric 1600), timeout kills and throws, a failure carries the last stderr line
 // (or the stdout of a spawn failure), a second render while one runs is rejected at once, and no temp HTML is left.
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { BriefingBusyError, renderPng } from "../src/ops/screenshot";
+
+/** Every `--out` a test hands to `renderPng`; removed after each test so a failing assertion leaks no PNG. */
+const outputs: string[] = [];
+afterEach(() => {
+	for (const out of outputs.splice(0)) rmSync(out, { recursive: true, force: true });
+});
+
+/** A temp `--out` path (`dir` makes it an existing directory), registered for removal. */
+function shotOut(name: string, dir = false): string {
+	const out = dir ? mkdtempSync(join(tmpdir(), `ompbot-shot-${name}-`)) : join(tmpdir(), `ompbot-shot-${name}`);
+	outputs.push(out);
+	return out;
+}
 
 const WIDTH = 1080;
 const html = "<html><body><h1>briefing</h1></body></html>";
@@ -43,7 +56,7 @@ const ok = (extra: Partial<RunProcessResult> = {}): Partial<RunProcessResult> =>
 
 describe("AC-2: renderPng", () => {
 	test("runs --dump-dom first and --screenshot second, both on the same temp HTML file", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-ok.png`);
+		const out = shotOut(`${process.pid}-ok.png`);
 		const { run, calls } = fakeRunner([ok({ stdout: "<html><head><title>1234</title></head></html>" }), ok({})]);
 		const size = await renderPng(html, out, { chromium: "/usr/bin/chromium", width: WIDTH, timeoutMs: 20_000, run });
 		expect(size).toEqual({ width: WIDTH, height: 1234 });
@@ -67,7 +80,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("a height past 4000 is cut to 4000 and a non-numeric title gives 1600", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-clamp.png`);
+		const out = shotOut(`${process.pid}-clamp.png`);
 		const tall = fakeRunner([ok({ stdout: "<title>5000</title>" }), ok({})]);
 		expect(await renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run: tall.run })).toEqual({
 			width: WIDTH,
@@ -85,7 +98,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("a timed-out stage throws with the timeout and never starts the screenshot stage", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-timeout.png`);
+		const out = shotOut(`${process.pid}-timeout.png`);
 		const { run, calls } = fakeRunner([{ code: null, stdout: "", timedOut: true }]);
 		await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1500, run })).rejects.toThrow(
 			/시간 초과|timed out/,
@@ -95,7 +108,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("a failed stage carries the last stderr line", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-stderr.png`);
+		const out = shotOut(`${process.pid}-stderr.png`);
 		const { run } = fakeRunner([
 			ok({ stdout: "<title>1600</title>" }),
 			{ code: 1, stderr: "line one\nFatal: cannot write screenshot\n" },
@@ -106,7 +119,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("a spawn failure with an empty stderr carries the stdout instead", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-spawn.png`);
+		const out = shotOut(`${process.pid}-spawn.png`);
 		const { run } = fakeRunner([{ code: null, stdout: "spawn failed: ENOENT chromium", stderr: "" }]);
 		await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
 			/spawn failed: ENOENT chromium/,
@@ -114,7 +127,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("exit 0 without the output file is a failure too", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-missing.png`);
+		const out = shotOut(`${process.pid}-missing.png`);
 		// Exit 0, no file on disk: the fake never writes one (unlike the shared harness), so only the module's own
 		// "did the file appear" check can catch it.
 		const run: ProcessRunner = async (cmd) =>
@@ -127,39 +140,31 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("exit 0 with a stale file already at --out is a failure carrying the browser's words (J-16, J-18)", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-stale.png`);
+		const out = shotOut(`${process.pid}-stale.png`);
 		writeFileSync(out, "old png");
 		const run: ProcessRunner = async (cmd) =>
 			cmd.some((arg) => arg.startsWith("--screenshot="))
 				? { code: 0, stdout: "", stderr: "warn\nERROR: could not write screenshot", timedOut: false }
 				: { code: 0, stdout: "<title>1200</title>", timedOut: false };
-		try {
-			await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
-				/만들지 못했습니다: ERROR: could not write screenshot/,
-			);
-		} finally {
-			rmSync(out, { force: true });
-		}
+		await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
+			/만들지 못했습니다: ERROR: could not write screenshot/,
+		);
 	});
 
 	test("a directory at --out is not a success either (J-16)", async () => {
-		const out = mkdtempSync(join(tmpdir(), `ompbot-shot-${process.pid}-dir-`));
+		const out = shotOut(`${process.pid}-dir`, true);
 		const run: ProcessRunner = async (cmd) => ({
 			code: 0,
 			stdout: cmd.includes("--dump-dom") ? "<title>1200</title>" : "",
 			timedOut: false,
 		});
-		try {
-			await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
-				/만들지 못/,
-			);
-		} finally {
-			rmSync(out, { recursive: true, force: true });
-		}
+		await expect(renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1000, run })).rejects.toThrow(
+			/만들지 못/,
+		);
 	});
 
 	test("the timeout message does not repeat 중 (J-19)", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-timeout-text.png`);
+		const out = shotOut(`${process.pid}-timeout-text.png`);
 		const { run } = fakeRunner([{ code: null, stdout: "", timedOut: true }]);
 		const error = await renderPng(html, out, { chromium: "chromium", width: WIDTH, timeoutMs: 1500, run }).catch(
 			(e: Error) => e,
@@ -168,7 +173,7 @@ describe("AC-2: renderPng", () => {
 	});
 
 	test("a second render while one runs is rejected at once with BriefingBusyError", async () => {
-		const out = join(tmpdir(), `ompbot-shot-${process.pid}-busy.png`);
+		const out = shotOut(`${process.pid}-busy.png`);
 		const release = Promise.withResolvers<void>();
 		const first: ProcessRunner = async (cmd) => {
 			await release.promise;
@@ -203,7 +208,7 @@ if (process.env.OMPBOT_E2E_CHROMIUM !== "1") {
 const chromiumE2e = describe.skipIf(chromium === undefined); // skipped only where no chromium is installed
 chromiumE2e("AC-2: real chromium", () => {
 	test("writes a 1080-wide PNG at the measured height", async () => {
-		const out = join(tmpdir(), `ompbot-shot-e2e-${process.pid}.png`);
+		const out = shotOut(`e2e-${process.pid}.png`);
 		const page = `<html><head><style>body{margin:0;font-family:sans-serif}div{height:600px}</style></head><body><div>briefing</div><script>window.addEventListener("load",()=>{document.title=String(document.documentElement.scrollHeight)})</script></body></html>`;
 		const size = await renderPng(page, out, { chromium: chromium as string, width: WIDTH, timeoutMs: 30_000 });
 		const png = readFileSync(out);

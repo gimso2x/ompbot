@@ -90,7 +90,7 @@ const isCard = (msg: OutboundMessage): boolean =>
  * is one embed — title, body (else text) as the description, fields, the note as a small last line — with `text` as
  * the content, the line a notification shows. A plain message is its text, plus the note when it has buttons.
  */
-function messageOf(msg: OutboundMessage): { content: string; embeds?: DiscordEmbed[] } {
+export function messageOf(msg: OutboundMessage): { content: string; embeds?: DiscordEmbed[] } {
 	if (isCard(msg)) {
 		const note = msg.buttonsNote === undefined ? [] : [subtext(mrkdwnToDiscord(msg.buttonsNote))];
 		const embed = fitEmbed({
@@ -114,7 +114,6 @@ function messageOf(msg: OutboundMessage): { content: string; embeds?: DiscordEmb
  */
 export class DiscordChannel implements ChannelPort {
 	readonly platform = "discord";
-	readonly capabilities = { permalink: true, reactions: true };
 	readonly transport: DiscordTransport;
 	readonly #ownerUserId: string;
 	/** Peer bots (`channels.discord.peerBots`): they listen for mentions only, so a mention of one must notify. */

@@ -1,8 +1,8 @@
 # Discord 봇 만들기
 
-ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. 슬래시 명령은 Portal에서 만들지 않습니다. ompbot이 기동할 때 스스로 등록합니다(초대 URL에 `applications.commands`를 넣는 이유입니다).
+ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. Discord에는 슬래시 명령이 없습니다. 명령은 `!status`처럼 메시지로 보냅니다.
 
-진행 상태: 대화 연결(DM·서버 채널·스레드, `!`·슬래시 명령, 👀·진행 표시, 2000자 분할, `!shutup` 뮤트, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부·👍/👎 피드백, 재시작 중 놓친 메시지 복구, `doctor` 점검)과 운영 기능(DM 모니터, 서버 채널 스레드의 작업 레인과 그 버튼, `inject --origin discord/…`)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다. 데몬 수준 알림(게이트·한도·재시작)은 계속 Slack 오너 DM으로 갑니다.
+진행 상태: 대화 연결(DM·서버 채널·스레드, `!` 명령, 👀·진행 표시, 2000자 분할, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부, 재시작 중 놓친 메시지 복구, `doctor` 점검)과 운영 기능(DM 모니터, 서버 채널 스레드의 작업 레인과 그 버튼, `inject --origin discord/…`)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다. 데몬 수준 알림(게이트·한도·재시작)은 Slack이 있으면 Slack 오너 DM, 없으면 오너의 가장 최근 1:1 대화(예: Discord DM)로 가고 `!home`으로 바꿀 수 있습니다.
 
 ## 요약 (이것만 맞으면 됩니다)
 
@@ -14,7 +14,7 @@ ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slac
 | Bot → Public Bot | 끔 |
 | Bot → Requires OAuth2 Code Grant | 끔 |
 | Privileged Gateway Intents | **Message Content Intent만 켬** (Presence·Server Members는 끔) |
-| OAuth2 scope | `bot`, `applications.commands` |
+| OAuth2 scope | `bot` |
 | 봇 권한(정수) | `309237763136` |
 | 토큰 파일 | `~/.ompbot/secrets/discord-bot-token` (0600) |
 
@@ -63,10 +63,10 @@ ls -l ~/.ompbot/secrets/discord-bot-token
 아래 URL에서 `<APP_ID>`를 1절의 Application ID로 바꿔 브라우저에서 엽니다.
 
 ```
-https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.commands&permissions=309237763136
+https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=309237763136
 ```
 
-서버를 고르고 권한 8개가 보이면 **승인**합니다. Portal의 **OAuth2 → URL Generator**에서 scope `bot`·`applications.commands`와 위 8개 권한을 체크해도 같은 URL이 만들어집니다.
+서버를 고르고 권한 8개가 보이면 **승인**합니다. Portal의 **OAuth2 → URL Generator**에서 scope `bot`과 위 8개 권한을 체크해도 같은 URL이 만들어집니다.
 
 ## 4. 오너 ID와 서버 ID
 
@@ -135,7 +135,6 @@ bun src/main.ts apply --detach  # 재시작
 - 서버 멤버 목록에서 봇이 온라인(초록불)으로 보입니다.
 - 승인이 필요한 일을 시키면 버튼 카드가 오고, 누르면 결과 줄로 바뀝니다.
 - 같은 시간에 Slack DM도 정상으로 답합니다.
-- `/status-ompbot`이 나에게만 보이는 응답으로 답합니다.
 - DM에서 `1분 뒤에 물 마시라고 알려줘` → 모니터가 등록되고(`모니터 목록 보여줘`에 보임) 1분 뒤 결과가 그 DM에 새 글로 옵니다.
 - DM에서 `작업: 테스트 @/home/<user>/work/<repo>` → `laneChannelId` 채널에 `🔄 테스트` 루트와 레인 스레드가 생기고 DM에 그 스레드 링크가 옵니다. 스레드 안 ⏸ 버튼·`멈춰`·`계속`이 동작하고, 끝나면 머지·폐기 카드가 옵니다.
 - `bun src/main.ts inject --origin discord/dm/<DM 채널 ID> --as-owner --text '안녕'` → DM에 `🧪 inject` 마커와 답이 옵니다.
@@ -158,10 +157,11 @@ Slack의 [피어 봇](guide.md#피어-봇)과 같은 규칙으로, 같은 서버
 
 - `userId`는 snowflake(숫자 17~20자리)이고 오너 ID는 안 됩니다. `name`은 1~32자입니다. 프롬프트에 `이 대화의 피어 봇: 떡 = <@…>` 줄로 들어가 봇이 상대를 멘션할 수 있습니다.
 - 서버 채널·스레드에서만 동작합니다. Discord DM은 1:1이라 피어 글을 받지 않습니다(`peer_dm`).
-- 피어 글은 이 봇 멘션(`<@봇 ID>`·`<@!봇 ID>`)이 있어야 받습니다. `mentionFreeChannels`·`requireMention`과 무관하고, 뮤트한 스레드에서는 버립니다. 명령·첨부·승인 카드 답장으로 쓰이지 않습니다.
+- 피어 글은 이 봇 멘션(`<@봇 ID>`·`<@!봇 ID>`)이 있어야 받습니다. `mentionFreeChannels`·`requireMention`과 무관합니다. 명령·첨부·승인 카드 답장으로 쓰이지 않습니다.
 - 채널 최상위 피어 글은 받아들여진 뒤에만 스레드를 엽니다. 상한에 걸리거나 레인 스레드라 버린 글에는 스레드가 생기지 않습니다.
 - 스레드당 왕복 상한은 최상위 `peerHopLimit`(기본 30분에 3번)을 Slack과 같이 씁니다. 넘으면 한 번만 "피어 대화 상한에 닿았습니다…" 안내가 붙습니다.
 - 답에 든 피어 멘션은 알림이 갑니다(오너·`peerBots`만, @everyone·역할·그 밖의 사용자는 알림 없음).
+- 피어 무응답 알림: 스레드에서 피어를 멘션한 봇 글이 발송된 뒤 최상위 `peerSilenceAlert.minutes`(기본 10분, 0이면 끔) 안에 그 피어가 그 스레드에 아무 글도 안 쓰면(봇 멘션 없는 글·상한으로 버린 글도 답으로 칩니다) 오너를 멘션해 스레드·피어마다 한 번 알립니다. 채널 최상위·DM·#log·게시판 글과 실패 안내는 호출로 치지 않습니다.
 - 재시작 중 놓친 피어 글은 백필이 피어 경로로 다시 받습니다.
 - `channels`라서 바꾸면 재시작(`apply --detach`)이 필요합니다.
 
@@ -177,4 +177,4 @@ Slack의 [피어 봇](guide.md#피어-봇)과 같은 규칙으로, 같은 서버
 | 작업 레인 루트가 `❌ 제목`으로 바뀜 | 레인 채널에서 스레드를 못 만듦(위와 같은 권한). 권한을 켜고 다시 요청 |
 | DM `작업: …`에 `laneChannelId`가 필요하다는 답 | 5절에 `laneChannelId`를 넣고 재시작 |
 | Public Bot을 끌 때 "기본 승인 링크" 오류 | Installation 탭 Install Link가 Discord Provided Link임. None으로 바꾸고 저장한 뒤 다시 끔(1절 3단계) |
-| 슬래시 명령이 안 보임 | 초대 URL에 `applications.commands`가 빠짐(3절 URL로 다시 초대). `guildIds` 없이 전역 등록이면 퍼지는 데 시간이 걸릴 수 있음. 로그의 `discord_commands_register_failed` 확인 |
+| 예전 버전이 등록한 `/…-ompbot` 슬래시 명령이 아직 보이고 누르면 "애플리케이션이 응답하지 않았어요"가 뜸 | 봇은 슬래시 명령을 더 이상 받지 않고 등록·삭제도 하지 않습니다. 서버에 남은 명령은 봇 토큰으로 빈 목록을 덮어써야 지워집니다: 전역은 `PUT /applications/<APP_ID>/commands`, `guildIds`를 쓰던 서버는 `PUT /applications/<APP_ID>/guilds/<서버 ID>/commands`에 본문 `[]`(헤더 `Authorization: Bot <토큰>`). 쓰지 않는 명령이 보이는 것 외에 해는 없습니다 |

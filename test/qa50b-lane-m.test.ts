@@ -1,21 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import {
-	existsSync,
-	lstatSync,
-	mkdirSync,
-	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCards } from "../src/dashboard/board";
 import { readSessionConversation } from "../src/dashboard/thread-conversation";
-import { exportFlow } from "../src/flow/task-flow";
 import { classifyLaneCompletion } from "../src/lanes/integrity";
 import type { GitRunner } from "../src/lanes/verify";
 import { resolveLaneRepo } from "../src/lanes/worktree";
@@ -183,39 +171,11 @@ describe("M-8: json: signals see only the file's own fields", () => {
 			runCheck: async () => {
 				throw new Error("not run");
 			},
-			readFile: async () => '{"a": {"b": 1}}',
+			readBytes: async () => Buffer.from('{"a": {"b": 1}}'),
 		};
 		expect(await runSignal("file x.json json:.__proto__={}", io)).toMatchObject({ ok: false });
 		expect(await runSignal("file x.json json:.a.constructor={}", io)).toMatchObject({ ok: false });
 		expect(await runSignal("file x.json json:.a.b=1", io)).toMatchObject({ ok: true });
-	});
-});
-
-describe("M-9·M-10: tasks flow export", () => {
-	test("M-10: a home without ompbot.db exports an empty flow instead of a raw SQLiteError", () => {
-		const out = join(tempDir("ompbot-lane-m-flow-"), "out");
-		exportFlow(join(tempDir("ompbot-lane-m-nodb-"), "ompbot.db"), out, false, "Asia/Seoul", 0);
-		expect(JSON.parse(readFileSync(join(out, "status.json"), "utf8"))).toEqual([]);
-		expect(existsSync(join(out, "viewer.html"))).toBe(true);
-	});
-
-	test("M-9: planted symlinks in --out are replaced, never written through", () => {
-		const base = tempDir("ompbot-lane-m-flow-link-");
-		const out = join(base, "out");
-		mkdirSync(out);
-		const victims = ["a", "b", "c"].map((name) => {
-			const path = join(base, `victim-${name}`);
-			writeFileSync(path, "keep\n");
-			return path;
-		});
-		symlinkSync(victims[0] as string, join(out, "status.json.tmp"));
-		symlinkSync(victims[1] as string, join(out, "viewer.html"));
-		symlinkSync(victims[2] as string, join(out, "viewer.html.tmp"));
-		exportFlow(join(base, "missing.db"), out, false, "Asia/Seoul", 0);
-		for (const victim of victims) expect(readFileSync(victim, "utf8")).toBe("keep\n");
-		expect(lstatSync(join(out, "status.json")).isFile()).toBe(true);
-		expect(lstatSync(join(out, "viewer.html")).isFile()).toBe(true);
-		expect(readdirSync(out).sort()).toEqual(["status.json", "viewer.html"]);
 	});
 });
 

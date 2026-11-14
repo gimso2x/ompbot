@@ -180,8 +180,13 @@ export function nextFire(cron: CronSchedule, timezone: string, afterMs: number):
 	while (t < limit) {
 		const w = wallClock(t, timezone);
 		if (!cron.months.has(w.month) || !dayMatches(cron, w)) {
-			// Jump to the next local midnight; DST days that land an hour off are corrected by the next round.
-			t += ((23 - w.hour) * 60 + (60 - w.minute)) * MINUTE_MS;
+			// Jump to the next local midnight. A 25-hour day lands at 23:00 of the same date and the next round
+			// finishes the jump; a 23-hour day overshoots into the new date, so step back to its midnight unless that
+			// midnight does not exist (zones that spring forward at 24:00).
+			const next = t + ((23 - w.hour) * 60 + (60 - w.minute)) * MINUTE_MS;
+			const landed = wallClock(next, timezone);
+			const back = next - (landed.hour * 60 + landed.minute) * MINUTE_MS;
+			t = landed.day !== w.day && back < next && wallClock(back, timezone).day === landed.day ? back : next;
 		} else if (!cron.hours.has(w.hour)) {
 			t += (60 - w.minute) * MINUTE_MS;
 		} else if (!cron.minutes.has(w.minute)) {

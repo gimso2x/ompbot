@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolveScript, SCRIPT_TIMEOUT_MS } from "./spec";
 
@@ -21,6 +21,8 @@ export interface ScriptResult {
 	fired: boolean;
 	exitCode: number | null;
 	timedOut: boolean;
+	/** Killed because `signal` aborted (daemon shutdown); `fired` is then false. */
+	aborted?: boolean;
 	/** Trimmed output cut to `MAX_SCRIPT_OUTPUT_CHARS` (the last line is kept). */
 	stdout: string;
 	/** Trimmed stderr cut to `MAX_SCRIPT_STDERR_TAIL_CHARS` (feeds only the monitor_script log tail). */
@@ -33,40 +35,62 @@ export interface ScriptResult {
 	error?: string;
 }
 
+/** The result of a check that never ran: no exit code, `error` says why (path check or spawn failure). */
+function notRun(error: string): ScriptResult {
+	return {
+		fired: false,
+		exitCode: null,
+		timedOut: false,
+		stdout: "",
+		stderr: "",
+		outputHash: EMPTY_HASH,
+		wakeOff: false,
+		error,
+	};
+}
+
 /**
  * Runs a watch script once. The command is re-checked against the scripts root on every run (a symlink swapped
- * after `add` must not escape), it gets a minimal environment, and the whole process group is killed on timeout.
+ * after `add` must not escape), it gets a minimal environment (`PATH`, `LANG`, `HOME`, `OMPBOT_HOME` = `homeDir`,
+ * `OMPBOT_MONITOR_ID`), and the whole process group is killed on timeout or when `signal` aborts.
  */
 export async function runScript(
 	command: readonly string[],
-	options: { scriptsRoot: string; timeoutMs?: number; cwd: string; monitorId?: string },
+	options: {
+		scriptsRoot: string;
+		timeoutMs?: number;
+		cwd: string;
+		monitorId?: string;
+		homeDir?: string;
+		signal?: AbortSignal;
+		streamCloseGraceMs?: number;
+	},
 ): Promise<ScriptResult> {
 	let real: string;
 	try {
 		real = resolveScript(command, options.scriptsRoot);
 	} catch (error) {
-		return {
-			fired: false,
-			exitCode: null,
-			timedOut: false,
-			stdout: "",
-			stderr: "",
-			outputHash: EMPTY_HASH,
-			wakeOff: false,
-			error: String(error instanceof Error ? error.message : error),
-		};
+		return notRun(String(error instanceof Error ? error.message : error));
 	}
-	const child = spawn(real, command.slice(1), {
-		cwd: options.cwd,
-		// stderr is piped for the monitor_script log tail; it never touches the gate, the hash or the wake call.
-		stdio: ["ignore", "pipe", "pipe"],
-		detached: true,
-		env: {
-			PATH: process.env.PATH ?? "/usr/bin:/bin",
-			LANG: process.env.LANG ?? "C.UTF-8",
-			...(options.monitorId === undefined ? {} : { OMPBOT_MONITOR_ID: options.monitorId }),
-		},
-	});
+	let child: ChildProcess;
+	try {
+		child = spawn(real, command.slice(1), {
+			cwd: options.cwd,
+			// stderr is piped for the monitor_script log tail; it never touches the gate, the hash or the wake call.
+			stdio: ["ignore", "pipe", "pipe"],
+			detached: true,
+			env: {
+				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				LANG: process.env.LANG ?? "C.UTF-8",
+				...(process.env.HOME === undefined ? {} : { HOME: process.env.HOME }),
+				...(options.homeDir === undefined ? {} : { OMPBOT_HOME: options.homeDir }),
+				...(options.monitorId === undefined ? {} : { OMPBOT_MONITOR_ID: options.monitorId }),
+			},
+		});
+	} catch (error) {
+		// spawn throws synchronously for what it cannot take (a NUL byte in an argument): a run that did not happen.
+		return notRun(error instanceof Error ? error.message : String(error));
+	}
 	// stdout: the head (payload) up to the collect bound, then a rolling tail (last line); the hash takes every chunk.
 	let head = "";
 	let tail: string | undefined;
@@ -96,31 +120,35 @@ export async function runScript(
 			child.stdout?.destroy();
 			child.stderr?.destroy();
 			done.resolve({ code });
-		}, STREAM_CLOSE_GRACE_MS);
+		}, options.streamCloseGraceMs ?? STREAM_CLOSE_GRACE_MS);
 		child.once("close", () => clearTimeout(drain));
 	});
-	let timedOut = false;
-	const timer = setTimeout(() => {
-		timedOut = true;
+	const killGroup = () => {
 		try {
 			if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
 		} catch {
 			child.kill("SIGKILL");
 		}
+	};
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		killGroup();
 	}, options.timeoutMs ?? SCRIPT_TIMEOUT_MS);
+	let abortRequested = false;
+	const onAbort = () => {
+		abortRequested = true;
+		killGroup();
+	};
+	if (options.signal?.aborted) onAbort();
+	else options.signal?.addEventListener("abort", onAbort, { once: true });
 	const { code, spawnError } = await done.promise;
 	clearTimeout(timer);
+	options.signal?.removeEventListener("abort", onAbort);
+	// A script that already exited 0 when the abort came finished its work: only a killed run counts as aborted.
+	const aborted = abortRequested && code !== 0;
 	if (spawnError !== undefined) {
-		return {
-			fired: false,
-			exitCode: null,
-			timedOut: false,
-			stdout: "",
-			stderr: "",
-			outputHash: EMPTY_HASH,
-			wakeOff: false,
-			error: spawnError,
-		};
+		return notRun(spawnError);
 	}
 	// Hash and wake gate come from the whole output; only the payload handed to the agent is cut. Past the collect
 	// bound the text is the head plus the tail's whole lines (its first line is cut off at the tail's start).
@@ -128,9 +156,10 @@ export async function runScript(
 	const lastLines = tail === undefined ? "" : newline === -1 ? undefined : tail.slice(newline + 1);
 	const full = tail === undefined ? head.trim() : `${head.trimStart()}\n${(lastLines ?? tail).trimEnd()}`;
 	return {
-		fired: !timedOut && code === 0,
+		fired: !timedOut && !aborted && code === 0,
 		exitCode: code,
 		timedOut,
+		...(aborted ? { aborted } : {}),
 		stdout: capPayload(full),
 		stderr: tailOf(stderr.trim()),
 		outputHash: hash.digest(),

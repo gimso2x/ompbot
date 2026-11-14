@@ -213,4 +213,41 @@ describe("daemon: a Discord peer request (AC-5)", () => {
 			"ompbot_work_start",
 		);
 	});
+
+	test("a peer reply in a thread the owner's clean child already runs in reuses that child: no restart (AC-1)", async () => {
+		const discord = new WaitingDiscordTransport();
+		discord.setChannel({ id: CH, type: 0, guildId: GUILD });
+		await boot(withPeers(), discord);
+		const root = "700000000000000002";
+		await discord.emitMessage({
+			id: root,
+			channel_id: CH,
+			guild_id: GUILD,
+			author: { id: DISCORD_OWNER },
+			content: `<@${BOT}> 오너 질문`,
+			type: 0,
+		});
+		const origin = `discord/ch/${CH}/t/${root}`;
+		await waitForLog(() => lines.some((line) => line.includes("event=turn_start")), "owner turn_start");
+		expect(built.map((b) => b.origin)).toEqual([origin]);
+		expect(built[0]?.tools).toContain("ompbot_work_start");
+		await discord.waitForPosts((text) => text.startsWith("ECHO "), 1, WAIT_MS);
+
+		discord.setChannel({ id: root, type: 11, parentId: CH, guildId: GUILD });
+		await discord.emitMessage({
+			id: "700000000000000003",
+			channel_id: root,
+			guild_id: GUILD,
+			author: { id: PEER, bot: true },
+			content: `<@${BOT}> 검토`,
+			type: 0,
+		});
+		await waitForLog(
+			() => lines.filter((line) => line.includes("event=turn_start")).length >= 2,
+			"peer turn_start on the same child",
+		);
+		expect(daemon?.peerTouched(origin)).toBe(true);
+		expect(built.map((b) => b.origin)).toEqual([origin]);
+		expect(lines.filter((line) => line.includes("event=driver_restart_peer_touched"))).toEqual([]);
+	});
 });

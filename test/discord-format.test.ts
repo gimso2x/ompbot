@@ -168,3 +168,12 @@ describe("qa50b K-9: tables without outer pipes", () => {
 		expect(renderDiscordParts(body, false)).toEqual([body]);
 	});
 });
+
+describe("renderDiscordParts qa-i low", () => {
+	test("a fence opened and closed on one line does not stop a later table from being fenced", () => {
+		const body = "```bash npm test```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |";
+		expect(renderDiscordParts(body, false)).toEqual([
+			"```bash npm test```\n\n```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```",
+		]);
+	});
+});

@@ -7,7 +7,7 @@ import { TeamsAdapter } from "./adapter";
 import { TeamsAuth } from "./auth";
 import type { TeamsChannel } from "./channel";
 
-export interface TeamsBindingOptions {
+interface TeamsBindingOptions {
 	/** Inbound token checks; default: the real Bot Framework and Entra metadata. */
 	auth?: TeamsAuth;
 	/** Overrides `channels.teams.listen` (tests bind port 0). */

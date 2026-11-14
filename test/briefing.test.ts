@@ -72,7 +72,6 @@ const snapshot = (extra: Partial<DashboardSnapshot> = {}): DashboardSnapshot => 
 		started: { at: "2026-11-11T06:00:00+09:00", ageMs: 90 * 60_000 },
 	},
 	turns: { ok: true, items: [], threads: [] },
-	feedback: { ok: true, days: 7, up: 0, down: 0, recentDown: [], verdicts: {} },
 	tasks: { ok: true, items: [] },
 	lanes: { ok: true, items: [] },
 	herdr: { ok: true, hosts: [] },

@@ -2,12 +2,12 @@
 // zipped with no dependency — a stored (uncompressed) zip and plain PNGs are written by hand.
 import { deflateSync } from "node:zlib";
 
-export const TEAMS_MANIFEST_VERSION = "1.17";
-export const TEAMS_MANIFEST_SCHEMA = `https://developer.microsoft.com/en-us/json-schemas/teams/v${TEAMS_MANIFEST_VERSION}/MicrosoftTeams.schema.json`;
-export const TEAMS_BOT_SCOPES = ["personal", "groupChat"] as const;
+const TEAMS_MANIFEST_VERSION = "1.17";
+const TEAMS_MANIFEST_SCHEMA = `https://developer.microsoft.com/en-us/json-schemas/teams/v${TEAMS_MANIFEST_VERSION}/MicrosoftTeams.schema.json`;
+const TEAMS_BOT_SCOPES = ["personal", "groupChat"] as const;
 const PROJECT_URL = "https://ompbot.invalid";
 
-export interface TeamsManifestInput {
+interface TeamsManifestInput {
 	appId: string;
 	/** Short name shown in Teams (30 characters at most). */
 	name?: string;
@@ -48,7 +48,7 @@ function crc32(data: Uint8Array): number {
 type Rgba = readonly [number, number, number, number];
 
 /** A square RGBA PNG drawn by `pixel` (outline icons need transparency). */
-export function iconPng(size: number, pixel: (x: number, y: number) => Rgba): Uint8Array {
+function iconPng(size: number, pixel: (x: number, y: number) => Rgba): Uint8Array {
 	const stride = 1 + size * 4;
 	const raw = new Uint8Array(stride * size);
 	for (let y = 0; y < size; y++) {
@@ -87,7 +87,7 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
 }
 
 /** A zip of `files` stored uncompressed (method 0), dated 1980-01-01 so the same input gives the same bytes. */
-export function storedZip(files: ReadonlyArray<{ name: string; data: Uint8Array }>): Uint8Array {
+function storedZip(files: ReadonlyArray<{ name: string; data: Uint8Array }>): Uint8Array {
 	const locals: Uint8Array[] = [];
 	const centrals: Uint8Array[] = [];
 	let offset = 0;

@@ -18,6 +18,21 @@ const CH = "111111111111111111";
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
 const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });
 const fence = (json: string): string => `\`\`\`card\n${json}\n\`\`\``;
+/** A bar chart card: the Chart renderers are still supported though the prompt no longer offers a skeleton. */
+const BAR_CHART = JSON.stringify({
+	root: "c",
+	elements: {
+		c: { type: "Card", props: { title: "일별 턴 수" }, children: ["g"] },
+		g: {
+			type: "Chart",
+			props: {
+				title: "일별 턴",
+				chart: { type: "bar", categories: ["월", "화", "수"], series: [{ name: "턴", values: [3, 5, 4] }] },
+			},
+			children: [],
+		},
+	},
+});
 
 interface Embed {
 	title?: string;
@@ -218,7 +233,7 @@ describe("```card fence in an answer → embed", () => {
 	});
 
 	test("Table and Chart become ASCII code blocks in the description", async () => {
-		const posts = await deliver(`${fence(CARD_SKELETONS[1])}\n${fence(CARD_SKELETONS[2])}`);
+		const posts = await deliver(`${fence(CARD_SKELETONS[1])}\n${fence(BAR_CHART)}`);
 		const embeds = posts.flatMap((p) => embedsOf(p));
 		expect(embeds).toHaveLength(2);
 		const [table, chart] = embeds;
@@ -315,5 +330,16 @@ describe("```card fence in an answer → embed", () => {
 		}
 		expect(embedLength(embed ?? {})).toBeLessThanOrEqual(6000);
 		expect(logs.some((line) => line.includes("card_spec_invalid"))).toBe(false);
+	});
+});
+
+describe("cardToEmbed qa-i low", () => {
+	test("a table cell holding ``` is wrapped in a longer fence so the code block stays whole", () => {
+		const card = {
+			type: "card",
+			children: [{ type: "table", headers: ["a", "b"], rows: [["```", "x"]] }],
+		} as unknown as Parameters<typeof discordCard.cardToEmbed>[0];
+		const description = discordCard.cardToEmbed(card).description ?? "";
+		expect(description).toBe("````\na   | b\n``` | x\n````");
 	});
 });

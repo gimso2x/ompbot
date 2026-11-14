@@ -11,7 +11,7 @@ import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
-import { killSpawned, runMain } from "./helpers/daemon-process";
+import { killSpawned, runCliCapture, runMain } from "./helpers/daemon-process";
 
 const clock = { now: () => Date.now() };
 let home: TestHome;
@@ -26,10 +26,10 @@ afterEach(() => {
 	home.remove();
 });
 
-const monitors = (...args: string[]) => runMain(home.dir, ["monitors", ...args]);
+// In-process: the real `bun src/main.ts` start is covered once by the smoke test below.
+const monitors = (...args: string[]) => runCliCapture(home.dir, ["monitors", ...args]);
 
-// Each CLI test spawns several `bun` processes one after another; on a loaded host (checks of other tasks running at
-// the same time) that alone passes bun's 5 s default. A bound, not a wait: a hung child still fails the test.
+// A bound, not a wait: a hung command still fails the test on a loaded host.
 setDefaultTimeout(30_000);
 
 function writeScript(name: string, body: string): string {
@@ -154,6 +154,32 @@ describe("ompbot monitors (CLI)", () => {
 		expect(text).toContain("copyChannel=C0123456789  next=");
 	});
 
+	test("list shows the last check error with its time and streak; a healthy monitor shows none", async () => {
+		const script = writeScript("broken.sh", "#!/bin/sh\nexit 0\n");
+		const ids: string[] = [];
+		for (const name of ["broken", "fine"]) {
+			const added = await monitors(
+				"add",
+				"--json",
+				JSON.stringify({ name, trigger: { kind: "script", command: [script], intervalMs: 60_000 }, instruction: "i" }),
+			);
+			expect(added.code).toBe(0);
+			ids.push(parse(added.stdout).monitor.id);
+		}
+		const ledger = openMonitorLedger(join(home.dir, "ompbot.db"), { now: () => Date.UTC(2026, 10, 13, 6, 0, 0) });
+		try {
+			ledger.recordCheckError(ids[0] ?? "", "spawn failed: EACCES");
+			ledger.recordCheckError(ids[0] ?? "", "spawn failed: EACCES");
+		} finally {
+			ledger.close();
+		}
+		const lines = (await monitors("list")).stdout.split("\n");
+		expect(lines.find((line) => line.includes(" broken "))).toContain(
+			"checkError(x2)=spawn failed: EACCES @ 2026-11-13 15:00:00 Asia/Seoul",
+		);
+		expect(lines.find((line) => line.includes(" fine "))).not.toContain("checkError");
+	});
+
 	test("remove by id reports removed:true, an unknown name fails", async () => {
 		const added = await monitors(
 			"add",
@@ -179,7 +205,10 @@ describe("ompbot monitors (CLI)", () => {
 		const unknown = await monitors("update", "nope", "--json", "{}");
 		expect(unknown.code).toBe(1);
 		expect(unknown.stderr).toContain("monitor not found");
-		expect((await monitors("bogus")).code).toBe(2);
+		// Smoke: a real `bun src/main.ts` process (exit code through process.exit).
+		const spawned = await runMain(home.dir, ["monitors", "bogus"]);
+		expect(spawned.code).toBe(2);
+		expect(spawned.stderr).toContain("monitors");
 	});
 
 	test("script intervalMs above 366 days is refused without a row; 366 days exactly is accepted", async () => {
@@ -269,7 +298,7 @@ describe("ompbot monitors (CLI)", () => {
 		});
 		expect([notScript.code, notScript.stderr]).toEqual([
 			1,
-			'monitors add: deliver "verbatim" needs a script trigger\n',
+			'monitors add: deliver "verbatim" needs a script trigger or a cron trigger with a command\n',
 		]);
 		const toCron = await monitors(
 			"update",
@@ -277,7 +306,10 @@ describe("ompbot monitors (CLI)", () => {
 			"--json",
 			JSON.stringify({ trigger: { kind: "cron", schedule: "0 8 * * *" } }),
 		);
-		expect([toCron.code, toCron.stderr]).toEqual([1, 'monitors update: deliver "verbatim" needs a script trigger\n']);
+		expect([toCron.code, toCron.stderr]).toEqual([
+			1,
+			'monitors update: deliver "verbatim" needs a script trigger or a cron trigger with a command\n',
+		]);
 		const plainToVerbatim = await monitors("update", "plain", "--json", JSON.stringify({ deliver: "verbatim" }));
 		expect(plainToVerbatim.code).toBe(1);
 
@@ -286,6 +318,51 @@ describe("ompbot monitors (CLI)", () => {
 		expect(parse(renamed.stdout).monitor).toMatchObject({ overlap: "skip", deliver: "verbatim" });
 		const back = await monitors("update", "relay", "--json", JSON.stringify({ deliver: "turn" }));
 		expect(parse(back.stdout).monitor).toMatchObject({ deliver: "turn" });
+	});
+
+	test("cron command: refusals exit 1, list and --json show it, an update keeps it and command null turns it back", async () => {
+		const script = writeScript("brief.sh", "#!/bin/sh\necho brief\n");
+		const cron = { kind: "cron", schedule: "0 8 * * *", timezone: "Asia/Seoul", command: [script], timeoutMs: 900_000 };
+		const add = (spec: Record<string, unknown>) => monitors("add", "--json", JSON.stringify(spec));
+		const noVerbatim = await add({ name: "brief", trigger: cron, instruction: "i" });
+		expect([noVerbatim.code, noVerbatim.stderr]).toEqual([
+			1,
+			'monitors add: a cron trigger with a command needs deliver "verbatim"\n',
+		]);
+		const badTimeout = await add({
+			name: "brief",
+			trigger: { ...cron, timeoutMs: 1_800_001 },
+			instruction: "i",
+			deliver: "verbatim",
+		});
+		expect(badTimeout.code).toBe(1);
+		expect((await add({ name: "brief", trigger: cron, instruction: "i", deliver: "verbatim" })).code).toBe(0);
+
+		const listed = parse((await monitors("list", "--json")).stdout).monitors as Array<{ trigger: unknown }>;
+		expect(listed.map((row) => row.trigger)).toEqual([cron]);
+		const line = (await monitors("list")).stdout.trim();
+		expect(line).toContain(`[cron "0 8 * * *" Asia/Seoul command=${script} timeout=900s]`);
+		expect(line).toContain("  deliver=verbatim  ");
+
+		const moved = await monitors("update", "brief", "--json", JSON.stringify({ trigger: { schedule: "30 7 * * *" } }));
+		expect(parse(moved.stdout).monitor).toMatchObject({
+			trigger: { ...cron, schedule: "30 7 * * *" },
+			deliver: "verbatim",
+		});
+		const half = await monitors("update", "brief", "--json", JSON.stringify({ trigger: { command: null } }));
+		expect(half.code).toBe(1);
+		const back = await monitors(
+			"update",
+			"brief",
+			"--json",
+			JSON.stringify({ trigger: { command: null }, deliver: "turn" }),
+		);
+		expect(back.code).toBe(0);
+		expect(parse(back.stdout).monitor).toMatchObject({
+			trigger: { kind: "cron", schedule: "30 7 * * *", timezone: "Asia/Seoul" },
+			deliver: "turn",
+		});
+		expect(parse(back.stdout).monitor.trigger).not.toHaveProperty("command");
 	});
 
 	test("a script monitor must live under <home>/scripts", async () => {

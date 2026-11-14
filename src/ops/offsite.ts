@@ -7,6 +7,7 @@ import {
 	BUNDLE_FILE_PATTERN,
 	DEFAULT_KEEP,
 	readStamp,
+	retentionDoomed,
 	sha256File,
 	writeStampAtomic,
 } from "./backup";
@@ -180,20 +181,16 @@ export async function runOffsite(options: OffsiteOptions): Promise<OffsiteResult
 		results.push({ ...file, status: "uploaded" });
 	}
 
-	// Retention: only strict daily names, newest `keep` per kind, never the files this run just verified.
+	// Retention: only strict daily names, `keep` days per kind (all of the uploaded files' day, the latest of each
+	// other day), never the files this run just verified - the same rule as the local prune.
 	const removed: string[] = [];
 	const listing = await remote(`ls -1 -- ${dir}`);
 	if (listing.code === 0) {
 		const names = listing.stdout.split("\n").map((line) => line.trim());
-		const guarded = new Set(files.map((file) => file.name));
-		const doomed: string[] = [];
-		for (const kind of [BACKUP_FILE_PATTERN, BUNDLE_FILE_PATTERN]) {
-			const daily = names
-				.filter((name) => kind.test(name))
-				.sort()
-				.reverse();
-			for (const name of daily.slice(keep)) if (!guarded.has(name)) doomed.push(name);
-		}
+		const guarded = files.map((file) => file.name);
+		const doomed = [BACKUP_FILE_PATTERN, BUNDLE_FILE_PATTERN].flatMap((kind) =>
+			retentionDoomed(names, keep, guarded, kind),
+		);
 		if (doomed.length > 0) {
 			const pruned = await remote(`rm -f -- ${doomed.map((name) => `${dir}/${name}`).join(" ")}`);
 			if (pruned.code === 0) removed.push(...doomed);

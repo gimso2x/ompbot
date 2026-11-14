@@ -46,12 +46,12 @@ export const OMP_USAGE = `  omp install <version>          install @oh-my-pi/pi-
                                  and updated (the bot's own kept); --init also copies the mnemopi memory once
 `;
 
-export const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
+const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
 /** An npm version of omp: `18.18.9`, `18.19.0-beta.1`. */
-export const OMP_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const OMP_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 /** The trial prompt of `omp use` (RPC turn and `omp -p`): the answer must contain `OK`. */
 export const TRIAL_PROMPT = "OK 한 단어로만 답해";
-export const TRIAL_TIMEOUT_MS = 120_000;
+const TRIAL_TIMEOUT_MS = 120_000;
 const INSTALL_TIMEOUT_MS = 600_000;
 const FAIL_TAIL_LINES = 20;
 
@@ -61,7 +61,7 @@ export const ompRoot = (homeDir: string): string => join(homeDir, "omp");
 export const cliPathIn = (installDir: string): string =>
 	join(installDir, "node_modules", OMP_PACKAGE, "dist", "cli.js");
 /** What `ompExecutable` names once the bot runs the pinned omp. */
-export const currentCliPath = (homeDir: string): string => cliPathIn(join(ompRoot(homeDir), "current"));
+const currentCliPath = (homeDir: string): string => cliPathIn(join(ompRoot(homeDir), "current"));
 /** omp's agent dir of `OMP_PROFILE=<profile>` (`~/.omp/profiles/<profile>/agent`). */
 export const profileAgentDir = (userHome: string, profile: string): string =>
 	join(userHome, ".omp", "profiles", profile, "agent");
@@ -133,7 +133,7 @@ async function launcherVersion(deps: OmpCliDeps, cliPath: string): Promise<strin
 }
 
 /** `ompbot omp install <version>`. */
-export async function ompInstall(version: string, deps: OmpCliDeps): Promise<number> {
+async function ompInstall(version: string, deps: OmpCliDeps): Promise<number> {
 	if (!OMP_VERSION_PATTERN.test(version)) {
 		deps.out(`omp install: invalid version ${version}`);
 		return 2;
@@ -175,7 +175,7 @@ export async function ompInstall(version: string, deps: OmpCliDeps): Promise<num
 }
 
 /** `ompbot omp use <version>`: trial-run the install with the bot's env, then switch `current` only if all three pass. */
-export async function ompUse(version: string, deps: OmpCliDeps): Promise<number> {
+async function ompUse(version: string, deps: OmpCliDeps): Promise<number> {
 	if (!OMP_VERSION_PATTERN.test(version)) {
 		deps.out(`omp use: invalid version ${version}`);
 		return 2;
@@ -242,7 +242,7 @@ export async function ompUse(version: string, deps: OmpCliDeps): Promise<number>
 }
 
 /** `ompbot omp rollback`: current ← previous, the old current becomes previous. */
-export function ompRollback(deps: OmpCliDeps): number {
+function ompRollback(deps: OmpCliDeps): number {
 	const root = ompRoot(deps.homeDir);
 	const previous = readLink(join(root, "previous"));
 	if (previous === undefined || !existsSync(join(root, previous))) {
@@ -258,7 +258,7 @@ export function ompRollback(deps: OmpCliDeps): number {
 }
 
 /** `ompbot omp prune`: removes version folders other than `current` and `previous` (only under `<home>/omp`). */
-export function ompPrune(deps: OmpCliDeps): number {
+function ompPrune(deps: OmpCliDeps): number {
 	const root = ompRoot(deps.homeDir);
 	const keep = new Set([readLink(join(root, "current")), readLink(join(root, "previous"))]);
 	let removed = 0;
@@ -273,7 +273,7 @@ export function ompPrune(deps: OmpCliDeps): number {
 }
 
 /** `ompbot omp status`; exit 1 when the pinned omp cannot read the login (or there is no current). */
-export async function ompStatus(deps: OmpCliDeps): Promise<number> {
+async function ompStatus(deps: OmpCliDeps): Promise<number> {
 	const root = ompRoot(deps.homeDir);
 	const current = readLink(join(root, "current"));
 	const previous = readLink(join(root, "previous"));
@@ -327,13 +327,13 @@ export async function ompStatus(deps: OmpCliDeps): Promise<number> {
 // ---------------------------------------------------------------- profile sync
 
 /** Entries mirrored from the owner's agent dir on every sync (removed from the profile when the owner has none). */
-export const SYNC_MIRRORED = ["RULES.md", "extensions", "skills", "models.yml", "mcp.json"] as const;
+const SYNC_MIRRORED = ["RULES.md", "extensions", "skills", "models.yml", "mcp.json"] as const;
 /** The login store: always symlinks to the owner's files, never copies (two copies would refresh OAuth tokens apart). */
-export const SYNC_LOGIN_LINKS = ["agent.db", "agent.db-shm", "agent.db-wal"] as const;
+const SYNC_LOGIN_LINKS = ["agent.db", "agent.db-shm", "agent.db-wal"] as const;
 /** Names never copied inside a mirrored tree. */
 const SKIPPED_NAME = /\.bak/;
 
-export interface SyncResult {
+interface SyncResult {
 	/** One line per change (`copied <path>`, `removed <path>`, `linked <path>`, …). */
 	changed: string[];
 	warnings: string[];
@@ -413,7 +413,7 @@ function mirror(src: string, dst: string, rel: string, ctx: SyncContext): void {
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** `config.yml` text with every path into the owner's agent dir (`~/.omp/agent`, its absolute form, the source) moved to `target`. */
-export function rewriteAgentPaths(text: string, source: string, target: string, userHome: string): string {
+function rewriteAgentPaths(text: string, source: string, target: string, userHome: string): string {
 	const forms = [...new Set(["~/.omp/agent", join(userHome, ".omp", "agent"), resolve(source)])];
 	const pattern = new RegExp(`(?:${forms.map(escapeRegExp).join("|")})(?=/|["'\\s,\\]}]|$)`, "gm");
 	return text.replace(pattern, target);
@@ -503,7 +503,7 @@ function syncManagedSkills(source: string, target: string, init: boolean, ctx: S
  * Brings the profile agent dir `target` in line with the owner's agent dir `source` (see `OMP_USAGE`). `dryRun` only
  * lists what would change. Sessions, caches, history, models.db and backups are never touched.
  */
-export function syncProfile(input: {
+function syncProfile(input: {
 	source: string;
 	target: string;
 	/** Whose `~/.omp/agent` the absolute config.yml paths name; default two levels above `source`. */
@@ -592,7 +592,7 @@ export function runProfileSync(input: {
 // ---------------------------------------------------------------- real trial and command
 
 /** Trial ②: one turn through `RpcOmpDriver` (the daemon's driver, same env), `OK` expected within the deadline. */
-export async function realRpcTrial(
+async function realRpcTrial(
 	input: { cliPath: string; cwd: string; profile?: string; model?: string },
 	bun: string,
 	env: Record<string, string | undefined>,

@@ -23,6 +23,21 @@ const textCard = (n: number): string => {
 	for (let i = 0; i < n; i++) elements[`t${i}`] = el("Text", { content: `줄 ${i}` });
 	return spec(elements);
 };
+/** A bar chart card: the Chart renderers are still supported though the prompt no longer offers a skeleton. */
+const BAR_CHART = JSON.stringify({
+	root: "c",
+	elements: {
+		c: { type: "Card", props: { title: "일별 턴 수" }, children: ["g"] },
+		g: {
+			type: "Chart",
+			props: {
+				title: "일별 턴",
+				chart: { type: "bar", categories: ["월", "화", "수"], series: [{ name: "턴", values: [3, 5, 4] }] },
+			},
+			children: [],
+		},
+	},
+});
 const FIELDS = spec({
 	c: el("Card", { title: "요약" }, ["f"]),
 	f: el("Fields", {}, ["a", "b"]),
@@ -31,9 +46,9 @@ const FIELDS = spec({
 });
 
 describe("parseCard", () => {
-	test("the four prompt skeletons (Fields, Table, bar chart, decision) validate with their native blocks", () => {
-		const expected = ["section", "data_table", "data_visualization", "section"];
-		expect(CARD_SKELETONS).toHaveLength(4);
+	test("the three prompt skeletons (Fields, Table, decision) validate with their native blocks", () => {
+		const expected = ["section", "data_table", "section"];
+		expect(CARD_SKELETONS).toHaveLength(3);
 		CARD_SKELETONS.forEach((json, i) => {
 			const parsed = parseCard(json);
 			expect(parsed.ok).toBe(true);
@@ -42,7 +57,7 @@ describe("parseCard", () => {
 	});
 
 	test("the decision skeleton passes validateCard and parseCard with its tone: a header and one fields section", () => {
-		const json = CARD_SKELETONS[3];
+		const json = CARD_SKELETONS[2];
 		const validated = validateCard(json);
 		expect(validated.ok && validated.tone).toBe("warn");
 		const parsed = parseCard(json);
@@ -144,8 +159,7 @@ describe("parseCard", () => {
 	});
 
 	test("charts: false draws the chart as an ASCII code block", () => {
-		const chart = CARD_SKELETONS[2];
-		const ascii = parseCard(chart, { charts: false });
+		const ascii = parseCard(BAR_CHART, { charts: false });
 		expect(ascii.ok).toBe(true);
 		if (ascii.ok) {
 			expect(ascii.blocks.map(typeOf)).not.toContain("data_visualization");

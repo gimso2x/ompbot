@@ -1,6 +1,7 @@
 import { redact } from "../redact";
 import { formatLocal, localIso, nextLocalMidnight } from "../time";
 import { columnFor } from "./board";
+import { hostChecksProblems } from "./host-checks";
 import { alertText, gateText } from "./html";
 import type { DashboardSnapshot, MonitorInfo, Section, TaskInfo, TurnInfo } from "./snapshot";
 
@@ -133,6 +134,14 @@ function attentionLines(snapshot: DashboardSnapshot): string[] {
 	for (const task of openTasks(snapshot)) {
 		if (task.status !== "blocked" && task.error === undefined) continue;
 		lines.push(`TASK ${esc(redact(`${task.taskId} ${task.title}`))} · ${esc(redact(task.status))}`);
+	}
+	// Last, so the bot's own lines above keep their places under the line cap; counts only, never a check's words.
+	const hosts = snapshot.hostChecks;
+	if (hosts !== undefined && !hosts.ok) {
+		lines.push(esc(`호스트 점검 읽지 못함: ${redact(hosts.error).slice(0, ERROR_CHARS)}`));
+	} else if (hosts !== undefined) {
+		const problems = hostChecksProblems(hosts);
+		if (problems.total > 0) lines.push(`호스트 점검 이상 ${problems.total}건(alert ${problems.alert})`);
 	}
 	return lines;
 }

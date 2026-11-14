@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { doctorCommand } from "../src/cli/index";
 import { openBotStore } from "../src/core/origin";
 import type { ProcessRunner } from "../src/dispatch/omp";
-import { openTaskLedger } from "../src/tasks/ledger";
 
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
 
@@ -35,12 +34,31 @@ describe("CLI argument errors are usage errors (exit 2, one line)", () => {
 			runMain(home.dir, ["backup", "--keep", "-1"]),
 			runMain(home.dir, ["inject", "--bogus"]),
 			runMain(home.dir, ["inject", "--origin", "slack/dm/D1", "--as-owner", "--text"]),
-			runMain(home.dir, ["feedback", "--days", "-1"]),
-			runMain(home.dir, ["tasks", "flow", "--out", join(home.dir, "flow"), "--watch", "-1"]),
 		]);
-		const commands = ["drain", "drain", "drain", "backup", "inject", "inject", "feedback", "tasks"];
+		const commands = ["drain", "drain", "drain", "backup", "inject", "inject"];
 		for (const [i, run] of runs.entries()) expectUsageLine(run, commands[i] ?? "");
-		expect(runs[6]?.stderr).toContain("--days=-XYZ");
+	});
+
+	test("the retired feedback command is unknown: usage text, exit 2", async () => {
+		const run = await runMain(home.dir, ["feedback"]);
+		expect(run.code).toBe(2);
+		expect(run.stderr.startsWith("usage: ompbot <command>")).toBe(true);
+		expect(run.stderr).not.toMatch(/^\s+feedback\b/m);
+	});
+
+	test("the retired briefing, offsite and tasks flow commands are unknown: usage text, exit 2", async () => {
+		const [briefing, offsite, flow] = await Promise.all([
+			runMain(home.dir, ["briefing", "--out", join(home.dir, "b.png")]),
+			runMain(home.dir, ["offsite"]),
+			runMain(home.dir, ["tasks", "flow", "--out", join(home.dir, "flow")]),
+		]);
+		for (const run of [briefing, offsite]) {
+			expect(run.code).toBe(2);
+			expect(run.stderr.startsWith("usage: ompbot <command>")).toBe(true);
+			expect(run.stderr).not.toMatch(/briefing|offsite \[|tasks flow/);
+		}
+		expect(flow.code).toBe(2);
+		expect(flow.stderr.startsWith("usage: ompbot tasks <list|show|check|close|pause|resume>")).toBe(true);
 	});
 
 	test("drain --timeout '' is refused instead of meaning 0 minutes", async () => {
@@ -78,53 +96,6 @@ describe("CLI commands without a daemon", () => {
 		const dbOnly = await runMain(home.dir, ["status", "--json"]);
 		expect(dbOnly.code, dbOnly.stderr).toBe(0);
 		expect(JSON.parse(dbOnly.stdout).ompVersion).toBe("unknown");
-	});
-});
-
-describe("ompbot tasks flow --watch", () => {
-	test("seconds outside 1..2147483 (setInterval's range) or not a number are a usage error", async () => {
-		openTaskLedger(join(home.dir, "ompbot.db"), "Asia/Seoul").close();
-		const out = join(home.dir, "flow");
-		const runs = await Promise.all(
-			["2147484", "0", "", "abc"].map(async (watch) => {
-				const proc = Bun.spawn(["bun", MAIN, "tasks", "flow", "--out", out, "--watch", watch], {
-					env: { ...process.env, OMPBOT_HOME: home.dir },
-					stdin: "ignore",
-					stdout: "ignore",
-					stderr: "pipe",
-				});
-				// Awaits the exit itself; the race only bounds a watch that (wrongly) started, so the child is killed.
-				const code = await Promise.race([proc.exited, Bun.sleep(4_000).then(() => "watching")]);
-				if (code === "watching") proc.kill();
-				return { watch, code, stderr: await new Response(proc.stderr).text() };
-			}),
-		);
-		for (const run of runs) {
-			expect(run.code, run.watch).toBe(2);
-			expect(run.stderr).toContain("--watch takes 1 to 2147483 seconds");
-		}
-	});
-
-	test("a database that goes away mid-watch ends the watch with one line, exit 1", async () => {
-		const db = join(home.dir, "ompbot.db");
-		openTaskLedger(db, "Asia/Seoul").close();
-		const proc = Bun.spawn(["bun", MAIN, "tasks", "flow", "--out", join(home.dir, "flow"), "--watch", "1"], {
-			env: { ...process.env, OMPBOT_HOME: home.dir },
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const reader = proc.stdout.getReader();
-		const first = new TextDecoder().decode((await reader.read()).value);
-		expect(first).toContain("viewer.html");
-		rmSync(db);
-		// Awaits the exit itself; the race only bounds the old behaviour (watching forever) so the child is killed.
-		const code = await Promise.race([proc.exited, Bun.sleep(4_000).then(() => "still running")]);
-		if (code === "still running") proc.kill();
-		expect(code).toBe(1);
-		const stderr = await new Response(proc.stderr).text();
-		expect(stderr.trimEnd().split("\n")).toHaveLength(1);
-		expect(stderr).toStartWith("tasks flow: status.json not rewritten:");
 	});
 });
 

@@ -245,7 +245,16 @@ export interface AutoLandPolicy {
 	repos: string[];
 	maxRisk: TaskRisk;
 	/** Lanes only: the independent review a lane's claim commit needs a `CLEAR` receipt from before it merges unasked. */
-	review?: { model: string; timeoutMs: number };
+	review?: { model: string; timeoutMs: number; confident?: LaneReviewConfident };
+}
+
+/**
+ * `taskAutoLand.review.confident`: a lane whose explicit risk is above `maxRisk` (policy) and at most this `maxRisk`
+ * merges unasked on a `CLEAR` receipt whose confidence is at least `minConfidence`.
+ */
+export interface LaneReviewConfident {
+	maxRisk: TaskRisk;
+	minConfidence: number;
 }
 
 /** The auto-merge blockers of re-run checks: failed (a violation) and inconclusive (timed out) counted apart. */
@@ -464,9 +473,10 @@ export const formatBlockedNotice = (
 export const formatSpecChangedNotice = (row: TaskRow): string =>
 	`⚠️ ${row.taskId} spec.md 수락기준이 등록 스냅샷과 다릅니다(개수·ID·문구). 고쳐질 때까지 Outcome에 도달하지 않습니다.`;
 
-export const formatStaleNotice = (row: TaskRow, minutes: number, link?: string): string =>
+/** `askedOwner`: the worker stopped on a question in prose, so the owner (this user id) is mentioned with it. */
+export const formatStaleNotice = (row: TaskRow, minutes: number, link?: string, askedOwner?: string): string =>
 	[
-		`⏰ ${row.title}: PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. (${ownerTag(row)})`,
+		`⏰ ${row.title}: PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. (${ownerTag(row)})${askedOwner === undefined ? "" : ` 워커가 질문하고 기다립니다. ${mentionToken(askedOwner)}`}`,
 		...boardFooter(link),
 	].join("\n");
 
@@ -514,12 +524,7 @@ export function buildAgentWaitingCard(
 	ownerUserId: string,
 	link?: string,
 ): TaskCard {
-	const lines = (screen.output ?? "")
-		.split("\n")
-		.filter((line) => line.trim() !== "")
-		.slice(-WAIT_SCREEN_LINES)
-		// Masked before the cut, so a clipped secret never escapes the shape match.
-		.map((line) => redact(line).slice(0, WAIT_SCREEN_LINE_MAX).replaceAll("```", "ʼʼʼ"));
+	const lines = cardTailLines(screen.output ?? "");
 	const tail = lines.join("\n");
 	const limited = screen.ok && PROVIDER_LIMIT_PATTERN.test(tail);
 	const resetAt = limited ? LIMIT_RESET_PATTERN.exec(tail)?.[1] : undefined;
@@ -544,6 +549,40 @@ export function buildAgentWaitingCard(
 		].join("\n"),
 		title: `⏸ 워커 대기 · ${row.title}`,
 		body: [`${waiting} ${mentionToken(ownerUserId)}`, ...details].join("\n"),
+		fields: [branchField(row), workerField(row)],
+		...(note === undefined ? {} : { note }),
+	};
+}
+
+/**
+ * The last {@link WAIT_SCREEN_LINES} non-empty lines of a text for a card's code block: each masked before the cut
+ * (so a clipped secret never escapes the shape match), cut at {@link WAIT_SCREEN_LINE_MAX}, fences neutralized.
+ */
+function cardTailLines(text: string): string[] {
+	return text
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.slice(-WAIT_SCREEN_LINES)
+		.map((line) => redact(line).slice(0, WAIT_SCREEN_LINE_MAX).replaceAll("```", "ʼʼʼ"));
+}
+
+/**
+ * The task's herdr agent ended its turn on a question in prose (herdr idle/done, no `ask` tool): the owner sees the
+ * end of its last answer. The answer goes through the bot, which hands a thread reply to the idle agent.
+ */
+export function buildAgentQuestionCard(row: TaskRow, question: string, ownerUserId: string, link?: string): TaskCard {
+	const asked = `herdr 에이전트 \`${row.agent}\`가 질문하고 멈췄습니다`;
+	const howTo = "*답하는 법*: 이 스레드에 답을 적어 주시면 그 답을 담당 에이전트에 넘겨 재개합니다.";
+	const details = ["*마지막 답 끝부분*:", "```", ...cardTailLines(question), "```", howTo];
+	const note = cardNote(link);
+	return {
+		text: [
+			`❓ 워커 질문 · ${row.title} — ${asked} (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
+			...details,
+			...boardFooter(link),
+		].join("\n"),
+		title: `❓ 워커 질문 · ${row.title}`,
+		body: [`${asked} ${mentionToken(ownerUserId)}`, ...details].join("\n"),
 		fields: [branchField(row), workerField(row)],
 		...(note === undefined ? {} : { note }),
 	};

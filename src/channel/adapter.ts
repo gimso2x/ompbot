@@ -54,6 +54,8 @@ export interface ChannelAdapter {
 	connectionState(): { state: "up" | "down"; since: number } | undefined;
 	/** Starts one missed-message recovery pass now (reconnect, failed ingest); a no-op without recovery. */
 	recover(): void;
+	/** Resolves once no recovery pass runs or waits; absent where nothing waits on it (only Discord's is awaited). */
+	recoveryIdle?(): Promise<void>;
 }
 
 /** What the daemon hands a binding to build its adapter. */

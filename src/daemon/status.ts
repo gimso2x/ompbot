@@ -3,8 +3,9 @@ import { dirname } from "node:path";
 import { isThreadOrigin } from "../core/normalize";
 import { chatOriginKey, parseChatOrigin } from "../core/origin-key";
 import { type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../monitors/ledger";
+import type { OmpState } from "../omp/driver";
 import { type FreezeState, readFreeze } from "../ops/freeze";
-import { collectGates } from "../ops/gates";
+import { assertRegularLedger, type ConfigGateOptions, collectGates } from "../ops/gates";
 import type { HostLoadReader } from "../ops/host-resources";
 import type { DeliveryState, InboundState, Store } from "../store/db";
 import { formatLocal } from "../time";
@@ -94,16 +95,15 @@ export function frozenField(homeDir: string): { frozen?: FreezeState } {
 export function openGateSummary(
 	dbPath: string,
 	now = Date.now(),
-	offsiteConfigured = false,
-	dailyCap?: { usd: number; timezone: string },
+	/** `gateOptionsFromConfig(config)`: the same gates the daemon's sweep judges. */
+	gateOptions: ConfigGateOptions = {},
 	/** Test seam for `host_pressure` (default this machine's readings). */
 	hostLoad?: Partial<HostLoadReader>,
 ): OpenGateSummary[] {
 	return collectGates({
 		homeDir: dirname(dbPath),
 		now,
-		offsiteConfigured,
-		...(dailyCap === undefined ? {} : { dailyCap }),
+		...gateOptions,
 		...(hostLoad === undefined ? {} : { hostLoad }),
 	})
 		.filter((gate) => gate.state === "open")
@@ -144,21 +144,14 @@ export function readStatusFromDb(
 	dbPath: string,
 	ompVersion: string,
 	timezone: string,
-	offsiteConfigured = false,
-	dailyCapUsd?: number,
+	gateOptions: ConfigGateOptions = {},
 	hostLoad?: Partial<HostLoadReader>,
 ): StatusReport {
-	const openGates = (): OpenGateSummary[] =>
-		openGateSummary(
-			dbPath,
-			Date.now(),
-			offsiteConfigured,
-			dailyCapUsd === undefined ? undefined : { usd: dailyCapUsd, timezone },
-			hostLoad,
-		);
+	const openGates = (): OpenGateSummary[] => openGateSummary(dbPath, Date.now(), gateOptions, hostLoad);
 	let db: Database | undefined;
 	let counts: Pick<StatusReport, "inbound" | "ledger" | "origins" | "monitors">;
 	try {
+		assertRegularLedger(dbPath);
 		db = new Database(dbPath, { readonly: true, strict: true });
 		counts = readCoreCounts(db);
 	} catch (error) {
@@ -252,6 +245,22 @@ function renderOriginLines(origins: readonly OriginStatus[]): string[] {
 	}
 	for (const [channel, count] of threadsPerChannel) lines.push(`• ${channel} × ${count}스레드`);
 	return lines;
+}
+
+/**
+ * First line of a conversation's `!status` / `/status-ompbot` (doc/plans/owner-stop-and-context.md): its context use
+ * and model. `idle`: no child runs (its state is read at the next message); `unknown`: the child did not answer.
+ */
+export function renderContextLine(state: OmpState | "idle" | "unknown"): string {
+	const head = "이 대화 컨텍스트:";
+	if (state === "idle") return `${head} 세션 쉬는 중(다음 메시지 때 다시 읽음)`;
+	const known = state === "unknown" ? undefined : state;
+	const model = known?.model === undefined ? "" : ` · 모델 ${known.model}`;
+	const context = known?.context;
+	if (context === undefined || context.tokens === null) return `${head} 알 수 없음${model}`;
+	const kilo = (tokens: number): string => `${Math.round(tokens / 1000).toLocaleString("en-US")}k`;
+	const percent = Math.round(context.percent ?? (context.tokens / context.window) * 100);
+	return `${head} ${kilo(context.tokens)} / ${kilo(context.window)} (${percent}%)${model}`;
 }
 
 /** Short text for `/status-ompbot` and the human `ompbot status` output. */

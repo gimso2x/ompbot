@@ -173,7 +173,7 @@ describe("host ops (fake runner)", () => {
 			});
 		const { commands, run } = answers();
 		expect(await createTaskHostOps({ sshTarget: "wsl", run }).commitOnTaskBranch(commitInput)).toBe("ok");
-		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--", "git", "-C", "/r/wt"];
+		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl", "git", "-C", "/r/wt"];
 		expect(commands).toEqual([
 			[...ssh, "cat-file", "-e", "abc1234^{commit}", "2>&1"],
 			[
@@ -222,7 +222,7 @@ describe("host ops (fake runner)", () => {
 		await ops.writeFile("/r/repo-t-20261026-01/docs/tasks/T/spec.md", "안녕");
 		await ops.readFile("/r/x/spec.md");
 		await ops.removeWorktree({ repo: "/r/repo", worktree: "/r/wt", branch: "task/T-20261026-01" });
-		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl", "--"];
+		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl"];
 		expect(commands[0]).toEqual([
 			...ssh,
 			"git",

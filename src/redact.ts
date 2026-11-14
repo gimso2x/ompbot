@@ -12,15 +12,30 @@ const DISCORD_TOKEN_SHAPE = "(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{23,28}\\.[A-Za-z0-9
 /** Entra (Azure AD) client secret, the Teams bot's credential: 3 chars, a digit, `Q~`, then 31–34 chars. */
 const ENTRA_SECRET_SHAPE = "(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}";
 
+/** A PEM private key (`RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, bare) from its BEGIN line through its END line. */
+const PEM_PRIVATE_KEY_SHAPE =
+	"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\\s\\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----";
+
+/**
+ * Cloud and forge keys: AWS access key id (`AKIA` + 16), Google API key (`AIza` + 35), GitLab personal token
+ * (`glpat-`), each at an alphanumeric edge so a longer word holding the prefix survives.
+ */
+const CLOUD_KEY_SHAPES =
+	"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])|(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])|(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}";
+
+/** Incoming webhook URLs, whose path is the credential: Slack (`hooks.slack.com/...`) and Discord (`/api/webhooks/<id>/<token>`). */
+const WEBHOOK_URL_SHAPES =
+	"https?://hooks\\.slack\\.com/(?:services|workflows|triggers)/[A-Za-z0-9_/-]+|https?://(?:(?:canary|ptb)\\.)?discord(?:app)?\\.com/api/webhooks/\\d+/[A-Za-z0-9_-]+";
+
 /**
  * xox[a-z]- (Slack bot/user/app/refresh/client/cookie tokens), xapp-, sk-ant-, sk-, GitHub tokens
- * (ghp_/gho_/ghu_/ghs_/ghr_, fine-grained github_pat_), Discord bot tokens, Entra client secrets as one regex
- * source. `sk-` needs a non-alphanumeric left edge so words like "task-1" or "risk-free" survive; `skRun` is the
- * quantifier of the key body after `sk-` / `sk-ant-`, the only part the upload check (`safety/host-tools.ts`) sets
- * differently.
+ * (ghp_/gho_/ghu_/ghs_/ghr_, fine-grained github_pat_), Discord bot tokens, Entra client secrets, cloud keys, webhook
+ * URLs and PEM private key blocks as one regex source. `sk-` needs a non-alphanumeric left edge so words like
+ * "task-1" or "risk-free" survive; `skRun` is the quantifier of the key body after `sk-` / `sk-ant-`, the only part
+ * the upload check (`safety/host-tools.ts`) sets differently.
  */
 export const secretShapes = (skRun: string): string =>
-	`xox[a-z]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|${DISCORD_TOKEN_SHAPE}|${ENTRA_SECRET_SHAPE}`;
+	`${PEM_PRIVATE_KEY_SHAPE}|${WEBHOOK_URL_SHAPES}|xox[a-z]-[A-Za-z0-9_-]*|xapp-[A-Za-z0-9_-]*|(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_-]${skRun}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|${CLOUD_KEY_SHAPES}|${DISCORD_TOKEN_SHAPE}|${ENTRA_SECRET_SHAPE}`;
 const SECRET_PATTERN = new RegExp(secretShapes("+"), "g");
 
 export type Redactor = (text: string) => string;

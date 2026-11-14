@@ -12,7 +12,6 @@ const SNAPSHOT_KEYS = [
 	"timezone",
 	"daemon",
 	"turns",
-	"feedback",
 	"tasks",
 	"flows",
 	"lanes",
@@ -24,6 +23,7 @@ const SNAPSHOT_KEYS = [
 	"backup",
 	"jobs",
 	"slackTeam",
+	"ompbotCli",
 	"slackOff",
 	"discordGuild",
 ];
@@ -121,6 +121,33 @@ describe("ompbot dashboard", () => {
 		setDashboardConfig({ port });
 		expect(await startDashboard([])).toBe(`http://127.0.0.1:${port}/`);
 		expect(await (await fetch(`http://127.0.0.1:${port}/healthz`)).text()).toBe("ok");
+	});
+
+	test("each opened page and detail read writes one dashboard_request line without the origin, id or card", async () => {
+		const url = await startDashboard(["--port", String(freePort())]);
+		for (const path of [
+			"?view=turns&origin=slack/dm/DSECRET1&id=ISECRET2&card=CSECRET3",
+			"?view=%0Aforged",
+			"api/turn/7/trace",
+			"api/thread/conversation?origin=slack/dm/DSECRET1",
+			"api/monitor/detail?id=ISECRET2",
+			"api/snapshot",
+			"healthz",
+		]) {
+			await (await fetch(`${url}${path}`)).arrayBuffer();
+		}
+		proc?.kill("SIGTERM");
+		expect(await proc?.exited).toBe(0);
+		const stderr = await new Response(proc?.stderr).text();
+		proc = undefined;
+		expect(stderr.split("\n").filter((line) => line.startsWith("dashboard_request"))).toEqual([
+			"dashboard_request kind=page view=turns",
+			"dashboard_request kind=page view=other",
+			"dashboard_request kind=trace",
+			"dashboard_request kind=conversation",
+			"dashboard_request kind=monitor_detail",
+		]);
+		expect(stderr).not.toMatch(/SECRET/);
 	});
 
 	test("AC-9: without herdrBoard no board source starts; the page keeps the herdr agent list block", async () => {

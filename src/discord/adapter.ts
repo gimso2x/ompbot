@@ -1,4 +1,4 @@
-// Discord's inbound path and delivery sender: the same rules as the Slack adapter (owner gate, addressing, mute,
+// Discord's inbound path and delivery sender: the same rules as the Slack adapter (owner gate, addressing,
 // 👀 + ⏳ status, the shared delivery pump), on Discord's shapes (doc/plans/discord-channel.md §7–8).
 import { join } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
@@ -8,17 +8,31 @@ import {
 	MAX_INBOUND_IMAGE_BYTES,
 	saveInboundAttachment,
 } from "../channel/attachments";
+import {
+	guardInbound,
+	isChannelMessageAddressed,
+	recordInbound,
+	recordPeerInbound,
+	resolveThreadLinks,
+	settleCardReply,
+} from "../channel/inbound";
 import { renderMentions } from "../channel/port";
-import { DeliveryPump, type DeliverySender, type DeliverySendResult } from "../channel/pump";
+import {
+	answerFooter,
+	DeliveryPump,
+	type DeliverySendResult,
+	deliverySender,
+	finishDeliveryStatus,
+} from "../channel/pump";
+import { RetryAfterGate } from "../channel/retry";
+import { type StatusEntry, StatusTracker } from "../channel/status";
 import {
 	cutCodePointSafe,
 	DENIED_TEXT,
-	FINAL_MARKS,
+	errorText,
 	type FinalOutcome,
-	formatElapsed,
 	oneLine,
 	progressLine,
-	runningStatusText,
 	STATUS_MIN_INTERVAL_MS,
 } from "../channel/text";
 import type { AdapterClock, CoreSink, DeliveryItem, DeliverySource, IngestOutcome } from "../channel/types";
@@ -29,53 +43,34 @@ import {
 	normalizePeerInbound,
 	originKeyForMessage,
 	parseThreadRef,
-	THREAD_LINK_PREFIX,
 	TOP_LEVEL_TS,
 	threadRefOf,
 } from "../core/normalize";
-import { chatOriginKey, parseChatOrigin } from "../core/origin-key";
-import {
-	COMMAND_TEXT,
-	type CommandKind,
-	parseCommand,
-	parseThreadMuteCommand,
-	TAKES_ARG,
-	type ThreadMuteCommand,
-} from "../core/types";
+import { parseChatOrigin } from "../core/origin-key";
 import type { Logger } from "../log";
 import { DEFAULT_PEER_HOP_LIMIT, PEER_HOP_NOTICE, type PeerBotList } from "../slack/adapter";
-import { type BackfillCursors, type BackfillTarget, DiscordBackfill } from "./backfill";
+import { type BackfillCursors, type BackfillTarget, DiscordBackfill, snowflakeTime } from "./backfill";
 import { type Destination, type DiscordChannel, PUBLIC_THREAD, THREAD_EXISTS, THREAD_NAME_MAX } from "./channel";
-import { fromDiscordEmoji, toDiscordEmoji } from "./emoji";
-import { type DiscordPart, mrkdwnToDiscord, renderDiscordMessages } from "./format";
+import { toDiscordEmoji } from "./emoji";
+import { type DiscordPart, renderDiscordMessages } from "./format";
 import {
-	type ApplicationCommand,
 	type DiscordAttachment,
 	DiscordCallError,
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
 	DiscordRateLimitedError,
-	type DiscordReactionEvent,
 	type DiscordTransport,
-	MESSAGE_CONTENT_LIMIT,
 } from "./transport";
 
 /** Message types the bot reads: a plain message and a reply. Everything else is a system message. */
 const READ_TYPES: ReadonlySet<number> = new Set([0, 19]);
 const DM_CHANNEL = 1;
-/** Interaction types: a slash command, a message component (button click). */
-const APPLICATION_COMMAND = 2;
+/** Interaction type of a message component (button click). */
 const MESSAGE_COMPONENT = 3;
-/**
- * Interaction callback types: a message (with flags), the deferred message a slash command fills later ("thinking"),
- * and the deferred update that only acknowledges a click.
- */
+/** Interaction callback types: a message (with flags), and the deferred update that only acknowledges a click. */
 const CHANNEL_MESSAGE = 4;
-const DEFERRED_CHANNEL_MESSAGE = 5;
 const DEFERRED_UPDATE_MESSAGE = 6;
-/** Application command option type of a free-text argument. */
-const STRING_OPTION = 3;
 /** Message flag: only the clicking user sees the response. */
 const EPHEMERAL = 64;
 /** Interaction ids remembered against gateway replays; the oldest are forgotten past this. */
@@ -88,44 +83,6 @@ const TYPING_INTERVAL_MS = 8_000;
 const TYPING_MAX_MS = 330_000;
 /** Characters of the replied-to post put in the prompt's context line. */
 const REPLY_CONTEXT_MAX = 300;
-
-/** What each slash command does, as its picker shows it (Slack's manifest wording; Discord allows 1–100 characters). */
-const COMMAND_DESCRIPTIONS: Record<CommandKind, string> = {
-	new: "ompbot 대화를 새로 시작",
-	status: "ompbot 상태 확인",
-	model: "모델 보기·바꾸기",
-	thinking: "thinking 수준 보기·바꾸기",
-	compact: "컨텍스트 압축",
-	resume: "저장된 세션 목록·이어가기",
-	queue: "진행 중인 작업과 대기열 보기·대기 취소",
-	followup: "끝난 뒤 다음 작업으로 보내기",
-	usage: "토큰·비용 사용량 보기",
-	distill: "이 대화 세션에서 스킬 후보 리뷰",
-	btw: "진행 중인 작업에 섞지 않고 곁질문에만 답하기",
-	undo: "최근 변경 턴 되돌리기",
-	budget: "오늘 비용과 상한 보기·오늘 상한 끄기",
-	brief: "지금 상태를 한 장 이미지로 받기",
-};
-
-/**
- * The slash command set: every `COMMAND_TEXT` entry without its `/` (`new-ompbot` …); a command that takes an
- * argument has one optional text option, so the core sees the same `<command> <text>` a typed command gives.
- */
-const SLASH_COMMANDS: readonly ApplicationCommand[] = (
-	Object.entries(COMMAND_TEXT) as Array<[CommandKind, string]>
-).map(([kind, text]) => ({
-	name: text.slice(1),
-	description: COMMAND_DESCRIPTIONS[kind],
-	options: TAKES_ARG.has(kind)
-		? [{ type: STRING_OPTION, name: "text", description: "명령 뒤에 붙일 내용", required: false }]
-		: [],
-}));
-const SLASH_KINDS: ReadonlyMap<string, CommandKind> = new Map(
-	(Object.entries(COMMAND_TEXT) as Array<[CommandKind, string]>).map(([kind, text]) => [text.slice(1), kind]),
-);
-/** Ephemeral hint for a command typed where the bot holds no conversation (a group DM). */
-const COMMAND_PLACE_TEXT = "이 명령은 봇과의 DM이나 봇이 있는 서버 채널에서만 쓸 수 있습니다.";
-const COMMAND_FAILED_TEXT = "명령 처리에 실패했습니다. 로그를 확인하세요.";
 
 export interface DiscordAdapterOptions {
 	/** The port: its transport carries every call, its channel cache tells threads from messages. */
@@ -158,7 +115,6 @@ export interface DiscordAdapterOptions {
 	recovery?: { cursors: BackfillCursors; targets(): BackfillTarget[]; maxPages?: number | undefined } | undefined;
 	/** Directory for downloaded inbound attachments (`<home>/media`); without it attachments are skipped with a note. */
 	mediaRoot?: string | undefined;
-	statusIntervalMs?: number | undefined;
 	/** The typing indicator's interval timer (tests fire it by hand). Default `setInterval`/`clearInterval`, unref'd. */
 	typingTimers?: TypingTimers | undefined;
 }
@@ -188,31 +144,8 @@ interface MessageSpot {
 	messageId: string;
 }
 
-interface StatusEntry {
-	conversationId: string;
-	root: string;
-	statusChannel: string | undefined;
-	statusId: string | undefined;
-	startedAt: number;
-	lastUpdateAt: number;
-	/** Owner messages carrying our 👀 in this thread: message id → channel. */
-	reactions: Map<string, string>;
-	setup: Promise<void>;
-	showStatus: boolean;
-	final: FinalOutcome | undefined;
-	stalled: boolean;
-	progress: TurnProgress | undefined;
-	finalAction: "delete" | "update";
-	statusDone: boolean;
-	reactionsDone: boolean;
-}
-
 /** One adapter-level block per kind of call: a 429 on posting must not stop status edits, and the other way round. */
 type Route = "post" | "edit" | "delete" | "react" | "typing";
-
-function errorText(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
 
 export class DiscordAdapter implements ChannelAdapter {
 	readonly platform = "discord" as const;
@@ -232,12 +165,11 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #isTaskRoot: ((threadRef: string) => boolean) | undefined;
 	readonly #onInboundFailure: (() => void) | undefined;
 	readonly #mediaRoot: string | undefined;
-	readonly #statusIntervalMs: number;
-	readonly #statuses = new Map<string, StatusEntry>();
+	readonly #status: StatusTracker;
 	/** Typing per thread ref; a stopped entry stays until finishStatus so the same turn is not typed again. */
 	readonly #typing = new Map<string, TypingEntry>();
 	readonly #typingTimers: TypingTimers;
-	readonly #blockedUntil = new Map<Route, number>();
+	readonly #gate: RetryAfterGate;
 	readonly #pump: DeliveryPump;
 	readonly #recovery: DiscordBackfill | undefined;
 	/** Interactions already handled (a resumed gateway can replay one): insertion-ordered, capped. */
@@ -247,10 +179,6 @@ export class DiscordAdapter implements ChannelAdapter {
 	/** Recovered server roots that opened their thread, until their scan's notice picks one (`#recoveryNotice`). */
 	readonly #recoveredThreads = new Set<string>();
 	#ready: Promise<string | undefined> = Promise.resolve(undefined);
-	/** The start-time slash command registration; settles (never rejects) once every scope was tried. */
-	#commands: Promise<void> = Promise.resolve();
-	/** Microseconds of the last feedback event stamp: stamps strictly increase, so a later event always wins. */
-	#lastFeedbackMicros = 0;
 	#botUserId: string | undefined;
 
 	constructor(options: DiscordAdapterOptions) {
@@ -270,13 +198,48 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#isTaskRoot = options.isTaskRoot;
 		this.#onInboundFailure = options.onInboundFailure;
 		this.#mediaRoot = options.mediaRoot;
-		this.#statusIntervalMs = options.statusIntervalMs ?? STATUS_MIN_INTERVAL_MS;
 		this.#typingTimers = options.typingTimers ?? INTERVAL_TIMERS;
+		this.#gate = new RetryAfterGate({
+			clock: options.clock,
+			park: (route, retryAfterMs) => options.log.warn("discord_rate_limited", { route, retry_after_ms: retryAfterMs }),
+		});
 		this.#pump = new DeliveryPump({
 			source: options.deliveries,
-			sender: this.#sender(),
+			sender: deliverySender({
+				gate: this.#gate,
+				key: "post",
+				blockedReason: "discord createMessage",
+				send: (delivery) => this.#send(delivery),
+				finish: (delivery, result) => this.#finishDelivered(delivery, result),
+			}),
 			clock: options.clock,
 			log: options.log,
+		});
+		this.#status = new StatusTracker({
+			clock: options.clock,
+			intervalMs: STATUS_MIN_INTERVAL_MS,
+			platform: {
+				create: (entry, text) => this.#createStatus(entry, text),
+				edit: (entry, text, final) => this.#editStatus(entry, text, final),
+				remove: (entry) => this.#removeStatus(entry),
+				removeEyes: (target) =>
+					this.#swapReaction(() =>
+						this.#transport.removeReaction({
+							channelId: target.channelId,
+							messageId: target.messageId,
+							emoji: toDiscordEmoji("eyes"),
+						}),
+					),
+				addMark: (target, mark) =>
+					this.#swapReaction(() =>
+						this.#transport.addReaction({
+							channelId: target.channelId,
+							messageId: target.messageId,
+							emoji: toDiscordEmoji(mark),
+						}),
+					),
+				isTaskRoot: (threadRef) => this.#isTaskRoot?.(threadRef),
+			},
 		});
 		const recovery = options.recovery;
 		this.#recovery =
@@ -314,13 +277,11 @@ export class DiscordAdapter implements ChannelAdapter {
 
 	/**
 	 * Connects in the background: the daemon (and Slack) never waits for the gateway. A failed start — a fatal close
-	 * such as 4004/4014 — leaves Discord off and is logged; every other part of the daemon keeps running. Once ready
-	 * the slash commands are registered; a refused registration is a warning, the typed `!` commands still work.
+	 * such as 4004/4014 — leaves Discord off and is logged; every other part of the daemon keeps running.
 	 */
 	async start(): Promise<void> {
 		const handlers: DiscordHandlers = {
 			message: (event) => this.handleMessage(event),
-			reaction: (event) => this.handleReaction(event),
 			interaction: (interaction) => this.handleInteraction(interaction),
 			// A new session lost the events in between (a resume replays them). The first Ready comes before start()
 			// has the bot id: that one is the daemon's own startup recover().
@@ -339,32 +300,6 @@ export class DiscordAdapter implements ChannelAdapter {
 				return undefined;
 			},
 		);
-		this.#commands = this.#ready.then((botUserId) => (botUserId === undefined ? undefined : this.#registerCommands()));
-	}
-
-	/** Resolves once the start-time command registration has settled (whatever its outcome). */
-	commandsReady(): Promise<void> {
-		return this.#commands;
-	}
-
-	/**
-	 * Overwrites the command set: globally (DMs and every server), or per allowed server when `guildIds` is set —
-	 * a server's set shows at once, the global one can take a while to spread.
-	 */
-	async #registerCommands(): Promise<void> {
-		const guilds = this.#guildIds === undefined || this.#guildIds.size === 0 ? [undefined] : [...this.#guildIds];
-		for (const guildId of guilds) {
-			const scope = guildId ?? "global";
-			try {
-				await this.#transport.registerCommands({
-					...(guildId === undefined ? {} : { guildId }),
-					commands: SLASH_COMMANDS,
-				});
-				this.#log.info("discord_commands_registered", { scope, count: SLASH_COMMANDS.length });
-			} catch (err) {
-				this.#log.warn("discord_commands_register_failed", { scope, error: errorText(err) });
-			}
-		}
 	}
 
 	async stop(): Promise<void> {
@@ -421,25 +356,13 @@ export class DiscordAdapter implements ChannelAdapter {
 
 	// ---- Discord calls with per-route Retry-After blocking ----
 
-	#isBlocked(route: Route): boolean {
-		const until = this.#blockedUntil.get(route);
-		return until !== undefined && this.#clock.now() < until;
-	}
-
 	async #call<T>(route: Route, fn: () => Promise<T>): Promise<T> {
-		const until = this.#blockedUntil.get(route);
-		if (until !== undefined && this.#clock.now() < until) {
-			throw new DiscordRateLimitedError(until - this.#clock.now());
-		}
-		try {
-			return await fn();
-		} catch (err) {
-			if (err instanceof DiscordRateLimitedError) {
-				this.#blockedUntil.set(route, this.#clock.now() + err.retryAfterMs);
-				this.#log.warn("discord_rate_limited", { route, retry_after_ms: err.retryAfterMs });
-			}
-			throw err;
-		}
+		return this.#gate.call(
+			route,
+			fn,
+			(remainingMs) => new DiscordRateLimitedError(remainingMs),
+			(err) => (err instanceof DiscordRateLimitedError ? err.retryAfterMs : undefined),
+		);
 	}
 
 	/** Best-effort post; failures are logged under `event`, never thrown. */
@@ -484,36 +407,6 @@ export class DiscordAdapter implements ChannelAdapter {
 		await this.#postText(conversationId, threadId, text, "notice_failed");
 	}
 
-	// ---- owner feedback reactions ----
-
-	/**
-	 * The owner's 👍/👎 added to or removed from a message a delivery posted goes to the delivery source, which binds
-	 * it to the turn of that answer. Gateway reactions carry no time, so each gets an arrival stamp in Slack's
-	 * `<seconds>.<micros>` form, strictly increasing: of two events on one message the later one wins. Anyone else's
-	 * reaction, other emoji and messages no delivery posted are dropped without a log line.
-	 */
-	async handleReaction(event: DiscordReactionEvent): Promise<void> {
-		if (!isOwner(event.user_id, this.#owner)) return;
-		const name = fromDiscordEmoji(event.emoji.name);
-		const verdict = name === "+1" ? "up" : name === "-1" ? "down" : undefined;
-		if (verdict === undefined) return;
-		const post = { channel: event.channel_id, ts: event.message_id };
-		const micros = Math.max(Math.floor(this.#clock.now() * 1000), this.#lastFeedbackMicros + 1);
-		this.#lastFeedbackMicros = micros;
-		const eventTs = `${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
-		try {
-			if (this.#deliveries.isPost !== undefined && !(await this.#deliveries.isPost(post))) return;
-			await this.#deliveries.recordFeedback?.({
-				...post,
-				verdict,
-				action: event.type === "add" ? "added" : "removed",
-				eventTs,
-			});
-		} catch (err) {
-			this.#log.warn("feedback_record_failed", { ...post, error: errorText(err) });
-		}
-	}
-
 	// ---- button clicks ----
 
 	/**
@@ -522,7 +415,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	 * core's onAction runs, the way a Slack block action does, and edits the card itself if it needs to.
 	 */
 	async handleInteraction(interaction: DiscordInteraction): Promise<void> {
-		if (interaction.type !== MESSAGE_COMPONENT && interaction.type !== APPLICATION_COMMAND) return;
+		if (interaction.type !== MESSAGE_COMPONENT) return;
 		if (this.#seenInteractions.has(interaction.id)) {
 			this.#log.info("interaction_duplicate", { id: interaction.id });
 			return;
@@ -531,10 +424,6 @@ export class DiscordAdapter implements ChannelAdapter {
 		if (this.#seenInteractions.size > SEEN_INTERACTIONS_MAX) {
 			const oldest = this.#seenInteractions.values().next().value;
 			if (oldest !== undefined) this.#seenInteractions.delete(oldest);
-		}
-		if (interaction.type === APPLICATION_COMMAND) {
-			await this.#handleCommand(interaction);
-			return;
 		}
 		try {
 			const userId = (interaction.member?.user ?? interaction.user)?.id ?? "";
@@ -570,114 +459,16 @@ export class DiscordAdapter implements ChannelAdapter {
 		}
 	}
 
-	/**
-	 * A slash command (INTERACTION_CREATE type 2), Slack's `handleSlash` on Discord's shapes. Refusals (a stranger, an
-	 * unknown name, a group DM) are an ephemeral reply. The owner's command is acknowledged within Discord's 3 s as a
-	 * deferred ephemeral response (type 5) before the core runs it, and the core's text then fills that response; with
-	 * no text (the answer is posted as its own message) the placeholder is deleted. In a server the command runs on the
-	 * conversation it was typed in: the channel's origin, or a thread's own origin with the answer inside the thread.
-	 */
-	async #handleCommand(interaction: DiscordInteraction): Promise<void> {
-		const userId = (interaction.member?.user ?? interaction.user)?.id ?? "";
-		const name = interaction.data?.name ?? "";
-		const { id: interactionId, token } = interaction;
-		const reply = (content: string) =>
-			this.#transport.respondInteraction({
-				interactionId,
-				token,
-				response: { type: CHANNEL_MESSAGE, data: { content, flags: EPHEMERAL } },
-			});
-		try {
-			if (!isOwner(userId, this.#owner)) {
-				this.#log.warn("command_denied", { command: name, user: userId });
-				await reply(DENIED_TEXT);
-				return;
-			}
-			const command = SLASH_KINDS.get(name);
-			if (command === undefined) {
-				await reply(`알 수 없는 명령: /${name}`);
-				return;
-			}
-			const channelId = interaction.channel_id ?? interaction.channel?.id;
-			const guildId = interaction.guild_id;
-			const dm = guildId === undefined && interaction.channel?.type === DM_CHANNEL;
-			if (channelId === undefined || (guildId === undefined && !dm)) {
-				await reply(COMMAND_PLACE_TEXT);
-				return;
-			}
-			if (guildId !== undefined && this.#guildIds !== undefined && !this.#guildIds.has(guildId)) {
-				await reply("이 서버에서는 ompbot 명령을 받지 않습니다.");
-				return;
-			}
-			try {
-				await this.#transport.respondInteraction({
-					interactionId,
-					token,
-					response: { type: DEFERRED_CHANNEL_MESSAGE, data: { flags: EPHEMERAL } },
-				});
-			} catch (err) {
-				// Too late or refused: Discord shows "interaction failed", the command still runs for the owner.
-				this.#log.warn("interaction_ack_failed", { id: interactionId, error: errorText(err) });
-			}
-			const option = interaction.data?.options?.find((o) => o.name === "text")?.value;
-			let text: string | undefined;
-			try {
-				let originKey: string;
-				if (dm) {
-					this.#port.remember({ id: channelId, type: DM_CHANNEL });
-					originKey = chatOriginKey({ platform: "discord", kind: "dm", conversationId: channelId });
-				} else {
-					// Inside the try: a failed lookup still fills the deferred response instead of leaving it "thinking".
-					const info = await this.#port.channelInfo(channelId);
-					const thread = info?.parentId !== undefined && info.type !== 0;
-					originKey = chatOriginKey({
-						platform: "discord",
-						kind: "ch",
-						conversationId: thread ? (info?.parentId ?? channelId) : channelId,
-						...(thread ? { threadId: channelId } : {}),
-					});
-				}
-				text = await this.#core.onCommand({
-					command,
-					arg: typeof option === "string" ? option.trim() : "",
-					originKey,
-					channel: channelId,
-					userId,
-				});
-			} catch (err) {
-				this.#log.error("command_failed", { command: name, error: errorText(err) });
-				text = COMMAND_FAILED_TEXT;
-			}
-			if (text === undefined) await this.#transport.deleteInteractionResponse({ token });
-			else {
-				await this.#transport.editInteractionResponse({
-					token,
-					content: cutCodePointSafe(mrkdwnToDiscord(text), MESSAGE_CONTENT_LIMIT),
-					allowedMentions: { parse: [] },
-				});
-			}
-		} catch (err) {
-			this.#log.error("command_interaction_failed", { command: name, error: errorText(err) });
-		}
-	}
-
 	// ---- inbound messages ----
 
 	async handleMessage(event: DiscordMessageEvent): Promise<void> {
-		try {
-			await this.#processMessage(event, []);
-		} catch (err) {
-			this.#log.error("inbound_failed", { channel: event.channel_id, id: event.id, error: errorText(err) });
-			try {
-				this.#onInboundFailure?.();
-			} catch (cbErr) {
-				this.#log.warn("inbound_failure_callback_failed", { error: errorText(cbErr) });
-			}
-		}
+		await guardInbound(this.#log, { channel: event.channel_id, id: event.id }, this.#onInboundFailure, () =>
+			this.#processMessage(event, []),
+		);
 	}
 
-	#drop(event: DiscordMessageEvent, reason: string): IngestOutcome {
-		this.#log.info("inbound_dropped", { reason, channel: event.channel_id, id: event.id });
+	#drop(event: DiscordMessageEvent, reason: string, peer?: string): IngestOutcome {
+		this.#log.info("inbound_dropped", { reason, channel: event.channel_id, id: event.id, ...(peer && { peer }) });
 		return "dropped";
 	}
 
@@ -741,9 +532,6 @@ export class DiscordAdapter implements ChannelAdapter {
 		}
 		const spot: MessageSpot = { channelId: event.channel_id, messageId: event.id };
 		let text = event.content;
-		let muteContext:
-			| { ref: string; mentioned: boolean; muted: boolean; command: ThreadMuteCommand | undefined }
-			| undefined;
 		if (!dm) {
 			const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`];
 			const repliesToBot = event.referenced_message?.author?.id === botUserId;
@@ -755,10 +543,6 @@ export class DiscordAdapter implements ChannelAdapter {
 			text = text.trim();
 			const cardReply = await this.#processCardReply(event, conversationId, threadId, text, spot, injected);
 			if (cardReply !== undefined) return cardReply;
-			const threadRef = threadId === undefined ? undefined : threadRefOf(conversationId, threadId);
-			const muteRef = threadRefOf(conversationId, threadId ?? event.id);
-			const muted = this.#core.isThreadMuted?.(muteRef) === true;
-			const command = parseThreadMuteCommand(text);
 			// A message that mentions a peer bot but not this bot is meant for the peer, whatever the channel policy says.
 			const forPeer =
 				!mentioned &&
@@ -768,18 +552,15 @@ export class DiscordAdapter implements ChannelAdapter {
 						text.includes(`<@!${p.userId}>`) ||
 						(event.mentions?.some((user) => user.id === p.userId) ?? false),
 				);
-			// A reply to this bot's post addresses it like a mention (requireMention and the mute release included),
-			// unless its text mentions only a peer: then `forPeer` wins.
-			const addressed = mentioned || (repliesToBot && !forPeer);
-			const audible = this.#requireMention
-				? addressed
-				: this.#mentionFree.has(conversationId) ||
-					addressed ||
-					(threadRef !== undefined && this.#core.knowsThread?.(threadRef) === true);
-			if (!audible || forPeer || !(addressed || command !== undefined || !muted)) {
-				return this.#drop(event, muted ? "thread_muted" : "not_addressed");
-			}
-			muteContext = { ref: muteRef, mentioned: addressed, muted, command };
+			const addressed = isChannelMessageAddressed(this.#core, {
+				// A reply to this bot's post addresses it like a mention, unless its text mentions only a peer.
+				mentioned: mentioned || (repliesToBot && !forPeer),
+				forPeer,
+				threadRef: threadId === undefined ? undefined : threadRefOf(conversationId, threadId),
+				requireMention: this.#requireMention,
+				mentionFree: this.#mentionFree.has(conversationId),
+			});
+			if (!addressed) return this.#drop(event, "not_addressed");
 		} else {
 			const cardReply = await this.#processCardReply(event, conversationId, undefined, text, spot, injected);
 			if (cardReply !== undefined) return cardReply;
@@ -814,21 +595,6 @@ export class DiscordAdapter implements ChannelAdapter {
 				.join("\n"),
 		});
 		if (!gate.accept) return this.#drop(event, gate.reason);
-		const muteCommand = muteContext?.command ?? (dm ? parseThreadMuteCommand(text) : undefined);
-		if (muteCommand !== undefined) {
-			const id = gate.inbound.platformMessageId;
-			if (this.#core.seenMuteCommand?.(id) === true) {
-				this.#log.info("inbound_duplicate", { id });
-				return "duplicate";
-			}
-			const outcome = await this.#runMuteCommand(muteCommand, conversationId, threadId ?? event.id, muteContext);
-			if (outcome === "recorded") this.#core.rememberMuteCommand?.(id);
-			return outcome;
-		}
-		if (muteContext?.muted && muteContext.mentioned) {
-			this.#core.setThreadMute?.(muteContext.ref, false);
-			this.#log.info("thread_mute", { thread: muteContext.ref, muted: false, via: "mention" });
-		}
 		// A server root that is no command opens its own thread, the way a Slack root opens its own origin.
 		let inbound = gate.inbound;
 		const opensThread = !dm && threadId === undefined && parseChatOrigin(inbound.originKey)?.threadId !== undefined;
@@ -844,21 +610,13 @@ export class DiscordAdapter implements ChannelAdapter {
 			if (!final.accept) return this.#drop(event, final.reason);
 			inbound = final.inbound;
 		}
-		const outcome = await this.#core.onInbound(inbound);
-		if (outcome?.duplicate) {
-			this.#log.info("inbound_duplicate", { id: inbound.platformMessageId });
-			return "duplicate";
-		}
-		const parsed = parseThreadRef(inbound.threadRef);
-		if (parsed !== undefined) {
-			const command = parseCommand(inbound.text);
-			const showStatus = command === undefined || command.kind === "followup";
-			await this.#beginStatus(inbound.threadRef, parsed.channel, parsed.threadTs, spot, inbound.originKey, {
+		const recorded = inbound;
+		return recordInbound(this.#core, this.#log, recorded, (thread, showStatus) =>
+			this.#beginStatus(recorded.threadRef, thread.channel, thread.threadTs, spot, recorded.originKey, {
 				showStatus,
 				typing: showStatus,
-			});
-		}
-		return "recorded";
+			}),
+		);
 	}
 
 	/**
@@ -873,30 +631,22 @@ export class DiscordAdapter implements ChannelAdapter {
 		botUserId: string,
 		peer: { userId: string; name: string },
 	): Promise<IngestOutcome> {
-		const drop = (reason: string): IngestOutcome => {
-			this.#log.info("inbound_dropped", { reason, channel: event.channel_id, id: event.id, peer: peer.userId });
-			return "dropped";
-		};
+		const drop = (reason: string): IngestOutcome => this.#drop(event, reason, peer.userId);
 		if (event.guild_id === undefined) return drop("peer_dm");
 		if (this.#guildIds !== undefined && !this.#guildIds.has(event.guild_id)) return drop("guild_not_allowed");
 		const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`];
-		if (!tokens.some((token) => event.content.includes(token))) return drop("peer_not_mentioned");
-		const onPeerInbound = this.#core.onPeerInbound;
-		if (onPeerInbound === undefined) return drop("peer_unsupported");
-		let conversationId = event.channel_id;
-		let threadId: string | undefined;
-		const info = await this.#port.channelInfo(event.channel_id);
-		if (info === undefined) throw new Error(`unknown channel ${event.channel_id}`);
-		if (info.parentId !== undefined && info.type !== 0) {
-			conversationId = info.parentId;
-			threadId = event.channel_id;
+		if (!tokens.some((token) => event.content.includes(token))) {
+			await this.#notePeerSeen(event, peer.userId);
+			return drop("peer_not_mentioned");
 		}
+		if (this.#core.onPeerInbound === undefined) return drop("peer_unsupported");
+		const { conversationId, threadId } = await this.#serverPlace(event);
 		if (conversationId === this.#logChannel) return drop("log_channel");
 		// A root's keys are those of the thread the owner path would open from it (Discord: thread id = message id).
 		const root = threadId ?? event.id;
 		const threadRef = threadRefOf(conversationId, root);
-		// An owner-muted thread stays quiet for peers too, and a peer mention never releases the mute.
-		if (this.#core.isThreadMuted?.(threadRef) === true) return drop("thread_muted");
+		// Before the hop cap: a post dropped there still shows the peer is awake.
+		this.#core.onPeerSeen?.({ threadRef, peerUserId: peer.userId, at: snowflakeTime(event.id) });
 		let text = event.content;
 		for (const token of tokens) text = text.split(token).join(" ");
 		text = text.trim();
@@ -915,22 +665,11 @@ export class DiscordAdapter implements ChannelAdapter {
 		});
 		if (!result.accept) return drop(result.reason);
 		const { inbound } = result;
-		const outcome = onPeerInbound(inbound, {
-			turns: this.#peerHopLimit.turns,
-			windowMs: this.#peerHopLimit.windowMinutes * 60_000,
-		});
-		if (outcome.duplicate) {
-			this.#log.info("inbound_duplicate", { id: inbound.platformMessageId });
-			return "duplicate";
-		}
-		if (outcome.dropped !== undefined) {
-			drop(outcome.dropped);
-			if (outcome.dropped === "peer_hop_cap" && outcome.notice === true) {
-				// No bot mention in the notice: it must not invite another peer reply. A root gets it as a reply, no thread.
-				await this.postNotice(conversationId, PEER_HOP_NOTICE, root);
-			}
-			return "dropped";
-		}
+		// A root gets the cap notice as a reply, no thread.
+		const refused = await recordPeerInbound(this.#core, this.#log, inbound, this.#peerHopLimit, drop, () =>
+			this.postNotice(conversationId, PEER_HOP_NOTICE, root),
+		);
+		if (refused !== undefined) return refused;
 		if (opensThread) await this.#startThread(conversationId, event, text, false);
 		await this.#beginStatus(
 			threadRef,
@@ -941,6 +680,35 @@ export class DiscordAdapter implements ChannelAdapter {
 			{ showStatus: true },
 		);
 		return "recorded";
+	}
+
+	/** A server message's conversation (a thread's parent) and thread (undefined at a channel root). */
+	async #serverPlace(event: DiscordMessageEvent): Promise<{ conversationId: string; threadId: string | undefined }> {
+		const info = await this.#port.channelInfo(event.channel_id);
+		if (info === undefined) throw new Error(`unknown channel ${event.channel_id}`);
+		return info.parentId !== undefined && info.type !== 0
+			? { conversationId: info.parentId, threadId: event.channel_id }
+			: { conversationId: event.channel_id, threadId: undefined };
+	}
+
+	/**
+	 * A peer post that does not mention this bot is never taken, but it still answers this bot's calls to that peer in
+	 * its thread (`onPeerSeen`), outside the #log channel. A failed channel lookup is logged and the
+	 * post dropped as before.
+	 */
+	async #notePeerSeen(event: DiscordMessageEvent, peerUserId: string): Promise<void> {
+		const onPeerSeen = this.#core.onPeerSeen;
+		if (onPeerSeen === undefined) return;
+		let place: { conversationId: string; threadId: string | undefined };
+		try {
+			place = await this.#serverPlace(event);
+		} catch (err) {
+			this.#log.warn("peer_seen_lookup_failed", { channel: event.channel_id, id: event.id, error: errorText(err) });
+			return;
+		}
+		if (place.conversationId === this.#logChannel) return;
+		const threadRef = threadRefOf(place.conversationId, place.threadId ?? event.id);
+		onPeerSeen({ threadRef, peerUserId, at: snowflakeTime(event.id) });
 	}
 
 	/**
@@ -1021,69 +789,23 @@ export class DiscordAdapter implements ChannelAdapter {
 		spot: MessageSpot,
 		injected: boolean,
 	): Promise<IngestOutcome | undefined> {
-		const onCardReply = this.#core.onCardReply;
-		if (onCardReply === undefined || text === "") return undefined;
+		if (this.#core.onCardReply === undefined || text === "") return undefined;
 		const platformMessageId = threadRefOf(conversationId, event.id);
 		const cards = [event.message_reference?.message_id, threadId].filter(
 			(id): id is string => id !== undefined && id !== event.id,
 		);
 		for (const card of cards) {
 			const threadRef = threadRefOf(conversationId, card);
-			const result = onCardReply({ threadRef, platformMessageId, text, injected });
-			if (result === undefined) continue;
-			if (result.kind === "injected_rejected") return "card_rejected";
-			if (result.kind === "duplicate") {
-				this.#log.info("inbound_duplicate", { id: platformMessageId });
-				return "duplicate";
-			}
-			if (result.kind === "settled") return "recorded";
-			const outcome = await this.#core.onInbound({
-				platformMessageId,
-				originKey: result.originKey,
-				text,
-				threadRef,
-				ownerVerified: true,
-			});
-			if (outcome?.duplicate) {
-				this.#log.info("inbound_duplicate", { id: platformMessageId });
-				return "duplicate";
-			}
-			await this.#beginStatus(threadRef, conversationId, card, spot, result.originKey, {
-				showStatus: true,
-				typing: true,
-			});
-			return "recorded";
+			const settled = await settleCardReply(
+				this.#core,
+				this.#log,
+				{ threadRef, platformMessageId, text, injected },
+				(originKey) =>
+					this.#beginStatus(threadRef, conversationId, card, spot, originKey, { showStatus: true, typing: true }),
+			);
+			if (settled !== undefined) return settled;
 		}
 		return undefined;
-	}
-
-	/** `!shutup` / `!unshutup`: a server thread's durable mute; a DM has nothing to mute, so it gets a hint. */
-	async #runMuteCommand(
-		command: ThreadMuteCommand,
-		conversationId: string,
-		threadId: string,
-		context: { ref: string; muted: boolean } | undefined,
-	): Promise<IngestOutcome> {
-		if (context === undefined) {
-			await this.#postText(
-				conversationId,
-				threadId,
-				"🤫 스레드 뮤트(!shutup)는 서버 채널이나 스레드에서만 쓸 수 있습니다. DM은 항상 반응합니다.",
-				"thread_mute_notice_failed",
-			);
-			return "recorded";
-		}
-		if (this.#core.setThreadMute === undefined) return "dropped";
-		const muted = command === "shutup";
-		this.#core.setThreadMute(context.ref, muted);
-		this.#log.info("thread_mute", { thread: context.ref, muted, via: "command" });
-		const text = muted
-			? "🤫 이 스레드를 뮤트했습니다. 이 스레드의 메시지에는 반응하지 않습니다. 해제는 !unshutup 또는 저를 멘션하는 것입니다."
-			: context.muted
-				? "🔊 스레드 뮤트를 해제했습니다. 이제 이 스레드에서 다시 반응합니다."
-				: "🔊 이 스레드는 뮤트되어 있지 않습니다.";
-		await this.#postText(conversationId, threadId, text, "thread_mute_notice_failed");
-		return "recorded";
 	}
 
 	// ---- 👀 and the status message ----
@@ -1110,35 +832,14 @@ export class DiscordAdapter implements ChannelAdapter {
 		options: { showStatus: boolean; typing?: boolean },
 	): Promise<void> {
 		const typing = options.typing === true ? this.#startTyping(threadRef, conversationId, root) : undefined;
-		const ack = this.#acknowledge(spot, originKey);
-		const existing = this.#statuses.get(threadRef);
-		if (existing !== undefined && existing.final === undefined) {
-			existing.reactions.set(spot.messageId, spot.channelId);
-			existing.setup = Promise.all([existing.setup, ack]).then(() => undefined);
-			return Promise.all([existing.setup, typing]).then(() => undefined);
-		}
-		const now = this.#clock.now();
-		const entry: StatusEntry = {
-			conversationId,
+		const setup = this.#status.begin(threadRef, {
+			channel: conversationId,
 			root,
-			statusChannel: undefined,
-			statusId: undefined,
-			startedAt: now,
-			lastUpdateAt: now,
-			reactions: new Map([[spot.messageId, spot.channelId]]),
-			setup: Promise.resolve(),
+			reaction: spot,
 			showStatus: options.showStatus,
-			final: undefined,
-			stalled: false,
-			progress: undefined,
-			finalAction: "update",
-			statusDone: false,
-			reactionsDone: false,
-		};
-		this.#statuses.set(threadRef, entry);
-		const created = options.showStatus ? this.#createStatus(threadRef, entry) : Promise.resolve();
-		entry.setup = Promise.all([ack, created]).then(() => undefined);
-		return Promise.all([entry.setup, typing]).then(() => undefined);
+			setup: this.#acknowledge(spot, originKey),
+		});
+		return Promise.all([setup, typing]).then(() => undefined);
 	}
 
 	// ---- typing indicator ----
@@ -1178,7 +879,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			return;
 		}
 		// Another thread's 429 blocked the route: skip this beat without a call.
-		if (this.#isBlocked("typing")) return;
+		if (this.#gate.isBlocked("typing")) return;
 		try {
 			await this.#call("typing", () => this.#transport.triggerTyping(channelId));
 		} catch (err) {
@@ -1202,13 +903,13 @@ export class DiscordAdapter implements ChannelAdapter {
 		if (forget) this.#typing.delete(threadRef);
 	}
 
-	async #createStatus(threadRef: string, entry: StatusEntry): Promise<void> {
+	async #createStatus(entry: StatusEntry, text: string): Promise<void> {
 		try {
-			const destination = await this.#port.destination(entry.conversationId, entry.root);
+			const destination = await this.#port.destination(entry.channel, entry.root);
 			const posted = await this.#call("post", () =>
 				this.#transport.createMessage({
 					channelId: destination.channelId,
-					content: `⏳ 작업 중 · ${formatElapsed(0)}`,
+					content: text,
 					messageReference: destination.messageReference,
 					allowedMentions: { parse: [] },
 				}),
@@ -1216,55 +917,60 @@ export class DiscordAdapter implements ChannelAdapter {
 			entry.statusChannel = destination.channelId;
 			entry.statusId = posted.id;
 		} catch (err) {
-			this.#log.warn("status_create_failed", { thread: threadRef, error: errorText(err) });
+			this.#log.warn("status_create_failed", { thread: threadRefOf(entry.channel, entry.root), error: errorText(err) });
 		}
 	}
 
 	async tick(): Promise<void> {
-		for (const [threadRef, entry] of [...this.#statuses]) {
-			if (entry.final !== undefined) await this.#flushFinal(threadRef, entry);
-			else if (this.#clock.now() - entry.lastUpdateAt >= this.#statusIntervalMs) {
-				await this.#updateRunning(threadRef, entry);
-			}
-		}
+		await this.#status.tick();
 	}
 
 	async setStalled(threadRef: string, stalled: boolean): Promise<void> {
-		const entry = this.#statuses.get(threadRef);
-		if (entry === undefined || entry.final !== undefined) return;
-		entry.stalled = stalled;
-		await entry.setup;
-		if (entry.final === undefined) await this.#updateRunning(threadRef, entry);
+		await this.#status.setStalled(threadRef, stalled);
 	}
 
 	async setProgress(threadRef: string, progress: TurnProgress): Promise<void> {
-		const entry = this.#statuses.get(threadRef);
-		if (entry === undefined || entry.final !== undefined) return;
-		entry.progress = progress;
-		await entry.setup;
-		if (entry.final === undefined && this.#clock.now() - entry.lastUpdateAt >= this.#statusIntervalMs) {
-			await this.#updateRunning(threadRef, entry);
-		}
+		await this.#status.setProgress(threadRef, progress);
 	}
 
-	async #updateRunning(threadRef: string, entry: StatusEntry): Promise<void> {
+	/** `true`: rate limited, the tracker retries on a later tick. A refusal is one warn line and `false`. */
+	async #editStatus(entry: StatusEntry, text: string, final: boolean): Promise<boolean> {
 		const { statusChannel, statusId } = entry;
-		if (statusChannel === undefined || statusId === undefined) return;
-		const content = runningStatusText(entry.stalled, this.#clock.now() - entry.startedAt, entry.progress);
+		if (statusChannel === undefined || statusId === undefined) return false;
 		try {
 			await this.#call("edit", () =>
 				this.#transport.editMessage({
 					channelId: statusChannel,
 					messageId: statusId,
-					content,
+					content: text,
 					allowedMentions: { parse: [] },
 				}),
 			);
-			entry.lastUpdateAt = this.#clock.now();
+			return false;
 		} catch (err) {
-			if (err instanceof DiscordRateLimitedError) return;
-			entry.lastUpdateAt = this.#clock.now();
-			this.#log.warn("status_update_failed", { thread: threadRef, error: errorText(err) });
+			if (err instanceof DiscordRateLimitedError) return true;
+			this.#log.warn(final ? "status_final_failed" : "status_update_failed", {
+				thread: threadRefOf(entry.channel, entry.root),
+				error: errorText(err),
+			});
+			return false;
+		}
+	}
+
+	/** `true`: rate limited, tick() deletes again. A refusal turns the finish into an update of the final label. */
+	async #removeStatus(entry: StatusEntry): Promise<boolean> {
+		const { statusChannel, statusId } = entry;
+		if (statusChannel === undefined || statusId === undefined) return false;
+		try {
+			await this.#call("delete", () =>
+				this.#transport.deleteMessage({ channelId: statusChannel, messageId: statusId }),
+			);
+			return false;
+		} catch (err) {
+			if (err instanceof DiscordRateLimitedError) return true;
+			this.#log.warn("status_delete_failed", { thread: threadRefOf(entry.channel, entry.root), error: errorText(err) });
+			entry.finalAction = "update";
+			return false;
 		}
 	}
 
@@ -1274,93 +980,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	 */
 	async finishStatus(threadRef: string, outcome: FinalOutcome, action: "delete" | "update" = "update"): Promise<void> {
 		this.#stopTyping(threadRef, true);
-		let entry = this.#statuses.get(threadRef);
-		if (entry === undefined) {
-			const parsed = parseThreadRef(threadRef);
-			if (parsed === undefined) return;
-			// After a restart nothing is tracked; the thread root (in the conversation channel) carries the first 👀.
-			entry = {
-				conversationId: parsed.channel,
-				root: parsed.threadTs,
-				statusChannel: undefined,
-				statusId: undefined,
-				startedAt: this.#clock.now(),
-				lastUpdateAt: this.#clock.now(),
-				reactions: new Map([[parsed.threadTs, parsed.channel]]),
-				setup: Promise.resolve(),
-				showStatus: false,
-				final: undefined,
-				stalled: false,
-				progress: undefined,
-				finalAction: "update",
-				statusDone: false,
-				reactionsDone: false,
-			};
-			this.#statuses.set(threadRef, entry);
-		}
-		entry.final = outcome;
-		entry.finalAction = action;
-		await this.#flushFinal(threadRef, entry);
-	}
-
-	async #flushFinal(threadRef: string, entry: StatusEntry): Promise<void> {
-		const outcome = entry.final;
-		if (outcome === undefined) return;
-		await entry.setup;
-		const { statusChannel, statusId } = entry;
-		if (!entry.statusDone && (statusChannel === undefined || statusId === undefined)) entry.statusDone = true;
-		if (!entry.statusDone && statusChannel !== undefined && statusId !== undefined) {
-			if (entry.finalAction === "delete") {
-				try {
-					await this.#call("delete", () =>
-						this.#transport.deleteMessage({ channelId: statusChannel, messageId: statusId }),
-					);
-					entry.statusDone = true;
-				} catch (err) {
-					// Rate limited: tick() deletes again. Refused: the status stays and shows the final label instead.
-					if (!(err instanceof DiscordRateLimitedError)) {
-						this.#log.warn("status_delete_failed", { thread: threadRef, error: errorText(err) });
-						entry.finalAction = "update";
-					}
-				}
-			}
-			if (!entry.statusDone && entry.finalAction === "update") {
-				const content = `${FINAL_MARKS[outcome].label} · ${formatElapsed(this.#clock.now() - entry.startedAt)}`;
-				try {
-					await this.#call("edit", () =>
-						this.#transport.editMessage({
-							channelId: statusChannel,
-							messageId: statusId,
-							content,
-							allowedMentions: { parse: [] },
-						}),
-					);
-					entry.statusDone = true;
-				} catch (err) {
-					if (!(err instanceof DiscordRateLimitedError)) {
-						entry.statusDone = true;
-						this.#log.warn("status_final_failed", { thread: threadRef, error: errorText(err) });
-					}
-				}
-			}
-		}
-		if (!entry.reactionsDone) {
-			const mark = toDiscordEmoji(FINAL_MARKS[outcome].mark);
-			const eyes = toDiscordEmoji("eyes");
-			let pending = false;
-			for (const [messageId, channelId] of entry.reactions) {
-				const target = { channelId, messageId };
-				pending =
-					(await this.#swapReaction(() => this.#transport.removeReaction({ ...target, emoji: eyes }))) || pending;
-				// A registered [TASK] root keeps the task sweep's status reaction; the turn mark would fight it.
-				if (messageId === entry.root && this.#isTaskRoot?.(threadRefOf(entry.conversationId, messageId)) === true) {
-					continue;
-				}
-				pending = (await this.#swapReaction(() => this.#transport.addReaction({ ...target, emoji: mark }))) || pending;
-			}
-			entry.reactionsDone = !pending;
-		}
-		if (entry.statusDone && entry.reactionsDone) this.#statuses.delete(threadRef);
+		await this.#status.finish(threadRef, outcome, action);
 	}
 
 	/** True when the step must be retried later (rate limited); other errors (unknown reaction) are final. */
@@ -1381,53 +1001,13 @@ export class DiscordAdapter implements ChannelAdapter {
 		return this.#pump.pump();
 	}
 
-	#sender(): DeliverySender {
-		return {
-			isBlocked: () => this.#isBlocked("post"),
-			blockedUntil: () => this.#blockedUntil.get("post") ?? this.#clock.now(),
-			blockedReason: () => "discord createMessage",
-			send: (delivery) => this.#send(delivery),
-			afterSent: (delivery) => this.#finishDelivered(delivery),
-		};
-	}
-
-	/** Mention tokens in the port's syntax, thread-link tokens as ` · [스레드 보기](<permalink>)` (none on failure). */
-	async #resolveTokens(body: string): Promise<string> {
-		const text = renderMentions(body, this.#port);
-		if (!text.includes(THREAD_LINK_PREFIX)) return text;
-		let out = "";
-		let last = 0;
-		for (const match of text.matchAll(/\{\{thread-link:([0-9]+):([0-9]+)\}\}/g)) {
-			out += text.slice(last, match.index);
-			last = match.index + match[0].length;
-			const [, conversationId = "", messageId = ""] = match;
-			try {
-				const url = await this.#port.permalink({
-					platform: "discord",
-					conversationId,
-					messageId,
-					threadId: messageId,
-				});
-				if (url !== undefined) out += ` · [스레드 보기](${url})`;
-			} catch (err) {
-				this.#log.warn("permalink_failed", { channel: conversationId, error: errorText(err) });
-			}
-		}
-		return out + text.slice(last);
-	}
-
 	async #send(delivery: DeliveryItem): Promise<DeliverySendResult> {
 		const target = parseThreadRef(delivery.threadRef);
 		if (target === undefined) {
 			return { kind: "failed", error: `invalid thread_ref ${delivery.threadRef}`, outcome: "definitive", sentParts: 0 };
 		}
 		const topLevel = target.threadTs === TOP_LEVEL_TS;
-		const cancelled = new Set(delivery.cancelThreadRefs ?? []);
-		const outcome = delivery.body.startsWith("[turn failed]") ? "failed" : "done";
-		const footer =
-			delivery.keepStatus || cancelled.has(delivery.threadRef)
-				? undefined
-				: this.#footerOf(delivery.threadRef, outcome);
+		const footer = answerFooter(delivery, (threadRef, outcome) => this.#status.footer(threadRef, outcome));
 		let sent = delivery.sentParts ?? 0;
 		// A top-level answer is one message: parts 2+ reply to part 1 instead of standing alone.
 		let replyTo = topLevel && sent > 0 ? (delivery.replyTs ?? undefined) : undefined;
@@ -1435,7 +1015,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			kind: "deferred",
 			error: err,
 			retry: {
-				at: this.#blockedUntil.get("post") ?? this.#clock.now() + err.retryAfterMs,
+				at: this.#gate.untilOf("post") ?? this.#clock.now() + err.retryAfterMs,
 				sentParts: sent,
 				...(topLevel && replyTo !== undefined ? { replyTs: replyTo } : {}),
 			},
@@ -1443,7 +1023,11 @@ export class DiscordAdapter implements ChannelAdapter {
 		let parts: DiscordPart[];
 		let destination: Destination | undefined;
 		try {
-			const body = await this.#resolveTokens(delivery.body);
+			// Mention tokens in the port's syntax, then thread-link tokens.
+			const links = /\{\{thread-link:([0-9]+):([0-9]+)\}\}/g;
+			const body = await resolveThreadLinks(renderMentions(delivery.body, this.#port), links, this.#log, (id, root) =>
+				this.#port.permalink({ platform: "discord", conversationId: id, messageId: root, threadId: root }),
+			);
 			const rendered = renderDiscordMessages(body, delivery.redelivered, footer);
 			if (rendered.cardIssues !== undefined) {
 				this.#log.warn("card_spec_invalid", {
@@ -1479,7 +1063,6 @@ export class DiscordAdapter implements ChannelAdapter {
 				);
 				if (topLevel) replyTo ??= posted.id;
 				this.#stopTyping(delivery.threadRef, false);
-				await this.#recordPost({ channel: channelId, ts: posted.id, deliveryId: delivery.deliveryId, part: sent });
 				sent += 1;
 			}
 			return { kind: "sent", parts: parts.length };
@@ -1497,36 +1080,11 @@ export class DiscordAdapter implements ChannelAdapter {
 		}
 	}
 
-	/** After the confirm: the answer's thread (and every thread its op closed) gets its status finished. */
-	async #finishDelivered(delivery: DeliveryItem): Promise<void> {
-		if (delivery.keepStatus) return;
-		const outcome = delivery.body.startsWith("[turn failed]") ? "failed" : "done";
-		const cancelled = new Set(delivery.cancelThreadRefs ?? []);
-		for (const threadRef of new Set([delivery.threadRef, ...(delivery.finishThreadRefs ?? [])])) {
-			if (delivery.finishUntracked === false && !this.#statuses.has(threadRef)) continue;
-			const final = cancelled.has(threadRef) ? "cancelled" : outcome;
-			await this.finishStatus(
-				threadRef,
-				final,
-				threadRef === delivery.threadRef && final !== "cancelled" ? "delete" : "update",
-			);
-		}
-	}
-
-	async #recordPost(post: { channel: string; ts: string; deliveryId: number; part: number }): Promise<void> {
-		try {
-			await this.#deliveries.recordPost?.(post);
-		} catch (err) {
-			this.#log.warn("delivery_post_record_failed", { id: post.deliveryId, part: post.part, error: errorText(err) });
-		}
-	}
-
-	/** `✅ 00:42 · 도구 6회` for a thread whose running status this answer replaces. */
-	#footerOf(threadRef: string, outcome: "done" | "failed"): string | undefined {
-		const entry = this.#statuses.get(threadRef);
-		if (entry === undefined || entry.final !== undefined || !entry.showStatus) return undefined;
-		const mark = FINAL_MARKS[outcome].label.split(" ")[0];
-		const tools = entry.progress?.tools ?? 0;
-		return `${mark} ${formatElapsed(this.#clock.now() - entry.startedAt)}${tools > 0 ? ` · 도구 ${tools}회` : ""}`;
+	/** After the confirm or once the answer is given up: the shared status finish over this adapter's statuses. */
+	#finishDelivered(delivery: DeliveryItem, result: "sent" | "undelivered"): Promise<void> {
+		return finishDeliveryStatus(delivery, result, {
+			finishStatus: (threadRef, outcome, action) => this.finishStatus(threadRef, outcome, action),
+			tracks: (threadRef) => this.#status.tracks(threadRef),
+		});
 	}
 }

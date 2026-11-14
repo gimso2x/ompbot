@@ -1059,7 +1059,9 @@ export class ApprovalBroker {
 					return false;
 				}
 			} catch (error) {
+				// Fail closed: an approval the ledger could not confirm grants nothing; a denial needs no confirmation.
 				log.warn("approval_click_ledger_failed", { user: action.userId, error: String(error) });
+				if (outcome === "approved") return false;
 			}
 		}
 		log.info("approval_click", { user: action.userId, action: parsed.decision });

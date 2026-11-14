@@ -1,7 +1,8 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { TASK_RISKS, type TaskRisk } from "./tasks/docs";
+import type { LaneReviewConfident } from "./tasks/notify";
 import { hostTimezone, isTimezone } from "./time";
 
 export type ConfigErrorCode =
@@ -130,6 +131,15 @@ export function primaryOwnerUserId(channels: ChannelsConfig): string {
 	return owner;
 }
 
+/** `peerSilenceAlert.minutes` when the key is left out, and the largest value it takes (one day). */
+export const PEER_SILENCE_DEFAULT_MINUTES = 10;
+const PEER_SILENCE_MAX_MINUTES = 1440;
+
+/** Minutes a peer may stay silent after a call before the owner hears of it; 0: the alert is off. */
+export function peerSilenceMinutes(config: Pick<OmpbotConfig, "peerSilenceAlert">): number {
+	return config.peerSilenceAlert?.minutes ?? PEER_SILENCE_DEFAULT_MINUTES;
+}
+
 /** Old top-level keys still read, each with the key that replaced it (the daemon warns about them at startup). */
 export const DEPRECATED_KEYS = { ownerSlackUserId: "channels.slack.ownerUserId" } as const;
 
@@ -164,6 +174,7 @@ const ROOT_KEYS = new Set([
 	"peerBots",
 	"requireMention",
 	"peerHopLimit",
+	"peerSilenceAlert",
 	"costCap",
 	"herdr",
 	"workerOmpArgs",
@@ -180,7 +191,29 @@ const ROOT_KEYS = new Set([
 	"dashboard",
 	"briefing",
 	"lanes",
+	"candidates",
+	"timezone",
+	"apply",
 ]);
+
+/**
+ * `apply.codeRollback`: `push` makes a revert commit with the head.last-good tree on main and pushes it (the owner's
+ * repository); `detach` leaves main alone and checks out head.last-good detached (a checkout following a public main);
+ * `off` reverts nothing and only names the revert command.
+ */
+export const CODE_ROLLBACK_MODES = ["push", "detach", "off"] as const;
+export type CodeRollbackMode = (typeof CODE_ROLLBACK_MODES)[number];
+export const DEFAULT_CODE_ROLLBACK: CodeRollbackMode = "detach";
+
+/** The code rollback mode of a home's config (`DEFAULT_CODE_ROLLBACK` without config or setting). */
+export function codeRollbackMode(config: Pick<OmpbotConfig, "apply"> | undefined): CodeRollbackMode {
+	return config?.apply?.codeRollback ?? DEFAULT_CODE_ROLLBACK;
+}
+
+/** The model tiers a lane may start on (`lanes.models`). */
+export const LANE_MODEL_TIERS = ["high", "middle", "low"] as const;
+export type LaneModelTier = (typeof LANE_MODEL_TIERS)[number];
+export type LaneModelTiers = Partial<Record<LaneModelTier, string>>;
 
 /** One `dispatchHosts` entry: ssh target, remote work directory, remote herdr binary, worker omp extra arguments. */
 export interface DispatchHostConfig {
@@ -232,9 +265,10 @@ export interface OmpbotConfig {
 	 */
 	maxBundleBytes?: number;
 	/**
-	 * Off-site copy of the newest backup + bundle (`ompbot backup` runs it after a good local backup, `ompbot offsite`
-	 * retries it). `ssh` is an ssh alias or `user@host` (BatchMode, key auth); `remoteDir` an absolute path or `~/…`
-	 * on that host; `keep` the newest daily files per kind kept there (default 14). Unset → no off-site copy.
+	 * Off-site copy of the newest backup + bundle (`ompbot backup` runs it after a good local backup; running
+	 * `ompbot backup` again retries it). `ssh` is an ssh alias or `user@host` (BatchMode, key auth); `remoteDir` an
+	 * absolute path or `~/…` on that host; `keep` the days of daily files per kind kept there - every file of the
+	 * uploaded day, the latest of each other day (default 14). Unset → no off-site copy.
 	 */
 	offsite?: { ssh: string; remoteDir: string; keep?: number };
 	/** Minutes an idle omp child is kept before it is stopped (the session stays); 0 disables. Default 30. */
@@ -253,6 +287,12 @@ export interface OmpbotConfig {
 	requireMention?: boolean;
 	/** Peer input cap per thread: more than `turns` peer messages within `windowMinutes` are dropped. Default 3 per 30. */
 	peerHopLimit?: { turns: number; windowMinutes: number };
+	/**
+	 * Peer silence alert: a confirmed post in a Discord thread that mentions a `channels.discord.peerBots` entry, left
+	 * without any post of that peer in the thread for `minutes`, gets one owner-mentioning notice there. 0 disables
+	 * (no call is recorded). Default {@link PEER_SILENCE_DEFAULT_MINUTES}.
+	 */
+	peerSilenceAlert?: { minutes: number };
 	/**
 	 * Cost ceiling in dollars as omp prices it (`usage.cost.total`, not the real bill): a turn that reaches `turnUsd`
 	 * is steered to wrap up and one that reaches 1.5x is stopped; a day (in `timezone`) whose session-file total passes
@@ -289,13 +329,22 @@ export interface OmpbotConfig {
 	 * (lanes); the [TASK] sweep itself only runs with it. `review` (lanes only): before an auto-merge a fresh read-only
 	 * `omp -p --model <model>` reviews the claim commit's diff against the lane's spec, and only its `CLEAR` receipt
 	 * for that commit lets the lane merge unasked (`timeoutMs` default 600000, at most 1800000). Unset → no review.
+	 * `review.confident` (`{ maxRisk, minConfidence }`): a lane whose explicit risk is above `maxRisk` and at most
+	 * `confident.maxRisk` (which must be above `maxRisk`) is reviewed too, and merges unasked when its `CLEAR` receipt
+	 * carries a confidence of at least `minConfidence` (0 < x ≤ 1). A lane without a risk is never in that band.
+	 * Turn `review` on alone first and watch the confidences for two weeks, then add `confident`.
 	 */
-	taskAutoLand?: { repos: string[]; maxRisk?: TaskRisk; review?: { model: string; timeoutMs?: number } };
+	taskAutoLand?: {
+		repos: string[];
+		maxRisk?: TaskRisk;
+		review?: { model: string; timeoutMs?: number; confident?: LaneReviewConfident };
+	};
 	/**
 	 * Work lanes. `completionNudges`: after a lane turn ends with no done claim the core nudges the lane this many
-	 * times per owner message (default 2; 0 turns nudges off).
+	 * times per owner message (default 2; 0 turns nudges off). `models`: the model (`provider/id`) of each tier the
+	 * session may pick when it starts a lane (`ompbot_work_start` `model`); a tier left out cannot be picked.
 	 */
-	lanes?: { completionNudges?: number };
+	lanes?: { completionNudges?: number; models?: LaneModelTiers };
 	/** Slack channel id that receives approval cards (owner mention, link back to the asking thread). Default: the asking conversation. */
 	escalationChannel?: string;
 	/** Slack channel id of the #log ledger: completion reports are copied there and nothing said there becomes a turn. */
@@ -322,14 +371,40 @@ export interface OmpbotConfig {
 	/**
 	 * Read-only status page of `ompbot dashboard` (a separate process; `--port`/`--bind` override). `bind` must be a
 	 * loopback address; the default is 127.0.0.1. Absent = the command needs `--port`. `herdrWebUrl` is herdr-web-ui's
-	 * address for the agent board's "herdr에서 답하기" links (absent = no link).
+	 * address for the agent board's "herdr에서 답하기" links (absent = no link). `opsStatus` is a command printing the
+	 * ops-status JSON for the system view's "호스트 점검" card and a `!brief` line (absent = no card, no command run);
+	 * `url` links the card head.
 	 */
-	dashboard?: { port: number; bind?: "127.0.0.1" | "::1"; herdrWebUrl?: string };
+	dashboard?: {
+		port: number;
+		bind?: "127.0.0.1" | "::1";
+		herdrWebUrl?: string;
+		opsStatus?: { command: string[]; url?: string };
+	};
 	/**
-	 * `!brief`/`ompbot briefing`: the chromium that draws the picture. `chromium` is a name on PATH or an absolute path
+	 * `ompbot apply` (read on every run, never by the daemon). `codeRollback`: what a failed apply whose config rollback
+	 * also failed does with the code — see `CodeRollbackMode`; absent = `DEFAULT_CODE_ROLLBACK`.
+	 */
+	apply?: { codeRollback?: CodeRollbackMode };
+	/**
+	 * `!brief`: the chromium that draws the picture. `chromium` is a name on PATH or an absolute path
 	 * (default `chromium`). No existence check at load: a missing browser is reported by the briefing's failure line.
 	 */
 	briefing?: { chromium?: string };
+	/**
+	 * Improvement-candidate ledger (`<workspace>/candidates.jsonl`): a problem the self-retro saw on `minDays` distinct
+	 * days within `windowDays` is raised as a #log line (`mode` "log", default) or an owner approval card ("card", at
+	 * most `maxOpenCards` at once); a candidate noticed or rejected once comes back after `snoozeDays`. Unset fields
+	 * take the defaults in `src/review/candidates.ts` (enabled, log, 3, 14, 1, 7).
+	 */
+	candidates?: {
+		enabled?: boolean;
+		mode?: "log" | "card";
+		minDays?: number;
+		windowDays?: number;
+		maxOpenCards?: number;
+		snoozeDays?: number;
+	};
 }
 
 export interface SlackTokens {
@@ -337,6 +412,8 @@ export interface SlackTokens {
 	appToken: string;
 }
 
+/** A `dispatchHosts.<h>.ssh` target: not an ssh option (no leading `-`), no whitespace or control character (NUL throws in spawn). */
+export const DISPATCH_SSH = /^[^\s-][^\s\p{Cc}]*$/u;
 /** An ssh alias or `user@host`: never starts with `-` (no option injection), no spaces or shell characters. */
 export const OFFSITE_SSH = /^([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$/;
 /** Absolute or `~/` path of plain characters, so it can sit unquoted in the remote shell command. */
@@ -669,11 +746,26 @@ function optionalChannelId(configPath: string, obj: Record<string, unknown>, key
 	return value;
 }
 
+/**
+ * Whether `workspaceDir` is the home, `config.json` or `secrets/` (or inside one): the workspace root would then hold
+ * the config or the token files (a procedure file under it could be a secret), or `mkdir` would collide with config.json.
+ */
+export function workspaceOverlapsHome(homeDir: string, workspaceDir: string): boolean {
+	const inside = (parent: string): boolean => {
+		const rel = relative(parent, workspaceDir);
+		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+	};
+	return workspaceDir === resolve(homeDir) || inside(join(homeDir, "config.json")) || inside(join(homeDir, "secrets"));
+}
+
 function checkHome(homeDir: string): void {
 	let mode: number;
 	try {
-		mode = statSync(homeDir).mode;
-	} catch {
+		const stat = statSync(homeDir);
+		if (!stat.isDirectory()) throw new ConfigError("home_missing", homeDir, "not a directory");
+		mode = stat.mode;
+	} catch (error) {
+		if (error instanceof ConfigError) throw error;
 		throw new ConfigError("home_missing", homeDir);
 	}
 	if ((mode & 0o777) !== HOME_MODE) {
@@ -762,6 +854,11 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	const configPath = join(home, "config.json");
 	let raw: string;
 	try {
+		// A FIFO or device would block this synchronous read (the daemon's event loop on a reload) for good.
+		const kind = statSync(configPath);
+		if (!kind.isFile() && !kind.isDirectory()) {
+			throw Object.assign(new Error("not a regular file"), { code: "ENOTREG" });
+		}
 		raw = readFileSync(configPath, "utf8");
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
@@ -793,6 +890,8 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 
 	const ompExecutable = requiredString(configPath, root, "ompExecutable");
 	if (!isAbsolute(ompExecutable)) invalid(configPath, "ompExecutable");
+	const workspaceDir = resolve(home, requiredString(configPath, root, "workspaceDir"));
+	if (workspaceOverlapsHome(home, workspaceDir)) invalid(configPath, "workspaceDir");
 	const ompProfile = optionalString(configPath, root, "ompProfile");
 	if (ompProfile !== undefined && !OMP_PROFILE_PATTERN.test(ompProfile)) invalid(configPath, "ompProfile");
 
@@ -861,9 +960,19 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		const record = asRecord(lanes);
 		if (record === undefined) invalid(configPath, "lanes");
 		for (const key of Object.keys(record)) {
-			if (key !== "completionNudges") invalid(configPath, `lanes.${key}`);
 			const value = record[key];
-			if (!Number.isSafeInteger(value) || (value as number) < 0) invalid(configPath, `lanes.${key}`);
+			if (key === "completionNudges") {
+				if (!Number.isSafeInteger(value) || (value as number) < 0) invalid(configPath, `lanes.${key}`);
+			} else if (key === "models") {
+				const models = asRecord(value);
+				if (models === undefined) invalid(configPath, "lanes.models");
+				for (const [tier, model] of Object.entries(models)) {
+					if (!(LANE_MODEL_TIERS as readonly string[]).includes(tier)) invalid(configPath, `lanes.models.${tier}`);
+					if (typeof model !== "string" || !/^[^/\s]+\/\S+$/.test(model)) invalid(configPath, `lanes.models.${tier}`);
+				}
+			} else {
+				invalid(configPath, `lanes.${key}`);
+			}
 		}
 	}
 
@@ -881,6 +990,24 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			if (key !== "turns" && key !== "windowMinutes") invalid(configPath, `peerHopLimit.${key}`);
 		}
 	}
+	let peerSilenceAlert: { minutes: number } | undefined;
+	if (root.peerSilenceAlert !== undefined) {
+		const record = asRecord(root.peerSilenceAlert);
+		if (record === undefined) invalid(configPath, "peerSilenceAlert");
+		for (const key of Object.keys(record)) {
+			if (key !== "minutes") invalid(configPath, `peerSilenceAlert.${key}`);
+		}
+		const minutes = record.minutes;
+		if (
+			typeof minutes !== "number" ||
+			!Number.isInteger(minutes) ||
+			minutes < 0 ||
+			minutes > PEER_SILENCE_MAX_MINUTES
+		) {
+			invalid(configPath, "peerSilenceAlert.minutes");
+		}
+		peerSilenceAlert = { minutes };
+	}
 
 	const dispatchHosts = root.dispatchHosts;
 	if (dispatchHosts !== undefined) {
@@ -888,7 +1015,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		if (hosts === undefined) invalid(configPath, "dispatchHosts");
 		for (const [name, entry] of Object.entries(hosts ?? {})) {
 			const record = asRecord(entry);
-			if (record === undefined || typeof record.ssh !== "string" || record.ssh.trim() === "") {
+			if (record === undefined || typeof record.ssh !== "string" || !DISPATCH_SSH.test(record.ssh)) {
 				invalid(configPath, `dispatchHosts.${name}.ssh`);
 			}
 			if (record.workDir !== undefined && typeof record.workDir !== "string") {
@@ -961,7 +1088,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		for (const key of Object.keys(record)) {
 			if (key !== "repos" && key !== "maxRisk" && key !== "review") invalid(configPath, `taskAutoLand.${key}`);
 		}
-		let review: { model: string; timeoutMs?: number } | undefined;
+		let review: NonNullable<OmpbotConfig["taskAutoLand"]>["review"];
 		if (record.review !== undefined) {
 			const reviewRecord = asRecord(record.review);
 			if (reviewRecord === undefined) invalid(configPath, "taskAutoLand.review");
@@ -981,9 +1108,41 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				invalid(configPath, "taskAutoLand.review.timeoutMs");
 			}
 			for (const key of Object.keys(reviewRecord)) {
-				if (key !== "model" && key !== "timeoutMs") invalid(configPath, `taskAutoLand.review.${key}`);
+				if (key !== "model" && key !== "timeoutMs" && key !== "confident") {
+					invalid(configPath, `taskAutoLand.review.${key}`);
+				}
 			}
-			review = { model, ...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }) };
+			let confident: LaneReviewConfident | undefined;
+			if (reviewRecord.confident !== undefined) {
+				const confidentRecord = asRecord(reviewRecord.confident);
+				if (confidentRecord === undefined) invalid(configPath, "taskAutoLand.review.confident");
+				const confidentRisk = confidentRecord.maxRisk;
+				// The band starts above `maxRisk`: at or below it the lane already merges on a plain CLEAR.
+				if (
+					!(TASK_RISKS as readonly unknown[]).includes(confidentRisk) ||
+					TASK_RISKS.indexOf(confidentRisk as TaskRisk) <= TASK_RISKS.indexOf((maxRisk ?? "L2") as TaskRisk)
+				) {
+					invalid(configPath, "taskAutoLand.review.confident.maxRisk");
+				}
+				const minConfidence = confidentRecord.minConfidence;
+				if (
+					typeof minConfidence !== "number" ||
+					!Number.isFinite(minConfidence) ||
+					minConfidence <= 0 ||
+					minConfidence > 1
+				) {
+					invalid(configPath, "taskAutoLand.review.confident.minConfidence");
+				}
+				for (const key of Object.keys(confidentRecord)) {
+					if (key !== "maxRisk" && key !== "minConfidence") invalid(configPath, `taskAutoLand.review.confident.${key}`);
+				}
+				confident = { maxRisk: confidentRisk as TaskRisk, minConfidence };
+			}
+			review = {
+				model,
+				...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }),
+				...(confident === undefined ? {} : { confident }),
+			};
 		}
 		taskAutoLand = {
 			repos: (repos as string[]).map((repo) => repo.replace(/(?<=.)\/+$/, "")),
@@ -1059,6 +1218,19 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		briefing = chromium === undefined ? {} : { chromium };
 	}
 
+	const applyRaw = root.apply;
+	let apply: NonNullable<OmpbotConfig["apply"]> | undefined;
+	if (applyRaw !== undefined) {
+		const record = asRecord(applyRaw);
+		if (record === undefined) invalid(configPath, "apply");
+		for (const key of Object.keys(record)) if (key !== "codeRollback") invalid(configPath, `apply.${key}`);
+		const mode = record.codeRollback;
+		if (mode !== undefined && !CODE_ROLLBACK_MODES.some((known) => known === mode)) {
+			invalid(configPath, "apply.codeRollback");
+		}
+		apply = mode === undefined ? {} : { codeRollback: mode as CodeRollbackMode };
+	}
+
 	const webhook = root.webhook;
 	if (webhook !== undefined) {
 		const record = asRecord(webhook);
@@ -1088,8 +1260,51 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		) {
 			invalid(configPath, "dashboard.herdrWebUrl");
 		}
+		if (record.opsStatus !== undefined) {
+			const ops = asRecord(record.opsStatus);
+			if (ops === undefined) invalid(configPath, "dashboard.opsStatus");
+			if (
+				!Array.isArray(ops.command) ||
+				ops.command.length === 0 ||
+				!ops.command.every((part) => typeof part === "string" && part !== "")
+			) {
+				invalid(configPath, "dashboard.opsStatus.command");
+			}
+			if (ops.url !== undefined && (typeof ops.url !== "string" || !/^https?:\/\/\S+$/.test(ops.url))) {
+				invalid(configPath, "dashboard.opsStatus.url");
+			}
+			for (const key of Object.keys(ops)) {
+				if (key !== "command" && key !== "url") invalid(configPath, `dashboard.opsStatus.${key}`);
+			}
+		}
 		for (const key of Object.keys(record)) {
-			if (key !== "port" && key !== "bind" && key !== "herdrWebUrl") invalid(configPath, `dashboard.${key}`);
+			if (key !== "port" && key !== "bind" && key !== "herdrWebUrl" && key !== "opsStatus") {
+				invalid(configPath, `dashboard.${key}`);
+			}
+		}
+	}
+
+	const candidatesRaw = root.candidates;
+	let candidates: NonNullable<OmpbotConfig["candidates"]> | undefined;
+	if (candidatesRaw !== undefined) {
+		const record = asRecord(candidatesRaw);
+		if (record === undefined) invalid(configPath, "candidates");
+		candidates = {};
+		for (const key of Object.keys(record)) {
+			const value = record[key];
+			if (key === "enabled") {
+				if (typeof value !== "boolean") invalid(configPath, "candidates.enabled");
+				candidates.enabled = value;
+			} else if (key === "mode") {
+				if (value !== "log" && value !== "card") invalid(configPath, "candidates.mode");
+				candidates.mode = value;
+			} else if (key === "minDays" || key === "windowDays" || key === "maxOpenCards" || key === "snoozeDays") {
+				if (typeof value !== "number" || !Number.isInteger(value) || value < 1)
+					invalid(configPath, `candidates.${key}`);
+				candidates[key] = value;
+			} else {
+				invalid(configPath, `candidates.${key}`);
+			}
 		}
 	}
 
@@ -1099,7 +1314,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		configPath,
 		channels,
 		ompExecutable,
-		workspaceDir: resolve(home, requiredString(configPath, root, "workspaceDir")),
+		workspaceDir,
 		timezone: timezoneRaw ?? hostTimezone(),
 	};
 	if (deprecated.length > 0) config.deprecated = deprecated;
@@ -1139,6 +1354,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	}
 	if (requireMention !== undefined) config.requireMention = requireMention;
 	if (peerHopLimit !== undefined) config.peerHopLimit = peerHopLimit as { turns: number; windowMinutes: number };
+	if (peerSilenceAlert !== undefined) config.peerSilenceAlert = peerSilenceAlert;
 	if (costCap !== undefined) {
 		const record = costCap as { turnUsd?: number; dailyUsd?: number };
 		const capped: { turnUsd?: number; dailyUsd?: number } = {};
@@ -1153,6 +1369,8 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (watcherRoots !== undefined) config.watcherRoots = (watcherRoots as string[]).map((r) => resolve(r));
 	if (turnSnapshot !== undefined) config.turnSnapshot = { repos: turnSnapshot.repos.map((repo) => resolve(repo)) };
 	if (briefing !== undefined) config.briefing = briefing;
+	if (candidates !== undefined) config.candidates = candidates;
+	if (apply !== undefined) config.apply = apply;
 	if (webhook !== undefined) config.webhook = webhook as { port: number; bind?: "127.0.0.1" | "::1" };
 	if (dashboard !== undefined) config.dashboard = dashboard as NonNullable<OmpbotConfig["dashboard"]>;
 	if (herdr !== undefined) config.herdr = herdr;
@@ -1161,7 +1379,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
 	if (taskAutoLand !== undefined) config.taskAutoLand = taskAutoLand;
-	if (lanes !== undefined) config.lanes = lanes as { completionNudges?: number };
+	if (lanes !== undefined) config.lanes = lanes as NonNullable<OmpbotConfig["lanes"]>;
 
 	if (options.checkTokens !== false) {
 		// Fail at startup on permissions/prefix/shape; values are discarded here.

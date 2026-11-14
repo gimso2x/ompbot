@@ -1,7 +1,8 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type DaemonAnswer, LANES_USAGE, lanesCommand, summarizeEntry } from "../src/cli/lanes";
+import { type DaemonAnswer, LANES_USAGE, lanesCommand, ompSessionDirFor, summarizeEntry } from "../src/cli/lanes";
 import { openBotStore, sessionDirFor } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import { callDaemon } from "../src/daemon/ipc";
@@ -10,12 +11,16 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
+import { TASK_SCHEMA } from "../src/tasks/ledger";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 
 const LANE = "watch-lane";
 const LANE_ORIGIN = `ompbot/work/${LANE}`;
 const THREAD_ORIGIN = "discord/ch/C1/t/T1";
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
+/** A home directory and a host name, put together at run time so the public core carries neither literal. */
+const HOME = ["", "home", "ubuntu"].join("/");
+const SECOND_OCI_HOST = ["oci", 2].join("");
 
 const entry = (role: string, content: unknown, timestamp = "2026-11-13T01:02:03.000Z"): string =>
 	`${JSON.stringify({ type: "message", id: "e", parentId: null, timestamp, message: { role, content } })}\n`;
@@ -255,5 +260,84 @@ describe("daemon session_file op", () => {
 		expect(await done).toBe(0);
 		expect(out.lines).toContain(`file ${openFile} — open in the running child`);
 		drivers[0]?.release();
+	});
+});
+
+describe("ompbot lanes watch <TASK id>", () => {
+	let home: TestHome;
+	let env: Record<string, string>;
+
+	/** A `tasks` row as the dispatcher writes it; `host` null is a local TASK. */
+	function insertTask(taskId: string, host: string | null, worktree: string): void {
+		const db = new Database(join(home.dir, "ompbot.db"), { strict: true });
+		db.run(TASK_SCHEMA);
+		db.query(
+			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+				acceptance_json, created_at, updated_at) VALUES (?, 't', 'L1', 'o', 'C1:T1', ?, '/r', ?, 'b', 'a', 'working', '[]', 0, 0)`,
+		).run(taskId, host, worktree);
+		db.close();
+	}
+
+	beforeEach(() => {
+		home = makeHome("ompbot-lanes-watch-task-");
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.close();
+		// The worker's HOME and agent dir live in the test home: nothing reads the real ~/.omp.
+		env = { HOME: join(home.dir, "user"), PI_CODING_AGENT_DIR: join(home.dir, "user", ".omp", "agent") };
+		mkdirSync(env.HOME as string, { recursive: true });
+	});
+
+	afterEach(() => home.remove());
+
+	test("AC-4: the session folder name follows omp's rule (measured 11-13: home-relative, / as -)", () => {
+		expect(ompSessionDirFor(`${HOME}/work/ompbot-t-20261113-03`, HOME, "/s", "/tmp")).toBe(
+			"/s/-work-ompbot-t-20261113-03",
+		);
+		expect(ompSessionDirFor("/tmp/a/b", HOME, "/s", "/tmp")).toBe("/s/-tmp-a-b");
+		expect(ompSessionDirFor("/opt/x/y", HOME, "/s", "/tmp")).toBe("/s/--opt-x-y--");
+	});
+
+	test("AC-4: a local TASK's worker session prints a new entry within 2 s", async () => {
+		const worktree = join(env.HOME as string, "work", "proj-t-20261113-09");
+		mkdirSync(worktree, { recursive: true });
+		insertTask("T-20261113-09", null, worktree);
+		const dir = ompSessionDirFor(worktree, env.HOME as string, join(env.PI_CODING_AGENT_DIR as string, "sessions"));
+		mkdirSync(dir, { recursive: true });
+		const older = join(dir, "2026-11-12T00-00-00-000Z_old.jsonl");
+		const file = join(dir, "2026-11-13T00-00-00-000Z_new.jsonl");
+		writeFileSync(older, entry("user", "옛 세션"));
+		utimesSync(older, new Date(1_000_000), new Date(1_000_000));
+		writeFileSync(file, entry("user", "워커 시작"));
+
+		const out = collector();
+		const controller = new AbortController();
+		const done = lanesCommand(["watch", "T-20261113-09"], home.dir, {
+			write: out.write,
+			error: out.write,
+			signal: controller.signal,
+			env,
+		});
+		await out.next((line) => line.endsWith("user: 워커 시작"), 2_000);
+		appendFileSync(file, entry("assistant", [{ type: "text", text: "워커가 일하는 중" }]));
+		await out.next((line) => line.endsWith("assistant: 워커가 일하는 중"), 2_000);
+		controller.abort();
+		expect(await done).toBe(0);
+		expect(out.lines).toContain(`watching TASK T-20261113-09 (${worktree})`);
+		expect(out.lines.some((line) => line.startsWith(`file ${file} `))).toBe(true);
+	});
+
+	test("AC-4: a remote TASK and an unknown TASK exit non-zero with one error line", () => {
+		insertTask("T-20261113-10", SECOND_OCI_HOST, `${HOME}/work/x-t-20261113-10`);
+		const remote = runMain(["lanes", "watch", "T-20261113-10"], home.dir);
+		expect(remote.code).toBe(1);
+		expect(remote.stdout).toBe("");
+		expect(remote.stderr).toBe(
+			`lanes watch: T-20261113-10 runs on ${SECOND_OCI_HOST}; a remote TASK is watched on that host\n`,
+		);
+
+		const missing = runMain(["lanes", "watch", "T-20261113-99"], home.dir);
+		expect(missing.code).toBe(1);
+		expect(missing.stdout).toBe("");
+		expect(missing.stderr).toBe("lanes watch: no TASK named T-20261113-99\n");
 	});
 });

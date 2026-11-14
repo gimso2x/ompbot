@@ -19,6 +19,7 @@ import {
 } from "../src/dashboard/snapshot";
 import { INJECTION_WARNING_HEAD } from "../src/safety/injection";
 import { openStore } from "../src/store/db";
+import { formatTypicalRange, typicalNote } from "../src/store/turn-duration";
 import type { TaskHostOps } from "../src/tasks/host";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 
@@ -183,6 +184,7 @@ function seedDatabase(): void {
 
 const hostOps = (): TaskHostOps => ({
 	readFile: async () => ({ ok: true, value: undefined }),
+	readBytes: async () => ({ ok: true, value: undefined }),
 	commitOnTaskBranch: async () => "ok",
 	pathExists: async () => ({ ok: true, value: true }),
 	createWorktree: async () => ({ ok: false, error: "read-only" }),
@@ -730,13 +732,131 @@ describe("a TASK's step band", () => {
 	});
 });
 
+describe("a working TASK's elapsed and typical time", () => {
+	/**
+	 * `count` closed TASKs of thread S that went to review 10, 20, … minutes after registration, plus T-W1 (thread W)
+	 * registered 30 minutes ago. With the fixture's T-A1 (5 min) and T-A3 (40 min) that is count + 2 samples.
+	 */
+	const seedSamples = (count: number): void => {
+		const db = new Database(dbPath, { strict: true });
+		seed(db, [
+			...Array.from({ length: count }, (_, i): Seed => {
+				const created = NOW - 2 * DAY + i * HOUR;
+				const review = created + (i + 1) * 10 * MIN;
+				return {
+					id: `T-S${i}`,
+					thread: "S",
+					status: "done",
+					created,
+					updated: review + MIN,
+					closed: review + MIN,
+					moves: [
+						["working", "review", review],
+						["review", "done", review + MIN],
+					],
+				};
+			}),
+			{ id: "T-W1", thread: "W", status: "working", created: NOW - 30 * MIN, updated: NOW - 30 * MIN },
+		]);
+		db.close();
+	};
+	const taskOfId = (snapshot: DashboardSnapshot, id: string): TaskInfo => {
+		if (!snapshot.tasks.ok) throw new Error(snapshot.tasks.error);
+		const found = snapshot.tasks.items.find((task) => task.taskId === id);
+		if (found === undefined) throw new Error(`no task ${id}`);
+		return found;
+	};
+	const stepOf = (snapshot: DashboardSnapshot, id: string) => {
+		const found = flowsOf(snapshot)
+			.flatMap((item) => item.tasks)
+			.find((step) => step.taskId === id);
+		if (found === undefined) throw new Error(`no step ${id}`);
+		return found;
+	};
+	const boxOf = (html: string, id: string): string =>
+		new RegExp(`<a class="flow-box[^"]*" href="\\?view=flow&amp;item=${id}"[\\s\\S]*?</a>`).exec(html)?.[0] ?? "";
+	const flowHtml = (snapshot: DashboardSnapshot): string =>
+		/<div id="main"[^>]*>([\s\S]*?)<\/div>\n<div class="search">/.exec(
+			renderDashboardPage(snapshot, { view: "flow" }),
+		)?.[1] ?? "";
+
+	test("AC-2: 11 samples give working TASKs the nearest-rank median and p90 and the time since registration", async () => {
+		seedSamples(9);
+		const snapshot = await buildSnapshot(deps());
+		// 5, 10, 20, 30, 40, 40, 50, 60, 70, 80, 90 minutes: the 6th is the median, the 10th the p90.
+		const typical = { medianMs: 40 * MIN, p90Ms: 80 * MIN };
+		for (const [id, elapsedMs] of [
+			["T-W1", 30 * MIN],
+			["T-A2", 2 * HOUR],
+			["T-E2", DAY],
+		] as const) {
+			expect(taskOfId(snapshot, id)).toMatchObject({ typical, elapsedMs });
+			expect(stepOf(snapshot, id)).toMatchObject({ typical, elapsedMs });
+		}
+		for (const id of ["T-B1", "T-A3", "T-A1", "T-S0"]) {
+			const step = stepOf(snapshot, id);
+			expect([step.typical, step.elapsedMs]).toEqual([undefined, undefined]);
+			if (id === "T-S0") continue;
+			const task = taskOfId(snapshot, id);
+			expect([task.typical, task.elapsedMs]).toEqual([undefined, undefined]);
+		}
+	});
+
+	test("AC-2: 9 samples leave both fields out of every TASK", async () => {
+		seedSamples(7);
+		const snapshot = await buildSnapshot(deps());
+		if (!snapshot.tasks.ok) throw new Error(snapshot.tasks.error);
+		const all = [...snapshot.tasks.items, ...flowsOf(snapshot).flatMap((item) => item.tasks)];
+		expect(all.some((task) => task.status === "working")).toBe(true);
+		expect(all.filter((task) => task.typical !== undefined || task.elapsedMs !== undefined)).toEqual([]);
+	});
+
+	test("AC-3: the flow box reads 보통 a~b분 within p90 and 평소보다 길어짐 past it; facts and inbox follow", async () => {
+		seedSamples(9);
+		const snapshot = await buildSnapshot(deps());
+		const html = flowHtml(snapshot);
+		expect(boxOf(html, "T-W1")).toContain('<span class="flow-bs">경과 30분 · 보통 40~80분</span>');
+		expect(boxOf(html, "T-A2")).toContain('<span class="flow-bs">경과 120분 · 평소보다 길어짐(보통 40~80분)</span>');
+		for (const id of ["T-B1", "T-A3", "T-A1"]) expect(boxOf(html, id)).not.toContain("경과");
+		expect(renderTaskFacts(taskOfId(snapshot, "T-W1"))).toContain(
+			"<dt>걸린 시간</dt><dd>경과 30분 · 보통 40~80분</dd>",
+		);
+		expect(renderTaskFacts(taskOfId(snapshot, "T-B1"))).not.toContain("걸린 시간");
+		const inbox = renderDashboardPage(snapshot, {});
+		const cardOf = (id: string) =>
+			new RegExp(`<a class="card[^"]*"[^>]*data-row="${id}"[\\s\\S]*?</a>`).exec(inbox)?.[0] ?? "";
+		expect(cardOf("T-A2")).toContain("평소보다 길어짐");
+		expect(cardOf("T-W1")).not.toContain("평소보다 길어짐");
+		expect(cardOf("T-W1")).not.toBe("");
+	});
+
+	test("AC-3: too few samples draw no elapsed line", async () => {
+		seedSamples(7);
+		const snapshot = await buildSnapshot(deps());
+		const html = flowHtml(snapshot);
+		expect(boxOf(html, "T-W1")).not.toBe("");
+		for (const word of ["경과 ", "보통 ", "평소보다 길어짐"]) expect(html).not.toContain(word);
+		expect(renderDashboardPage(snapshot, {})).not.toContain("평소보다 길어짐</span>");
+	});
+});
+
 describe("shipped renderers", () => {
 	test("AC-6: renderFlowChain and renderTaskFacts evaluated alone from toString() draw what the server draws", () => {
 		const names = ["Date", "Math", "String", "Number", "Array", "Object", "encodeURIComponent"] as const;
 		const values = [Date, Math, String, Number, Array, Object, encodeURIComponent];
 		const isolated = <T>(fn: T): T => new Function(...names, `"use strict"; return (${String(fn)});`)(...values) as T;
-		const flow = isolated(renderFlowChain);
-		const facts = isolated(renderTaskFacts);
+		// typicalNote ships beside them (the page script), with the formatTypicalRange it calls.
+		const formatTypicalRangeShipped = isolated(formatTypicalRange);
+		const typicalNoteShipped = new Function("formatTypicalRange", `"use strict"; return (${String(typicalNote)});`)(
+			formatTypicalRangeShipped,
+		) as typeof typicalNote;
+		const withNote = <T>(fn: T): T =>
+			new Function(...names, "typicalNote", `"use strict"; return (${String(fn)});`)(
+				...values,
+				typicalNoteShipped,
+			) as T;
+		const flow = withNote(renderFlowChain);
+		const facts = withNote(renderTaskFacts);
 		const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 		for (const [focus, panel] of [
 			["", false],
@@ -748,5 +868,15 @@ describe("shipped renderers", () => {
 		expect(facts(copy(task))).toBe(renderTaskFacts(task));
 		const folded = taskOf(12, 7, "S8");
 		expect(facts(copy(folded))).toBe(renderTaskFacts(folded));
+		const typical = { medianMs: 40 * MIN, p90Ms: 80 * MIN };
+		const timed = { ...task, typical, elapsedMs: 30 * MIN };
+		expect(facts(copy(timed))).toBe(renderTaskFacts(timed));
+		expect(renderTaskFacts(timed)).toContain("경과 30분 · 보통 40~80분");
+		const late: FlowChainInfo = {
+			...QA50,
+			tasks: QA50.tasks.map((step, i) => (i === 0 ? { ...step, typical, elapsedMs: 90 * MIN } : step)),
+		};
+		expect(flow(copy(late), "", false)).toBe(renderFlowChain(late, "", false));
+		expect(renderFlowChain(late, "", false)).toContain("경과 90분 · 평소보다 길어짐(보통 40~80분)");
 	});
 });

@@ -9,7 +9,7 @@ import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Logger } from "../log";
 import { scanForInjection } from "../safety/injection";
-import { oneLine } from "./text";
+import { errorText, oneLine } from "./text";
 
 /** Inbound attachment budget (hermes-agent parity: images get more room than documents). */
 export const MAX_INBOUND_FILES = 6;
@@ -236,10 +236,6 @@ async function fileExists(path: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-function errorText(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
 }
 
 /** What the platform's transport does to fetch one file; throws with the reason on failure. */

@@ -92,7 +92,7 @@ function sessionFileOf(origin: SessionModelOrigin): string | undefined {
 }
 
 /** Model and thinking of one session file of `size` bytes; `undefined` when it names no model. */
-export function readSessionModel(
+function readSessionModel(
 	file: string,
 	size: number,
 	origin: Pick<SessionModelOrigin, "model" | "thinking">,

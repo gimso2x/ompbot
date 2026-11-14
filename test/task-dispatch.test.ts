@@ -66,6 +66,10 @@ function fakeHost(): FakeHost {
 			host.files.set(path, content);
 			return { ok: true, value: null };
 		},
+		async readBytes(path) {
+			const text = host.files.get(path);
+			return { ok: true, value: text === undefined ? undefined : Buffer.from(text) };
+		},
 		async readFile(path) {
 			if (host.failProgressRead !== undefined && path.endsWith("/PROGRESS.md"))
 				return { ok: false, error: host.failProgressRead };
@@ -148,7 +152,7 @@ function harness(
 	const prompts: HerdrPromptInput[] = [];
 	const run: ProcessRunner = async (cmd) => {
 		// Over ssh every remote word is single-quoted (or a bare `~`); record the words the remote shell would see.
-		const sshAt = cmd[0] === "ssh" ? cmd.indexOf("--") : -1;
+		const sshAt = cmd[0] === "ssh" ? cmd.indexOf("--") + 1 : -1;
 		const args = sshAt >= 0 ? cmd.slice(sshAt + 1).map(unquoteRemote) : cmd;
 		herdr.push(sshAt >= 0 ? [...cmd.slice(0, sshAt + 1), ...args] : cmd);
 		const ok = (stdout = "{}") => ({ code: 0, stdout, timedOut: false });
@@ -372,7 +376,7 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		await call(h, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
 		expect(h.ledger.require("T-20261026-01").host).toBe("wsl");
 		const start = h.herdr.find((cmd) => cmd.includes("start") && cmd[0] === "ssh");
-		expect(start?.slice(0, 6)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl-ssh"]);
+		expect(start?.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl-ssh"]);
 		expect(h.herdr.some((cmd) => cmd.includes("--cwd") && cmd.includes("/r/repo-t-20261026-01"))).toBe(true);
 	});
 
@@ -420,7 +424,7 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 			h.failFirstPrompt.value = true;
 			const result = await call(h, { taskSpec: GOOD_SPEC, task: "go", ...(host === undefined ? {} : { host }) });
 			expect(result).toContain("시작 실패: agent prompt failed: boom");
-			const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd.slice(1));
+			const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 3) : cmd.slice(1));
 			// This start created workspace W1 (no owners workspace was listed on the host), so W1 is what closes.
 			expect(h.herdr.map(words).filter((args) => args[1] === "close")).toEqual([["workspace", "close", "W1"]]);
 			expect(h.ledger.list()).toEqual([]);
@@ -903,7 +907,7 @@ describe("ompbot_dispatch handoff risk scan", () => {
 
 describe("worker omp arguments (workerOmpArgs, dispatchHosts.<h>.ompArgs)", () => {
 	/** The herdr words of a recorded call (after the ssh `--` for a remote one; the harness unquotes those). */
-	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 1) : cmd);
+	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd);
 	const starts = (h: Harness): string[][] =>
 		h.herdr.map(words).filter((args) => args[1] === "agent" && args[2] === "start");
 	const BASE_START = [

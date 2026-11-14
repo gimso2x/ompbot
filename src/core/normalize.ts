@@ -2,7 +2,7 @@
 // `ompbot inject` (todo 7) both call normalizeInbound, so owner gating and quoted-content fencing cannot diverge.
 import { randomBytes } from "node:crypto";
 import { injectionWarning, scanForInjection } from "../safety/injection";
-import { chatOriginKey, type IdPlatform, parseChatOrigin, platformOfConversationId } from "./origin-key";
+import { type ChatPlatform, chatOriginKey, parseChatOrigin, platformOfConversationId } from "./origin-key";
 import { parseCommand } from "./types";
 
 export interface NormalizeInput {
@@ -19,7 +19,7 @@ export interface NormalizeInput {
 	/** Slack `channel_type`: `im` (the default) is the owner DM; anything else is a channel conversation. */
 	channelType?: string | undefined;
 	/** Platform of `channel` (the origin key namespace). Default Slack. */
-	platform?: IdPlatform | undefined;
+	platform?: ChatPlatform | undefined;
 	/** Test seam: returns the 16-hex fence id. Defaults to crypto randomness, fresh per message. */
 	fenceId?: () => string;
 }
@@ -45,7 +45,7 @@ export function isOwner(userId: string | undefined, ownerUserId: string): boolea
 }
 
 /** `slack/dm/<D…>` for the owner DM, `slack/ch/<C…|G…>` for a channel (one conversation per channel); `discord/…` alike. */
-export function originKeyForChannel(channel: string, channelType = "im", platform: IdPlatform = "slack"): string {
+export function originKeyForChannel(channel: string, channelType = "im", platform: ChatPlatform = "slack"): string {
 	return chatOriginKey({ platform, kind: channelType === "im" ? "dm" : "ch", conversationId: channel });
 }
 
@@ -63,7 +63,7 @@ export function originKeyForMessage(
 	ts: string,
 	threadTs: string | undefined,
 	text: string,
-	platform: IdPlatform = "slack",
+	platform: ChatPlatform = "slack",
 ): string {
 	if (channelType === undefined || channelType === "im") return originKeyForChannel(channel, channelType, platform);
 	const root = threadTs === undefined || threadTs === "" || threadTs === ts;
@@ -82,6 +82,12 @@ export function isThreadOrigin(originKey: string): boolean {
 	return threadRefOfOrigin(originKey) !== undefined;
 }
 
+/**
+ * Whether the bot answers a daemon-put owner message in `channel` as in a DM or as in a channel (where the bot mention
+ * leads the text). Slack DM ids start with `D`; every other conversation counts as a channel.
+ */
+export const conversationKind = (channel: string): "dm" | "ch" => (channel.startsWith("D") ? "dm" : "ch");
+
 export function threadRefOf(channel: string, threadTs: string): string {
 	return `${channel}:${threadTs}`;
 }
@@ -99,7 +105,7 @@ export function parseThreadRef(threadRef: string): { channel: string; threadTs: 
 }
 
 /** Platform a thread ref (`<conversationId>:<threadId|->`) posts to, read from its conversation id. */
-export function platformOfThreadRef(threadRef: string): IdPlatform | undefined {
+export function platformOfThreadRef(threadRef: string): ChatPlatform | undefined {
 	const ref = parseThreadRef(threadRef);
 	return ref === undefined ? undefined : platformOfConversationId(ref.channel);
 }

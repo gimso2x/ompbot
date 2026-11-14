@@ -399,7 +399,7 @@ describe("herdrInterruptAgent (AC-3)", () => {
 	test("a remote host runs the same three calls as ssh arguments after `--`", async () => {
 		const h = fakeHerdr({ list: listing("idle") });
 		const result = await herdrInterruptAgent("t-1", { run: h.run, sshTarget: "wsl-ssh" });
-		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "wsl-ssh", "--"];
+		const ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl-ssh"];
 		const quoted = (args: string[]) => args.map((arg) => `'${arg}'`);
 		expect(h.calls).toEqual([
 			[...ssh, ...quoted(["herdr", "agent", "send-keys", "t-1", "esc"])],

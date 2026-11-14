@@ -1,13 +1,10 @@
-import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { parseTaskJson, type TaskRow, type TaskTransitionRow } from "../tasks/ledger";
+import type { TaskRow, TaskTransitionRow } from "../tasks/ledger";
 import { formatLocal } from "../time";
 
 export type FlowTask = Pick<TaskRow, "taskId" | "status" | "createdAt" | "progressAt" | "notices">;
 export type FlowTransition = Pick<TaskTransitionRow, "taskId" | "fromStatus" | "toStatus" | "actor" | "reason" | "at">;
 export type FlowNodeStatus = "running" | "pass" | "fail" | "fixed";
-/** One line of `status.json`: the viewer paints `status` and `msg` on `node` while `task` is the selected chip. */
+/** One node state of one task: `status` and `msg` on `node`. */
 export interface FlowStatus {
 	task: string;
 	node: string;
@@ -88,7 +85,7 @@ export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[],
 	});
 }
 
-/** Short node names of the `task-flow-viewer.md` flow graph, in flow order. */
+/** Short node names of the TASK flow graph, in flow order. */
 const NODE_NAMES: Record<string, string> = {
 	spec: "스펙",
 	review: "검토",
@@ -142,106 +139,4 @@ export function taskStage(
 		msg: task.progressAt === null ? "" : `진행 기록 ${short(task.progressAt)}`,
 		tone: "run",
 	};
-}
-
-const VIEWER = new URL("./viewer.html", import.meta.url);
-const jsonBlock = (id: string) => new RegExp(`(<script type="application/json" id="${id}">)([\\s\\S]*?)(</script>)`);
-/** JSON safe inside a `<script>` element: `<` never starts a closing tag. */
-const embed = (value: unknown) => JSON.stringify(value).replace(/</g, "\\u003c");
-
-/**
- * Tasks and transitions from a read-only handle; the database file is never written. A home without a ledger has no
- * tasks (like `ompbot feedback`).
- */
-function readFlow(dbPath: string): { tasks: (FlowTask & { updatedAt: number })[]; transitions: FlowTransition[] } {
-	if (!existsSync(dbPath)) return { tasks: [], transitions: [] };
-	const db = new Database(dbPath, { readonly: true, strict: true });
-	try {
-		const rows = db
-			.query("SELECT task_id, status, created_at, updated_at, progress_at, notices_json FROM tasks ORDER BY task_id")
-			.all() as {
-			task_id: string;
-			status: TaskRow["status"];
-			created_at: number;
-			updated_at: number;
-			progress_at: number | null;
-			notices_json: string;
-		}[];
-		const transitions = db
-			.query(
-				`SELECT task_id AS taskId, from_status AS fromStatus, to_status AS toStatus, actor, reason, at
-				FROM task_transitions ORDER BY transition_id`,
-			)
-			.all() as FlowTransition[];
-		const tasks = rows.map((r) => ({
-			taskId: r.task_id,
-			status: r.status,
-			createdAt: r.created_at,
-			updatedAt: r.updated_at,
-			progressAt: r.progress_at,
-			notices: parseTaskJson("[]", r.notices_json).notices,
-		}));
-		return { tasks, transitions };
-	} finally {
-		db.close();
-	}
-}
-
-/**
- * Writes `target` through a new temporary file (`wx`: a link planted at the temporary name is removed, never followed)
- * renamed over it, so a polling viewer never reads half of it and a link at `target` is replaced, not written through.
- */
-function writeReplacing(target: string, text: string): void {
-	const tmp = `${target}.tmp`;
-	rmSync(tmp, { force: true });
-	writeFileSync(tmp, text, { flag: "wx" });
-	renameSync(tmp, target);
-}
-
-/** Writes `status.json` (see `writeReplacing`). */
-export function writeFlowStatus(dbPath: string, outDir: string, review: boolean): FlowStatus[] {
-	const { tasks, transitions } = readFlow(dbPath);
-	const status = taskFlowStatus(tasks, transitions, review);
-	writeReplacing(join(outDir, "status.json"), JSON.stringify(status));
-	return status;
-}
-
-interface FlowEdge {
-	from: string;
-	to: string;
-}
-
-/** The default graph without the review node: its incoming edges are joined to its outgoing ones. */
-function withoutReview(graph: { nodes: { id: string }[]; edges: FlowEdge[] }): void {
-	const into = graph.edges.filter((e) => e.to === "review").map((e) => e.from);
-	const out = graph.edges.filter((e) => e.from === "review").map((e) => e.to);
-	graph.nodes = graph.nodes.filter((n) => n.id !== "review");
-	graph.edges = [
-		...graph.edges.filter((e) => e.from !== "review" && e.to !== "review"),
-		...into.flatMap((from) => out.map((to) => ({ from, to }))),
-	];
-}
-
-/**
- * `viewer.html` with the default graph, this package's version and the database snapshot, plus `status.json`.
- * `review`: see {@link taskFlowStatus}; false drops the review node from the graph too. `timezone` names the snapshot time.
- */
-export function exportFlow(dbPath: string, outDir: string, review: boolean, timezone: string, now = Date.now()): void {
-	mkdirSync(outDir, { recursive: true });
-	const { tasks } = readFlow(dbPath);
-	const status = writeFlowStatus(dbPath, outDir, review);
-	const html = readFileSync(VIEWER, "utf8");
-	const graph = JSON.parse(jsonBlock("flow-default").exec(html)?.[2] ?? "{}");
-	if (!review) withoutReview(graph);
-	const { version } = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
-
-	Object.assign(graph, {
-		version,
-		memo: `ompbot.db 스냅샷 ${formatLocal(now, timezone).slice(0, 16)} ${timezone}`,
-		items: tasks.map((t) => ({ id: t.taskId, status: t.status, at: new Date(t.updatedAt).toISOString() })),
-	});
-	const filled = html
-		.replace(jsonBlock("flow-data"), (_, open, _old, close) => open + embed(graph) + close)
-		.replace(jsonBlock("flow-status"), (_, open, _old, close) => open + embed(status) + close);
-	writeReplacing(join(outDir, "viewer.html"), filled);
 }

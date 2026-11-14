@@ -62,6 +62,11 @@ export interface CoreSink {
 	 * the adapter then posts the cap notice).
 	 */
 	onPeerInbound?(message: PeerInboundMessage, hop: { turns: number; windowMs: number }): PeerInboundOutcome;
+	/**
+	 * A peer bot posted in `threadRef` at `at` (the post's own time), whether or not the bot takes the post (no mention,
+	 * muted thread, hop cap): it answers this bot's earlier calls to that peer there (peer silence alert).
+	 */
+	onPeerSeen?(seen: { threadRef: string; peerUserId: string; at: number }): void;
 	/** `duplicate: true` (Slack redelivery of a message already recorded) suppresses the 👀 and the status message. */
 	onInbound(
 		message: InboundMessage,
@@ -101,18 +106,6 @@ export interface CoreSink {
 		| undefined;
 	/** Whether the bot already takes part in this thread, so an unaddressed owner reply in a channel thread counts. */
 	knowsThread?(threadRef: string): boolean;
-	/** Whether the owner muted this thread with `!shutup`: the bot stays quiet there until a mention or `!unshutup`. */
-	isThreadMuted?(threadRef: string): boolean;
-	/** Records or clears a thread mute (`!shutup` / `!unshutup` / mention release); idempotent. */
-	setThreadMute?(threadRef: string, muted: boolean): void;
-	/**
-	 * Whether this exact mute-command event was already handled. A mute command never becomes an inbound row (it takes
-	 * no turn), so without this a backfill replay of the same `!shutup` event would re-post the 🤫/🔊 notice on every
-	 * pass. Pure lookup; `rememberMuteCommand` is the recording half.
-	 */
-	seenMuteCommand?(platformMessageId: string): boolean;
-	/** Durably marks a mute-command event handled after it ran, so replays resolve as duplicates. */
-	rememberMuteCommand?(platformMessageId: string): void;
 	/** True while a restart drain holds dispatch: a message taken now waits for the next process (no typing shown). */
 	isDraining?(): boolean;
 }
@@ -154,28 +147,22 @@ export interface DeliveryRetry {
 export interface DeliverySource {
 	claimDue(): Promise<DeliveryItem[]> | DeliveryItem[];
 	confirm(deliveryId: number): Promise<void> | void;
-	/** `definitive`: nothing was posted (backoff and retry). `ambiguous`: a message may exist (sticky, never auto-resent). */
-	fail(deliveryId: number, error: string, outcome: "definitive" | "ambiguous"): Promise<void> | void;
+	/**
+	 * `definitive`: nothing was posted (backoff and retry). `ambiguous`: a message may exist (sticky, never auto-resent).
+	 * True when a definitive failure spent the retries (the row expired): the answer will not be sent.
+	 */
+	fail(
+		deliveryId: number,
+		error: string,
+		outcome: "definitive" | "ambiguous",
+	): Promise<boolean | undefined> | boolean | undefined;
+	/**
+	 * This platform's rows the ledger expired since the last call (past the freshness window while pending), each handed
+	 * over once. Absent: expiry finishes nothing.
+	 */
+	takeExpired?(): Promise<DeliveryItem[]> | DeliveryItem[];
 	/** Rate limited (429 or still blocked): nothing more was posted; retry at `retry.at` without counting a failure. */
 	defer(deliveryId: number, error: string, retry: DeliveryRetry): Promise<void> | void;
-	/**
-	 * One message a delivery posted (`part`: its 0-based index in the answer), so a reaction on it finds the turn.
-	 * A throw is logged (`delivery_post_record_failed`) and never stops the delivery. Absent: nothing is recorded.
-	 */
-	recordPost?(post: { channel: string; ts: string; deliveryId: number; part: number }): Promise<void> | void;
-	/**
-	 * Whether a delivery posted that message (`recordPost` saw it). A platform whose reaction events do not say who
-	 * wrote the message asks this before `recordFeedback`. Absent: every reaction goes on to `recordFeedback`.
-	 */
-	isPost?(post: { channel: string; ts: string }): Promise<boolean> | boolean;
-	/** The owner added or removed 👍/👎 on a message; the source ignores messages no delivery posted. */
-	recordFeedback?(feedback: {
-		channel: string;
-		ts: string;
-		verdict: "up" | "down";
-		action: "added" | "removed";
-		eventTs: string;
-	}): Promise<void> | void;
 }
 
 export interface AdapterClock {

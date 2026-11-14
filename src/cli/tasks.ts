@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, timezoneOfHome } from "../config";
 import { callDaemon, IpcNoResponse } from "../daemon/ipc";
-import { exportFlow, writeFlowStatus } from "../flow/task-flow";
 import { summarizeJudgement, taskChecksOf } from "../tasks/checker";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
@@ -16,7 +15,6 @@ export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
   tasks close <id> --as done|cancelled   human-only completion (the bot can never do this); worktree and branch stay
   tasks pause <id>               owner pause: the sweep holds prompts, stale notice and auto-merge; the worker gets an Esc
   tasks resume <id>              lifts the pause (sweep hold only; the worker is not prompted)
-  tasks flow --out <dir> [--watch <s>]   flow viewer html + status.json from a read-only database; --watch rewrites status.json
 `;
 
 function describe(row: TaskRow): string {
@@ -31,18 +29,6 @@ function dispatchHostsOf(homeDir: string): Record<string, { ssh: string }> | und
 		// Without the config a remote TASK resolves as local and fails later with a misleading read error.
 		process.stderr.write(`tasks: config unreadable, dispatch hosts unknown: ${String(error)}\n`);
 		return undefined;
-	}
-}
-
-/** Whether the flow has the spec review node: `peerBots` or `channels.discord.peerBots` names at least one peer bot. */
-function hasPeerReview(homeDir: string): boolean {
-	if (!existsSync(join(homeDir, "config.json"))) return false;
-	try {
-		const config = loadConfig(homeDir, { checkTokens: false });
-		return (config.peerBots?.length ?? 0) > 0 || (config.channels.discord?.peerBots?.length ?? 0) > 0;
-	} catch (error) {
-		process.stderr.write(`tasks flow: config unreadable, review node left out: ${String(error)}\n`);
-		return false;
 	}
 }
 
@@ -87,57 +73,26 @@ export async function tasksCommand(
 	options: TasksCommandOptions = {},
 ): Promise<number> {
 	const [sub, ...rest] = args;
-	if (
-		sub !== "list" &&
-		sub !== "show" &&
-		sub !== "check" &&
-		sub !== "close" &&
-		sub !== "pause" &&
-		sub !== "resume" &&
-		sub !== "flow"
-	) {
-		process.stderr.write(`usage: ompbot tasks <list|show|check|close|pause|resume|flow>\n${TASKS_USAGE}`);
+	if (sub !== "list" && sub !== "show" && sub !== "check" && sub !== "close" && sub !== "pause" && sub !== "resume") {
+		process.stderr.write(`usage: ompbot tasks <list|show|check|close|pause|resume>\n${TASKS_USAGE}`);
 		return 2;
 	}
 	const { values, positionals } = parseArgs({
 		args: rest,
 		allowPositionals: true,
-		options: { json: { type: "boolean" }, as: { type: "string" }, out: { type: "string" }, watch: { type: "string" } },
+		options: { json: { type: "boolean" }, as: { type: "string" } },
 	});
-	if (sub === "flow") {
-		// Before the ledger: opening it migrates the schema, and the flow export must never write the database.
-		// setInterval holds at most 2^31-1 ms; a longer period fires every 1 ms instead.
-		const seconds = values.watch === undefined ? 0 : /^\d+(\.\d+)?$/.test(values.watch) ? Number(values.watch) : 0;
-		if (values.out === undefined || (values.watch !== undefined && !(seconds >= 1 && seconds <= 2_147_483))) {
-			process.stderr.write("tasks flow: --out <dir> required, --watch takes 1 to 2147483 seconds\n");
-			return 2;
+	const dbPath = join(homeDir, "ompbot.db");
+	if (!existsSync(dbPath)) {
+		// A read must not create a ledger holding only `tasks`: `gates` and `status` would call it unreadable.
+		if (sub === "list") {
+			process.stdout.write(values.json === true ? `${JSON.stringify({ tasks: [] })}\n` : "no tasks\n");
+			return 0;
 		}
-		const dbPath = join(homeDir, "ompbot.db");
-		const outDir = values.out;
-		const review = hasPeerReview(homeDir);
-		const timezone = timezoneOfHome(homeDir);
-		// A home without ompbot.db exports an empty flow, but a database that was there and went away ends the watch.
-		// Checked before the viewer line: a reader may remove the database as soon as it sees that line.
-		const hadDb = existsSync(dbPath);
-		exportFlow(dbPath, outDir, review, timezone);
-		process.stdout.write(`${join(outDir, "viewer.html")}\n`);
-		if (seconds === 0) return 0;
-		const { promise, resolve } = Promise.withResolvers<number>();
-		const timer = setInterval(() => {
-			try {
-				if (hadDb && !existsSync(dbPath)) throw new Error(`database went away: ${dbPath}`);
-				writeFlowStatus(dbPath, outDir, review);
-			} catch (error) {
-				// The same failure would repeat every period (a database that went away): report it once and stop.
-				clearInterval(timer);
-				const reason = error instanceof Error ? error.message : String(error);
-				process.stderr.write(`tasks flow: status.json not rewritten: ${reason.split("\n")[0]}\n`);
-				resolve(1);
-			}
-		}, seconds * 1000);
-		return await promise;
+		process.stderr.write(`tasks ${sub}: task not found: ${positionals[0] ?? "(id required)"}\n`);
+		return 1;
 	}
-	const ledger = openTaskLedger(join(homeDir, "ompbot.db"), timezoneOfHome(homeDir));
+	const ledger = openTaskLedger(dbPath, timezoneOfHome(homeDir));
 	try {
 		const out = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 		if (sub === "list") {
@@ -161,8 +116,10 @@ export async function tasksCommand(
 			const closed = ledger.transition(row.taskId, values.as, "human", `close --as ${values.as}`);
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
-			if (typeof synced === "string" || synced.ok !== true)
+			if (typeof synced === "string")
 				process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
+			else if (synced.ok !== true)
+				process.stderr.write(`tasks close: daemon refused: ${String(synced.error)} — Slack reaction not updated\n`);
 			return 0;
 		}
 		if (sub === "pause" || sub === "resume") {
@@ -195,7 +152,11 @@ export async function tasksCommand(
 				out(checked);
 				return 0;
 			}
-			process.stderr.write("tasks check: daemon not reachable — judging only, nothing posted\n");
+			process.stderr.write(
+				checked === "unreachable"
+					? "tasks check: daemon not reachable — judging only, nothing posted\n"
+					: `tasks check: daemon refused: ${String(checked.error)} — judging only, nothing posted\n`,
+			);
 		}
 		const evaluation = await evaluateTask(row, resolveTaskHost(row.host, dispatchHostsOf(homeDir)));
 		if (!evaluation.ok) {

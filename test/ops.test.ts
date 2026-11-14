@@ -42,7 +42,7 @@ import { renderStatusText } from "../src/daemon/status";
 import { herdrSshArgv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { MONITOR_SCHEMA } from "../src/monitors/ledger";
-import { OmpDriverError, type OmpEvent } from "../src/omp/driver";
+import { OmpDriverError, type OmpEvent, type OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { BackupError, readStamp, runBackup, STAMP_FILE } from "../src/ops/backup";
 import { collectGates, INBOUND_STARVATION_MS, SWEEP_STALLED_MS, TURNS_FAILING_WINDOW_MS } from "../src/ops/gates";
@@ -90,6 +90,13 @@ class OpsDriver extends FakeOmpDriver {
 			throw new OmpDriverError("rpc_error", "Could not restore model: fake/alpha");
 		}
 		return super.prompt(text);
+	}
+
+	/** Make `state()` fail like a child that does not answer `get_state`. */
+	failState = false;
+	override async state(): Promise<OmpState> {
+		if (this.failState) throw new OmpDriverError("rpc_error", "get_state timed out");
+		return super.state();
 	}
 
 	override onEvent(listener: (event: OmpEvent) => void): () => void {
@@ -726,7 +733,11 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		home.remove();
 	});
 
-	async function startDaemon(holdTurns: boolean, toolCalls?: FakeOmpDriverOptions["toolCalls"]): Promise<void> {
+	async function startDaemon(
+		holdTurns: boolean,
+		toolCalls?: FakeOmpDriverOptions["toolCalls"],
+		context?: FakeOmpDriverOptions["context"],
+	): Promise<void> {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
@@ -737,7 +748,13 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 			bootId: "boot",
 			hostLoad: IDLE_HOST_LOAD, // status is read twice (slash, CLI): live load would differ between the readings
 			driverFactory: (_origin, sessionDir) => {
-				const driver = new OpsDriver({ sessionDir, store: sessions, holdTurns, ...(toolCalls ? { toolCalls } : {}) });
+				const driver = new OpsDriver({
+					sessionDir,
+					store: sessions,
+					holdTurns,
+					...(toolCalls ? { toolCalls } : {}),
+					...(context ? { context } : {}),
+				});
 				drivers.push(driver);
 				return driver;
 			},
@@ -781,7 +798,10 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const driver = drivers[0];
 		if (!driver) throw new Error("no driver was started");
 
-		// Tool activity is stored as it happens and rendered on the regular 15 s cadence.
+		// Tool activity is stored as it happens and rendered on the regular 15 s cadence. The fake reports the tool call
+		// a macrotask after `turn_start`: a sweep before it lands renders the bare status and spends the cadence slot, so
+		// the activity would wait for a next sweep that never comes. `tool_start` is logged in the step that stores it.
+		await untilLine(() => lines.some((l) => l.includes("event=tool_start")));
 		clock.advance(16_000);
 		const withActivity = transport.waitForUpdate((text) => text.includes("bash command=git status"));
 		await daemon.sweep();
@@ -820,7 +840,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		);
 	});
 
-	test("/status-ompbot answers exactly what `ompbot status` prints", async () => {
+	test("/status-ompbot answers this conversation's context line, then exactly what `ompbot status` prints", async () => {
 		await startDaemon(false);
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "hello" });
 		await transport.waitForPosts((text) => text.includes("ECHO hello"));
@@ -828,12 +848,43 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const ack = await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: "D1" });
 		const cli = await runMain(home.dir, ["status"]);
 		expect(cli.code, cli.stderr).toBe(0);
-		expect(ack?.text).toContain("데몬 실행 중");
+		const [first, ...rest] = (ack?.text ?? "").split("\n");
+		// The fake child reports no context use: the line says so instead of a made-up 0.
+		expect(first).toBe("이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha");
+		const body = rest.join("\n");
+		expect(body).toContain("데몬 실행 중");
 		// host_pressure reads this machine's live load and memory at each call: its numbers may move between the reads.
 		const steady = (text: string | undefined) =>
 			text?.replace(/host_pressure load15=\S+ cpus=\d+ mem_avail_pct=\S+/, "host_pressure <live>");
-		expect(steady(cli.stdout)).toBe(`${steady(ack?.text)}\n`);
-		expect(steady(ack?.text)).toBe(steady(renderStatusText(daemon.status())));
+		expect(steady(cli.stdout)).toBe(`${steady(body)}\n`);
+		expect(steady(body)).toBe(steady(renderStatusText(daemon.status())));
+	});
+
+	test("!status and /status-ompbot start with the asking conversation's context: use, idle session, unreadable child", async () => {
+		await startDaemon(false, undefined, { tokens: 123000, window: 1000000, percent: 12.3 });
+		const failing = "slack/dm/D3";
+		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "hello" });
+		await daemon.inject({ origin: failing, asOwner: true, text: "hi" });
+		await transport.waitForPosts((text) => text.startsWith("ECHO"), 2);
+		const [, broken] = drivers;
+		if (!broken) throw new Error("no driver for D3");
+		broken.failState = true;
+		const used = "이 대화 컨텍스트: 123k / 1,000k (12%) · 모델 fake/alpha";
+
+		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "!status" });
+		await transport.waitForPosts((text) => text.startsWith("이 대화 컨텍스트:"));
+		const typed = transport.posts((text) => text.startsWith("이 대화 컨텍스트:"));
+		expect(typed.map((post) => [post.channel, post.text.split("\n")[0]])).toEqual([["D1", used]]);
+		expect(typed[0]?.text).toContain("데몬 실행 중");
+
+		const firstLine = async (channel: string) =>
+			(await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: channel }))?.text?.split(
+				"\n",
+			)[0];
+		expect(await firstLine("D1")).toBe(used);
+		expect(await firstLine("D2")).toBe("이 대화 컨텍스트: 세션 쉬는 중(다음 메시지 때 다시 읽음)");
+		expect(await firstLine("D3")).toBe("이 대화 컨텍스트: 알 수 없음");
+		expect(lines.some((line) => line.includes("event=status_context_failed"))).toBe(true);
 	});
 
 	test("/model-ompbot answers at the top level where it was typed: empty ack, no placeholder root post", async () => {
@@ -1454,6 +1505,28 @@ describe("ompbot doctor backup bundle check", () => {
 		expect(await bundleLine()).toBe(FIRST_INSTALL_LINE);
 	});
 
+	test("an apply backup (skipBundle) after a bundled backup keeps the bundle line passing", async () => {
+		new Database(join(dir, "ompbot.db")).close();
+		mkdirSync(join(dir, "sessions"), { recursive: true });
+		writeFileSync(join(dir, "sessions", "s.jsonl"), "{}\n");
+		runBackup({ homeDir: dir, now: new Date(Date.now() - 60_000) });
+		const skipped = runBackup({ homeDir: dir, skipBundle: true });
+		expect(skipped.bundle).toBeUndefined();
+		const lines: string[] = [];
+		let failures = 0;
+		checkBackupBundle(
+			dir,
+			(ok, name, detail) => {
+				if (!ok) failures += 1;
+				lines.push(`${ok ? "ok" : "fail"} ${name}: ${detail}`);
+			},
+			(name, detail) => lines.push(`warn ${name}: ${detail}`),
+		);
+		expect(failures).toBe(0);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toStartWith("ok backup bundle: bundle=ompbot-bundle-");
+	});
+
 	test("a DB without a stamp (the daemon ran, no backup succeeded) still fails", async () => {
 		new Database(join(dir, "ompbot.db")).close();
 		const line = await bundleLine();
@@ -2063,6 +2136,146 @@ describe("ompbot gc: deleted-monitor origins", () => {
 		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
 		expect(result.monitorOriginsRemoved).toEqual([]);
 		expect(existsSync(sessionOf("monitor/mold"))).toBe(true);
+	});
+});
+
+describe("ompbot gc: ledger retention", () => {
+	let home: TestHome;
+	const NOW = Date.UTC(2026, 10, 13);
+	const KEY = "slack/ch/C1/t/1.1";
+	const dbFile = () => join(home.dir, "ompbot.db");
+	/** Ids of rows the fixture made, by name. */
+	const ids = new Map<string, number>();
+
+	beforeEach(() => {
+		home = makeHome("ompbot-ops-gc-ledger-");
+		const store = openBotStore(dbFile(), { now: () => NOW }, "Asia/Seoul");
+		store.ensureOrigin(KEY, join(home.dir, "sessions", "t"));
+		store.close();
+		const db = new Database(dbFile(), { strict: true });
+		const inbound = (name: string, ageDays: number, state: string, opRef: string, threadRef = "C1:1.1") => {
+			const row = db
+				.query(
+					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, op_ref, thread_ref) VALUES (?, ?, 1, 'x', ?, ?, ?, ?) RETURNING inbound_id",
+				)
+				.get(name, KEY, state, NOW - ageDays * DAY_MS, opRef, threadRef) as { inbound_id: number };
+			ids.set(name, row.inbound_id);
+		};
+		const delivery = (name: string, ageDays: number, state: string, posts: number) => {
+			const row = db
+				.query(
+					"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES (?, ?, 0, 'C1:1.1', 'b', ?, 0, ?) RETURNING delivery_id",
+				)
+				.get(KEY, `op-${name}`, state, NOW - ageDays * DAY_MS) as { delivery_id: number };
+			ids.set(name, row.delivery_id);
+			for (let i = 0; i < posts; i += 1) {
+				db.query(
+					"INSERT INTO delivery_posts (channel, ts, delivery_id, part, created_at) VALUES ('C1', ?, ?, ?, 0)",
+				).run(`${name}.${i}`, row.delivery_id, i);
+			}
+		};
+		const approval = (id: string, status: string, threadRef: string) =>
+			db
+				.query(
+					"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref) VALUES (?, 'C1', ?, 's', ?, 0, 0, ?, ?)",
+				)
+				.run(id, id, status, KEY, threadRef);
+		inbound("in-old-answered", 91, "answered", "opA");
+		inbound("in-old-failed", 91, "failed_notified", "opA2");
+		inbound("in-old-discarded", 91, "discarded", "opA3");
+		inbound("in-approval-done", 91, "answered", "opA4", "C1:8.8");
+		inbound("in-89", 89, "answered", "opK");
+		inbound("in-old-pending", 91, "pending", "opK2");
+		inbound("in-old-dispatched", 91, "dispatched", "opK3");
+		inbound("in-approval-pending", 91, "answered", "opK6", "C1:7.7");
+		delivery("d-old-confirmed", 91, "confirmed", 2);
+		delivery("d-old-expired", 91, "expired", 1);
+		delivery("d-old-ambiguous", 91, "failed_ambiguous", 0);
+		delivery("d-89", 89, "confirmed", 1);
+		delivery("d-old-pending", 91, "pending", 0);
+		delivery("d-old-inflight", 91, "inflight", 0);
+		approval("ap-pending", "pending", "C1:7.7");
+		approval("ap-done", "approved", "C1:8.8");
+		db.close();
+	});
+	afterEach(() => {
+		killSpawned();
+		home.remove();
+		ids.clear();
+	});
+
+	function names(table: "inbound" | "deliveries"): string[] {
+		const db = new Database(dbFile(), { readonly: true, strict: true });
+		try {
+			const column = table === "inbound" ? "inbound_id" : "delivery_id";
+			const present = new Set(
+				(db.query(`SELECT ${column} AS id FROM ${table}`).all() as Array<{ id: number }>).map((row) => row.id),
+			);
+			const prefix = table === "inbound" ? "in-" : "d-";
+			return [...ids]
+				.filter(([name, id]) => name.startsWith(prefix) && present.has(id))
+				.map(([name]) => name)
+				.sort();
+		} finally {
+			db.close();
+		}
+	}
+
+	function count(sql: string): number {
+		const db = new Database(dbFile(), { readonly: true, strict: true });
+		try {
+			return (db.query(sql).get() as { n: number }).n;
+		} finally {
+			db.close();
+		}
+	}
+
+	const KEPT_INBOUND = ["in-89", "in-approval-pending", "in-old-dispatched", "in-old-pending"];
+	const KEPT_DELIVERIES = ["d-89", "d-old-inflight", "d-old-pending"];
+	const EXPECTED = { inbound: 4, deliveries: 3, deliveryPosts: 3, monitorEvents: 0 };
+
+	test("91-day finished rows go; 89-day, waiting and pending-approval rows stay; no orphan posts", () => {
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: NOW });
+		expect(result.ledgerRemoved).toEqual(EXPECTED);
+		expect(names("inbound")).toEqual(KEPT_INBOUND);
+		expect(names("deliveries")).toEqual(KEPT_DELIVERIES);
+		expect(count("SELECT COUNT(*) AS n FROM delivery_posts")).toBe(1);
+		expect(
+			count("SELECT COUNT(*) AS n FROM delivery_posts WHERE delivery_id NOT IN (SELECT delivery_id FROM deliveries)"),
+		).toBe(0);
+		expect(count("SELECT COUNT(*) AS n FROM approvals")).toBe(2);
+		// A second pass finds nothing more.
+		expect(gcSessions({ homeDir: home.dir, retentionDays: 30, now: NOW }).ledgerRemoved).toEqual({
+			inbound: 0,
+			deliveries: 0,
+			deliveryPosts: 0,
+			monitorEvents: 0,
+		});
+	});
+
+	test("dry-run counts the same rows and deletes none", () => {
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: NOW, dryRun: true });
+		expect(result.ledgerRemoved).toEqual(EXPECTED);
+		expect(names("inbound")).toHaveLength(8);
+		expect(names("deliveries")).toHaveLength(6);
+		expect(count("SELECT COUNT(*) AS n FROM delivery_posts")).toBe(4);
+	});
+
+	test("a home without the posts and approvals tables prunes by age and state alone", () => {
+		const db = new Database(dbFile(), { strict: true });
+		db.exec("DROP TABLE delivery_posts; DROP TABLE approvals");
+		db.close();
+		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: NOW });
+		expect(result.ledgerRemoved).toEqual({ inbound: 5, deliveries: 3, deliveryPosts: 0, monitorEvents: 0 });
+		expect(names("inbound")).toEqual(["in-89", "in-old-dispatched", "in-old-pending"]);
+		expect(names("deliveries")).toEqual(["d-89", "d-old-inflight", "d-old-pending"]);
+	});
+
+	test("`ompbot gc --dry-run` prints the ledger counts in gc_done", async () => {
+		const dry = await runMain(home.dir, ["gc", "--dry-run"]);
+		expect(dry.code, dry.stderr).toBe(0);
+		expect(dry.stdout).toMatch(/gc_done .* inbound=\d+ deliveries=\d+ delivery_posts=\d+ monitor_events=\d+\n/);
+		expect(names("inbound")).toHaveLength(8);
 	});
 });
 

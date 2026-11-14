@@ -32,16 +32,24 @@ import { git, makeRepo } from "./helpers/git-fixtures";
 
 const repos: string[] = [];
 const stores: Store[] = [];
+/** Ledger and home directories; removed after each test (after the stores close) so a failing assertion leaks none. */
+const tempDirs: string[] = [];
 
 afterEach(() => {
 	for (const store of stores.splice(0)) store.close();
-	for (const repo of repos.splice(0)) rmSync(repo, { recursive: true, force: true });
+	for (const dir of [...repos.splice(0), ...tempDirs.splice(0)]) rmSync(dir, { recursive: true, force: true });
 });
+
+function tempDir(prefix: string): string {
+	const dir = mkdtempSync(join(tmpdir(), prefix));
+	tempDirs.push(dir);
+	return dir;
+}
 
 const clock = { now: () => 1_000_000 };
 
 function newStore(): Store {
-	const dir = mkdtempSync(join(tmpdir(), "ompbot-turn-store-"));
+	const dir = tempDir("ompbot-turn-store-");
 	const store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact: (text) => text });
 	stores.push(store);
 	return store;
@@ -344,6 +352,43 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		expect(existsSync(join(repo, "made.txt"))).toBe(false);
 	});
 
+	test("a file the turn turned into a directory comes back whole: the created child counts as already gone (qa-i #22)", async () => {
+		const repo = makeRepo(repos);
+		writeFileSync(join(repo, "pkg"), "module\n");
+		git(repo, "add", "pkg");
+		git(repo, "commit", "-q", "-m", "pkg");
+		const before = await captureTree(repo);
+		rmSync(join(repo, "pkg"));
+		mkdirSync(join(repo, "pkg"));
+		writeFileSync(join(repo, "pkg", "inner.txt"), "inner\n");
+		const after = await captureTree(repo);
+		const plan = await planUndo({ row: rowOf({ before, after }, { repo }) });
+		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([
+			["pkg", "revert"],
+			["pkg/inner.txt", "revert"],
+		]);
+		const result = await applyUndo(plan);
+		expect(result).toEqual({ reverted: 2, conflicts: [] });
+		expect(readFileSync(join(repo, "pkg"), "utf8")).toBe("module\n");
+		expect(git(repo, "status", "--porcelain")).toBe("");
+	});
+
+	test("a directory with untracked files where the turn deleted a file is a conflict, not restored over (qa-i #21 #71)", async () => {
+		const repo = makeRepo(repos);
+		writeFileSync(join(repo, "cfg.json"), "{}\n");
+		git(repo, "add", "cfg.json");
+		git(repo, "commit", "-q", "-m", "cfg");
+		const before = await captureTree(repo);
+		rmSync(join(repo, "cfg.json"));
+		const after = await captureTree(repo);
+		mkdirSync(join(repo, "cfg.json"));
+		writeFileSync(join(repo, "cfg.json", "mine.txt"), "mine\n");
+		const plan = await planUndo({ row: rowOf({ before, after }, { repo }) });
+		const result = await applyUndo(plan);
+		expect(result).toEqual({ reverted: 0, conflicts: ["cfg.json"] });
+		expect(readFileSync(join(repo, "cfg.json", "mine.txt"), "utf8")).toBe("mine\n");
+	});
+
 	test("a turn that committed touches no file and answers with the revert advice", async () => {
 		const repo = makeRepo(repos);
 		const before = await captureTree(repo);
@@ -444,7 +489,7 @@ describe("ledger retention and refs (AC-4)", () => {
 	});
 
 	test("gc removes rows older than 7 days (and only those) and drops their refs", async () => {
-		const home = mkdtempSync(join(tmpdir(), "ompbot-turn-gc-"));
+		const home = tempDir("ompbot-turn-gc-");
 		const repo = makeRepo(repos);
 		const dbPath = join(home, "ompbot.db");
 		const now = 1_700_000_000_000;
@@ -499,7 +544,6 @@ describe("ledger retention and refs (AC-4)", () => {
 			`refs/ompbot/turns/${freshId}/after\nrefs/ompbot/turns/${freshId}/before`,
 		);
 		expect(oldId).toBeGreaterThan(0);
-		rmSync(home, { recursive: true, force: true });
 	});
 
 	test("recordTurn writes nothing for a turn that changed nothing", async () => {

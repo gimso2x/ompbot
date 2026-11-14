@@ -1,7 +1,7 @@
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { defaultHomeDir, HOME_MODE, SECRET_MODE } from "../config";
+import { defaultHomeDir, HOME_MODE, SECRET_MODE, workspaceOverlapsHome } from "../config";
 
 export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>] | --help
   init --platform discord --owner <Discord user id> --app-id <application id> [--omp …] [--workspace …]
@@ -93,6 +93,9 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 	if (existsSync(configPath)) return fail(`${configPath} already exists; nothing changed`);
 	const workspaceDir = resolve(values.workspace ?? join(homeDir, "workspace"));
 	const secretsDir = join(homeDir, "secrets");
+	if (workspaceOverlapsHome(homeDir, workspaceDir)) {
+		return fail(`--workspace ${workspaceDir} is the home, config.json or inside secrets/; pick another directory`);
+	}
 	// mkdir fails halfway (raw EEXIST/ENOTDIR, a bare home left behind) when a file sits where a directory goes.
 	for (const [label, dir] of [
 		["home", homeDir],

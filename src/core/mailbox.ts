@@ -12,6 +12,7 @@ import {
 	type OmpExitInfo,
 	type OmpFinal,
 	type OmpSessionDriver,
+	type OmpState,
 	type TodoPhase,
 } from "../omp/driver";
 import { type HealedSessionModel, healSessionModelFile, newestSessionFile } from "../omp/session-heal";
@@ -46,10 +47,11 @@ import {
 } from "../ops/turn-snapshot";
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import { injectionWarning, scanForInjection } from "../safety/injection";
+import { peerTouchedTurnNotice } from "../safety/prompt";
 import type { InboundRow, OriginRow, Store } from "../store/db";
 import { type TypicalDuration, typicalTurnDuration } from "../store/turn-duration";
 import { LiveTurn, type LiveView } from "./live-turn";
-import { parseThreadRef, TOP_LEVEL_TS, threadRefOfOrigin, wrapQuoted } from "./normalize";
+import { parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOfOrigin, wrapQuoted } from "./normalize";
 import { type ChatPlatform, parseChatOrigin } from "./origin-key";
 import { buildRecallBlock } from "./recall";
 import { epochDirIsFresh, listSavedSessions, pickSession } from "./sessions";
@@ -65,7 +67,11 @@ import {
 	MONITOR_IDLE_STOP_MS,
 	MONITOR_STALL_ABORT_MS,
 	type ParsedCommand,
+	PEER_FAILURE_MARK,
 	parseCommand,
+	RESTART_DRAINING_TEXT,
+	RESTART_REFUSED_TEXT,
+	type RestartProvider,
 	STALL_MS,
 	STALL_NOTIFY_COUNT,
 	STALL_NOTIFY_MS,
@@ -78,7 +84,7 @@ import {
 export type DriverFactory = (originKey: string, sessionDir: string) => OmpSessionDriver;
 
 /** Consecutive failed turns (dispatch, failed final, mid-turn exit) before the owner escalation fires. */
-export const DEFAULT_ESCALATE_AFTER = 3;
+const DEFAULT_ESCALATE_AFTER = 3;
 
 /**
  * Failure signs that mean the session's model is gone (a provider removed it while the child was running, the
@@ -87,12 +93,12 @@ export const DEFAULT_ESCALATE_AFTER = 3;
 const MODEL_FAILURE_SIGN = /could not restore model|model not found|unknown model|no such model/i;
 
 /** Whether a failure sign names a missing model and is therefore worth an immediate `#healStaleModel` run. */
-export function isModelFailureSign(sign: string): boolean {
+function isModelFailureSign(sign: string): boolean {
 	return MODEL_FAILURE_SIGN.test(sign);
 }
 
 /** The message a failure carries into sign matching and failure records. */
-export function failureSign(error: unknown): string {
+function failureSign(error: unknown): string {
 	return error instanceof OmpDriverError ? error.message : String(error);
 }
 
@@ -128,7 +134,7 @@ export interface ColdCacheInfo {
 }
 
 /** Retry causes that are a provider usage limit (429, rate/usage limit, quota), not a timeout or a dropped stream. */
-export const PROVIDER_LIMIT = /\b429\b|rate[_ ]?limit|usage[_ ]limit|limit exhausted|quota/i;
+const PROVIDER_LIMIT = /\b429\b|rate[_ ]?limit|usage[_ ]limit|limit exhausted|quota/i;
 
 export function isProviderLimit(message: string): boolean {
 	return PROVIDER_LIMIT.test(message);
@@ -186,6 +192,12 @@ export interface StallEscalation {
 	totalSilentMs: number;
 }
 
+/** The lane board's head line for a turn prompt and the cursor move to run once that prompt reached the driver. */
+export interface BoardNotice {
+	block: string;
+	commit(): void;
+}
+
 export interface MailboxDeps {
 	originKey: string;
 	store: Store;
@@ -205,6 +217,8 @@ export interface MailboxDeps {
 	budgetProvider?: (arg: string) => Promise<string>;
 	/** Read on every new turn: whether its prompt may carry channel-scoped recall. Absent = never. */
 	recallEnabled?: () => boolean;
+	/** Read when a child starts: whether it gets ompbot host tools (an omp child; agy and claude get none). Absent = yes. */
+	hostTools?: () => boolean;
 	/**
 	 * Live `costCap` from config, read per assistant call: `turnUsd` steers a turn at the ceiling and stops it at
 	 * 1.5x. Absent, or a key absent, = that ceiling is off. `dailyUsd` is not read here (`src/ops/cost-cap.ts`).
@@ -226,22 +240,13 @@ export interface MailboxDeps {
 	 */
 	sessionBackupsRoot?: string;
 	idleStopMs?: number;
-	stallMs?: number;
 	/** Consecutive failed turns that fire `onEscalate` (default 3); 0 disables escalation. */
 	escalateAfter?: number;
-	/** Silent turn: gap before the status text is released after the last stall-clearing event (default `STALL_RELEASE_MS`). */
-	stallReleaseMs?: number;
-	/** Conversation origin: stalls per turn that ask the owner (default `STALL_NOTIFY_COUNT`); 0 disables the count rule. */
-	stallNotifyCount?: number;
-	/** Conversation origin: accumulated silence per turn that asks the owner (default `STALL_NOTIFY_MS`); 0 disables. */
-	stallNotifyMs?: number;
-	/** Monitor origin: accumulated silence per turn that aborts it (default `MONITOR_STALL_ABORT_MS`); 0 disables. */
-	monitorStallAbortMs?: number;
 	/** Owner escalation of a stalled turn: at most once per turn (`opRef`). */
 	onStallEscalate?: (info: StallEscalation) => void;
 	/**
 	 * The status text of a turn switches to stalled on its first stall (`stalled: true`) and back (`stalled: false`)
-	 * only once the turn has run `stallReleaseMs` past a stall-clearing event without stalling again; further stalls
+	 * only once the turn has run `STALL_RELEASE_MS` past a stall-clearing event without stalling again; further stalls
 	 * of the same turn do not call it.
 	 */
 	onStall?: (info: { originKey: string; threadRef: string; stalled: boolean; silentMs: number }) => void;
@@ -270,6 +275,11 @@ export interface MailboxDeps {
 	 */
 	isHeld?: () => boolean;
 	/**
+	 * True while the origin's session is handed to a terminal omp (`ompbot lanes attach`): no child starts — not even
+	 * for a `!` command, which stays pending like any other row until the session comes back.
+	 */
+	isAttached?: () => boolean;
+	/**
 	 * The held origin's driver started working on its own (a queued message omp began without the mailbox: a
 	 * `tool_execution_start` outside any turn). Once per pause is the caller's (the lane warns and re-aborts).
 	 */
@@ -289,6 +299,12 @@ export interface MailboxDeps {
 	 */
 	initialTodos?: () => TodoPhase[] | undefined;
 	/**
+	 * Read for every new turn prompt (never a steer): the lane board's head line for new posts, put in the prompt's
+	 * context blocks, and the cursor move `commit` the mailbox runs only once the prompt reached the driver (a failed
+	 * prompt announces again). Absent or undefined = no line.
+	 */
+	boardNotice?: () => BoardNotice | undefined;
+	/**
 	 * Every turn that ended through the final path (completed, failed, paused, aborted), after its answer or failure
 	 * was recorded and before the next queued row starts. Called on the actor chain: it must never await.
 	 */
@@ -300,6 +316,8 @@ export interface MailboxDeps {
 	 * the thread; throwing = nothing was uploaded and the reason becomes the one failure line. Absent = not wired.
 	 */
 	briefingProvider?: (originKey: string, threadRef: string) => Promise<void>;
+	/** `!restart`: called with the row's origin and thread, its line becomes the answer. Absent = not wired. */
+	restartProvider?: RestartProvider;
 }
 
 /**
@@ -322,8 +340,15 @@ export interface TurnUndoDeps {
 	run?: GitRunner;
 }
 
+/** One turn's `!undo` card: the per-repository plans, the card text, and the answer when nothing can be reverted. */
+interface UndoCard {
+	plans: RepoPlan[];
+	summary: string;
+	nothing: string;
+}
+
 /** The owner-facing omp dialogs of each origin (`ApprovalBroker.choose` cards), as the mailbox sees them. */
-export interface OpenDialogs {
+interface OpenDialogs {
 	/** Dialogs of the origin still waiting for an answer. */
 	open(originKey: string): number;
 	/**
@@ -352,13 +377,13 @@ export interface TurnProgress {
 }
 
 /** Tool lines a status message lists. */
-export const RECENT_TOOLS = 3;
+const RECENT_TOOLS = 3;
 
 /**
  * Todo summary of a `todo` tool result (`details: {op, phases}`, omp `tools/todo.ts`); undefined for `view` reads,
  * errors and shapes it does not know.
  */
-export function todoProgress(result: unknown): TurnProgress["todo"] | undefined {
+function todoProgress(result: unknown): TurnProgress["todo"] | undefined {
 	if (typeof result !== "object" || result === null || !("details" in result)) return undefined;
 	const details = result.details;
 	if (typeof details !== "object" || details === null || !("phases" in details) || !Array.isArray(details.phases)) {
@@ -400,7 +425,7 @@ export interface SessionMismatchInfo {
 }
 
 /** Outcome of `openOriginSession`: `mismatch` only when both files are known and resolve to different paths. */
-export type SessionOpenCheck =
+type SessionOpenCheck =
 	| { mismatch: true; expected: string; actual: string }
 	| { mismatch: false; expected: string | undefined; actual: string | undefined };
 
@@ -435,7 +460,7 @@ interface ActiveTurn {
 	stallSilentMs: number;
 	/** `onStall(stalled: true)` was sent and not yet released. */
 	stallShown: boolean;
-	/** When the last stall ended; the status text is released `stallReleaseMs` after it without a new stall. */
+	/** When the last stall ended; the status text is released `STALL_RELEASE_MS` after it without a new stall. */
 	stallClearedAt: number;
 	/** The owner was asked (or the abort was started) for this turn: never twice. */
 	stallEscalated: boolean;
@@ -535,7 +560,7 @@ export function toolActivityText(toolName: string, args: unknown, intent?: unkno
 }
 
 /** `/model-ompbot <arg>`: an exact `provider/id`, a 1-based index into `options`, or a substring matching exactly one. */
-export function pickOption(options: readonly string[], arg: string): string | undefined {
+function pickOption(options: readonly string[], arg: string): string | undefined {
 	if (options.includes(arg)) return arg;
 	if (/^\d+$/.test(arg)) return options[Number(arg) - 1];
 	const needle = arg.toLowerCase();
@@ -543,7 +568,7 @@ export function pickOption(options: readonly string[], arg: string): string | un
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
-export interface MailboxState {
+interface MailboxState {
 	originKey: string;
 	driverRunning: boolean;
 	busy: boolean;
@@ -560,10 +585,10 @@ export interface PauseCheck {
 }
 
 /**
- * Both halves of a peer failure notice (`failedNotice` with a peer). A peer turn opened by a text that carries both
- * never mentions back when it fails too: a failure notice answers a peer once, never in a loop.
+ * Second half of a peer failure notice (`failedNotice` with a peer; the first is `PEER_FAILURE_MARK`). A peer turn
+ * opened by a text that carries both never mentions back when it fails too: a failure notice answers a peer once,
+ * never in a loop.
  */
-const PEER_FAILURE_MARK = "응답 실패(";
 const PEER_FAILURE_TAIL = "직접 검토해 주세요";
 /** Characters of the failure reason a peer failure notice keeps (after redaction). */
 const PEER_REASON_MAX = 80;
@@ -573,6 +598,13 @@ const NO_MODEL_SIGN = /No default model selected/;
 /** The owner's notice for that error: the generic "send it again" would fail the same way until omp has a model. */
 export const NO_MODEL_NOTICE =
 	"[turn failed] omp_no_model — 봇을 돌리는 계정에서 omp가 쓸 모델을 찾지 못했습니다. 그 계정으로 `omp login`(또는 공급자 API 키 설정)을 한 뒤 다시 보내 주세요";
+
+/** Final error of a turn the owner stopped with `!stop` (doc/plans/owner-stop-and-context.md). */
+const OWNER_STOP_ERROR = "owner_stop";
+/** `!stop`'s answer when it stopped a turn; the session stays, so the owner just keeps talking. */
+export const OWNER_STOPPED_TEXT = "⏹ 멈췄습니다. 세션은 그대로라 이어서 말하면 됩니다.";
+/** `!stop`'s answer when no turn ran. */
+export const NOTHING_TO_STOP_TEXT = "멈출 작업이 없습니다.";
 
 /**
  * First line of an owner steer written before the turn's last answer reached the owner (2026-11-11: "어디갔어"
@@ -630,7 +662,7 @@ const THREAD_CONTEXT_TIMEOUT_MS = 10_000;
  * thread. The 2026-10-29 misses — a KakaoTalk-log thread answered from the bot's own work log — came exactly
  * from this gap. Null when the origin is not a thread session or there is nothing to inject.
  */
-export function threadContextBlock(store: Store, originKey: string, current: InboundRow): string | null {
+function threadContextBlock(store: Store, originKey: string, current: InboundRow): string | null {
 	const threadRef = threadRefOfOrigin(originKey);
 	if (threadRef === undefined) return null;
 	const lines: string[] = [];
@@ -723,7 +755,7 @@ export function peerThreadContextBlock(
 }
 
 /** Context line of an owner reply's thread whose root is this bot's own post; starts with `THREAD_ANSWER_LINE` so it is scanned. */
-export function ownerThreadRootBlock(root: SlackThreadMessage, threadRef: string): string {
+function ownerThreadRootBlock(root: SlackThreadMessage, threadRef: string): string {
 	const ms = root.at ?? Number(root.ts) * 1000;
 	const when = Number.isFinite(ms) ? new Date(ms).toISOString() : root.ts;
 	const preview = truncateUtf8(redact(root.text), MAX_THREAD_ROOT_CHARS).replace(/\s+/g, " ").trim();
@@ -754,19 +786,24 @@ export class OriginMailbox {
 	 */
 	#lastUndoFailures: { opRef: string; failed: ReadonlyMap<string, string> } | undefined;
 	#lastActivityAt: number;
-	readonly #stallMs: number;
 	#lastEventAt = 0;
 	/** When the running turn's last event was written to the ledger (throttled by EVENT_PERSIST_MS). */
 	#eventPersistedAt = 0;
 	#stalled = false;
 	/** True until the first prompt of a freshly created session (`openSession` resumed=false): the one turn that may carry injected thread context. */
 	#freshSession = false;
-	/** Whether the live child was started for an origin a peer bot had already spoken in (its host tools are the reduced set). */
-	#driverPeerTouched = false;
+	/**
+	 * Whether the live child needs no peer-taint notice: it was started after a peer bot wrote here (reduced host tools,
+	 * told in its system prompt), it has no host tools (`hostTools`), or a prompt carrying `peerTouchedTurnNotice` went
+	 * through. A child started before keeps its full tool list; the daemon refuses the restricted ones when they run.
+	 */
+	#skipPeerNotice = false;
 	/** Host tool calls (approval wait, upload, dispatch) running for this origin's child; no omp events come meanwhile. */
 	#hostToolsRunning = 0;
 	/** Set by `stopWhenIdle()` while a turn runs: the child is stopped once that turn has settled. */
 	#stopAfterTurn = false;
+	/** `whenTurnEnds` callers, woken where the turn is dropped (final, exit, `/new`). */
+	readonly #turnEndWaiters: Array<() => void> = [];
 	/** Set at shutdown (`stopDispatching`): pending rows stay pending — the drain awaits running turns only. */
 	#acceptingDispatch = true;
 	/** Failed turns in a row; a completed turn resets it (`성공 시 리셋`). */
@@ -791,7 +828,6 @@ export class OriginMailbox {
 			deps.originKey.startsWith(MONITOR_ORIGIN_PREFIX) && idleStopMs > 0
 				? Math.min(idleStopMs, MONITOR_IDLE_STOP_MS)
 				: idleStopMs;
-		this.#stallMs = deps.stallMs ?? STALL_MS;
 		this.#lastActivityAt = deps.clock.now();
 	}
 
@@ -866,12 +902,12 @@ export class OriginMailbox {
 	}
 
 	/**
-	 * Reports a running turn that has emitted no omp event for `stallMs`. Synchronous and clock-driven, so the daemon
+	 * Reports a running turn that has emitted no omp event for `STALL_MS`. Synchronous and clock-driven, so the daemon
 	 * sweep and tests with a fake clock both call it. Returns whether a new stall just began.
 	 * Never while a host tool runs: the child waits on ompbot (an approval click, an upload), not on its model.
 	 *
 	 * Stalls of one turn merge: the first logs `stall_alert` and shows the stalled status text; later ones log
-	 * `stall_repeat` (count, totalSilentMs) and leave the text alone until `stallReleaseMs` of calm. Every call also
+	 * `stall_repeat` (count, totalSilentMs) and leave the text alone until `STALL_RELEASE_MS` of calm. Every call also
 	 * judges the turn's accumulated silence: a conversation turn past the count/time threshold asks the owner once
 	 * (never aborted), a monitor turn past its threshold is aborted and failed.
 	 */
@@ -883,7 +919,7 @@ export class OriginMailbox {
 		let began = false;
 		if (!this.#stalled) {
 			const silentMs = now - this.#lastEventAt;
-			if (silentMs >= this.#stallMs) {
+			if (silentMs >= STALL_MS) {
 				this.#stalled = true;
 				began = true;
 				turn.stallCount += 1;
@@ -901,7 +937,7 @@ export class OriginMailbox {
 					turn.stallShown = true;
 					onStall?.({ originKey, threadRef: turn.threadRef, stalled: true, silentMs });
 				}
-			} else if (turn.stallShown && now - turn.stallClearedAt >= (this.#deps.stallReleaseMs ?? STALL_RELEASE_MS)) {
+			} else if (turn.stallShown && now - turn.stallClearedAt >= STALL_RELEASE_MS) {
 				turn.stallShown = false;
 				log.info("stall_released", { origin: originKey, opRef: turn.opRef, count: turn.stallCount });
 				onStall?.({ originKey, threadRef: turn.threadRef, stalled: false, silentMs });
@@ -917,12 +953,9 @@ export class OriginMailbox {
 		const { originKey, log, onStallEscalate } = this.#deps;
 		const totalSilentMs = turn.stallSilentMs + (this.#stalled ? now - this.#lastEventAt : 0);
 		const monitor = originKey.startsWith(MONITOR_ORIGIN_PREFIX);
-		const abortMs = this.#deps.monitorStallAbortMs ?? MONITOR_STALL_ABORT_MS;
-		const notifyCount = this.#deps.stallNotifyCount ?? STALL_NOTIFY_COUNT;
-		const notifyMs = this.#deps.stallNotifyMs ?? STALL_NOTIFY_MS;
 		const over = monitor
-			? abortMs > 0 && totalSilentMs >= abortMs
-			: (notifyCount > 0 && turn.stallCount >= notifyCount) || (notifyMs > 0 && totalSilentMs >= notifyMs);
+			? totalSilentMs >= MONITOR_STALL_ABORT_MS
+			: turn.stallCount >= STALL_NOTIFY_COUNT || totalSilentMs >= STALL_NOTIFY_MS;
 		if (!over) return;
 		turn.stallEscalated = true;
 		const kind = monitor ? "abort" : "notify";
@@ -1037,23 +1070,32 @@ export class OriginMailbox {
 	 * Adds the finished turn's priced cost (its own session after the start cursor plus in-window sub-agent transcripts)
 	 * to `usage_daily`. The turn's live `costUsd` is the fallback when the session file cannot be read — that total
 	 * misses sub-agents, so the miss is logged as `usage_daily_failed`. A missing `sessionFile` (no session yet) is not
-	 * an error: there is no transcript to read and nothing was spent.
+	 * error: there is no transcript to read and nothing was spent. `wedged`: the child is being stopped as unresponsive,
+	 * so its state is not asked again (another RPC timeout) and the live total is charged.
 	 */
-	async #recordDailyCost(driver: OmpSessionDriver, turn: ActiveTurn): Promise<void> {
+	async #recordDailyCost(driver: OmpSessionDriver, turn: ActiveTurn, wedged = false): Promise<void> {
 		if (turn.costRecorded) return;
 		turn.costRecorded = true;
 		const { store, originKey, log, clock } = this.#deps;
-		let file: string | undefined;
-		try {
-			file = (await driver.state()).sessionFile;
-		} catch (error) {
-			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+		const chargeLive = (): void => {
 			store.addDailyUsage({
 				day: ledgerDay(clock.now(), this.#deps.timezone),
 				originKey,
 				cost: turn.costUsd,
 				calls: 1,
 			});
+		};
+		if (wedged) {
+			log.info("usage_daily_live", { origin: originKey, opRef: turn.opRef, reason: "child_stopped" });
+			chargeLive();
+			return;
+		}
+		let file: string | undefined;
+		try {
+			file = (await driver.state()).sessionFile;
+		} catch (error) {
+			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+			chargeLive();
 			return;
 		}
 		if (file === undefined || file === "") return;
@@ -1188,6 +1230,14 @@ export class OriginMailbox {
 	async openSessionFile(): Promise<string | undefined> {
 		const driver = this.#driver;
 		return driver === undefined ? undefined : (await driver.state()).sessionFile;
+	}
+
+	/**
+	 * The live child's state for `!status` (context use); undefined without a child. Off the serial chain like
+	 * `openSessionFile`: `!status` asks from inside it, and `get_state` changes nothing while a turn runs.
+	 */
+	driverState(): Promise<OmpState | undefined> {
+		return this.#driver?.state() ?? Promise.resolve(undefined);
 	}
 
 	#onDriverEvent(event: OmpEvent): void {
@@ -1398,6 +1448,22 @@ export class OriginMailbox {
 		return run;
 	}
 
+	#wakeTurnEndWaiters(): void {
+		if (this.#turn !== undefined) return;
+		for (const wake of this.#turnEndWaiters.splice(0)) wake();
+	}
+
+	/**
+	 * Resolves once no turn runs (at once when none does). Does not hold new turns back: the caller holds the origin
+	 * first (a paused lane), so the turn running now is the last one (`ompbot lanes attach --wait`).
+	 */
+	whenTurnEnds(): Promise<void> {
+		if (this.#turn === undefined) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#turnEndWaiters.push(resolve);
+		return promise;
+	}
+
 	/** Events from the driver have nobody to reject to: errors are logged, never dropped silently. */
 	#background(event: string, task: () => Promise<void>): void {
 		this.#serial(task).catch((error: unknown) => {
@@ -1420,13 +1486,23 @@ export class OriginMailbox {
 			log.info("inbound_duplicate", { origin: originKey, id: record.platformMessageId });
 			return;
 		}
+		const command = parseCommand(record.text);
+		if (command?.kind === "restart") {
+			// Before the drain and attach deferrals: a held `!restart` would run again in the next process.
+			await this.#runCommand(row, command);
+			return;
+		}
 		if (this.#deps.isDraining?.()) {
 			log.info("drain_deferred", { origin: originKey, id: record.platformMessageId });
 			return;
 		}
-		const command = parseCommand(record.text);
 		// A `btw` with no turn to ask beside is a plain message: it stays pending and the drain starts a turn with it.
 		const viaDrain = command?.kind === "followup" || (command?.kind === "btw" && command.arg !== "" && !this.#turn);
+		if (command && !viaDrain && this.#deps.isAttached?.()) {
+			// The session is open in a terminal omp: the command waits for it like a held message (the drain runs it).
+			log.info("attached_command_deferred", { origin: originKey, id: record.platformMessageId });
+			return;
+		}
 		if (command && !viaDrain) await this.#runCommand(row, command);
 		else await this.#drain();
 	}
@@ -1470,8 +1546,15 @@ export class OriginMailbox {
 	 */
 	async #drain(): Promise<void> {
 		const { store, originKey } = this.#deps;
-		if (this.#deps.isDraining?.()) return; // a restart drain: rows wait for the next process (or the cancel)
-		if (this.#deps.isHeld?.()) return; // a paused lane: rows wait for the owner's resume
+		// A restart drain: rows wait for the next process (or the cancel). A paused lane: rows wait for the owner's
+		// resume. Either way a `!restart` is answered now: held over a drain, the next process would run it once more.
+		if (this.#deps.isDraining?.() || this.#deps.isHeld?.()) {
+			for (const row of store.listInbound({ originKey, state: "pending" })) {
+				const command = row.peerUserId === null ? parseCommand(row.textRef) : undefined;
+				if (command?.kind === "restart") await this.#runCommand(row, command);
+			}
+			return;
+		}
 		for (const listed of store.listInbound({ originKey, state: "pending" })) {
 			// Checked per row so a drain already mid-loop stops too when shutdown flips the flag.
 			if (!this.#acceptingDispatch) return;
@@ -1663,13 +1746,9 @@ export class OriginMailbox {
 	/** Opens the origin's session in a driver and starts one turn for the row; nothing is recorded on failure. */
 	async #startTurn(row: InboundRow, text: string): Promise<void> {
 		const { store, log, originKey } = this.#deps;
-		// The child's host tools are fixed when it starts: one built before any peer bot spoke here still has the owner's
-		// full set, so it is replaced (session kept) before a turn that may follow a peer message.
-		if (this.#driver && !this.#driverPeerTouched && store.originHasPeerInbound(originKey)) {
-			log.info("driver_restart_peer_touched", { origin: originKey, id: row.platformMessageId });
-			await this.#stopDriver();
-		}
 		const driver = await this.#ensureDriver(row.threadRef);
+		// A child started before a peer bot wrote here is kept: it is told once, in front of its next prompt.
+		const peerNotice = !this.#skipPeerNotice && store.originHasPeerInbound(originKey);
 		this.#warnColdCache(row.threadRef);
 		// Before `#firstTurnPrompt` clears the fresh flag: a continued session already has its todos.
 		if (this.#freshSession) await this.#plantTodos(driver);
@@ -1677,7 +1756,11 @@ export class OriginMailbox {
 		const entryCursor = await driver.leafId();
 		// Before the prompt, not after: the first tool call would otherwise race the capture and land in no turn's diff.
 		const undoBefore = await this.#captureUndoBefore(originKey);
-		const opRef = await driver.prompt(await this.#firstTurnPrompt(row, text));
+		const board = this.#deps.boardNotice?.();
+		const opRef = await driver.prompt(await this.#firstTurnPrompt(row, text, peerNotice, board?.block));
+		// Only once the prompt went through: a failed one leaves the notices for the next turn.
+		if (peerNotice) this.#skipPeerNotice = true;
+		board?.commit();
 		store.markDispatched(row.platformMessageId, { opRef, entryCursor });
 		this.#turnGeneration += 1;
 		this.#turn = {
@@ -1734,13 +1817,20 @@ export class OriginMailbox {
 	 * Prompt of a new turn (never a steer): the first prompt of a freshly created thread session is preceded by the
 	 * thread context it never saw, and a Slack conversation's turn by channel-scoped recall when `buildRecallBlock`
 	 * finds the text points at the past (or a fresh session shares rare words). Bot answers quoted in either block
-	 * are scanned for instruction-like passages; a hit puts a warning line in front of that block.
+	 * are scanned for instruction-like passages; a hit puts a warning line in front of that block. `peerNotice` puts
+	 * the peer-taint notice first: a block, so the prompt still ends with the request (`isTurnPromptFor`). `boardLine`
+	 * (the lane board's new-post head line) is the last block, right above the request.
 	 */
-	async #firstTurnPrompt(row: InboundRow, text: string): Promise<string> {
+	async #firstTurnPrompt(
+		row: InboundRow,
+		text: string,
+		peerNotice: boolean,
+		boardLine: string | undefined,
+	): Promise<string> {
 		const { store, originKey, log } = this.#deps;
 		const fresh = this.#freshSession;
 		this.#freshSession = false;
-		const blocks: string[] = [];
+		const blocks: string[] = peerNotice ? [peerTouchedTurnNotice(originKey)] : [];
 		const context = fresh ? threadContextBlock(store, originKey, row) : null;
 		if (context !== null) {
 			const answers = context.split("\n").filter((line) => line.startsWith(THREAD_ANSWER_LINE));
@@ -1771,6 +1861,7 @@ export class OriginMailbox {
 				blocks.push(this.#withInjectionWarning(recall.block, answers, "이전 대화 회상의 봇 답"));
 			}
 		}
+		if (boardLine !== undefined) blocks.push(boardLine);
 		return composeTurnPrompt(blocks, text);
 	}
 
@@ -1876,6 +1967,9 @@ export class OriginMailbox {
 	async #ensureDriver(threadRef: string): Promise<OmpSessionDriver> {
 		if (this.#driver) return this.#driver;
 		const { store, originKey, driverFactory, log } = this.#deps;
+		// Two omp processes writing one session file tangle its history: none starts while a terminal holds it.
+		if (this.#deps.isAttached?.())
+			throw new OmpDriverError("not_started", `${originKey} is attached to a terminal omp`);
 		const origin = store.getOrigin(originKey);
 		if (!origin) throw new OmpDriverError("not_started", `unknown origin ${originKey}`);
 		// Freshness must be read before the child exists: a spawned omp child (and the fake driver's `start()`)
@@ -1913,7 +2007,8 @@ export class OriginMailbox {
 			driver.onEvent((event) => this.#onDriverEvent(event)),
 		];
 		this.#driver = driver;
-		this.#driverPeerTouched = peerTouched;
+		// A child without host tools has nothing to be told about them.
+		this.#skipPeerNotice = peerTouched || this.#deps.hostTools?.() === false;
 		return driver;
 	}
 
@@ -2057,13 +2152,18 @@ export class OriginMailbox {
 			return;
 		}
 		this.#turn = undefined;
+		this.#wakeTurnEndWaiters();
 		this.#lastActivityAt = this.#deps.clock.now();
-		await this.#recordDailyCost(driver, turn);
+		await this.#recordDailyCost(driver, turn, stopFirst);
 		const base = { originKey, opRef: turn.opRef, threadRef: turn.threadRef };
 		if (final.status === "completed") {
 			const answer = await this.#turnAnswer(driver, turn, final.text);
 			store.recordAnswer({ ...base, parts: [answer.body], answer: answer.whole });
 			this.#consecFailures = 0;
+		} else if (final.error === OWNER_STOP_ERROR) {
+			// The owner's `!stop`: its answer (the `stop:` op, which took over the turn's rows) is the one message —
+			// no notice, no failure count.
+			log.info("owner_stop_settled", { origin: originKey, opRef: turn.opRef });
 		} else if (final.error === "lane_paused") {
 			// The owner's own hold, not a failure: no notice, no failure count — one short line in the thread.
 			store.recordAnswer({
@@ -2133,6 +2233,7 @@ export class OriginMailbox {
 		log.warn("omp_exit", { origin: originKey, code: info.code, expected: info.expected });
 		const turn = this.#turn;
 		this.#turn = undefined;
+		this.#wakeTurnEndWaiters();
 		// The dispatched rows of the dead turn are answered with one notice; the prompt is never resent.
 		if (turn) {
 			// The dead child spent money too: charge the day as `#onFinal` does (its live total when the state is gone).
@@ -2174,6 +2275,10 @@ export class OriginMailbox {
 		const opRef = `${command.kind}:${row.platformMessageId}`;
 		if (command.kind === "new") {
 			await this.#newEpoch(opRef, threadRef);
+			return;
+		}
+		if (command.kind === "stop") {
+			await this.#stopTurn(row, opRef);
 			return;
 		}
 		// Mark first so a failing command can never leave its text pending for a later prompt.
@@ -2273,7 +2378,8 @@ export class OriginMailbox {
 	/**
 	 * `!undo` (doc/plans/turn-undo.md §E): the origin's newest turn that changed a repository, put back after the owner
 	 * approves. Runs outside the serial chain (the card waits minutes) and re-enters it for the write, where the plan is
-	 * recomputed: files that changed meanwhile become conflicts, and a turn that started meanwhile cancels the undo.
+	 * recomputed: files that changed meanwhile become conflicts, and a turn that started meanwhile cancels the undo. A
+	 * newest turn with nothing left to revert is closed first and the turn before it is offered instead.
 	 */
 	#startUndo(opRef: string, threadRef: string): void {
 		const { store, originKey, log } = this.#deps;
@@ -2298,16 +2404,45 @@ export class OriginMailbox {
 		// A repository the last turn could not snapshot has no row for that turn: its newest row belongs to an older
 		// turn, which the owner is not asking to undo. Leave it out instead of silently going further back.
 		const failed = this.#lastUndoFailures;
-		const rows = store
-			.latestUndoableTurn(originKey)
-			.filter((row) => failed === undefined || !failed.failed.has(row.repo) || row.opRef === failed.opRef);
-		if (rows.length === 0) {
+		const newest = (): TurnSnapshotRow[] =>
+			store
+				.latestUndoableTurn(originKey)
+				.filter((row) => failed === undefined || !failed.failed.has(row.repo) || row.opRef === failed.opRef);
+		const first = newest();
+		if (first.length === 0) {
 			reply(notes.length > 0 ? notes.join("\n") : "되돌릴 턴 변경이 없습니다.");
 			return;
 		}
 		const generation = this.#turnGeneration;
-		this.#planUndoCard(rows, notes, { run: turnUndo.run })
+		let rows = first;
+		const planNewest = async (): Promise<UndoCard | undefined> => {
+			// A turn whose files are all conflicts or overlaps can never be reverted (a revert that stopped midway, a
+			// hand edit since): it is closed so it does not pin `!undo` to itself, and the turn before it is planned.
+			for (;;) {
+				const planned = await this.#planUndoCard(rows, notes, { run: turnUndo.run });
+				const stuck =
+					planned.plans.some((repoPlan) => repoPlan.files.length > 0) &&
+					planned.plans.every(
+						(repoPlan) => repoPlan.commit === undefined && repoPlan.files.every((file) => file.kind !== "revert"),
+					);
+				if (!stuck) return planned;
+				const opRefs = [...new Set(rows.map((row) => row.opRef))];
+				for (const turnRef of opRefs) store.markTurnReverted(originKey, turnRef, this.#deps.clock.now());
+				log.info("undo_turn_closed", { origin: originKey, opRef: opRefs.join(",") });
+				notes.push(
+					`되돌릴 파일이 없어 닫은 턴: ${rows.map((row) => row.repo).join(", ")} — 충돌·겹침만 남아 그 이전 턴으로 넘어감`,
+				);
+				const older = newest();
+				if (older.length === 0) return undefined;
+				rows = older;
+			}
+		};
+		planNewest()
 			.then(async (planned) => {
+				if (planned === undefined) {
+					reply([...notes, "더 되돌릴 턴 변경이 없습니다."].join("\n"));
+					return;
+				}
 				if (planned.plans.every((plan) => plan.files.length === 0 && plan.commit === undefined)) {
 					reply(planned.nothing);
 					return;
@@ -2334,7 +2469,7 @@ export class OriginMailbox {
 		rows: readonly TurnSnapshotRow[],
 		notes: readonly string[],
 		options: { run?: GitRunner },
-	): Promise<{ plans: RepoPlan[]; summary: string; nothing: string }> {
+	): Promise<UndoCard> {
 		// Overlap is checked against every row of the repository, whatever its origin: a turn of another conversation is
 		// exactly the case that must be seen (turns of one origin never run at the same time).
 		const plans = await Promise.all(
@@ -2488,7 +2623,25 @@ export class OriginMailbox {
 				throw new Error("unreachable: undo is handled by #startUndo");
 			case "brief":
 				throw new Error("unreachable: brief is handled by #startBrief");
+			case "stop":
+				throw new Error("unreachable: stop is handled by #stopTurn");
+			case "restart":
+				return await this.#restartCommand(threadRef);
 		}
+	}
+
+	/**
+	 * `!restart` never touches the driver or a turn: a drain already running answers at once, a Teams conversation or a
+	 * monitor origin is refused, and otherwise the daemon's provider launches the detached apply (or says why not).
+	 */
+	async #restartCommand(threadRef: string): Promise<string> {
+		const { originKey, restartProvider } = this.#deps;
+		if (this.#deps.isDraining?.()) return RESTART_DRAINING_TEXT;
+		const platform = platformOfThreadRef(threadRef);
+		if (originKey.startsWith(MONITOR_ORIGIN_PREFIX) || (platform !== "slack" && platform !== "discord"))
+			return RESTART_REFUSED_TEXT;
+		if (restartProvider === undefined) return "재시작이 연결되지 않았습니다";
+		return await restartProvider(originKey, threadRef);
 	}
 
 	async #modelCommand(arg: string, threadRef: string): Promise<string> {
@@ -2669,13 +2822,76 @@ export class OriginMailbox {
 		});
 	}
 
-	/** /new: abort + newSession, bump the epoch (discards pending rows, this command included), drop the old turn. */
+	/**
+	 * `!stop` (doc/plans/owner-stop-and-context.md): stops the running turn but keeps the session — no new epoch, the
+	 * child stays. First the rows that waited before this command (a steer-blocked message, a `!followup`) are
+	 * cancelled: the stopped turn's final drains, and they must not start the next turn. Then the turn is aborted with
+	 * omp's own queue emptied, so a steered message does not run once more. The turn's rows move to the command op (as
+	 * `/new` does), so the command's one answer finishes their threads' status as 🚫 취소됨 and the turn posts nothing.
+	 * A child whose abort throws — or that still holds queued messages when no queue-clearing abort exists — is stopped;
+	 * the next message reopens the same session directory.
+	 */
+	async #stopTurn(row: InboundRow, opRef: string): Promise<void> {
+		const { store, originKey, log } = this.#deps;
+		const pendingIds = store.listInbound({ originKey, state: "pending" }).map((pending) => pending.platformMessageId);
+		const earlier = new Set(pendingIds.slice(0, Math.max(pendingIds.indexOf(row.platformMessageId), 0)));
+		const cancelled = this.#waitingRows().filter((waiting) => earlier.has(waiting.row.platformMessageId));
+		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+		for (const waiting of cancelled) store.discard(waiting.row.platformMessageId, opRef);
+		const note = cancelled.length === 0 ? "" : ` 대기 ${cancelled.length}개를 취소했습니다.`;
+		const answer = (text: string): void => {
+			store.recordAnswer({ originKey, opRef, threadRef: row.threadRef, parts: [`${text}${note}`] });
+		};
+		const turn = this.#turn;
+		const driver = this.#driver;
+		if (turn === undefined || driver === undefined) {
+			log.info("owner_stop_idle", { origin: originKey, cancelled: cancelled.length });
+			answer(NOTHING_TO_STOP_TEXT);
+			return;
+		}
+		let stopChild = false;
+		try {
+			if (driver.abortAndClearQueue !== undefined) await driver.abortAndClearQueue();
+			else {
+				await driver.abort();
+				stopChild = (await driver.state()).queuedMessageCount > 0;
+			}
+		} catch (error) {
+			stopChild = true;
+			log.warn("owner_stop_abort_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
+		}
+		log.info("owner_stop", { origin: originKey, opRef: turn.opRef, cancelled: cancelled.length, stopChild });
+		const settles = this.#turn === turn && this.#driver === driver;
+		if (settles) {
+			for (const dispatched of store.listInbound({ originKey, state: "dispatched" })) {
+				if (dispatched.opRef === turn.opRef) store.discard(dispatched.platformMessageId, opRef);
+			}
+		}
+		answer(OWNER_STOPPED_TEXT);
+		if (settles) {
+			const final: OmpFinal = { opRef: turn.opRef, status: "aborted", text: "", error: OWNER_STOP_ERROR };
+			await this.#onFinal(driver, final, stopChild);
+		}
+	}
+
+	/**
+	 * /new: abort the running turn, charge what it spent, stop the child (the next dispatch opens the bumped epoch's
+	 * empty session), bump the epoch (discards pending rows, this command included) and drop the old turn. A wedged
+	 * child whose abort throws — when /new is needed most — is still stopped and the owner still gets the answer.
+	 */
 	async #newEpoch(opRef: string, threadRef: string): Promise<void> {
-		const { store, originKey } = this.#deps;
+		const { store, originKey, log } = this.#deps;
+		const turn = this.#turn;
 		this.#turn = undefined;
-		if (this.#driver) {
-			await this.#driver.abort();
-			await this.#driver.newSession();
+		this.#wakeTurnEndWaiters();
+		const driver = this.#driver;
+		if (driver) {
+			try {
+				await driver.abort();
+			} catch (error) {
+				log.warn("new_abort_failed", { origin: originKey, error: String(error) });
+			}
+			if (turn) await this.#recordDailyCost(driver, turn);
 			await this.#stopDriver();
 		}
 		const origin = store.getOrigin(originKey);

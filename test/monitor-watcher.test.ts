@@ -6,7 +6,7 @@ import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
 import { MonitorScheduler } from "../src/monitors/scheduler";
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../src/monitors/spec";
-import { fsWatchStarter, MAX_WATCH_PATHS, type WatchStarter } from "../src/monitors/watcher";
+import { fsWatchStarter, MAX_WATCH_PATHS, WatcherSet, type WatchStarter } from "../src/monitors/watcher";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 
@@ -107,6 +107,7 @@ beforeEach(() => {
 		log,
 		scriptsRoot: join(dir, "scripts"),
 		workspaceDir: dir,
+		homeDir: dir,
 		watcherRoots: [allowed],
 		watch: starter,
 	});
@@ -277,6 +278,28 @@ describe("watcher runtime", () => {
 		expect(lines.at(-1)).toBe("… and 7 more");
 	});
 
+	test("the `… and N more` count is distinct changed paths even past the tracked-path bound", () => {
+		const root = join(allowed, "proj");
+		const monitor = add(root, { debounceMs: 100 });
+		let emit: (rel: string) => void = () => {};
+		const set = new WatcherSet({
+			log: createLogger({ sink: () => {}, clock, redact }),
+			clock,
+			watchRoots: () => [allowed],
+			starter: (_root, onChange) => {
+				emit = onChange;
+				return { close() {} };
+			},
+		});
+		set.reconcile([monitor]);
+		const tracked = 1000;
+		for (let i = 0; i < tracked; i++) emit(`f${i}.txt`);
+		for (let round = 0; round < 2; round++) for (const name of ["x.txt", "y.txt", "z.txt"]) emit(name);
+		clock.advance(100);
+		const lines = (set.take(monitor.id, 100, clock.now()) ?? "").split("\n");
+		expect(lines.at(-1)).toBe(`… and ${tracked + 3 - MAX_WATCH_PATHS} more`);
+	});
+
 	test("a removed, disabled or retargeted monitor stops its watch on the next tick", async () => {
 		const root = join(allowed, "proj");
 		const monitor = add(root);
@@ -310,6 +333,19 @@ describe("watcher runtime", () => {
 		clock.advance(100);
 		expect((await scheduler.tick()).claimed).toBe(1);
 		expect(store.monitors.listEvents({ monitorId: monitor.id })).toHaveLength(1);
+	});
+
+	test("watch errors land in the monitor's check error columns; three in a row alert once; a started watch clears them", async () => {
+		const root = join(allowed, "proj");
+		const monitor = add(root, { debounceMs: 100 });
+		const row = () => store.monitors.getMonitor(monitor.id);
+		watchFails = new Error("EMFILE: too many open files");
+		for (let i = 0; i < 4; i++) await scheduler.tick();
+		expect([row()?.checkErrorStreak, row()?.lastCheckError]).toEqual([4, "EMFILE: too many open files"]);
+		expect(store.listDeliveries({ originKey: `monitor/${monitor.id}` })).toHaveLength(1);
+		watchFails = undefined;
+		await scheduler.tick();
+		expect([row()?.checkErrorStreak, row()?.lastCheckError]).toEqual([0, null]);
 	});
 
 	test("a deleted root is noticed on the next tick (fs.watch gives no error) and watched again once recreated", async () => {
@@ -358,6 +394,7 @@ describe("watcher runtime", () => {
 			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
 			scriptsRoot: join(dir, "scripts"),
 			workspaceDir: dir,
+			homeDir: dir,
 			watcherRoots: [],
 			watch: starter,
 		});

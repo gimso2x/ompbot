@@ -227,6 +227,47 @@ describe("runOffsite", () => {
 		expect(left).toContain("ompbot-20261003-043000.db");
 	});
 
+	test("retention counts days: every file of the uploaded day, the latest of each other day, nothing past keep days", async () => {
+		seedLocal();
+		mkdirSync(remote, { recursive: true });
+		const stamps = [
+			"20261030-010000",
+			"20261030-020000",
+			"20261029-010000",
+			"20261029-230000",
+			"20261028-120000",
+			"20261027-120000",
+		];
+		for (const stamp of stamps) {
+			writeFileSync(join(remote, `ompbot-${stamp}.db`), stamp);
+			writeFileSync(join(remote, `ompbot-bundle-${stamp}.tar.gz`), stamp);
+		}
+		writeFileSync(join(remote, "ompbot-pre-upgrade-20261001.db"), "manual");
+		const fake = fakeRemote();
+		const result = await runOffsite({
+			homeDir: home,
+			target: { ssh: "box", remoteDir: remote, keep: 3 },
+			run: fake.run,
+			env: {},
+		});
+		// keep=3 days: the uploaded day (all of it) + 10-29 (its latest) + 10-28; 10-27 is past the window.
+		expect(result.removed).toEqual([
+			"ompbot-20261029-010000.db",
+			"ompbot-20261027-120000.db",
+			"ompbot-bundle-20261029-010000.tar.gz",
+			"ompbot-bundle-20261027-120000.tar.gz",
+		]);
+		const survivors = ["20261028-120000", "20261029-230000", "20261030-010000", "20261030-020000", "20261030-043000"];
+		const left = readdirSync(remote).sort();
+		expect(left.filter((name) => /^ompbot-\d{8}-\d{6}\.db$/.test(name))).toEqual(
+			survivors.map((s) => `ompbot-${s}.db`),
+		);
+		expect(left.filter((name) => name.startsWith("ompbot-bundle-"))).toEqual(
+			survivors.map((s) => `ompbot-bundle-${s}.tar.gz`),
+		);
+		expect(left).toContain("ompbot-pre-upgrade-20261001.db");
+	});
+
 	test("no local snapshot is an error, and a hostile ssh/remoteDir never reaches a process", async () => {
 		const fake = fakeRemote();
 		const none = await runOffsite({

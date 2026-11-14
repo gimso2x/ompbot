@@ -11,12 +11,10 @@ import {
 	type DiscordMessageEvent,
 	type DiscordTransport,
 	type DownloadAttachmentArgs,
-	type EditInteractionResponseArgs,
 	type EditMessageArgs,
 	type ListMessagesArgs,
 	type MessageTarget,
 	type ReactionArgs,
-	type RegisterCommandsArgs,
 	type RespondInteractionArgs,
 	type StartThreadArgs,
 	type UploadFileArgs,
@@ -78,7 +76,6 @@ export class DiscordSocketTransport implements DiscordTransport {
 			onReconnect: (reason) => lifecycle({ type: "reconnecting", detail: reason }),
 		});
 		const ids = await this.#gateway.start();
-		this.#rest.setApplicationId(ids.applicationId);
 		const displayName = this.#options.displayName;
 		if (displayName !== undefined) {
 			try {
@@ -149,18 +146,6 @@ export class DiscordSocketTransport implements DiscordTransport {
 
 	respondInteraction(args: RespondInteractionArgs): Promise<void> {
 		return this.#rest.respondInteraction(args);
-	}
-
-	editInteractionResponse(args: EditInteractionResponseArgs): Promise<void> {
-		return this.#rest.editInteractionResponse(args);
-	}
-
-	deleteInteractionResponse(args: { token: string }): Promise<void> {
-		return this.#rest.deleteInteractionResponse(args);
-	}
-
-	registerCommands(args: RegisterCommandsArgs): Promise<void> {
-		return this.#rest.registerCommands(args);
 	}
 
 	triggerTyping(channelId: string): Promise<void> {

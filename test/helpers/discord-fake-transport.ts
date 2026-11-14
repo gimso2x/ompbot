@@ -7,15 +7,12 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
-	type DiscordReactionEvent,
 	type DiscordTransport,
 	type DownloadAttachmentArgs,
-	type EditInteractionResponseArgs,
 	type EditMessageArgs,
 	type ListMessagesArgs,
 	type MessageTarget,
 	type ReactionArgs,
-	type RegisterCommandsArgs,
 	type RespondInteractionArgs,
 	type StartThreadArgs,
 	type UploadFileArgs,
@@ -33,8 +30,6 @@ export type FakeDiscordCall =
 	| ({ method: "uploadFile"; id: string } & UploadFileArgs)
 	| ({ method: "downloadAttachment" } & DownloadAttachmentArgs)
 	| ({ method: "respondInteraction" } & RespondInteractionArgs)
-	| ({ method: "editInteractionResponse" } & EditInteractionResponseArgs)
-	| { method: "deleteInteractionResponse"; token: string }
 	| { method: "getChannel"; channelId: string }
 	| ({ method: "listMessages" } & ListMessagesArgs);
 
@@ -44,11 +39,9 @@ export type FakeDiscordCall =
  */
 export class FakeDiscordTransport implements DiscordTransport {
 	readonly calls: FakeDiscordCall[] = [];
-	readonly failNext: Partial<Record<FakeDiscordCall["method"] | "registerCommands" | "triggerTyping", Error[]>> = {};
+	readonly failNext: Partial<Record<FakeDiscordCall["method"] | "triggerTyping", Error[]>> = {};
 	/** Channels `triggerTyping` was called for, in order; kept apart from `calls`, which log the message path. */
 	readonly typing: string[] = [];
-	/** Slash command sets registered at start; kept apart from `calls`, which log the message path. */
-	readonly commandSets: RegisterCommandsArgs[] = [];
 	/** Canned channel history for `listMessages`: `history[<channel>]`, any order (served oldest-first). */
 	readonly history: Map<string, DiscordMessageEvent[]> = new Map();
 	/** CDN files `downloadAttachment` serves, by URL (anything else is a 404). */
@@ -89,7 +82,7 @@ export class FakeDiscordTransport implements DiscordTransport {
 		return String(FAKE_ID_BASE + this.#seq);
 	}
 
-	#maybeFail(method: FakeDiscordCall["method"] | "registerCommands" | "triggerTyping"): void {
+	#maybeFail(method: FakeDiscordCall["method"] | "triggerTyping"): void {
 		const err = this.failNext[method]?.shift();
 		if (err) throw err;
 	}
@@ -180,21 +173,6 @@ export class FakeDiscordTransport implements DiscordTransport {
 		this.#maybeFail("respondInteraction");
 	}
 
-	async editInteractionResponse(args: EditInteractionResponseArgs): Promise<void> {
-		this.calls.push({ method: "editInteractionResponse", ...args });
-		this.#maybeFail("editInteractionResponse");
-	}
-
-	async deleteInteractionResponse(args: { token: string }): Promise<void> {
-		this.calls.push({ method: "deleteInteractionResponse", ...args });
-		this.#maybeFail("deleteInteractionResponse");
-	}
-
-	async registerCommands(args: RegisterCommandsArgs): Promise<void> {
-		this.commandSets.push(args);
-		this.#maybeFail("registerCommands");
-	}
-
 	async triggerTyping(channelId: string): Promise<void> {
 		this.typing.push(channelId);
 		this.#maybeFail("triggerTyping");
@@ -207,10 +185,6 @@ export class FakeDiscordTransport implements DiscordTransport {
 
 	async emitMessage(event: DiscordMessageEvent): Promise<void> {
 		await this.handlers?.message(event);
-	}
-
-	async emitReaction(event: DiscordReactionEvent): Promise<void> {
-		await this.handlers?.reaction(event);
 	}
 
 	async emitInteraction(interaction: DiscordInteraction): Promise<void> {

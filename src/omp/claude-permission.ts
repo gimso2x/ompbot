@@ -1,6 +1,7 @@
-import { type BigIntStats, readdirSync, realpathSync, statSync } from "node:fs";
+import { type BigIntStats, lstatSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { blankGitGlobalOptions } from "../safety/handoff-risk";
 import { isInside } from "../safety/inside";
 
 /**
@@ -11,7 +12,7 @@ import { isInside } from "../safety/inside";
  */
 
 /** Tools that edit files; allowed only when every target path stays inside the workspace. */
-export const EDIT_TOOLS: Record<string, true> = {
+const EDIT_TOOLS: Record<string, true> = {
 	Edit: true,
 	Write: true,
 	MultiEdit: true,
@@ -34,18 +35,24 @@ const DANGEROUS_BASH: RegExp[] = [
 	/\bdd\b[^;\n|]*\bof=\/dev\//,
 	/:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
 	/\b(shutdown|reboot|halt|poweroff)\b/,
-	/\bgit\s+push\b[^;\n|]*(--force|-f)\b/,
-	/\bgit\s+reset\s+--hard\b/,
-	/\bgit\s+clean\s+-[a-zA-Z]*f[a-zA-Z]*\b/,
-	/\bgit\s+branch\s+-D\b/,
-	/\b(sudo|systemctl|service|docker|podman|pm2)\b/,
+	// git rules are also tried with the global options blanked (`blankGitGlobalOptions`, see `isDangerousBash`).
+	/\bgit\s+push\b[^;\n|]*\s(?:--force(?:-with-lease)?|-[a-zA-Z]*f[a-zA-Z]*|\+\S+)/,
+	/\bgit\s+push\b[^;\n|]*\s(?:--delete|-d)(?![\w-])/,
+	/\bgit\s+reset\b[^;\n|]*\s--hard\b/,
+	/\bgit\s+clean\b[^;\n|]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)\b/,
+	/\bgit\s+branch\b[^;\n|]*\s-[a-zA-Z]*D/,
+	/\bgit\s+stash\s+(?:drop|clear)\b/,
+	/\bgit\s+(?:checkout(?:\s+--)?|restore(?![^;\n|]*--staged)[^;\n|]*)\s+\.(?=\s|$|[;&|])/,
+	/\bgh\s+(?:pr\s+(?:merge|close)|repo\s+delete)\b/,
 	/\b(curl|wget)\b[^;\n|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b/,
-	/\bkillall\b|\bkill\s+-9\b/,
+	/\bkillall\b/,
+	// SIGKILL however it is spelled: `-9`, `-KILL`, `-SIGKILL`, `-s KILL`, `-n 9`, `--signal KILL`.
+	/\bkill\s+(?:-[sn]\s*|--signal[\s=]+|-)(?:9|(?:SIG)?KILL)\b/i,
 	/\bchmod\s+(-R\s+)?777\b/,
 ];
 
 /** Where relative arguments resolve and what `~` / `$HOME` / `${HOME}` expand to. */
-export interface BashPathContext {
+interface BashPathContext {
 	cwd: string;
 	userHome: string;
 }
@@ -130,29 +137,62 @@ function withoutProcRoot(path: string): string {
 	return path.replace(PROC_ROOT, "") || "/";
 }
 
+/** `/proc/self/cwd` and `/proc/thread-self/cwd`: the working directory of the process opening the path. */
+const PROC_SELF_CWD = /^\/proc\/(?:self|thread-self)\/cwd(?=\/|$)/;
+/** Another process's working directory: where it leads cannot be judged. */
+const PROC_PID_CWD = /^\/proc\/\d+\/cwd(?=\/|$)/;
+
+/** Symlinks followed while resolving one path before giving up, the kernel's ELOOP limit. */
+const MAX_LINKS = 40;
+
 /**
- * Where an absolute `path` (`..` not yet folded) really leads: its longest existing prefix goes through realpath — so
- * symlinks, and a `..` after one, resolve the way the kernel follows them — and the missing rest is appended.
+ * Where an absolute `path` (`..` not yet folded) really leads, resolved component by component from the root the way
+ * the kernel walks it: a symlink — dangling ones included — is replaced by its target (a relative target read from the
+ * link's directory) and a `..` after one climbs from where the link led. The first missing component and everything
+ * after it is a name still to be created and is appended as spelled. `undefined` when it cannot be judged: more than
+ * `MAX_LINKS` links (a cycle) or an lstat/readlink error other than a missing name. Each caller reads that as the
+ * blocking answer.
  */
-function physicalPath(path: string): string {
-	const rest: string[] = [];
-	let head = path;
-	for (;;) {
+function physicalPath(path: string): string | undefined {
+	const pending = path.split("/").filter((part) => part !== "");
+	let current = "/";
+	let links = 0;
+	for (let part = pending.shift(); part !== undefined; part = pending.shift()) {
+		if (part === ".") continue;
+		if (part === "..") {
+			current = dirname(current);
+			continue;
+		}
+		const next = join(current, part);
 		try {
-			return resolve(realpathSync(head), ...rest);
-		} catch {
-			const parent = dirname(head);
-			if (parent === head) return resolve(path);
-			rest.unshift(basename(head));
-			head = parent;
+			if (!lstatSync(next).isSymbolicLink()) {
+				current = next;
+				continue;
+			}
+			if (++links > MAX_LINKS) return undefined;
+			const target = readlinkSync(next);
+			if (isAbsolute(target)) current = "/";
+			pending.unshift(...target.split("/").filter((piece) => piece !== ""));
+		} catch (error) {
+			// A missing name (or a file used as a directory, which the kernel refuses too) starts the part to be created.
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ENOTDIR") return resolve(next, ...pending);
+			return undefined;
 		}
 	}
+	return current;
 }
 
-/** A path argument with `~` / `$HOME` / `${HOME}` expanded, as spelled (folded against `cwd`) and as physically reached. */
-function locate(arg: string, cwd: string, userHome: string): { lexical: string; physical: string } {
+/**
+ * A path argument with `~` / `$HOME` / `${HOME}` expanded, as spelled (folded against `cwd`) and as physically reached
+ * (`undefined` when that cannot be judged). `/proc/self/cwd` stands for `cwd` — the process opening the path runs
+ * there — and another process's `/proc/<pid>/cwd` cannot be judged.
+ */
+function locate(arg: string, cwd: string, userHome: string): { lexical: string; physical: string | undefined } {
 	const expanded = expandHome(arg, userHome);
-	const joined = withoutProcRoot(isAbsolute(expanded) ? expanded : `${cwd}/${expanded}`);
+	const rooted = withoutProcRoot(isAbsolute(expanded) ? expanded : `${cwd}/${expanded}`);
+	if (PROC_PID_CWD.test(rooted)) return { lexical: rooted, physical: undefined };
+	const joined = withoutProcRoot(rooted.replace(PROC_SELF_CWD, () => cwd));
 	return { lexical: withoutProcRoot(resolve(joined)), physical: physicalPath(joined) };
 }
 
@@ -181,9 +221,18 @@ function inodesUnder(dir: string): Set<string> {
  * an existing file with more than one link also compares its `dev:ino` with the directory's files — read at most once
  * per judgment and never kept across judgments, since a rotated token gets a new inode.
  */
-function secretsJudge(secretsDir: string, userHome: string) {
+interface SecretsJudge {
+	home: string;
+	locate(arg: string, cwd: string, argHome?: string): { lexical: string; physical: string | undefined };
+	isSecretsDir(dir: string): boolean;
+	reaches(arg: string, cwd: string, argHome?: string): boolean;
+	covers(arg: string, cwd: string, argHome?: string): boolean;
+}
+
+function secretsJudge(secretsDir: string, userHome: string): SecretsJudge {
 	const lexicalSecrets = resolve(secretsDir);
-	const physicalSecrets = physicalPath(lexicalSecrets);
+	// The configured directory itself unresolvable (a link cycle on its way): compare as spelled only.
+	const physicalSecrets = physicalPath(lexicalSecrets) ?? lexicalSecrets;
 	const home = resolve(userHome);
 	let inodes: Set<string> | undefined;
 	const hardLinked = (path: string): boolean => {
@@ -203,12 +252,15 @@ function secretsJudge(secretsDir: string, userHome: string) {
 		isSecretsDir: (dir: string): boolean => insideOrSelf(dir, lexicalSecrets) || insideOrSelf(dir, physicalSecrets),
 		reaches(arg: string, cwd: string, argHome = home): boolean {
 			const { lexical, physical } = locate(arg, cwd, argHome);
+			// Where it leads cannot be judged: it may lead in.
+			if (physical === undefined) return true;
 			if (pathReachesSecrets(lexical, lexicalSecrets) || pathReachesSecrets(physical, physicalSecrets)) return true;
 			return !GLOB_CHAR.test(physical) && hardLinked(physical);
 		},
 		/** Whether `arg` names the secrets directory or an ancestor of it: a recursive walk from there reaches it. */
 		covers(arg: string, cwd: string, argHome = home): boolean {
 			const { lexical, physical } = locate(arg, cwd, argHome);
+			if (physical === undefined) return true;
 			return pathCoversSecrets(lexical, lexicalSecrets) || pathCoversSecrets(physical, physicalSecrets);
 		},
 	};
@@ -351,6 +403,10 @@ function shellSegments(command: string): string[][] {
 			const { text, end } = ansiC(command, i + 2);
 			word += text;
 			i = end;
+		} else if (quote === "" && ch === "$" && command.charAt(i + 1) === '"') {
+			// `$"…"` is a double-quoted string translated by the locale: the same text in the C locale.
+			quote = '"';
+			i++;
 		} else if (quote === "" ? ch === '"' || ch === "'" : ch === quote) quote = quote === "" ? ch : "";
 		else if (quote === "" && /[;|&()\n]/.test(ch)) {
 			endWord();
@@ -382,20 +438,33 @@ function gluedPath(value: string): string | undefined {
  * glued to a short option or an `@` when it looks like a path: `-o/x`, `-d@~/x`, `@a/b`, never the `a` of `ls -la`) is expanded
  * (`~`, `$HOME` / `${HOME}` anywhere in it, ANSI-C `$'…'`, braces `{a,b}` / `{a..z}`), resolved against that cwd and compared component by component — glob components
  * (`secre*`, `*`) match the secrets directory's own names — then again after symlinks resolve, and an existing hard
- * link by inode. A directory change it cannot resolve (`cd "$D"`, `cd $(…)`, `pushd +1`) makes the cwd unknown, and
- * any relative argument after it is refused (fail closed). A recursive search (`grep -r`, `rg`) rooted at the
- * secrets directory or one of its ancestors is refused too, and so is a copy or archive (`cp -a`, `tar`, `rsync`,
- * `zip -r`) of one.
- * A mistake guard, not a sandbox: variables assembled at run time, script files and `eval` are not seen.
+ * link by inode. A directory change it cannot resolve (`cd "$D"`, `cd $(…)`, `pushd +1`, a relative `cd` with
+ * `CDPATH` set) makes the cwd unknown, and any relative argument after it is refused (fail closed); a `cd` to a
+ * directory it cannot see may fail at run time, so the directory before it stays a candidate. A recursive search
+ * (`grep -r`, `rg`) rooted at the secrets directory or one of its ancestors is refused too, and so is a copy or
+ * archive (`cp -a`, `tar`, `rsync`, `zip -r`) of one and a `find` that runs, deletes or writes from one — named by
+ * path (`/bin/grep`) or behind a wrapper (`env`, `nice`, `xargs`…). A command line given to `bash -c`, `eval` or
+ * `env -S` is judged as one, from the same cwd.
+ * A mistake guard, not a sandbox: variables assembled at run time and script files are not seen.
  */
 export function bashTouchesSecrets(command: string, secretsDir: string, context: BashPathContext): boolean {
 	if (secretsDir === "") return false;
+	const start = physicalPath(resolve(context.cwd));
 	const judge = secretsJudge(secretsDir, context.userHome);
-	/** `undefined`: a directory change the guard could not resolve. */
-	let cwd: string | undefined = physicalPath(resolve(context.cwd));
+	return commandTouchesSecrets(command, judge, start === undefined ? undefined : [start]);
+}
+
+/**
+ * {@link bashTouchesSecrets} for one command line run from `startCwds`: every directory the shell may stand in
+ * (`undefined`: a directory change the guard could not resolve).
+ */
+function commandTouchesSecrets(command: string, judge: SecretsJudge, startCwds: string[] | undefined): boolean {
+	let cwds = startCwds;
 	// OLDPWD and the directory stack may come from earlier calls of the same shell: unknown until set here.
-	let oldCwd: string | undefined;
-	const stack: Array<string | undefined> = [];
+	let oldCwds: string[] | undefined;
+	const stack: Array<string[] | undefined> = [];
+	/** `CDPATH` set by an earlier segment (`CDPATH=…;`, `export CDPATH=…`). */
+	let cdpath = false;
 	for (const words of shellSegments(command)) {
 		const { assigns, name, args } = simpleCommand(words);
 		const spelled = [...assigns, ...args].flatMap((word) => {
@@ -413,48 +482,155 @@ export function bashTouchesSecrets(command: string, secretsDir: string, context:
 		if (name?.includes("/")) spelled.push(name);
 		const operands = spelled.flatMap(expandBraces);
 		const dirChange = name === "cd" || name === "pushd" || name === "popd";
-		if (cwd === undefined) {
-			if (!dirChange && operands.some((arg) => !isAbsolute(arg) && !HOME_PREFIX.test(arg))) return true;
-			if (operands.some((arg) => (isAbsolute(arg) || HOME_PREFIX.test(arg)) && judge.reaches(arg, "/"))) return true;
+		const setsCdpath = (word: string) => word.startsWith("CDPATH=");
+		if (name === undefined ? assigns.some(setsCdpath) : DECLARES[name] === true && args.some(setsCdpath)) cdpath = true;
+		/** Resolved against the cwd: `/proc/self/cwd` is the cwd too. */
+		const relative = (arg: string) => (!isAbsolute(arg) && !HOME_PREFIX.test(arg)) || PROC_SELF_CWD.test(arg);
+		const commands = name === undefined ? [] : commandsIn(name, args);
+		if (cwds === undefined) {
+			if (!dirChange && operands.some(relative)) return true;
+			if (operands.some((arg) => !relative(arg) && judge.reaches(arg, "/"))) return true;
 		} else {
-			const at = cwd;
-			if (operands.some((arg) => judge.reaches(arg, at))) return true;
-			if (name !== undefined) {
-				const paths = args.filter((arg) => !arg.startsWith("-"));
-				// With one operand (the pattern) a search walks the cwd; a copy or archive walks only what it names.
-				const roots = recursiveSearch(name, args)
-					? paths.length <= 1
-						? [...paths, "."]
-						: paths
-					: recursiveCopy(name, args)
-						? paths
-						: [];
-				if (roots.some((arg) => judge.covers(arg, at))) return true;
+			const known = cwds;
+			if (operands.some((arg) => known.some((at) => judge.reaches(arg, at)))) return true;
+			for (const walk of commands.map(walkOf)) {
+				for (const at of known) {
+					// A tar member is read from under its `-C` / `--directory` too.
+					const bases = [at];
+					for (const dir of walk.dirs) {
+						const base = judge.locate(dir, at).physical;
+						if (base === undefined) return true;
+						bases.push(base);
+					}
+					if (walk.dirs.length > 0 && operands.some((arg) => bases.some((base) => judge.reaches(arg, base))))
+						return true;
+					if (walk.roots.some((arg) => bases.some((base) => judge.covers(arg, base)))) return true;
+				}
 			}
+		}
+		for (const inner of commands.flatMap((command) => innerCommandLine(command.name, command.args) ?? [])) {
+			if (commandTouchesSecrets(inner, judge, cwds)) return true;
 		}
 		if (!dirChange) continue;
 		const home = assigns.flatMap((word) => (word.startsWith("HOME=") ? [word.slice(5)] : [])).at(-1) ?? "~";
-		const resolveDir = (target: string): string | undefined => {
+		const viaCdpath = cdpath || assigns.some(setsCdpath);
+		const resolveDir = (target: string): string[] | undefined => {
 			const expanded = expandHome(target, judge.home);
 			if (/[$`]/.test(expanded) || expanded.startsWith("~")) return undefined;
-			if (cwd === undefined && !isAbsolute(expanded)) return undefined;
-			return judge.locate(expanded, cwd ?? "/").physical;
+			// `CDPATH` is searched for a relative target not starting with `.` or `..`.
+			if (viaCdpath && !isAbsolute(expanded) && !/^\.\.?(?:\/|$)/.test(expanded)) return undefined;
+			const bases = isAbsolute(expanded) ? ["/"] : cwds;
+			if (bases === undefined) return undefined;
+			const found = new Set<string>();
+			for (const base of bases) {
+				const physical = judge.locate(expanded, base).physical;
+				if (physical === undefined) return undefined;
+				found.add(physical);
+				// A target not seen as a directory may fail to change into, leaving the shell where it was.
+				if (!isDirectory(physical)) {
+					if (cwds === undefined) return undefined;
+					for (const at of cwds) found.add(at);
+				}
+			}
+			return [...found];
 		};
 		const dirArgs = dirOperands(args);
 		const target = dirArgs[0];
-		const before = cwd;
-		if (name === "popd") cwd = dirArgs.length === 0 ? stack.pop() : undefined;
+		const before = cwds;
+		if (name === "popd") cwds = dirArgs.length === 0 ? stack.pop() : undefined;
 		else if (name === "pushd" && args.includes("-n")) {
 			stack.push(target === undefined ? undefined : resolveDir(target));
 			continue;
-		} else if (name === "pushd" && (target === undefined || /^[+-]\d+$/.test(target))) cwd = undefined;
-		else if (target === "-") cwd = oldCwd;
-		else cwd = resolveDir(target ?? home);
+		} else if (name === "pushd" && (target === undefined || /^[+-]\d+$/.test(target))) cwds = undefined;
+		else if (target === "-") cwds = oldCwds;
+		else cwds = resolveDir(target ?? home);
 		if (name === "pushd") stack.push(before);
-		oldCwd = before;
-		if (cwd !== undefined && judge.isSecretsDir(cwd)) return true;
+		oldCwds = before;
+		if (cwds?.some((at) => judge.isSecretsDir(at)) === true) return true;
 	}
 	return false;
+}
+
+/** Builtins that set a shell variable named in their arguments (`export CDPATH=…`). */
+const DECLARES: Record<string, true> = { export: true, declare: true, typeset: true, readonly: true, local: true };
+
+function isDirectory(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The command a segment runs, by its name without a directory (`/bin/grep` → `grep`), and — behind a wrapper that
+ * runs the rest of its arguments here (`env`, `nice`, `timeout`, `xargs`, a shell…; not `ssh`) — every later word as
+ * a command of its own with the words after it.
+ */
+function commandsIn(name: string, args: string[]): Array<{ name: string; args: string[] }> {
+	const command = basename(name);
+	const commands = [{ name: command, args }];
+	if (COMMAND_WRAPPERS[command] !== true || command === "ssh") return commands;
+	args.forEach((word, index) => {
+		commands.push({ name: basename(word), args: args.slice(index + 1) });
+	});
+	return commands;
+}
+
+/**
+ * What a command walks: the roots of a recursive search (the cwd when only the pattern is given), copy or archive,
+ * or of a `find` that runs, deletes or writes (`-exec`, `-delete`, `-fprint`…), and a tar's `-C` / `--directory`
+ * directories.
+ */
+function walkOf({ name, args }: { name: string; args: string[] }): { roots: string[]; dirs: string[] } {
+	const paths = args.filter((arg) => !arg.startsWith("-"));
+	if (recursiveSearch(name, args)) return { roots: paths.length <= 1 ? [...paths, "."] : paths, dirs: [] };
+	if (name === "find") return { roots: findActs(args) ? findRoots(args) : [], dirs: [] };
+	if (!recursiveCopy(name, args)) return { roots: [], dirs: [] };
+	if (name !== "tar") return { roots: paths, dirs: [] };
+	const dirs = args.flatMap((arg) => {
+		const glued = /^(?:-C|--directory=)(.+)$/.exec(arg);
+		return glued?.[1] === undefined ? [] : [glued[1]];
+	});
+	args.forEach((arg, index) => {
+		const next = args[index + 1];
+		if ((arg === "-C" || arg === "--directory") && next !== undefined) dirs.push(next);
+	});
+	return { roots: [...paths, ...dirs], dirs };
+}
+
+/** A `find` expression with an action that reads, runs, deletes or writes, not only lists. */
+function findActs(args: string[]): boolean {
+	return args.some((arg) => /^-(?:exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/.test(arg));
+}
+
+/** `find`'s starting points: the words before its expression, past `-H` / `-L` / `-P`, `-D <list>`, `-O<n>`; `.` when none. */
+function findRoots(args: string[]): string[] {
+	let i = 0;
+	while (i < args.length && /^-(?:[HLP]|D|O\d*)$/.test(args[i] as string)) i += args[i] === "-D" ? 2 : 1;
+	const roots: string[] = [];
+	for (; i < args.length && !/^[-(!),]/.test(args[i] as string); i++) roots.push(args[i] as string);
+	return roots.length === 0 ? ["."] : roots;
+}
+
+/** Shells whose `-c` argument is a command line. */
+const SHELLS: Record<string, true> = { bash: true, sh: true, zsh: true, dash: true, ksh: true };
+
+/**
+ * The command line a command runs as its own (`bash -c '…'`, `eval …`, `env -S '…'`), rebuilt from the words the
+ * segment split it into; `undefined` for any other command.
+ */
+function innerCommandLine(name: string, args: string[]): string | undefined {
+	if (name === "eval") return args.join(" ");
+	if (SHELLS[name] === true) {
+		const option = args.findIndex((arg) => /^-[A-Za-z]*c[A-Za-z]*$/.test(arg));
+		return option < 0 ? undefined : args.slice(option + 1).join(" ");
+	}
+	if (name !== "env") return undefined;
+	const option = args.findIndex((arg) => /^(?:-S|--split-string(?:=|$))/.test(arg));
+	if (option < 0) return undefined;
+	const glued = (args[option] as string).replace(/^(?:-S|--split-string=?)/, "");
+	return [glued, ...args.slice(option + 1)].join(" ");
 }
 
 /** Shell words that may stand before a command name without being it; `time`/`command`/`builtin` take options. */
@@ -535,7 +711,7 @@ const RECURSIVE_TOOLS: Record<string, true> = { Grep: true, Glob: true, LS: true
  * Grep `glob` / `include` (under its `path`, else the cwd) and a `file://` URL (WebFetch). A `path` input — for
  * Grep, Glob and LS also the cwd they default to — naming the secrets directory or an ancestor of it is a walk into it.
  */
-export function toolTouchesSecrets(
+function toolTouchesSecrets(
 	toolName: string,
 	input: Record<string, unknown>,
 	secretsDir: string,
@@ -544,6 +720,8 @@ export function toolTouchesSecrets(
 	if (secretsDir === "") return false;
 	const judge = secretsJudge(secretsDir, context.userHome);
 	const cwd = physicalPath(resolve(context.cwd));
+	// An unresolvable cwd: relative paths and default walks could start anywhere.
+	if (cwd === undefined) return true;
 	const args = TOOL_PATH_KEYS.map((key) => input[key]).filter(
 		(value): value is string => typeof value === "string" && value !== "",
 	);
@@ -579,12 +757,14 @@ export function editsInside(
 	const keys = EDIT_PATH_KEYS[toolName];
 	if (keys === undefined) return false;
 	const realCwd = physicalPath(resolve(cwd));
+	if (realCwd === undefined) return false;
 	const home = resolve(userHome);
 	for (const key of keys) {
 		const value = input[key];
 		if (typeof value !== "string" || value === "") return false;
 		const { physical } = locate(value, realCwd, home);
-		if (!isInside(physical, realCwd) || hasOtherLinks(physical)) return false;
+		// Unjudgeable (a link cycle): not shown to stay inside.
+		if (physical === undefined || !isInside(physical, realCwd) || hasOtherLinks(physical)) return false;
 	}
 	return true;
 }
@@ -659,8 +839,52 @@ export async function classifyPermission(classify: ClassifyInput): Promise<Permi
 	return allow(input);
 }
 
+/** Commands that always need a card when they run, judged by command name so `rg service`, `cat docker-compose.yml` pass. */
+const DANGEROUS_COMMANDS: Record<string, true> = {
+	sudo: true,
+	doas: true,
+	su: true,
+	pkill: true,
+	systemctl: true,
+	service: true,
+	docker: true,
+	podman: true,
+	pm2: true,
+};
+/** Commands that run their arguments as a command line: a dangerous name anywhere after them counts. */
+const COMMAND_WRAPPERS: Record<string, true> = {
+	bash: true,
+	sh: true,
+	zsh: true,
+	dash: true,
+	env: true,
+	xargs: true,
+	nohup: true,
+	timeout: true,
+	nice: true,
+	exec: true,
+	eval: true,
+	ssh: true,
+	watch: true,
+	setsid: true,
+	stdbuf: true,
+	ionice: true,
+	script: true,
+	busybox: true,
+};
+
 export function isDangerousBash(command: string): boolean {
-	return DANGEROUS_BASH.some((pattern) => pattern.test(command));
+	const blanked = blankGitGlobalOptions(command);
+	if (DANGEROUS_BASH.some((pattern) => pattern.test(command) || pattern.test(blanked))) return true;
+	const dangerous = (word: string): boolean => DANGEROUS_COMMANDS[basename(word)] === true;
+	// A backtick substitution runs a command of its own, like `$( )`, even inside double quotes: every piece between
+	// backticks is judged as a command line too (a piece inside single quotes only adds segments to judge).
+	const pieces = command.includes("`") ? [command, ...command.split("`")] : [command];
+	return pieces.flatMap(shellSegments).some((words) => {
+		const { name, args } = simpleCommand(words);
+		if (name === undefined) return false;
+		return dangerous(name) || (COMMAND_WRAPPERS[basename(name)] === true && args.some(dangerous));
+	});
 }
 
 function allow(input: Record<string, unknown>): PermissionDecision {

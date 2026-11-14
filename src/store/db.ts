@@ -1,13 +1,15 @@
 import { Database } from "bun:sqlite";
+import { mentionToken } from "../channel/port";
+import { cutCodePointSafe } from "../channel/text";
 import { parseThreadRef, platformOfThreadRef, THREAD_LINK_PREFIX, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import {
 	type ChatPlatform,
+	chatOriginKey,
 	chatPlatformOf,
-	type IdPlatform,
 	parseChatOrigin,
 	platformOfConversationId,
 } from "../core/origin-key";
-import { COMMAND_OP_REF, parseCommand } from "../core/types";
+import { COMMAND_OP_REF, PEER_FAILURE_MARK, parseCommand } from "../core/types";
 import { previewLine } from "../dashboard/snapshot";
 import {
 	assertLaneTransition,
@@ -19,6 +21,7 @@ import {
 } from "../lanes/status";
 import { countIncident, resolveIncidents } from "../monitors/incidents";
 import {
+	type CheckErrorAlert,
 	MONITOR_ORIGIN_PREFIX,
 	MonitorLedger,
 	type MonitorRow,
@@ -27,7 +30,6 @@ import {
 } from "../monitors/ledger";
 import type { ApprovalDetail } from "../safety/approval";
 import { TaskLedger } from "../tasks/ledger";
-import { FEEDBACK_DDL, FeedbackLedger } from "./feedback";
 import {
 	assertInboundTransition,
 	type DeliveryEvent,
@@ -56,13 +58,14 @@ export const TEAMS_QA_ORIGIN_PREFIX = "teams-qa/";
 const TURN_FAILED_HEAD = "[turn failed]";
 /** How far back recall candidates reach. */
 const RECALL_WINDOW_MS = 90 * 24 * 60 * 60_000;
+/** Expired rows kept for `takeExpired` at most (a platform without an adapter never takes its rows). */
+const EXPIRED_HANDOFF_MAX = 200;
 /** How far back turn-duration samples reach, and at most how many (newest first). */
-const TURN_SAMPLE_WINDOW_MS = 30 * 24 * 60 * 60_000;
-const TURN_SAMPLE_LIMIT = 200;
+export const TURN_SAMPLE_WINDOW_MS = 30 * 24 * 60 * 60_000;
+export const TURN_SAMPLE_LIMIT = 200;
 /** Origin-key prefixes of every chat platform (`chatPlatformOf`): the turns typical durations are read from. */
 const CHAT_ORIGIN_PREFIXES = Object.keys({
 	slack: true,
-	telegram: true,
 	discord: true,
 	teams: true,
 } satisfies Record<ChatPlatform, true>).map((platform) => `${platform}/%`);
@@ -98,6 +101,24 @@ export interface StoreClock {
 export interface LogChannels {
 	slack?: string | undefined;
 	discord?: string | undefined;
+}
+
+/** Op ref prefix of a peer silence alert (`peer-silence:<first call_id>`); it never finishes a thread's status. */
+export const PEER_SILENCE_OP_PREFIX = "peer-silence:";
+
+/**
+ * When a confirmed delivery is a call a peer bot must answer (`peer_calls`) and how its silence is reported
+ * (doc/plans/peer-silence-alert.md). Absent: the alert is off, no call is recorded.
+ */
+export interface PeerCallPolicy {
+	/** Discord peer bots (`channels.discord.peerBots`): a thread post mentioning one is a call to it. */
+	peers: ReadonlyArray<{ userId: string; name: string }>;
+	/** Conversations whose posts are no calls (the Discord #log channel). */
+	skipConversations: readonly string[];
+	/** The Discord owner the alert mentions. */
+	ownerUserId: string;
+	/** Silence after the call before the alert; positive. */
+	silenceMs: number;
 }
 
 export interface StoreOptions {
@@ -211,6 +232,35 @@ type ExpiredApproval = {
 	originThreadRef: string | null;
 	mirrorRef: string | null;
 };
+
+/**
+ * Written by older versions (owner 👍/👎 on answers): nothing reads or writes these tables now. `delivery_posts` rows
+ * still go with their delivery in `gc`; `turn_feedback` is never pruned.
+ */
+const LEGACY_FEEDBACK_DDL = `
+CREATE TABLE IF NOT EXISTS delivery_posts (
+	channel TEXT NOT NULL,
+	ts TEXT NOT NULL,
+	delivery_id INTEGER NOT NULL REFERENCES deliveries(delivery_id),
+	part INTEGER NOT NULL,
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY (channel, ts)
+);
+CREATE TABLE IF NOT EXISTS turn_feedback (
+	channel TEXT NOT NULL,
+	ts TEXT NOT NULL,
+	delivery_id INTEGER NOT NULL,
+	origin_key TEXT NOT NULL,
+	op_ref TEXT NOT NULL,
+	inbound_id INTEGER,
+	verdict TEXT NOT NULL CHECK (verdict IN ('up','down')),
+	last_event_ts TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	removed_at INTEGER,
+	PRIMARY KEY (channel, ts)
+);
+CREATE INDEX IF NOT EXISTS turn_feedback_turn ON turn_feedback(origin_key, op_ref);
+`;
 
 /**
  * Approval card ledger. `origin_key`/`origin_thread_ref` map a card back to the conversation that asked (NULL on rows
@@ -367,6 +417,101 @@ export const HERDR_PROMPT_KEEP_MS = 30 * 24 * 60 * 60_000;
 /** Longest stored preview. */
 export const HERDR_PROMPT_PREVIEW_CHARS = 120;
 
+/** Left from the removed Discord forum board: nothing reads or writes it any more; existing installs keep their rows. */
+const DISCORD_BOARD_DDL = `CREATE TABLE IF NOT EXISTS discord_board_posts (
+	forum_id TEXT NOT NULL,
+	item_key TEXT NOT NULL,
+	thread_id TEXT NOT NULL,
+	message_id TEXT NOT NULL,
+	status TEXT NOT NULL,
+	last_comment_status TEXT,
+	rendered_hash TEXT NOT NULL,
+	status_since INTEGER NOT NULL,
+	archived_at INTEGER,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (forum_id, item_key)
+);`;
+
+/**
+ * One peer bot mentioned by one confirmed delivery (doc/plans/peer-silence-alert.md): `pending` until a post of that
+ * peer in the thread (`answered`), the silence alert (`alerted`) or the alert switched off (`skipped`). UNIQUE keeps
+ * a re-confirmed delivery from adding a second call.
+ */
+const PEER_CALLS_DDL = `CREATE TABLE IF NOT EXISTS peer_calls (
+	call_id INTEGER PRIMARY KEY,
+	thread_ref TEXT NOT NULL,
+	peer_user_id TEXT NOT NULL,
+	delivery_id INTEGER NOT NULL,
+	called_at INTEGER NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','answered','alerted','skipped')),
+	settled_at INTEGER,
+	UNIQUE (delivery_id, peer_user_id)
+);
+CREATE INDEX IF NOT EXISTS peer_calls_state_called ON peer_calls(state, called_at);
+CREATE INDEX IF NOT EXISTS peer_calls_thread_peer ON peer_calls(thread_ref, peer_user_id, state);`;
+/** Settled calls are kept this long (the sweep prunes older ones). */
+const PEER_CALL_KEEP_MS = 30 * 24 * 60 * 60_000;
+
+/**
+ * The lane board (doc/plans/lane-board.md): posts of lanes and owner conversations by channel (`general`,
+ * `repo:<path>`), and per reader and channel the last post read and the last post a turn prompt announced.
+ */
+const LANE_BOARD_DDL = `CREATE TABLE IF NOT EXISTS board_posts (
+	id INTEGER PRIMARY KEY,
+	channel TEXT NOT NULL,
+	author_origin TEXT NOT NULL,
+	author_label TEXT NOT NULL,
+	text TEXT NOT NULL,
+	reply_to INTEGER,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS board_posts_channel_id ON board_posts(channel, id);
+CREATE TABLE IF NOT EXISTS board_reads (
+	origin_key TEXT NOT NULL,
+	channel TEXT NOT NULL,
+	last_read INTEGER NOT NULL DEFAULT 0,
+	last_noticed INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (origin_key, channel)
+);`;
+/** Longest stored board post (UTF-16 units), cut after redaction. */
+export const LANE_BOARD_TEXT_MAX = 2_000;
+
+export interface LaneBoardPost {
+	id: number;
+	channel: string;
+	authorOrigin: string;
+	authorLabel: string;
+	text: string;
+	replyTo: number | null;
+	createdAt: number;
+}
+
+interface LaneBoardPostSql {
+	id: number;
+	channel: string;
+	author_origin: string;
+	author_label: string;
+	text: string;
+	reply_to: number | null;
+	created_at: number;
+}
+
+const toLaneBoardPost = (r: LaneBoardPostSql): LaneBoardPost => ({
+	id: r.id,
+	channel: r.channel,
+	authorOrigin: r.author_origin,
+	authorLabel: r.author_label,
+	text: r.text,
+	replyTo: r.reply_to,
+	createdAt: r.created_at,
+});
+
+/** Where one reader stands in one channel: the last post read and the last one a turn prompt announced (0 = none). */
+export interface LaneBoardCursor {
+	lastRead: number;
+	lastNoticed: number;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS origins (
 	origin_key TEXT PRIMARY KEY,
@@ -393,6 +538,9 @@ CREATE TABLE IF NOT EXISTS inbound (
 CREATE INDEX IF NOT EXISTS inbound_origin_state ON inbound(origin_key, state);
 CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
 CREATE INDEX IF NOT EXISTS inbound_origin_op ON inbound(origin_key, op_ref);
+CREATE INDEX IF NOT EXISTS inbound_origin_created ON inbound(origin_key, created_at);
+CREATE INDEX IF NOT EXISTS inbound_created ON inbound(created_at);
+CREATE INDEX IF NOT EXISTS inbound_state_dispatched ON inbound(state, dispatched_at);
 CREATE TABLE IF NOT EXISTS deliveries (
 	delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
 	origin_key TEXT NOT NULL,
@@ -468,9 +616,12 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 	calls INTEGER NOT NULL,
 	PRIMARY KEY(day, origin_key)
 );
-${FEEDBACK_DDL}
+${LEGACY_FEEDBACK_DDL}
 ${TURN_SNAPSHOTS_DDL}
 ${HERDR_PROMPTS_DDL}
+${DISCORD_BOARD_DDL}
+${PEER_CALLS_DDL}
+${LANE_BOARD_DDL}
 `;
 
 interface LaneSql {
@@ -625,10 +776,24 @@ export class Store {
 	readonly monitors: MonitorLedger;
 	/** [TASK] registry; shares this connection. */
 	readonly tasks: TaskLedger;
-	/** Posted delivery messages and the owner's 👍/👎 on them; shares this connection. */
-	readonly feedback: FeedbackLedger;
 	private readonly slackOwnerUserId: string | undefined;
 	private logChannels: LogChannels = {};
+	/** Rows `sweepExpired` expired that no adapter took yet (`takeExpired`); memory only, like the statuses they end. */
+	private expiredUnfinished: DeliveryRow[] = [];
+	private peerCallPolicy: PeerCallPolicy | undefined;
+
+	/**
+	 * Start and config reload: confirmed deliveries from now on are recorded as peer calls under `policy`. `undefined`
+	 * switches the alert off: nothing is recorded and the calls still pending are `skipped`, so switching it back on
+	 * never reports an old silence.
+	 */
+	setPeerCallPolicy(policy: PeerCallPolicy | undefined): void {
+		this.peerCallPolicy = policy;
+		if (policy !== undefined) return;
+		this.db
+			.query("UPDATE peer_calls SET state = 'skipped', settled_at = ? WHERE state = 'pending'")
+			.run(this.clock.now());
+	}
 
 	/** Config reload: answers recorded from now on copy to the new #log channels (a string: Slack's alone). */
 	setLogChannel(channel: string | LogChannels | undefined): void {
@@ -648,9 +813,12 @@ export class Store {
 		this.db.run("PRAGMA busy_timeout = 5000");
 		this.db.run(SCHEMA);
 		this.migrate();
-		this.monitors = new MonitorLedger(this.db, { clock: options.clock, redact: options.redact });
+		this.monitors = new MonitorLedger(this.db, {
+			clock: options.clock,
+			redact: options.redact,
+			onCheckErrorAlert: (alert) => this.postCheckErrorNotice(alert),
+		});
 		this.tasks = new TaskLedger(this.db, { clock: options.clock, timezone: options.timezone });
-		this.feedback = new FeedbackLedger(this.db, { clock: options.clock });
 		this.recoveredInflight = this.db
 			.query("UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'inflight'")
 			.run(this.clock.now()).changes;
@@ -910,6 +1078,19 @@ export class Store {
 		return this.requireOrigin(originKey);
 	}
 
+	/**
+	 * Pins the session file the origin's next child resumes (`sessionToResume`) without a new epoch: the session dir,
+	 * the pending rows and the epoch stay as they are. A lane handed back from a terminal omp keeps writing the file the
+	 * terminal wrote, whatever else appeared in its session dir.
+	 */
+	pinSessionFile(originKey: string, sessionFile: string): OriginRow {
+		this.requireOrigin(originKey);
+		this.db
+			.query("UPDATE origins SET session_file = ?, updated_at = ? WHERE origin_key = ?")
+			.run(sessionFile, this.clock.now(), originKey);
+		return this.requireOrigin(originKey);
+	}
+
 	/** `null` clears a setting (back to the omp default); `undefined` leaves it unchanged. */
 	setOriginSettings(originKey: string, settings: Partial<OriginSettings>): OriginRow {
 		const origin = this.requireOrigin(originKey);
@@ -995,12 +1176,23 @@ export class Store {
 		return row ? toInbound(row) : undefined;
 	}
 
+	/**
+	 * Inbound rows in arrival order. Each filter combination has its own fixed SQL: an `(? IS NULL OR …)` predicate
+	 * cannot use an index, so the 15-second pending sweep would scan the whole table.
+	 */
 	listInbound(filter: { originKey?: string; state?: InboundState } = {}): InboundRow[] {
-		const rows = this.db
-			.query(
-				"SELECT * FROM inbound WHERE (?1 IS NULL OR origin_key = ?1) AND (?2 IS NULL OR state = ?2) ORDER BY inbound_id",
-			)
-			.all(filter.originKey ?? null, filter.state ?? null) as InboundSql[];
+		const { originKey, state } = filter;
+		const rows = (
+			originKey !== undefined && state !== undefined
+				? this.db
+						.query("SELECT * FROM inbound WHERE origin_key = ? AND state = ? ORDER BY inbound_id")
+						.all(originKey, state)
+				: originKey !== undefined
+					? this.db.query("SELECT * FROM inbound WHERE origin_key = ? ORDER BY inbound_id").all(originKey)
+					: state !== undefined
+						? this.db.query("SELECT * FROM inbound WHERE state = ? ORDER BY inbound_id").all(state)
+						: this.db.query("SELECT * FROM inbound ORDER BY inbound_id").all()
+		) as InboundSql[];
 		return rows.map(toInbound);
 	}
 
@@ -1089,9 +1281,8 @@ export class Store {
 			.query(
 				`SELECT d.created_at - MIN(i.dispatched_at) AS ms
 				 FROM inbound i JOIN deliveries d ON d.origin_key = i.origin_key AND d.op_ref = i.op_ref AND d.part = 0
-				 WHERE i.state = 'answered' AND i.dispatched_at IS NOT NULL AND ${scope}
+				 WHERE i.state = 'answered' AND i.dispatched_at >= $since AND ${scope}
 				 GROUP BY i.origin_key, i.op_ref
-				 HAVING MIN(i.dispatched_at) >= $since
 				 ORDER BY MIN(i.dispatched_at) DESC LIMIT $limit`,
 			)
 			.all({
@@ -1246,9 +1437,12 @@ export class Store {
 	/** Bodies of the op's interim deliveries in the order they were recorded (stored, so redacted). */
 	interimBodies(originKey: string, opRef: string): string[] {
 		const prefix = `${opRef}${INTERIM_INFIX}`;
+		// "Starts with prefix" as a range the (origin_key, op_ref, part) key can seek: the infix ends in ASCII ':', so
+		// bumping that last character gives the first string past every one carrying the prefix.
+		const end = `${prefix.slice(0, -1)}${String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1)}`;
 		const rows = this.db
-			.query("SELECT body FROM deliveries WHERE origin_key = ? AND substr(op_ref, 1, ?) = ? ORDER BY delivery_id")
-			.all(originKey, prefix.length, prefix) as Array<{ body: string }>;
+			.query("SELECT body FROM deliveries WHERE origin_key = ? AND op_ref >= ? AND op_ref < ? ORDER BY delivery_id")
+			.all(originKey, prefix, end) as Array<{ body: string }>;
 		return rows.map((row) => row.body);
 	}
 
@@ -1450,8 +1644,7 @@ export class Store {
 		const spoken = this.db
 			.query(
 				`SELECT origin_key FROM inbound WHERE peer_user_id IS NULL
-				 AND (origin_key LIKE 'slack/%' OR origin_key LIKE 'discord/%' OR origin_key LIKE 'telegram/%'
-				      OR origin_key LIKE 'teams/dm/%')
+				 AND (origin_key LIKE 'slack/%' OR origin_key LIKE 'discord/%' OR origin_key LIKE 'teams/dm/%')
 				 ORDER BY inbound_id DESC LIMIT 50`,
 			)
 			.all() as Array<{ origin_key: string }>;
@@ -1530,13 +1723,15 @@ export class Store {
 	}): number {
 		const row = this.db
 			.query("INSERT INTO teams_qa (alias, asker_aad, asker_name, question, at) VALUES (?, ?, ?, ?, ?) RETURNING id")
-			.get(input.alias, input.askerAad, input.askerName ?? null, input.question, this.clock.now()) as { id: number };
+			.get(input.alias, input.askerAad, input.askerName ?? null, this.redact(input.question), this.clock.now()) as {
+			id: number;
+		};
 		return row.id;
 	}
 
 	/** The answer the guest/qa run gave to `recordTeamsQuestion`'s row. */
 	recordTeamsAnswer(id: number, answer: string): void {
-		this.db.query("UPDATE teams_qa SET answer = ? WHERE id = ?").run(answer, id);
+		this.db.query("UPDATE teams_qa SET answer = ? WHERE id = ?").run(this.redact(answer), id);
 	}
 
 	/**
@@ -1632,11 +1827,12 @@ export class Store {
 	/**
 	 * Settles one waiting event of a `verbatim` monitor in one transaction, without a turn or an inbound row: its stored
 	 * payload is the answer and is posted exactly like a turn's report; an empty payload ends as `no_report` with no
-	 * post and no copy. Returns false when the event was not waiting to run.
+	 * post and no copy. With `output` (a cron command's stdout, see `MonitorLedger.settleVerbatim`) that is the answer.
+	 * Returns false when the event was not waiting to run.
 	 */
-	deliverMonitorVerbatim(eventId: number, opRef: string): boolean {
+	deliverMonitorVerbatim(eventId: number, opRef: string, output?: string): boolean {
 		return this.db.transaction((): boolean => {
-			const settled = this.monitors.settleVerbatim(eventId, opRef);
+			const settled = this.monitors.settleVerbatim(eventId, opRef, output);
 			if (settled === undefined) return false;
 			this.monitors.resolveMonitorIncidents(settled.event.monitorId);
 			if (!settled.report) return true;
@@ -1708,15 +1904,18 @@ export class Store {
 		})();
 	}
 
-	/** Counts one failed attempt; the final failure (retries spent) posts a single notice to the owner DM. */
-	failMonitorEvent(eventId: number, error: string): DeliveryRow | undefined {
+	/**
+	 * Counts one failed attempt; the final failure (retries spent, or the first one with `retry: false`) posts a single
+	 * notice to the owner DM.
+	 */
+	failMonitorEvent(eventId: number, error: string, options: { retry?: boolean } = {}): DeliveryRow | undefined {
 		return this.db.transaction(() => {
-			const settled = this.monitors.settleFailed(eventId, error);
+			const settled = this.monitors.settleFailed(eventId, error, options);
 			if (!settled?.terminal) return undefined;
 			// Same monitor + same normalized error inside the repeat window stays quiet (hermes incident dedup).
 			const incident = this.monitors.recordMonitorIncident(settled.event.monitorId, error, this.clock.now());
 			if (!incident.notify) return undefined;
-			const reason = error.replace(/^\[turn failed\]\s*/, "").replace(/\s+—.*$/, "");
+			const reason = error.replace(/^\[(?:turn|command) failed\]\s*/, "").replace(/\s+—.*$/, "");
 			const repeat = incident.count > 1 ? ` · 반복 ${incident.count}회차` : "";
 			const target = { originKey: monitorOrigin(settled.event.monitorId), opRef: `monitor-notice:${eventId}` };
 			const threadRef = this.ownerTopLevelThreadRef(target);
@@ -1727,6 +1926,20 @@ export class Store {
 				`⏰ ${settled.monitorName}\n⚠️ 모니터 실행이 ${settled.event.attempts}번 실패해 재시도를 멈췄습니다 (failed_no_retry${repeat}): ${reason}`,
 			);
 		})();
+	}
+
+	/** A script check or watch that keeps failing: one notice at the top of the owner home, like a failed_no_retry one. */
+	private postCheckErrorNotice(alert: CheckErrorAlert): void {
+		const now = this.clock.now();
+		const target = { originKey: monitorOrigin(alert.monitorId), opRef: `monitor-check-error:${now}` };
+		const threadRef = this.ownerTopLevelThreadRef(target);
+		if (threadRef === undefined) return;
+		const repeat = alert.count > 1 ? ` · 반복 ${alert.count}회차` : "";
+		this.insertDelivery(
+			{ ...target, threadRef },
+			0,
+			`⏰ ${alert.monitorName}\n⚠️ 모니터 점검이 ${alert.streak}번 연속 실패했습니다${repeat}: ${alert.error}`,
+		);
 	}
 
 	// ---- daily cost ledger (`costCap`, src/ops/cost-cap.ts) ----
@@ -1778,24 +1991,6 @@ export class Store {
 	/** Marks the scope's open incidents resolved, so the same condition re-alerts when it comes back. */
 	resolveAlertIncidents(scope: string): void {
 		resolveIncidents(this.db, "alert_incidents", scope);
-	}
-
-	// ---- thread mutes ----
-
-	/** Whether the owner muted this thread with `!shutup` (channel threads): addressed messages there stay quiet. */
-	isThreadMuted(threadRef: string): boolean {
-		return this.db.query("SELECT 1 FROM thread_mutes WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
-	}
-
-	/** Records or clears a thread mute (`!shutup`, `!unshutup`, or the owner mentioning the bot); idempotent. */
-	setThreadMute(threadRef: string, muted: boolean): void {
-		if (muted) {
-			this.db
-				.query("INSERT INTO thread_mutes (thread_ref, muted_at) VALUES (?, ?) ON CONFLICT(thread_ref) DO NOTHING")
-				.run(threadRef, this.clock.now());
-		} else {
-			this.db.query("DELETE FROM thread_mutes WHERE thread_ref = ?").run(threadRef);
-		}
 	}
 
 	// ---- herdr prompts (dashboard 마지막 지시) ----
@@ -1953,16 +2148,32 @@ export class Store {
 		return counts;
 	}
 
-	/** Expires pending rows older than 24h. failed_ambiguous rows are never touched. Returns how many expired. */
+	/**
+	 * Expires pending rows older than 24h. failed_ambiguous rows are never touched. Each expired row waits for its
+	 * platform's adapter in `takeExpired` (its thread's status is finished there). Returns how many expired.
+	 */
 	sweepExpired(): number {
 		const now = this.clock.now();
-		return this.db.transaction(() => {
-			let expired = 0;
-			for (const row of this.selectDeliveries("state = 'pending' AND created_at <= ?", [now - FRESHNESS_MS])) {
-				if (this.applyEvent(row, "expire_check", now).state === "expired") expired++;
-			}
-			return expired;
-		})();
+		const expired = this.db.transaction(() =>
+			this.selectDeliveries("state = 'pending' AND created_at <= ?", [now - FRESHNESS_MS])
+				.map((row) => this.applyEvent(row, "expire_check", now))
+				.filter((row) => row.state === "expired"),
+		)();
+		// Rows of a platform no adapter takes would wait forever: only the newest are kept.
+		this.expiredUnfinished.push(...expired);
+		this.expiredUnfinished.splice(0, Math.max(0, this.expiredUnfinished.length - EXPIRED_HANDOFF_MAX));
+		return expired.length;
+	}
+
+	/** The rows `sweepExpired` expired whose thread ref posts to `platform` (all without one), each handed over once. */
+	takeExpired(platform?: ChatPlatform): DeliveryRow[] {
+		const taken: DeliveryRow[] = [];
+		const kept: DeliveryRow[] = [];
+		for (const row of this.expiredUnfinished) {
+			(platform === undefined || platformOfThreadRef(row.threadRef) === platform ? taken : kept).push(row);
+		}
+		this.expiredUnfinished = kept;
+		return taken;
 	}
 
 	/**
@@ -1970,7 +2181,7 @@ export class Store {
 	 * With `platform` only the rows whose thread ref posts to that platform are taken (monitor and lane answers
 	 * included: their thread ref is a chat conversation like any other); the rest stay pending for their adapter.
 	 */
-	claimDue(limit = 20, platform?: IdPlatform): DeliveryRow[] {
+	claimDue(limit = 20, platform?: ChatPlatform): DeliveryRow[] {
 		const now = this.clock.now();
 		this.sweepExpired();
 		return this.db.transaction(() =>
@@ -1981,8 +2192,103 @@ export class Store {
 		)();
 	}
 
+	/** The send went out; in the same transaction the peer bots it mentions become calls (`recordPeerCalls`). */
 	confirmDelivery(deliveryId: number): DeliveryRow {
-		return this.applyEvent(this.requireDelivery(deliveryId), "confirmed", this.clock.now());
+		return this.db.transaction(() => {
+			const now = this.clock.now();
+			const row = this.requireDelivery(deliveryId);
+			const confirmed = this.applyEvent(row, "confirmed", now);
+			if (row.state !== "confirmed" && confirmed.state === "confirmed") this.recordPeerCalls(confirmed, now);
+			return confirmed;
+		})();
+	}
+
+	// ---- peer calls (doc/plans/peer-silence-alert.md) ----
+
+	/**
+	 * A post of `peerUserId` in the thread at `at` (its own time, so a backfilled one counts as when it was written)
+	 * answers every pending call to that peer made there before it. Returns how many calls it answered.
+	 */
+	notePeerSeen(seen: { threadRef: string; peerUserId: string; at: number }): number {
+		return this.db
+			.query(
+				"UPDATE peer_calls SET state = 'answered', settled_at = ? WHERE thread_ref = ? AND peer_user_id = ? AND state = 'pending' AND called_at <= ?",
+			)
+			.run(this.clock.now(), seen.threadRef, seen.peerUserId, seen.at).changes;
+	}
+
+	/**
+	 * The calls left unanswered past the policy's silence, one alert per thread and peer: every pending call of that
+	 * pair becomes `alerted` and one delivery (`peer-silence:<first call_id>`, so a replay inserts nothing) mentions the
+	 * owner in the thread. One transaction. Returns the alerts.
+	 */
+	alertSilentPeers(): number {
+		const policy = this.peerCallPolicy;
+		if (policy === undefined) return 0;
+		const now = this.clock.now();
+		return this.db.transaction(() => {
+			this.db.query("DELETE FROM peer_calls WHERE state != 'pending' AND settled_at < ?").run(now - PEER_CALL_KEEP_MS);
+			const due = this.db
+				.query(
+					`SELECT thread_ref, peer_user_id, MIN(call_id) AS first_id, MIN(called_at) AS first_at FROM peer_calls
+					 WHERE state = 'pending' GROUP BY thread_ref, peer_user_id HAVING MIN(called_at) <= ? ORDER BY first_id`,
+				)
+				.all(now - policy.silenceMs) as Array<{
+				thread_ref: string;
+				peer_user_id: string;
+				first_id: number;
+				first_at: number;
+			}>;
+			let alerts = 0;
+			for (const group of due) {
+				this.db
+					.query(
+						"UPDATE peer_calls SET state = 'alerted', settled_at = ? WHERE thread_ref = ? AND peer_user_id = ? AND state = 'pending'",
+					)
+					.run(now, group.thread_ref, group.peer_user_id);
+				const thread = parseThreadRef(group.thread_ref);
+				const platform = platformOfThreadRef(group.thread_ref);
+				if (thread === undefined || platform === undefined) continue;
+				const name = policy.peers.find((peer) => peer.userId === group.peer_user_id)?.name ?? group.peer_user_id;
+				const minutes = Math.floor((now - group.first_at) / 60_000);
+				this.insertDelivery(
+					{
+						originKey: chatOriginKey({
+							platform,
+							kind: "ch",
+							conversationId: thread.channel,
+							threadId: thread.threadTs,
+						}),
+						opRef: `${PEER_SILENCE_OP_PREFIX}${group.first_id}`,
+						threadRef: group.thread_ref,
+					},
+					0,
+					`<@${policy.ownerUserId}> ⚠️ ${name} 무응답 ${minutes}분 — VM이 잠든 것 같으니 앱을 열어 주세요`,
+				);
+				alerts += 1;
+			}
+			return alerts;
+		})();
+	}
+
+	/**
+	 * A confirmed Discord thread post (not a channel root, DM, #log or board post, log copy or peer failure notice)
+	 * that mentions a policy peer (`<@id>`, `<@!id>` or the core's mention token) is one pending call per peer.
+	 */
+	private recordPeerCalls(row: DeliveryRow, now: number): void {
+		const policy = this.peerCallPolicy;
+		if (policy === undefined || row.opRef.endsWith(LOG_COPY_SUFFIX) || row.body.includes(PEER_FAILURE_MARK)) return;
+		const thread = parseThreadRef(row.threadRef);
+		if (thread === undefined || thread.threadTs === TOP_LEVEL_TS) return;
+		if (platformOfThreadRef(row.threadRef) !== "discord" || policy.skipConversations.includes(thread.channel)) return;
+		if (parseChatOrigin(row.originKey)?.kind === "dm") return;
+		const insert = this.db.query(
+			"INSERT INTO peer_calls (thread_ref, peer_user_id, delivery_id, called_at) VALUES (?, ?, ?, ?) ON CONFLICT(delivery_id, peer_user_id) DO NOTHING",
+		);
+		for (const peer of policy.peers) {
+			const tokens = [`<@${peer.userId}>`, `<@!${peer.userId}>`, mentionToken(peer.userId)];
+			if (tokens.some((token) => row.body.includes(token))) insert.run(row.threadRef, peer.userId, row.deliveryId, now);
+		}
 	}
 
 	/** A send that definitely did not happen: backoff, or expired after 5 failures / 24h. */
@@ -2026,6 +2332,85 @@ export class Store {
 				"UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'failed_ambiguous' AND ? - created_at < ?",
 			)
 			.run(now, now, FRESHNESS_MS).changes;
+	}
+
+	// ---- lane board (lane and owner-conversation posts) ----
+
+	/**
+	 * Stores one lane board post. The text is redacted first and cut to {@link LANE_BOARD_TEXT_MAX} after: cut first, a
+	 * secret split at the limit would no longer match its shape and its head would stay.
+	 */
+	addLaneBoardPost(input: {
+		channel: string;
+		authorOrigin: string;
+		authorLabel: string;
+		text: string;
+		replyTo?: number | undefined;
+	}): LaneBoardPost {
+		const text = cutCodePointSafe(this.redact(input.text), LANE_BOARD_TEXT_MAX);
+		const row = this.db
+			.query(
+				"INSERT INTO board_posts (channel, author_origin, author_label, text, reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
+			)
+			.get(
+				input.channel,
+				input.authorOrigin,
+				input.authorLabel,
+				text,
+				input.replyTo ?? null,
+				this.clock.now(),
+			) as LaneBoardPostSql;
+		return toLaneBoardPost(row);
+	}
+
+	getLaneBoardPost(id: number): LaneBoardPost | undefined {
+		const row = this.db.query("SELECT * FROM board_posts WHERE id = ?").get(id) as LaneBoardPostSql | null;
+		return row === null ? undefined : toLaneBoardPost(row);
+	}
+
+	/** Posts of `channel` after id `after`, oldest first, at most `limit`; `excludeAuthor`'s own posts left out. */
+	listLaneBoardPosts(channel: string, after: number, limit: number, excludeAuthor?: string): LaneBoardPost[] {
+		const rows = this.db
+			.query(
+				"SELECT * FROM board_posts WHERE channel = ?1 AND id > ?2 AND (?3 IS NULL OR author_origin != ?3) ORDER BY id LIMIT ?4",
+			)
+			.all(channel, after, excludeAuthor ?? null, limit) as LaneBoardPostSql[];
+		return rows.map(toLaneBoardPost);
+	}
+
+	/** How many posts of `channel` after id `after` others than `excludeAuthor` wrote, and the newest id among them. */
+	countLaneBoardPosts(channel: string, after: number, excludeAuthor: string): { count: number; maxId: number } {
+		const row = this.db
+			.query(
+				"SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS max_id FROM board_posts WHERE channel = ? AND id > ? AND author_origin != ?",
+			)
+			.get(channel, after, excludeAuthor) as { n: number; max_id: number };
+		return { count: row.n, maxId: row.max_id };
+	}
+
+	laneBoardCursor(originKey: string, channel: string): LaneBoardCursor {
+		const row = this.db
+			.query("SELECT last_read, last_noticed FROM board_reads WHERE origin_key = ? AND channel = ?")
+			.get(originKey, channel) as { last_read: number; last_noticed: number } | null;
+		return { lastRead: row?.last_read ?? 0, lastNoticed: row?.last_noticed ?? 0 };
+	}
+
+	/** Moves `originKey`'s read cursor of `channel` up to `id` (never back). */
+	markLaneBoardRead(originKey: string, channel: string, id: number): void {
+		this.db
+			.query(
+				"INSERT INTO board_reads (origin_key, channel, last_read) VALUES (?, ?, ?) ON CONFLICT (origin_key, channel) DO UPDATE SET last_read = MAX(last_read, excluded.last_read)",
+			)
+			.run(originKey, channel, id);
+	}
+
+	/** Moves `originKey`'s announced cursor of `channel` up to `id` (never back). */
+	markLaneBoardNoticed(originKey: string, channel: string, id: number): void {
+		this.db
+			.query(
+				"INSERT INTO board_reads (origin_key, channel, last_noticed) VALUES (?, ?, ?) ON CONFLICT (origin_key, channel) DO UPDATE SET last_noticed = MAX(last_noticed, excluded.last_noticed)",
+			)
+			.run(originKey, channel, id);
 	}
 
 	// ---- lanes (work lane registry) ----

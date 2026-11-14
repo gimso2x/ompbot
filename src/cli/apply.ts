@@ -1,21 +1,23 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { defaultHomeDir, loadConfig } from "../config";
+import { codeRollbackMode, defaultHomeDir, loadConfig } from "../config";
 import { runDoctor } from "../daemon/doctor";
 import { readSweepHeartbeat } from "../daemon/heartbeat";
 import { callDaemon } from "../daemon/ipc";
+import { pidAlive } from "../daemon/lock";
 import {
 	type ApplyDeps,
+	type ApplyOptions,
 	applyPathEnv,
 	DEFAULT_DRAIN_CUT_MIN,
 	DEFAULT_DRAIN_TIMEOUT_MIN,
+	detachedApplyCommand,
 	findBun,
 	findDaemonUnits,
 	isExecutableFile,
 	isReportOrigin,
 	type PeerApply,
-	pidAlive,
 	readLockStartedAt,
 	receiptPathFor,
 	reportThreadPattern,
@@ -25,16 +27,30 @@ import {
 	spawnRunner,
 } from "../ops/apply";
 import { backupStamp, runBackup } from "../ops/backup";
-import { collectGates } from "../ops/gates";
+import { collectGates, gateOptionsFromConfig } from "../ops/gates";
 import { socketDrainCall, waitForDrain } from "./drain";
 import { runProfileSync } from "./omp";
 
-export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>> --report-thread <ts|message id>] [--json]
+export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>> --report-thread <ts|message id> [--report-plain]] [--no-code-rollback] [--clear-rollback] [--allow-detached] [--json]
                                  precheck (main, HEAD==main, clean src, bun) → backup + config copy → with config ompProfile,
                                  ompbot omp sync (a failure stops here) → drain --wait (default 60 min) → systemctl --user
                                  restart <this home's unit> → wait for a fresh daemon (2 min) → wait for its heartbeat
-                                 after the restart with no Slack/Discord transport down (2 min) → gates/doctor summary; on
-                                 failure restores config and restarts once (code is not reverted).
+                                 after the restart with no Slack/Discord transport down (2 min) → gates/doctor summary; ok
+                                 with doctor rc=0 and no omp_runtime/turns_failing gate open records the loaded commit in
+                                 <home>/head.last-good. On failure restores config and restarts once; if that restart
+                                 fails too, the code goes back to head.last-good (main only, no staged or uncommitted
+                                 tracked change) as config apply.codeRollback says: detach (default) writes
+                                 <git dir>/ompbot-code-rollback.json and checks head.last-good out detached, main
+                                 untouched; push makes one revert commit on main with its tree and runs git push origin
+                                 main; off reverts nothing and names the revert command. Then bun install
+                                 --frozen-lockfile when package.json/bun.lock differ, restarts once more, writes
+                                 <home>/autoland.hold (auto-merge stops until the next ok apply on main) and still exits 1.
+                                 --no-code-rollback: never revert code (as off).
+                                 With the journal, apply runs only on its detached commit (keeping journal, hold and
+                                 head.last-good) or on a main past the commit that broke the daemon (which removes it);
+                                 HEAD still that commit or anything else SKIPs. --clear-rollback: remove the journal
+                                 first. --allow-detached: apply a detached HEAD picked by hand (no journal), recording
+                                 no head.last-good and keeping autoland.hold.
                                  --cut-after <min> (default 5): a drain still busy then restarts anyway; the daemon records
                                  the cut turns (<home>/restart-cut.json) and the next process resumes each once in its
                                  session. --cut-after 0: no cut, a --timeout cancels the drain and nothing restarts.
@@ -45,7 +61,9 @@ export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--ti
                                  One apply per home at a time (<home>/apply.lock): a second one waits (step wait_apply) and
                                  ends already_applied when the one it waited for finished ok on the same HEAD.
                                  --merged-at: skip when the daemon already started after that time. exit 0 ok/already
-                                 applied, 1 failed, 2 usage, 3 precheck SKIP
+                                 applied, 1 failed, 2 usage, 3 precheck SKIP. --report-origin asks the model of that thread
+                                 to report (an [자동 후속] turn); with --report-plain the daemon posts the result line
+                                 itself (IPC notify, no model turn). The --detach unit is ompbot-apply-<stamp>-<4 hex>.
 `;
 
 /** Checkout holding this very file's `src/main.ts` (src/cli/apply.ts → repo root). */
@@ -103,6 +121,8 @@ export async function applyCommand(
 			"--report-thread needs --report-origin and a Slack ts like 1793318305.840629 (slack/...) or a Discord message id (discord/...)",
 		);
 	}
+	if (values["report-plain"] === true && reportOrigin === undefined)
+		return usageError("--report-plain needs --report-origin");
 	if (values.stamp !== undefined && !STAMP_PATTERN.test(values.stamp))
 		return usageError("--stamp must be YYYYMMDD-HHMMSS");
 
@@ -110,32 +130,37 @@ export async function applyCommand(
 	const pathEnv = applyPathEnv(env);
 	if (values.detach === true) return await detach({ values, stamp, pathEnv, homeDir, env });
 
-	const options = {
+	const options: ApplyOptions = {
 		timeoutMin,
 		cutAfterMin,
 		stamp,
 		...(mergedAt === undefined ? {} : { mergedAt }),
+		codeRollback: codeRollbackMode(
+			existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir, { checkTokens: false }) : undefined,
+		),
+		...(values["clear-rollback"] === true ? { clearRollback: true } : {}),
+		...(values["allow-detached"] === true ? { allowDetached: true } : {}),
+		...(values["no-code-rollback"] === true ? { codeRollbackOff: "--no-code-rollback" } : {}),
+		...(reportOrigin === undefined ? {} : { reportOrigin }),
+		...(reportThread === undefined ? {} : { reportThread }),
+		...(values["report-plain"] === true ? { reportPlain: true } : {}),
 	};
 	const units = await findDaemonUnits(spawnRunner, pathEnv, REPO_DIR, defaultHomeDir({}));
 	const self = resolve(homeDir);
 	const peers = units.filter((u) => resolve(u.homeDir) !== self);
 	const deps = homeDeps(homeDir, units.find((u) => resolve(u.homeDir) === self)?.unit ?? SYSTEMD_UNIT, pathEnv);
-	deps.peers = async () => {
+	deps.peers = async (afterCodeRollback = false) => {
 		const results: PeerApply[] = [];
 		for (const peer of peers) {
-			const { exitCode, receipt } = await runApply(options, homeDeps(peer.homeDir, peer.unit, pathEnv));
+			const { exitCode, receipt } = await runApply(
+				peerApplyOptions(options, afterCodeRollback),
+				homeDeps(peer.homeDir, peer.unit, pathEnv),
+			);
 			results.push({ unit: peer.unit, status: receipt.status, exitCode, receiptPath: receipt.receiptPath });
 		}
 		return results;
 	};
-	const { exitCode, receipt } = await runApply(
-		{
-			...options,
-			...(reportOrigin === undefined ? {} : { reportOrigin }),
-			...(reportThread === undefined ? {} : { reportThread }),
-		},
-		deps,
-	);
+	const { exitCode, receipt } = await runApply(options, deps);
 	if (values.json === true) process.stdout.write(`${JSON.stringify(receipt)}\n`);
 	else {
 		for (const step of receipt.steps)
@@ -147,14 +172,30 @@ export async function applyCommand(
 }
 
 /**
+ * What the apply of every other install on the checkout runs with. The checkout is shared: only this (first) home's
+ * apply reverts code, clears the journal and reports. After a code rollback every peer restarts onto the reverted
+ * code, even one that started after --merged-at. `--allow-detached` goes along: the peers load the same detached HEAD
+ * and would SKIP without it.
+ */
+export function peerApplyOptions(options: ApplyOptions, afterCodeRollback: boolean): ApplyOptions {
+	return {
+		timeoutMin: options.timeoutMin,
+		...(options.cutAfterMin === undefined ? {} : { cutAfterMin: options.cutAfterMin }),
+		...(options.stamp === undefined ? {} : { stamp: options.stamp }),
+		...(options.mergedAt === undefined || afterCodeRollback ? {} : { mergedAt: options.mergedAt }),
+		...(options.allowDetached === true ? { allowDetached: true } : {}),
+		...(options.codeRollback === undefined ? {} : { codeRollback: options.codeRollback }),
+		codeRollbackOff: "peer install (the first home's apply owns the code rollback)",
+	};
+}
+
+/**
  * Everything `runApply` needs for one install: its home, socket, config-driven backup/gates, its unit and, with config
  * `ompProfile`, the profile sync.
  */
 export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyDeps {
 	const config = existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir) : undefined;
 	const socketPath = join(homeDir, "ompbot.sock");
-	const omp = config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {};
-	const profile = config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile };
 	return {
 		homeDir,
 		unit,
@@ -170,25 +211,17 @@ export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyD
 				timeoutMin: min,
 				...(cutAfterMin === undefined ? {} : { cutAfterMin }),
 			}),
-		backup: () =>
-			runBackup({
-				homeDir,
-				...(config?.maxBundleBytes === undefined ? {} : { maxBundleBytes: config.maxBundleBytes }),
-			}),
+		// The db snapshot is what an apply rolls back to; the session bundle is the daily backup's job.
+		backup: () => runBackup({ homeDir, skipBundle: true }),
 		gates: () =>
 			collectGates({
 				homeDir,
 				now: Date.now(),
-				offsiteConfigured: config?.offsite !== undefined,
-				...(config?.costCap?.dailyUsd === undefined
-					? {}
-					: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
-				...omp,
-				...profile,
+				...gateOptionsFromConfig(config),
 			}),
 		doctor: async () => {
 			const lines: string[] = [];
-			const code = await runDoctor(homeDir, (line) => lines.push(line));
+			const code = await runDoctor(homeDir, (line) => lines.push(line), REPO_DIR);
 			return { code, lines };
 		},
 		...(config?.ompProfile === undefined
@@ -223,7 +256,11 @@ function parseValues(args: string[]) {
 			"merged-at": { type: "string" },
 			"report-origin": { type: "string" },
 			"report-thread": { type: "string" },
+			"report-plain": { type: "boolean" },
 			json: { type: "boolean" },
+			"no-code-rollback": { type: "boolean" },
+			"clear-rollback": { type: "boolean" },
+			"allow-detached": { type: "boolean" },
 			stamp: { type: "string" },
 			help: { type: "boolean" },
 		},
@@ -245,29 +282,24 @@ async function detach(input: {
 		process.stderr.write(`apply: bun not found on PATH (${pathEnv})\n`);
 		return 3;
 	}
-	const unit = `ompbot-apply-${stamp}`;
 	const childArgs = ["apply", "--stamp", stamp];
 	for (const key of ["timeout", "cut-after", "merged-at", "report-origin", "report-thread"] as const) {
 		const value = values[key];
 		if (value !== undefined) childArgs.push(`--${key}`, value);
 	}
 	if (values.json === true) childArgs.push("--json");
-	const setenv = [`--setenv=PATH=${pathEnv}`];
-	if (env.OMPBOT_HOME !== undefined) setenv.push(`--setenv=OMPBOT_HOME=${homeDir}`);
-	const result = await spawnRunner(
-		[
-			"systemd-run",
-			"--user",
-			"--collect",
-			`--unit=${unit}`,
-			`--working-directory=${REPO_DIR}`,
-			...setenv,
-			bun,
-			join(REPO_DIR, "src", "main.ts"),
-			...childArgs,
-		],
-		{ env: { PATH: pathEnv } },
-	);
+	for (const key of ["no-code-rollback", "clear-rollback", "allow-detached", "report-plain"] as const) {
+		if (values[key] === true) childArgs.push(`--${key}`);
+	}
+	const { unit, argv } = detachedApplyCommand({
+		bun,
+		repoDir: REPO_DIR,
+		pathEnv,
+		stamp,
+		childArgs,
+		...(env.OMPBOT_HOME === undefined ? {} : { homeEnv: homeDir }),
+	});
+	const result = await spawnRunner(argv, { env: { PATH: pathEnv } });
 	if (result.code !== 0) {
 		process.stderr.write(`apply: systemd-run failed rc=${result.code}: ${result.stderr.trim()}\n`);
 		return 1;

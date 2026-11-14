@@ -18,12 +18,15 @@ import type {
 export class NamespacedDriver implements OmpSessionDriver {
 	/** Side question, defined only when the wrapped driver supports it (absent = unsupported, like the inner driver). */
 	readonly btw?: (question: string) => Promise<string>;
+	/** Queue-clearing abort, defined only when the wrapped driver has one (`!stop` falls back otherwise). */
+	readonly abortAndClearQueue?: () => Promise<void>;
 
 	constructor(
 		private readonly inner: OmpSessionDriver,
 		private readonly prefix: string,
 	) {
 		if (inner.btw !== undefined) this.btw = inner.btw.bind(inner);
+		if (inner.abortAndClearQueue !== undefined) this.abortAndClearQueue = inner.abortAndClearQueue.bind(inner);
 	}
 
 	/** Pid of the omp child when the wrapped driver exposes one (`RpcOmpDriver`). */

@@ -11,7 +11,6 @@ import { acquireLock, currentBootId, LockHeldError } from "../src/daemon/lock";
 import { INTERRUPTED_NOTICE } from "../src/daemon/recovery";
 import { runDaemon } from "../src/daemon/run";
 import { createLogger } from "../src/log";
-import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { redact } from "../src/redact";
@@ -229,25 +228,21 @@ describe("inject", () => {
 	});
 });
 
-describe("thread mute commands", () => {
-	test("a redelivered !shutup event posts the hint once; the handled id is remembered in the ledger KV", async () => {
+describe("retired thread mute", () => {
+	test("!shutup is an ordinary prompt: it becomes an inbound row and omp answers it", async () => {
 		const transport = new WaitingTransport();
 		const daemon = newDaemon(transport);
 		await daemon.start();
-		const event = {
+		await transport.emitMessage({
 			type: "message" as const,
 			channel: "D1",
 			channel_type: "im",
 			user: OWNER,
 			text: "!shutup",
 			ts: "1800000000.010000",
-		};
-		await transport.emitMessage(event);
-		await transport.emitMessage({ ...event });
-		expect(transport.posts((text) => text.includes("DM은 항상 반응합니다"))).toHaveLength(1);
-		expect(daemon.store.getCursor("mute:D1:1800000000.010000")).toBe("1");
-		// Mute commands never become prompts: no inbound row was recorded for either delivery.
-		expect(daemon.store.listInbound()).toHaveLength(0);
+		});
+		await transport.waitForPosts(echoes("!shutup"));
+		expect(daemon.store.listInbound().map((row) => row.textRef)).toEqual(["!shutup"]);
 	});
 });
 
@@ -677,16 +672,6 @@ async function untilLog(lines: string[], needle: string, count = 1): Promise<voi
 	}
 }
 
-/** A driver whose `abort` fails until the test un-wedges it: the deterministic `dispatch_pending_failed` source. */
-class WedgedAbortDriver extends FakeOmpDriver {
-	wedged = true;
-
-	override async abort(): Promise<void> {
-		if (this.wedged) throw new OmpDriverError("rpc_error", "abort wedged");
-		await super.abort();
-	}
-}
-
 describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-up)", () => {
 	let clock: FakeClock;
 	let lines: string[];
@@ -697,7 +682,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 		lines = [];
 	});
 
-	function newRetryDaemon(transport: WaitingTransport, drivers: FakeOmpDriver[], wedged: boolean): Daemon {
+	function newRetryDaemon(transport: WaitingTransport, drivers: FakeOmpDriver[], holdTurns: boolean): Daemon {
 		const daemon = new Daemon({
 			config: home.config,
 			channels: [new SlackBinding(new SlackChannel(transport))],
@@ -709,9 +694,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 			taskSweepMs: 0,
 			pendingRetryMs: 60_000,
 			driverFactory: (_origin, sessionDir) => {
-				const driver = wedged
-					? new WedgedAbortDriver({ sessionDir, store: sessions })
-					: new FakeOmpDriver({ sessionDir, store: sessions, holdTurns: true });
+				const driver = new FakeOmpDriver({ sessionDir, store: sessions, holdTurns });
 				drivers.push(driver);
 				return driver;
 			},
@@ -723,20 +706,24 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 	test("failed retries alert the owner once, then recovery re-dispatches and re-arms the incident", async () => {
 		const transport = new WaitingTransport();
 		const drivers: FakeOmpDriver[] = [];
-		const daemon = newRetryDaemon(transport, drivers, true);
+		const daemon = newRetryDaemon(transport, drivers, false);
 		await daemon.start();
-		// A live idle child, so `/new-ompbot` has a driver to abort.
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "warmup" });
 		await transport.waitForPosts(echoes("warmup"));
 
-		// The wedged abort throws out of the drain: the row strands pending with only a log line, no turn failure.
+		// A ledger that cannot bump the epoch throws out of `/new-ompbot`'s drain: the row strands pending with only a
+		// log line, no turn failure.
+		const newEpoch = daemon.store.newEpoch.bind(daemon.store);
+		daemon.store.newEpoch = () => {
+			throw new Error("database is locked");
+		};
 		const { threadRef } = await daemon.inject({ origin: ORIGIN, asOwner: true, text: "/new-ompbot" });
 		await untilLog(lines, "event=dispatch_pending_failed");
 		expect(daemon.store.getInbound(threadRef)?.state).toBe("pending");
 		expect(transport.posts((text) => text.startsWith("[turn failed]"))).toHaveLength(0);
 
 		// Two failed sweep retries stay quiet; the third alerts the owner once, in the owner DM.
-		const sign = String(new OmpDriverError("rpc_error", "abort wedged"));
+		const sign = String(new Error("database is locked"));
 		// The retry runs in the background of the sweep: wait for each one's outcome before the next sweep.
 		for (let i = 0; i < PENDING_ALERT_AFTER - 1; i++) {
 			clock.advance(61_000);
@@ -752,7 +739,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 		expect(notices).toHaveLength(1);
 		expect(notices[0]?.channel).toBe("D1");
 		expect(notices[0]?.text).toContain(ORIGIN);
-		expect(notices[0]?.text).toContain("abort wedged");
+		expect(notices[0]?.text).toContain("database is locked");
 		expect(lines.some((line) => line.includes("event=pending_dispatch_notified"))).toBe(true);
 
 		// A further failed retry stays quiet for 24h (same sign, incident repeat suppression).
@@ -760,9 +747,9 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 		await daemon.sweep();
 		expect(transport.posts((text) => text.includes("보내지 못하고"))).toHaveLength(1);
 
-		// Recovery: the abort works again, the next sweep's retry dispatches the row with no human action.
+		// Recovery: the ledger works again, the next sweep's retry dispatches the row with no human action.
 		expect(drivers).toHaveLength(1);
-		(drivers[0] as WedgedAbortDriver).wedged = false;
+		daemon.store.newEpoch = newEpoch;
 		const answered = transport.waitForPosts((text) => text.includes("새 대화를 시작했습니다"));
 		clock.advance(61_000);
 		await daemon.sweep();
@@ -779,7 +766,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 	test("a restart drain's held rows are not retried or reported as stuck; cancelling the drain dispatches them", async () => {
 		const transport = new WaitingTransport();
 		const drivers: FakeOmpDriver[] = [];
-		const daemon = newRetryDaemon(transport, drivers, false);
+		const daemon = newRetryDaemon(transport, drivers, true);
 		await daemon.start();
 		daemon.setDraining(true);
 		const { threadRef } = await daemon.inject({ origin: ORIGIN, asOwner: true, text: "held by the drain" });
@@ -804,7 +791,7 @@ describe("sweep retry for stranded pending rows (dispatch_pending_failed follow-
 	test("a stale pending row is left alone while the origin is busy, and a fresh row is never retried", async () => {
 		const transport = new WaitingTransport();
 		const drivers: FakeOmpDriver[] = [];
-		const daemon = newRetryDaemon(transport, drivers, false);
+		const daemon = newRetryDaemon(transport, drivers, true);
 		await daemon.start();
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "long job" });
 		await untilLog(lines, "event=turn_start");

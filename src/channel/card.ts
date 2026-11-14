@@ -18,7 +18,14 @@ const { Actions: _actions, Button: _button, ...CARD_COMPONENTS } = standardCompo
 export { CARD_COMPONENTS };
 
 /** Per-card limits the spec is validated against (Slack's, kept for every platform: 1 table, 2 charts). */
-export const CARD_LIMITS = { tables: 1, charts: 2, tableRows: 100, chartLabel: 20, chartTitle: 50 } as const;
+export const CARD_LIMITS = {
+	tables: 1,
+	charts: 2,
+	tableRows: 100,
+	chartLabel: 20,
+	chartTitle: 50,
+	chartPoints: 200,
+} as const;
 
 /** Card fences one answer turns into card parts at most; later ones stay text. */
 export const MAX_CARDS = 3;
@@ -67,6 +74,48 @@ export function splitCards(body: string): CardSegment[] {
 	}
 	if (text.length > 0) segments.push({ kind: "text", text: text.join("\n") });
 	return segments;
+}
+
+export type CardRun<T> = { kind: "text"; text: string } | ({ kind: "card"; raw: string } & T);
+
+/**
+ * `body` as text runs (leading blank lines and trailing space trimmed, blank ones dropped) and the cards `accept`
+ * takes; `first`: no text precedes the card. A card `accept` refuses (returns its issues) stays in the text around it,
+ * its issues in `issues` as `card <n>: <issue>`.
+ */
+export function cardRuns<T extends object>(
+	body: string,
+	issues: string[],
+	accept: (json: string, first: boolean) => T | readonly string[],
+): CardRun<T>[] {
+	const runs: CardRun<T>[] = [];
+	let text: string[] = [];
+	let n = 0;
+	const flush = (): void => {
+		const joined = text
+			.join("\n")
+			.replace(/^(?:[ \t]*\n)+/, "")
+			.trimEnd();
+		if (joined.trim() !== "") runs.push({ kind: "text", text: joined });
+		text = [];
+	};
+	for (const segment of splitCards(body)) {
+		if (segment.kind === "text") {
+			text.push(segment.text);
+			continue;
+		}
+		n += 1;
+		const card = accept(segment.json, runs.length === 0 && text.join("\n").trim() === "");
+		if (Array.isArray(card)) {
+			issues.push(...card.map((issue) => `card ${n}: ${issue}`));
+			text.push(segment.raw);
+			continue;
+		}
+		flush();
+		runs.push({ kind: "card", raw: segment.raw, ...(card as T) });
+	}
+	flush();
+	return runs;
 }
 
 /** A card's risk colour (root Card prop `tone`): Slack draws it as the attachment's colour bar, Discord as the embed's. */
@@ -157,6 +206,31 @@ function reservedIds(spec: Record<string, unknown>): string[] {
 }
 
 /**
+ * One issue per element id the spec cannot express without losing content. json-render keeps each output key once and
+ * drops a revisit silently, so a reference to an element already reached (a cycle, a self reference, a second parent)
+ * and an id with `#` (the key `repeat` gives its n-th copy, `id#n`) would make part of the card vanish.
+ */
+function graphIssues(spec: Record<string, unknown>): string[] {
+	const elements = isRecord(spec.elements) ? spec.elements : {};
+	const issues = Object.keys(elements)
+		.filter((id) => id.includes("#"))
+		.map((id) => `element id "${id}" must not contain "#"`);
+	const reached = new Set<string>();
+	const visit = (id: unknown): void => {
+		if (typeof id !== "string") return;
+		if (reached.has(id)) {
+			issues.push(`element "${id}" is referenced more than once (cycle or shared child)`);
+			return;
+		}
+		reached.add(id);
+		const element = elements[id];
+		if (isRecord(element) && Array.isArray(element.children)) for (const child of element.children) visit(child);
+	};
+	visit(spec.root);
+	return [...new Set(issues)];
+}
+
+/**
  * One issue per chart category given twice (sections searched too): every platform draws a chart's values by
  * category, so a repeated one would show the first value twice. Slack's chart block refuses it as well.
  */
@@ -193,6 +267,8 @@ export function validateCard(json: string): ValidatedCard {
 	repairSpec(spec);
 	const reserved = reservedIds(spec);
 	if (reserved.length > 0) return { ok: false, issues: reserved.map((id) => `element id "${id}" is reserved`) };
+	const graph = graphIssues(spec);
+	if (graph.length > 0) return { ok: false, issues: graph };
 	const tone = takeTone(spec);
 	try {
 		// The spec's shape is checked by toCard itself (zod catalog and structure validation).
@@ -238,13 +314,14 @@ export function chartToAscii(element: ChartChild): string {
 		});
 		return `${title}\n${table}`;
 	}
+	const values = chart.series.map((s) => new Map(s.data.map((p) => [p.label, p.value] as const).reverse()));
 	const table = tableToAscii({
 		headers: [chart.xLabel ?? "", ...chart.series.map((s) => s.name)],
 		rows: chart.categories.map((category) => [
 			category,
-			...chart.series.map((s) => {
-				const point = s.data.find((p) => p.label === category);
-				return point ? String(point.value) : "";
+			...values.map((byLabel) => {
+				const value = byLabel.get(category);
+				return value === undefined ? "" : String(value);
 			}),
 		]),
 	});

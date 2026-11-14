@@ -92,6 +92,62 @@ describe("classifyLaneCompletion", () => {
 		expect(categories("done", next)).toEqual(["unfinished_work_marker", "skipped_test"]);
 	});
 
+	test("a bare TODO inside a multi-line block comment is refused (qa-i-low 55)", () => {
+		const open = DIFF("src/a.ts", "+/*", "+TODO: later", "+*/");
+		expect(categories("done", open)).toEqual(["unfinished_work_marker"]);
+		expect(categories("done", DIFF("src/a.ts", "+/*", "+explains why", "+*/", "+const todo = 1; // fine"))).toEqual([]);
+		// Code after the closer is code again; a closed block does not leak into the next hunk.
+		const hunks = [
+			"diff --git a/src/a.ts b/src/a.ts",
+			"--- a/src/a.ts",
+			"+++ b/src/a.ts",
+			"@@ -0,0 +1 @@",
+			"+/* open",
+			"@@ -9,0 +10 @@",
+			"+TODO_NAME = 1;",
+		].join("\n");
+		expect(categories("done", hunks)).toEqual([]);
+	});
+
+	test("stub detection ignores assertions about stubs but keeps real stub bodies (qa-i-low 120)", () => {
+		// Stub words are assembled from pieces so this file's own added lines do not trip the stub check.
+		const message = ["not", "implemented"].join(" ");
+		const macro = (name: string): string => `${name}!()`;
+		expect(categories("done", DIFF("test/a.test.ts", `+expect(() => run()).toThrow("${message}");`))).toEqual([]);
+		expect(categories("done", DIFF("src/a.ts", `+const msg = "${macro("todo").slice(0, -1)}" + "x";`))).toEqual([]);
+		expect(categories("done", DIFF("src/a.ts", `+\tthrow new Error("${message}");`))).toEqual(["stub_implementation"]);
+		const pyError = `${["Not", "Implemented"].join("")}Error`;
+		expect(categories("done", DIFF("src/a.py", `+    raise ${pyError}`))).toEqual(["stub_implementation"]);
+		expect(categories("done", DIFF("src/a.rs", `+    ${macro("todo")}`))).toEqual(["stub_implementation"]);
+		expect(categories("done", DIFF("src/a.rs", `+    ${macro("unimplemented")}`))).toEqual(["stub_implementation"]);
+	});
+
+	test("a path fragment containing tsc is not a verification command (qa-i-low 121)", () => {
+		expect(categories("변경: src/tsc.ts 문구 정리, 검증 완료", "")).toEqual(["unproven_claim_word"]);
+		expect(categories("tsc --noEmit 통과", "")).toEqual([]);
+		expect(categories("bun x biome check 통과", "")).toEqual([]);
+	});
+
+	test("guard deletions in php, c, c# and vue files are judged (qa-i-low 122)", () => {
+		for (const file of ["src/auth.php", "src/auth.c", "src/Auth.cs", "src/Auth.vue", "src/auth.swift"]) {
+			const diff = `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +0,0 @@\n-if (!allowed) throw denied;`;
+			expect(categories("done", diff)).toEqual(["guard_deletion_without_adversarial_regression"]);
+		}
+	});
+
+	test("chained and option-object skips are refused (qa-i-low 123)", () => {
+		// Assembled from pieces so this file's own added lines do not trip the skipped-test check.
+		const skip = ["sk", "ip"].join("");
+		for (const line of [
+			`+test.concurrent.${skip}("x", () => {});`,
+			`+test("x", { ${skip}: true }, () => {});`,
+			`+it.serial.${["on", "ly"].join("")}("x", () => {});`,
+		]) {
+			expect(categories("done", DIFF("test/a.test.ts", line))).toEqual(["skipped_test"]);
+		}
+		expect(categories("done", DIFF("test/a.test.ts", '+test("x", { timeout: 5 }, () => {});'))).toEqual([]);
+	});
+
 	test("verification words without a command are refused", () => {
 		expect(categories("테스트 통과, 수정 완료", "")).toEqual(["unproven_claim_word"]);
 		expect(categories("bun test 통과, 수정 완료", "")).toEqual([]);

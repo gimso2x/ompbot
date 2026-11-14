@@ -1,18 +1,23 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	rmSync,
 	symlinkSync,
+	watch,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { OriginRouter, sessionDirFor } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
@@ -30,6 +35,7 @@ import { MAX_SCRIPT_STDERR_TAIL_CHARS, runScript } from "../src/monitors/script"
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../src/monitors/spec";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { gcSessions, LEDGER_RETENTION_DAYS } from "../src/ops/gc";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 
@@ -110,6 +116,7 @@ beforeEach(() => {
 		log,
 		scriptsRoot: scriptsRoot(),
 		workspaceDir: join(dir, "workspace"),
+		homeDir: dir,
 		frozen: () => frozenState,
 		budgetExceeded: () => budgetState,
 	});
@@ -178,6 +185,29 @@ describe("monitors: exactly once", () => {
 		expect(store.monitors.listEvents()).toHaveLength(1);
 		expect(store.monitors.listSlots(monitor.id)).toEqual([{ slotAt: slot, state: "claimed", reason: null }]);
 		expect(prompts()).toHaveLength(1);
+	});
+});
+
+describe("monitors: cron cursor", () => {
+	test("a tick with no slot due leaves the cursor and the next fire alone; a due slot moves the cursor to now", async () => {
+		const monitor = cronMonitor("* * * * *");
+		const cursorOf = () => store.monitors.getMonitor(monitor.id)?.cursorAt;
+		clock.advance(MINUTE);
+		expect((await run()).claimed).toBe(1);
+		expect(cursorOf()).toBe(T0 + MINUTE);
+
+		for (let i = 0; i < 3; i++) {
+			clock.advance(15_000);
+			expect((await run()).claimed).toBe(0);
+		}
+		expect(cursorOf()).toBe(T0 + MINUTE);
+		const row = store.monitors.getMonitor(monitor.id);
+		expect(row === undefined ? null : nextFireOf(row)).toBe(T0 + 2 * MINUTE);
+
+		clock.advance(15_000);
+		expect((await run()).claimed).toBe(1);
+		expect(cursorOf()).toBe(clock.now());
+		expect(store.monitors.listSlots(monitor.id)).toHaveLength(2);
 	});
 });
 
@@ -641,6 +671,7 @@ describe("monitors: verbatim delivery", () => {
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			scriptsRoot: scriptsRoot(),
 			workspaceDir: join(dir, "workspace"),
+			homeDir: dir,
 		});
 		const runOnce = async () => {
 			await verbatimScheduler.tick();
@@ -787,6 +818,385 @@ describe("monitors: verbatim delivery", () => {
 	});
 });
 
+describe("monitors: cron command (verbatim, no turn)", () => {
+	const ctx = () => ({ scriptsRoot: scriptsRoot(), defaultTimezone: "UTC" });
+	/** A minutely cron monitor whose command is `body`, built through the spec parser like `monitors add`. */
+	const commandMonitor = (
+		body: string,
+		extra: { args?: string[]; copyChannel?: string; overlap?: "skip" | "queue"; timeoutMs?: number } = {},
+	) => {
+		const script = writeScript("cmd.sh", body);
+		const spec = parseMonitorSpec(
+			{
+				name: "brief",
+				trigger: {
+					kind: "cron",
+					schedule: "* * * * *",
+					command: [script, ...(extra.args ?? [])],
+					...(extra.timeoutMs === undefined ? {} : { timeoutMs: extra.timeoutMs }),
+				},
+				instruction: "run the script and answer its stdout verbatim",
+				deliver: "verbatim",
+				...(extra.overlap === undefined ? {} : { overlap: extra.overlap }),
+				...(extra.copyChannel === undefined ? {} : { copyChannel: extra.copyChannel }),
+			},
+			ctx(),
+		);
+		return store.monitors.addMonitor(spec);
+	};
+	const PAYLOAD = "*아침 브리핑*\n<@UOWNER> 확인 필요\n- `run:all` _2건_ [링크](https://example.com)";
+	const logged = (name: string) => logLines.filter((line) => line.includes(`event=${name} `));
+	const bodies = (monitorId: string) =>
+		store.listDeliveries({ originKey: monitorOrigin(monitorId) }).map((row) => row.body);
+	const runsIn = (file: string) => (existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").length : 0);
+	/** Resolves once `path` exists, woken by a watch on its directory (the test timeout bounds the wait). */
+	const fileAppears = (path: string): Promise<void> => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		const watcher = watch(dirname(path), () => {
+			if (!existsSync(path)) return;
+			watcher.close();
+			resolve();
+		});
+		if (existsSync(path)) {
+			watcher.close();
+			resolve();
+		}
+		return promise;
+	};
+	/** Exits 0 at once from its second run on; the first run writes its pid to $1 and blocks until $2 (a FIFO) is written. */
+	const BLOCKING =
+		'#!/bin/sh\nif [ -f "$1" ]; then echo second; exit 0; fi\necho $$ > "$1.tmp"\nmv "$1.tmp" "$1"\nread line < "$2"\necho "done $line"\n';
+	const fifo = () => {
+		const path = join(dir, "release.fifo");
+		expect(spawnSync("mkfifo", [path]).status).toBe(0);
+		return path;
+	};
+	const release = (path: string) => {
+		const fd = openSync(path, "w");
+		writeSync(fd, "go\n");
+		closeSync(fd);
+	};
+
+	test("a due slot runs the command once without a turn; stdout is posted word for word, with its copy", async () => {
+		const out = join(dir, "out.txt");
+		const runs = join(dir, "runs");
+		writeFileSync(out, PAYLOAD);
+		const monitor = commandMonitor('#!/bin/sh\necho run >> "$2"\ncat "$1"\n', {
+			args: [out, runs],
+			copyChannel: "C0COPYCHAN1",
+		});
+		const seen: EventStage[] = [];
+		const off = store.monitors.subscribe((event) => {
+			if (seen.at(-1) !== event.stage) seen.push(event.stage);
+		});
+		clock.advance(MINUTE);
+		await run();
+		expect(runsIn(runs)).toBe(1);
+		expect(prompts()).toEqual([]);
+		expect(drivers).toHaveLength(0);
+		expect(store.listInbound().filter((row) => row.originKey === monitorOrigin(monitor.id))).toHaveLength(0);
+		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+		const opRef = `monitor:${monitor.id}:${event?.eventId}:1:verbatim`;
+		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
+		expect(rows.map((row) => [row.opRef, row.threadRef, row.body])).toEqual([
+			[opRef, `${OWNER}:-`, `⏰ brief\n${PAYLOAD}`],
+			[`${opRef}:copy`, "C0COPYCHAN1:-", `⏰ brief\n${PAYLOAD}`],
+		]);
+		expect([event?.stage, event?.payload, event?.answer, event?.deliveryId]).toEqual([
+			"authored",
+			PAYLOAD,
+			PAYLOAD,
+			rows[0]?.deliveryId,
+		]);
+
+		for (const row of store.claimDue()) store.confirmDelivery(row.deliveryId);
+		await run();
+		off();
+		expect(seen).toEqual(["admitted", "dispatched", "authored", "delivered"]);
+		expect(runsIn(runs)).toBe(1);
+		expect(logged("monitor_command")).toHaveLength(1);
+		expect(logged("monitor_verbatim")).toHaveLength(1);
+		expect(logged("monitor_dispatch")).toHaveLength(0);
+	});
+
+	test("spec: command lives under the scripts dir, needs verbatim, bounds timeoutMs, is kept by updates and cleared by null", () => {
+		const outsideDir = join(dir, "outside");
+		mkdirSync(outsideDir);
+		const outside = writeScript("evil.sh", "#!/bin/sh\nexit 0\n", outsideDir);
+		const plain = join(scriptsRoot(), "plain.sh");
+		writeFileSync(plain, "#!/bin/sh\nexit 0\n");
+		const script = writeScript("cmd.sh", "#!/bin/sh\necho hi\n");
+		const spec = (trigger: Record<string, unknown>, deliver?: string) => ({
+			name: "n",
+			trigger: { kind: "cron", schedule: "0 8 * * *", ...trigger },
+			instruction: "x",
+			...(deliver === undefined ? {} : { deliver }),
+		});
+		const rejects = (input: unknown, message: string) =>
+			expect(() => parseMonitorSpec(input, ctx())).toThrow(new RegExp(message));
+		rejects(spec({ command: [outside] }, "verbatim"), "must live under");
+		rejects(spec({ command: [plain] }, "verbatim"), "not an executable");
+		rejects(spec({ command: [script] }), 'needs deliver "verbatim"');
+		rejects(spec({ command: [script] }, "turn"), 'needs deliver "verbatim"');
+		rejects(spec({}, "verbatim"), "cron trigger with a command");
+		rejects(spec({ command: [script], timeoutMs: 999 }, "verbatim"), "timeoutMs must be");
+		rejects(spec({ command: [script], timeoutMs: 1_800_001 }, "verbatim"), "timeoutMs must be");
+		rejects(spec({ command: [script], timeoutMs: 1500.5 }, "verbatim"), "timeoutMs must be");
+		rejects(spec({ timeoutMs: 60_000 }), "timeoutMs needs trigger.command");
+
+		expect(parseMonitorSpec(spec({ command: script }, "verbatim"), ctx()).trigger).toEqual({
+			kind: "cron",
+			schedule: "0 8 * * *",
+			timezone: "UTC",
+			command: [script],
+		});
+		const current = parseMonitorSpec(
+			spec({ command: [script, "--days", "7"], timeoutMs: 1_800_000 }, "verbatim"),
+			ctx(),
+		);
+		const moved = mergeMonitorSpec(current, { trigger: { schedule: "30 7 * * *" } }, ctx());
+		expect(moved.trigger).toEqual({
+			kind: "cron",
+			schedule: "30 7 * * *",
+			timezone: "UTC",
+			command: [script, "--days", "7"],
+			timeoutMs: 1_800_000,
+		});
+		expect(mergeMonitorSpec(current, { overlap: "skip" }, ctx()).trigger).toEqual(current.trigger);
+		expect(() => mergeMonitorSpec(current, { trigger: { command: null } }, ctx())).toThrow(MonitorSpecError);
+		const back = mergeMonitorSpec(current, { trigger: { command: null }, deliver: "turn" }, ctx());
+		expect([back.trigger, back.deliver ?? "turn"]).toEqual([
+			{ kind: "cron", schedule: "0 8 * * *", timezone: "UTC" },
+			"turn",
+		]);
+	});
+
+	test("a failing command ends failed_no_retry at once with one owner notice carrying its first stdout line; a repeat stays quiet", async () => {
+		const monitor = commandMonitor('#!/bin/sh\necho "agy quota exhausted"\necho detail\nexit 3\n');
+		clock.advance(MINUTE);
+		await run();
+		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+		expect([event?.stage, event?.attempts, event?.nextAttemptAt]).toEqual(["failed_no_retry", 1, null]);
+		expect(event?.error).toBe("[command failed] agy quota exhausted");
+		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
+		expect(rows.map((row) => row.threadRef)).toEqual([`${OWNER}:-`]);
+		expect(rows[0]?.body).toBe(
+			"⏰ brief\n⚠️ 모니터 실행이 1번 실패해 재시도를 멈췄습니다 (failed_no_retry): agy quota exhausted",
+		);
+		expect(logged("monitor_command_failed")).toHaveLength(1);
+
+		clock.advance(MINUTE);
+		await run();
+		expect(stages()).toEqual(["failed_no_retry", "failed_no_retry"]);
+		expect(bodies(monitor.id)).toHaveLength(1);
+		clock.advance(BACKOFF_1);
+		await run();
+		expect(bodies(monitor.id)).toHaveLength(1);
+		expect(stages().every((stage) => stage === "failed_no_retry")).toBe(true);
+	});
+
+	test("a command past its timeoutMs is killed and fails with `timed out after <n>s`", async () => {
+		const pidFile = join(dir, "pid");
+		// Real 1 s (the smallest timeoutMs): this exercises the runner's own timer and a real SIGKILL of the group.
+		const monitor = commandMonitor('#!/bin/sh\necho $$ > "$1"\necho started\nexec sleep 30\n', {
+			args: [pidFile],
+			timeoutMs: 1000,
+		});
+		clock.advance(MINUTE);
+		await run();
+		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+		expect([event?.stage, event?.attempts, event?.nextAttemptAt]).toEqual(["failed_no_retry", 1, null]);
+		expect(event?.error?.startsWith("[command failed] timed out after 1s")).toBe(true);
+		const notices = bodies(monitor.id);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("(failed_no_retry): timed out after 1s");
+		const pid = Number(readFileSync(pidFile, "utf8").trim());
+		expect(() => process.kill(-pid, 0)).toThrow();
+	});
+
+	test("an exception inside the run is caught: monitor_command_failed and failed_no_retry, the scheduler keeps going", async () => {
+		const monitor = commandMonitor("#!/bin/sh\necho ok\n");
+		store.deliverMonitorVerbatim = () => {
+			throw new Error("ledger exploded");
+		};
+		clock.advance(MINUTE);
+		await run();
+		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+		expect([event?.stage, event?.attempts]).toEqual(["failed_no_retry", 1]);
+		expect(event?.error).toBe("[command failed] Error: ledger exploded");
+		expect(logged("monitor_command_failed").some((line) => line.includes("ledger exploded"))).toBe(true);
+		expect(bodies(monitor.id)).toHaveLength(1);
+		clock.advance(MINUTE);
+		expect((await run()).claimed).toBe(1);
+	});
+
+	test('exit 0 with empty output or a closing `{"wakeAgent": false}` is no_report with no post and no copy; [SILENT] is posted as is', async () => {
+		const out = join(dir, "out.txt");
+		const monitor = commandMonitor('#!/bin/sh\ncat "$1"\n', { args: [out], copyChannel: "C0COPYCHAN1" });
+		writeFileSync(out, "");
+		clock.advance(MINUTE);
+		await run();
+		writeFileSync(out, 'checked 3 feeds\n{"wakeAgent": false}\n');
+		clock.advance(MINUTE);
+		await run();
+		expect(stages()).toEqual(["no_report", "no_report"]);
+		expect(bodies(monitor.id)).toEqual([]);
+
+		writeFileSync(out, "[SILENT]\n");
+		clock.advance(MINUTE);
+		await run();
+		expect(stages()).toEqual(["no_report", "no_report", "authored"]);
+		expect(bodies(monitor.id)).toEqual(["⏰ brief\n[SILENT]", "⏰ brief\n[SILENT]"]);
+	});
+
+	test("environment: HOME, OMPBOT_HOME, OMPBOT_MONITOR_ID, PATH and LANG reach the command and a script check, nothing else of the daemon's", async () => {
+		const allowed = ["HOME", "OMPBOT_HOME", "OMPBOT_MONITOR_ID", "PATH", "LANG", "PWD", "SHLVL", "_"];
+		const keysOf = (text: string | null | undefined) =>
+			new Map(
+				(text ?? "")
+					.split("\n")
+					.filter((line) => line.includes("="))
+					.map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+			);
+		process.env.OMPBOT_TEST_DAEMON_ONLY = "leak";
+		try {
+			const command = commandMonitor("#!/bin/sh\nenv\n");
+			const check = store.monitors.addMonitor({
+				name: "check",
+				trigger: {
+					kind: "script",
+					command: [writeScript("check.sh", "#!/bin/sh\nenv\n")],
+					intervalMs: MINUTE,
+					fire: "every",
+				},
+				instruction: "x",
+				overlap: "queue",
+				enabled: true,
+				deliver: "verbatim",
+			});
+			clock.advance(MINUTE);
+			await run();
+			for (const monitor of [command, check]) {
+				const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+				const env = keysOf(event?.answer);
+				expect([...env.keys()].filter((key) => !allowed.includes(key))).toEqual([]);
+				expect([env.get("HOME"), env.get("OMPBOT_HOME"), env.get("OMPBOT_MONITOR_ID")]).toEqual([
+					process.env.HOME,
+					dir,
+					monitor.id,
+				]);
+				expect(env.has("PATH") && env.has("LANG")).toBe(true);
+			}
+		} finally {
+			delete process.env.OMPBOT_TEST_DAEMON_ONLY;
+		}
+	});
+
+	test("after stop() a due event starts no command and stays admitted", async () => {
+		const runs = join(dir, "runs");
+		commandMonitor('#!/bin/sh\necho run >> "$1"\necho hi\n', { args: [runs] });
+		scheduler.stop();
+		clock.advance(MINUTE);
+		await run();
+		expect(stages()).toEqual(["admitted"]);
+		expect(runsIn(runs)).toBe(0);
+		expect(logged("monitor_command")).toHaveLength(0);
+	});
+
+	test("stop() mid-command: idle() does not wait for timeoutMs, the group dies, the event stays dispatched and a restart posts it once", async () => {
+		const pidFile = join(dir, "pid");
+		const monitor = commandMonitor(BLOCKING, { args: [pidFile, fifo()], timeoutMs: 1_800_000 });
+		clock.advance(MINUTE);
+		await scheduler.tick();
+		await fileAppears(pidFile);
+		const pid = Number(readFileSync(pidFile, "utf8").trim());
+		expect(stages()).toEqual(["dispatched"]);
+
+		scheduler.stop();
+		await scheduler.idle();
+		expect(() => process.kill(-pid, 0)).toThrow();
+		expect(stages()).toEqual(["dispatched"]);
+		expect(logged("monitor_command_aborted")).toHaveLength(1);
+		expect(bodies(monitor.id)).toEqual([]);
+
+		const reopened = openStore({
+			timezone: "Asia/Seoul",
+			path: join(dir, "ompbot.db"),
+			clock,
+			redact,
+			slackOwnerUserId: OWNER,
+		});
+		const restarted = new MonitorScheduler({
+			store: reopened,
+			router: { route: async () => {}, newEpochIfIdle: async () => false },
+			clock,
+			log: createLogger({ sink: () => {}, clock, redact }),
+			scriptsRoot: scriptsRoot(),
+			workspaceDir: join(dir, "workspace"),
+			homeDir: dir,
+		});
+		try {
+			expect(restarted.start()).toBe(1);
+			expect(reopened.monitors.listEvents().map((event) => event.stage)).toEqual(["admitted"]);
+			await restarted.tick();
+			await restarted.idle();
+			await restarted.tick();
+			await restarted.idle();
+			expect(reopened.monitors.listEvents().map((event) => event.stage)).toEqual(["authored"]);
+			expect(reopened.listDeliveries({ originKey: monitorOrigin(monitor.id) }).map((row) => row.body)).toEqual([
+				"⏰ brief\nsecond",
+			]);
+		} finally {
+			reopened.close();
+		}
+	});
+
+	test("queue: the next event waits while the command runs, then runs; skip records skipped_overlap", async () => {
+		const pidFile = join(dir, "pid");
+		const gate = fifo();
+		const monitor = commandMonitor(BLOCKING, { args: [pidFile, gate] });
+		clock.advance(MINUTE);
+		await scheduler.tick();
+		await fileAppears(pidFile);
+		clock.advance(MINUTE);
+		await scheduler.tick();
+		expect(stages()).toEqual(["dispatched", "admitted"]);
+		expect(logged("monitor_command")).toHaveLength(1);
+		release(gate);
+		await scheduler.idle();
+		expect(stages()).toEqual(["authored", "authored"]);
+		expect(bodies(monitor.id)).toEqual(["⏰ brief\ndone go", "⏰ brief\nsecond"]);
+
+		store.monitors.removeMonitor(monitor.id);
+		rmSync(pidFile);
+		const skipping = commandMonitor(BLOCKING, { args: [pidFile, gate], overlap: "skip" });
+		clock.advance(MINUTE);
+		await scheduler.tick();
+		await fileAppears(pidFile);
+		clock.advance(MINUTE);
+		const second = await scheduler.tick();
+		expect(second.skippedOverlap).toBe(1);
+		const events = () => store.monitors.listEvents({ monitorId: skipping.id }).map((event) => event.stage);
+		expect(events()).toEqual(["dispatched", "skipped"]);
+		release(gate);
+		await scheduler.idle();
+		expect(events()).toEqual(["authored", "skipped"]);
+	});
+
+	test("frozen: the command does not run and the event is skipped `frozen`", async () => {
+		const runs = join(dir, "runs");
+		const monitor = commandMonitor('#!/bin/sh\necho run >> "$1"\necho hi\n', { args: [runs] });
+		frozenState = { since: "2026-06-01T00:00:00Z", reason: "test", by: "owner" };
+		clock.advance(MINUTE);
+		await run();
+		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
+		expect(event?.stage).toBe("skipped");
+		expect(event?.payload?.startsWith("frozen")).toBe(true);
+		expect(runsIn(runs)).toBe(0);
+		expect(bodies(monitor.id)).toEqual([]);
+	});
+});
+
 describe("monitors: failure backoff", () => {
 	test("retries after 10m, 1h and 4h, then failed_no_retry with exactly one notice", async () => {
 		behavior.startFails = true;
@@ -881,6 +1291,18 @@ describe("monitors: failure backoff", () => {
 		ledger.updateMonitor(monitor.id, { ...specOfRow(row), enabled: false });
 		ledger.updateMonitor(monitor.id, { ...specOfRow(row), enabled: true });
 		expect(ledger.recordMonitorIncident(monitor.id, "boom", 3_000).notify).toBe(true);
+	});
+
+	test("disabling a monitor by an update skips its queued fires instead of running them (qa-i 66)", async () => {
+		const monitor = cronMonitor("* * * * *", { channel: "C0CHAN" });
+		const claim = store.monitors.claimSlot({ monitorId: monitor.id, slotAt: T0 });
+		if (claim.status !== "admitted") throw new Error("expected an admitted fire");
+		const row = store.monitors.getMonitor(monitor.id);
+		if (row === undefined) throw new Error("monitor gone");
+		store.monitors.updateMonitor(monitor.id, { ...specOfRow(row), enabled: false });
+		await run();
+		expect(prompts()).toHaveLength(0);
+		expect(stages()).toEqual(["skipped"]);
 	});
 
 	test("incidents suppress repeats, reopen after a healthy run, and re-alert after the window", () => {
@@ -1035,6 +1457,20 @@ describe("monitors: script runner", () => {
 		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false, stdout: "payload-text" });
 	});
 
+	test("a NUL byte in a command argument is rejected by the spec and reported, not thrown, by the runner (qa-i 131)", async () => {
+		const script = writeScript("nul.sh", "#!/bin/sh\nexit 0\n");
+		const ctx = { scriptsRoot: scriptsRoot(), defaultTimezone: "Asia/Seoul" };
+		expect(() =>
+			parseMonitorSpec(
+				{ name: "n", trigger: { kind: "script", command: [script, "a\u0000b"], intervalMs: MINUTE }, instruction: "x" },
+				ctx,
+			),
+		).toThrow(MonitorSpecError);
+		const result = await runScript([script, "a\u0000b"], { scriptsRoot: scriptsRoot(), cwd: dir });
+		expect(result).toMatchObject({ fired: false, exitCode: null });
+		expect(result.error).toBeString();
+	});
+
 	test("exit 1 does not fire", async () => {
 		const script = writeScript("no.sh", "#!/bin/sh\necho nope\nexit 1\n");
 		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
@@ -1072,16 +1508,25 @@ describe("monitors: script runner", () => {
 	test("a background child holding the stderr pipe does not push the run to the timeout", async () => {
 		const script = writeScript("holder.sh", "#!/bin/sh\n( sleep 30 >&2 ) &\nsleep 0.2\nexit 0\n");
 		const started = Date.now();
-		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
+		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir, streamCloseGraceMs: 100 });
 		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false });
-		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(Date.now() - started).toBeLessThan(500);
 	});
 
 	test("a setsid daemon holding the stderr pipe cannot stall the runner", async () => {
 		const script = writeScript("daemon.sh", "#!/bin/sh\nsetsid sleep 30 >&2 &\nexit 0\n");
 		const started = Date.now();
+		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir, streamCloseGraceMs: 100 });
+		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false });
+		expect(Date.now() - started).toBeLessThan(500);
+	});
+
+	test("without the option a held pipe gets the default 1 s close grace", async () => {
+		const script = writeScript("holder.sh", "#!/bin/sh\n( sleep 30 >&2 ) &\nexit 0\n");
+		const started = Date.now();
 		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
 		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false });
+		expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
 		expect(Date.now() - started).toBeLessThan(5_000);
 	});
 
@@ -1295,6 +1740,7 @@ describe("monitors: script edge triggering", () => {
 			log: createLogger({ sink: () => {}, clock, redact }),
 			scriptsRoot: scriptsRoot(),
 			workspaceDir: join(dir, "workspace"),
+			homeDir: dir,
 		});
 		try {
 			restarted.start();
@@ -1374,6 +1820,49 @@ describe("monitors: script edge triggering", () => {
 			ledger.close();
 			old.close();
 		}
+	});
+
+	test("three check errors in a row alert the owner once; a 4th adds none; a good check clears the streak", async () => {
+		const monitor = addWatch();
+		const row = () => store.monitors.getMonitor(monitor.id);
+		const notices = () => store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
+		rmSync(join(scriptsRoot(), "flag.sh"));
+		await interval();
+		await interval();
+		expect(row()?.checkErrorStreak).toBe(2);
+		expect(row()?.lastCheckError).toBeTruthy();
+		expect(row()?.lastCheckErrorAt).toBe(clock.now());
+		expect(notices()).toHaveLength(0);
+		await interval();
+		expect(row()?.checkErrorStreak).toBe(3);
+		expect(notices()).toHaveLength(1);
+		expect(notices()[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(notices()[0]?.body.startsWith("⏰ flagwatch\n")).toBe(true);
+		expect(notices()[0]?.body).toContain("3번 연속");
+		await interval();
+		expect(row()?.checkErrorStreak).toBe(4);
+		expect(notices()).toHaveLength(1);
+		flagScript();
+		await interval();
+		expect([row()?.checkErrorStreak, row()?.lastCheckError, row()?.lastCheckErrorAt]).toEqual([0, null, null]);
+		// The recovery resolved the incident: the next run of three errors alerts again.
+		rmSync(join(scriptsRoot(), "flag.sh"));
+		for (let i = 0; i < 3; i++) await interval();
+		expect(notices()).toHaveLength(2);
+	});
+
+	test("rows from before the check error columns gain them with a zero streak", () => {
+		const monitor = addWatch();
+		const path = join(dir, "ompbot.db");
+		store.close();
+		const raw = new Database(path);
+		raw.run("ALTER TABLE monitors DROP COLUMN last_check_error");
+		raw.run("ALTER TABLE monitors DROP COLUMN last_check_error_at");
+		raw.run("ALTER TABLE monitors DROP COLUMN check_error_streak");
+		raw.close();
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact, slackOwnerUserId: OWNER });
+		const migrated = store.monitors.getMonitor(monitor.id);
+		expect([migrated?.checkErrorStreak, migrated?.lastCheckError, migrated?.lastCheckErrorAt]).toEqual([0, null, null]);
 	});
 
 	test("spec: fire defaults to edge, once to false; merge inherits; bad values are rejected", () => {
@@ -1491,5 +1980,53 @@ describe("monitors: spec validation", () => {
 			ctx(),
 		);
 		expect(spec.trigger).toEqual({ kind: "at", at: "2026-06-01T00:00:00.000Z" });
+	});
+});
+
+describe("monitors: event retention (gc)", () => {
+	const DAY = 24 * HOUR;
+	const FINAL = ["delivered", "failed_no_retry", "skipped", "no_report"];
+	const OPEN = ["admitted", "dispatched", "authored", "failed"];
+	let home: string;
+
+	beforeEach(() => {
+		home = mkdtempSync(join(tmpdir(), "ompbot-monitor-gc-"));
+		openStore({ timezone: "Asia/Seoul", path: join(home, "ompbot.db"), clock: new FakeClock(), redact }).close();
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run(
+			"INSERT INTO monitors (id, name, trigger_json, instruction, cursor_at, created_at, updated_at) VALUES ('m1', 'm', '{}', 'x', 0, 0, 0)",
+		);
+		const insert = db.query(
+			"INSERT INTO monitor_events (monitor_id, slot_at, stage, created_at, updated_at) VALUES ('m1', 0, ?, 0, ?)",
+		);
+		for (const stage of [...FINAL, ...OPEN]) insert.run(stage, T0 - 91 * DAY);
+		for (const stage of FINAL) insert.run(stage, T0 - 89 * DAY);
+		db.close();
+	});
+	afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+	function stages(): string[] {
+		const db = new Database(join(home, "ompbot.db"), { readonly: true });
+		try {
+			return (
+				db.query("SELECT stage, updated_at FROM monitor_events ORDER BY event_id").all() as Array<{
+					stage: string;
+					updated_at: number;
+				}>
+			).map((row) => `${row.stage}@${Math.round((T0 - row.updated_at) / DAY)}`);
+		} finally {
+			db.close();
+		}
+	}
+
+	test(`final stages older than ${LEDGER_RETENTION_DAYS} days go; open stages and younger events stay`, () => {
+		const result = gcSessions({ homeDir: home, retentionDays: 30, now: T0 });
+		expect(result.ledgerRemoved.monitorEvents).toBe(4);
+		expect(stages()).toEqual([...OPEN.map((stage) => `${stage}@91`), ...FINAL.map((stage) => `${stage}@89`)]);
+	});
+
+	test("dry-run counts them and deletes nothing", () => {
+		expect(gcSessions({ homeDir: home, retentionDays: 30, now: T0, dryRun: true }).ledgerRemoved.monitorEvents).toBe(4);
+		expect(stages()).toHaveLength(12);
 	});
 });

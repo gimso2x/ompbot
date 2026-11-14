@@ -1,0 +1,8 @@
+{
+	"name": "주간 모델 점검",
+	"trigger": { "kind": "cron", "schedule": "40 8 * * 1" },
+	"instruction": "주간 모델 점검을 한다. 절차 파일의 순서를 그대로 따른다.",
+	"overlap": "skip",
+	"thinking": "medium",
+	"procedureFiles": ["@OMPBOT_HOME@/scripts/model-review-procedure.md"]
+}

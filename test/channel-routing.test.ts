@@ -248,7 +248,6 @@ const DISCORD_DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
 /** A second platform's port: records posts and wakes a waiter on each one. */
 class SecondPort implements ChannelPort {
 	readonly platform = "discord" as const;
-	readonly capabilities = { permalink: false, reactions: true };
 	readonly posts: Array<{ target: PostTarget; msg: OutboundMessage }> = [];
 	#waiters: Array<() => void> = [];
 

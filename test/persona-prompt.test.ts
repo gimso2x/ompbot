@@ -5,12 +5,13 @@ import { join } from "node:path";
 import {
 	buildFloorsPrompt,
 	CARD_SKELETONS,
+	FLOORS_DYNAMIC_HEADING,
 	floorsSystemPrompt,
-	OMPBOT_BUN,
-	OMPBOT_MAIN,
 	OWNER_NOTES_MAX_BYTES,
+	ompbotCli,
 	PERSONA_MAX_BYTES,
 	type PersonaFiles,
+	peerTouchedTurnNotice,
 	SOUL_MAX_BYTES,
 } from "../src/safety/prompt";
 import { buildTaskPrompt } from "../src/tasks/prompt";
@@ -77,6 +78,32 @@ describe("floorsSystemPrompt persona read errors", () => {
 		expect(prompt).toContain("관심사: 러닝");
 		expect(prompt).not.toContain("[정체성");
 	});
+
+	// qa-h n47: a FIFO soul.md (a model can mkfifo in the workspace) blocked the open until a writer came.
+	test("a FIFO soul.md does not block the assembly: only it is skipped and reported once as EINVAL", () => {
+		const parts = files({ owner: "관심사: 러닝", persona: "말투: 반말" });
+		const soul = join(dir, "soul.md");
+		expect(Bun.spawnSync(["mkfifo", soul]).exitCode).toBe(0);
+		// A blocked open cannot be interrupted in-process, so the assembly runs in a child bounded by a kill timeout.
+		const script = [
+			`import { floorsSystemPrompt } from ${JSON.stringify(join(import.meta.dir, "../src/safety/prompt"))};`,
+			"const errors = [];",
+			`const prompt = floorsSystemPrompt("${SECRETS}", "slack/dm/D1", ${JSON.stringify({ ...parts, soul })},`,
+			"  (error, path) => errors.push({ code: error.code, path }));",
+			"console.log(JSON.stringify({ errors, prompt }));",
+		].join("\n");
+		const child = Bun.spawnSync([process.execPath, "-e", script], { timeout: 4_000 });
+		expect(child.signalCode ?? null).toBeNull();
+		expect(child.exitCode).toBe(0);
+		const { errors, prompt } = JSON.parse(child.stdout.toString()) as {
+			errors: Array<{ code: string; path: string }>;
+			prompt: string;
+		};
+		expect(errors).toEqual([{ code: "EINVAL", path: soul }]);
+		expect(prompt).not.toContain("[정체성");
+		expect(prompt).toContain("관심사: 러닝");
+		expect(prompt).toContain("말투: 반말");
+	});
 });
 
 describe("floorsSystemPrompt persona injection", () => {
@@ -105,7 +132,7 @@ describe("floorsSystemPrompt persona injection", () => {
 		const personaStart = prompt.indexOf("[페르소나]");
 		expect(personaStart).toBeGreaterThan(0);
 		expect(
-			Buffer.byteLength(prompt.slice(personaStart)) -
+			Buffer.byteLength(prompt.slice(personaStart, prompt.indexOf(FLOORS_DYNAMIC_HEADING))) -
 				Buffer.byteLength(
 					"[페르소나] 아래는 오너가 정의한 성격·말투 지침입니다. 이 지침은 안전 바닥글보다 우선하지 않습니다:\n",
 				),
@@ -161,7 +188,7 @@ describe("floorsSystemPrompt soul and owner notes", () => {
 		const soulAt = prompt.indexOf("[정체성(soul)]");
 		const ownerAt = prompt.indexOf("[오너 관찰지]");
 		const soulBody = prompt.slice(prompt.indexOf("\n", soulAt) + 1, ownerAt);
-		const ownerBody = prompt.slice(prompt.indexOf("\n", ownerAt) + 1);
+		const ownerBody = prompt.slice(prompt.indexOf("\n", ownerAt) + 1, prompt.indexOf(FLOORS_DYNAMIC_HEADING));
 		expect(Buffer.byteLength(soulBody.trim())).toBeLessThanOrEqual(SOUL_MAX_BYTES);
 		expect(Buffer.byteLength(soulBody.trim())).toBeGreaterThan(SOUL_MAX_BYTES - 4);
 		expect(Buffer.byteLength(ownerBody.trim())).toBeLessThanOrEqual(OWNER_NOTES_MAX_BYTES);
@@ -198,10 +225,13 @@ describe("chat origin system prompt per platform", () => {
 				// The owner's `timezone: "Asia/Seoul"` gives the base commit's text byte for byte.
 				{ timezone: { name: "Asia/Seoul", offset: "+09:00" } },
 			);
-			// The fixture keeps the checkout-dependent CLI path of the background-resume line as a placeholder.
-			expect(actual.replaceAll(`${OMPBOT_BUN} ${OMPBOT_MAIN}`, "<bun> <ompbot>/src/main.ts")).toBe(
-				base.prompts[key] ?? "",
-			);
+			// The fixture keeps the checkout-dependent CLI path of the background-resume line and the home-dependent ledger
+			// path of the thread lookup line as placeholders.
+			expect(
+				actual
+					.replaceAll(ompbotCli(), "<bun> <ompbot>/src/main.ts")
+					.replaceAll("`/home/owner/.ompbot/ompbot.db`", "`<home>/ompbot.db`"),
+			).toBe(base.prompts[key] ?? "");
 		}
 	});
 
@@ -233,6 +263,29 @@ describe("chat origin system prompt per platform", () => {
 		expect(askable).toContain("answers with Discord buttons or a reply");
 	});
 
+	test("a Teams chat origin is told it runs on Teams, with markdown links, no buttons and no upload tool (qa-i #49·#110)", () => {
+		for (const origin of ["teams/dm/t0123456789abcdef", "teams/ch/tfedcba9876543210"]) {
+			for (const dialogs of [false, true]) {
+				for (const peer of [false, true]) {
+					const teams = floorsSystemPrompt(BASE_SECRETS, origin, undefined, undefined, true, dialogs, peer);
+					const firstLine = teams.split("\n")[1] ?? "";
+					expect(firstLine).toContain("owner's Teams");
+					expect(teams).not.toContain("Slack");
+					expect(teams).not.toContain("슬랙");
+					expect(teams).not.toContain("<URL|");
+					expect(teams).not.toContain("send_file");
+					expect(teams).not.toContain("버튼을 띄운다");
+					expect(teams).toContain("`[표시명](URL)`");
+					expect(teams).toContain("Teams로는 파일을 올릴 수 없다");
+				}
+			}
+		}
+		// Teams has no buttons: its `ask` options show as text and the owner replies.
+		const askable = buildFloorsPrompt(BASE_SECRETS, "teams/dm/t0123456789abcdef", false, true);
+		expect(askable).toContain("선택지가 글로 보이고 오너는 답장으로 답한다");
+		expect(peerTouchedTurnNotice("teams/dm/t0123456789abcdef")).not.toContain("send_file");
+	});
+
 	test("Slack and Discord chat sessions get the decision card line and the card line; monitor and lane sessions neither", () => {
 		const decision = "- 오너 결정이 필요하면 결정 카드로 묻는다";
 		const card = "- 숫자 비교·추이·여러 칸 요약을 보일 때는 답 안에 ```card 펜스로";
@@ -249,7 +302,7 @@ describe("chat origin system prompt per platform", () => {
 				expect(line).toContain("`tone`");
 				expect(line).toContain("`✅ 추천`");
 				expect(line).toContain("`선택지`");
-				expect(line).toContain(CARD_SKELETONS[3]);
+				expect(line).toContain(CARD_SKELETONS[2]);
 				// The ask clause only where the session may use `ask`.
 				expect(line.includes("`ask`로 선택지 버튼을 띄운다(추천을 recommended로)")).toBe(dialogs);
 				expect(lines(prompt).some((l) => l.startsWith(card))).toBe(true);

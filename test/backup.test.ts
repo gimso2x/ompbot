@@ -5,7 +5,14 @@ import * as nodeFs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BACKUP_FILE_PATTERN, BUNDLE_FILE_PATTERN, readStamp, runBackup, STAMP_FILE } from "../src/ops/backup";
+import {
+	BACKUP_FILE_PATTERN,
+	BUNDLE_FILE_PATTERN,
+	readStamp,
+	retentionDoomed,
+	runBackup,
+	STAMP_FILE,
+} from "../src/ops/backup";
 import { dailyBackupNames, seedDb } from "./helpers/backup-fixtures";
 
 const sha256OfFile = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -180,6 +187,50 @@ describe("backup bundle (sessions + config.json)", () => {
 		expect(entries.some((e) => e === "config.json")).toBe(true);
 		expect(entries.some((e) => e.startsWith("sessions/") && e.endsWith("s.jsonl"))).toBe(true);
 		expect(entries.some((e) => e.startsWith("secrets"))).toBe(false);
+	});
+
+	test("skipBundle: a verified db, no bundle, and the bundled stamp before it stays the stamp", () => {
+		seedDb(home);
+		seedSources();
+		const backupsDir = join(home, "backups");
+		runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0) });
+		const stampBefore = readFileSync(join(backupsDir, STAMP_FILE), "utf8");
+
+		const result = runBackup({ homeDir: home, now: new Date(2026, 9, 23, 9, 0, 0), skipBundle: true });
+
+		expect(result.file.endsWith("ompbot-20261023-090000.db")).toBe(true);
+		expect(result.sha256).toBe(sha256OfFile(result.file));
+		const copy = new Database(result.file, { readonly: true, strict: true });
+		const check = copy.query("PRAGMA quick_check").get() as { quick_check: string };
+		copy.close();
+		expect(check.quick_check).toBe("ok");
+		expect(result.bundle).toBeUndefined();
+		expect(result.bundleBytes).toBeUndefined();
+		expect(result.bundleSha256).toBeUndefined();
+		expect(result.stamp).toBeUndefined();
+		expect(readdirSync(backupsDir).filter((name) => BUNDLE_FILE_PATTERN.test(name))).toEqual([
+			"ompbot-bundle-20261023-043000.tar.gz",
+		]);
+		expect(readFileSync(join(backupsDir, STAMP_FILE), "utf8")).toBe(stampBefore);
+	});
+
+	test("skipBundle prunes the db snapshots without a stamp and leaves the bundles to the daily backup", () => {
+		seedDb(home);
+		seedSources();
+		const backupsDir = join(home, "backups");
+		mkdirSync(backupsDir, { recursive: true });
+		for (const day of ["20261020", "20261021", "20261022"]) {
+			writeFileSync(join(backupsDir, `ompbot-${day}-043000.db`), "x");
+			writeFileSync(join(backupsDir, `ompbot-bundle-${day}-043000.tar.gz`), "x");
+		}
+		runBackup({ homeDir: home, now: new Date(2026, 9, 23, 9, 0, 0), keep: 2, skipBundle: true });
+		expect(existsSync(join(backupsDir, STAMP_FILE))).toBe(false);
+		expect(dailyBackupNames(home)).toEqual(["ompbot-20261022-043000.db", "ompbot-20261023-090000.db"]);
+		expect(
+			readdirSync(backupsDir)
+				.filter((name) => BUNDLE_FILE_PATTERN.test(name))
+				.sort(),
+		).toEqual(["ompbot-bundle-20261021-043000.tar.gz", "ompbot-bundle-20261022-043000.tar.gz"]);
 	});
 
 	test("workspace/ and scripts/ are bundled; secrets/ is not; a home without scripts/ still backs up", () => {
@@ -373,6 +424,75 @@ describe("backup bundle (sessions + config.json)", () => {
 		expect(existsSync(join(backupsDir, "ompbot-bundle-pre-upgrade.tar.gz"))).toBe(true);
 		// The daily db file of the same run is kept too.
 		expect(readdirSync(backupsDir).some((name) => name === "ompbot-20261025-043000.db")).toBe(true);
+	});
+
+	test("keep counts days: every file of the run's day, the latest of each other day, nothing past keep days", () => {
+		seedDb(home);
+		seedSources();
+		const backupsDir = join(home, "backups");
+		mkdirSync(backupsDir, { recursive: true });
+		const stamps = [
+			"20261025-010000", // the run's day, earlier applies
+			"20261025-020000",
+			"20301010-000000", // future-dated (clock stepped back): another day, its latest only
+			"20301010-120000",
+			"20261024-010000",
+			"20261024-230000",
+			"20261023-120000",
+			"20261022-120000",
+		];
+		for (const stamp of stamps) {
+			writeFileSync(join(backupsDir, `ompbot-${stamp}.db`), "x");
+			writeFileSync(join(backupsDir, `ompbot-bundle-${stamp}.tar.gz`), "x");
+		}
+		const manual = [
+			"ompbot-pre-upgrade-20261001T000000Z.db",
+			"ompbot-20261001-000000.db.bak-1",
+			"config.json.bak-20261001",
+		];
+		for (const name of manual) writeFileSync(join(backupsDir, name), "x");
+
+		const result = runBackup({ homeDir: home, keep: 3, now: new Date(2026, 9, 25, 4, 30, 0) });
+
+		// keep=3 days: the run's day (all three) + the two newest other days (2030-10-10, 2026-10-24), one each.
+		const survivors = ["20261024-230000", "20261025-010000", "20261025-020000", "20261025-043000", "20301010-120000"];
+		expect(dailyBackupNames(home)).toEqual(survivors.map((s) => `ompbot-${s}.db`));
+		expect(
+			readdirSync(backupsDir)
+				.filter((name) => BUNDLE_FILE_PATTERN.test(name))
+				.sort(),
+		).toEqual(survivors.map((s) => `ompbot-bundle-${s}.tar.gz`));
+		const gone = ["20301010-000000", "20261024-010000", "20261023-120000", "20261022-120000"];
+		expect(result.removed).toEqual([
+			...gone.map((s) => join(backupsDir, `ompbot-${s}.db`)),
+			...gone.map((s) => join(backupsDir, `ompbot-bundle-${s}.tar.gz`)),
+		]);
+		for (const name of manual) expect(existsSync(join(backupsDir, name))).toBe(true);
+		expect(existsSync(join(backupsDir, STAMP_FILE))).toBe(true);
+		// kept = every daily .db left after retention, newest name first (bundles are not counted).
+		expect(result.kept).toEqual([...survivors].reverse().map((s) => join(backupsDir, `ompbot-${s}.db`)));
+	});
+
+	test("without a protected file the newest day is the base day, kept whole", () => {
+		const names = [
+			"ompbot-20261024-010000.db",
+			"ompbot-20261024-020000.db",
+			"ompbot-20261023-010000.db",
+			"ompbot-20261023-020000.db",
+			"ompbot-20261022-010000.db",
+			"ompbot-pre-upgrade-20261001T000000Z.db",
+			"ompbot-bundle-20261024-010000.tar.gz",
+		];
+		expect(retentionDoomed(names, 2, [], BACKUP_FILE_PATTERN)).toEqual([
+			"ompbot-20261023-010000.db",
+			"ompbot-20261022-010000.db",
+		]);
+		// A protected name pins its day as the base day even when it is not the newest.
+		expect(retentionDoomed(names, 1, ["ompbot-20261023-010000.db"], BACKUP_FILE_PATTERN)).toEqual([
+			"ompbot-20261024-020000.db",
+			"ompbot-20261024-010000.db",
+			"ompbot-20261022-010000.db",
+		]);
 	});
 
 	test("a hard link to a secrets/ file inside a bundle source fails the backup (J-1/J-5)", () => {

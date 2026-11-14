@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ConfigError, defaultHomeDir, loadConfig, type OmpbotConfig, timezoneOfHome } from "../config";
-import { runDoctor } from "../daemon/doctor";
+import { escapeControl, runDoctor } from "../daemon/doctor";
 import { callDaemon } from "../daemon/ipc";
 import type { ReloadResult } from "../daemon/reload";
 import { runDaemon } from "../daemon/run";
@@ -12,15 +12,13 @@ import { herdrSshArgv, type ProcessRunner, realProcessRunner } from "../dispatch
 import { readConfigText } from "../ops/apply";
 import { BackupError, type BackupResult, DEFAULT_KEEP, runBackup } from "../ops/backup";
 import { clearFreeze, readFreeze, writeFreeze } from "../ops/freeze";
-import { collectGates, type GatesOptions } from "../ops/gates";
+import { collectGates, type GatesOptions, gateOptionsFromConfig } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
 import { type HostLoadReader, testHostLoad } from "../ops/host-resources";
 import { OffsiteError, type OffsiteResult, runOffsite } from "../ops/offsite";
 import { APPLY_USAGE, applyCommand } from "./apply";
-import { BRIEFING_USAGE, briefingCommand } from "./briefing";
 import { DASHBOARD_USAGE, dashboardCommand } from "./dashboard";
 import { DRAIN_USAGE, drainCommand } from "./drain";
-import { FEEDBACK_USAGE, feedbackCommand } from "./feedback";
 import { INIT_USAGE, initCommand } from "./init";
 import { LANES_USAGE, lanesCommand } from "./lanes";
 import { MONITORS_USAGE, monitorsCommand } from "./monitors";
@@ -41,13 +39,11 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  integration (herdr on), and ssh reach plus the herdr omp integration per dispatchHosts entry (integration
                                  and host lines are warnings and do not change the exit code)
   gc [--dry-run]                 delete previous-epoch session dirs, idle thread origins and deleted-monitor origins older than sessionRetentionDays (default 30)
-  backup [--keep N] [--max-bundle-bytes N]    consistent ompbot.db snapshot (VACUUM INTO), quick_check, retention (default 14) + stamp
+  backup [--keep N] [--max-bundle-bytes N]    consistent ompbot.db snapshot (VACUUM INTO), quick_check, retention: 14 days (one per day, all of the run's day) + stamp
                                  + sessions/config.json/workspace/scripts bundle (tar.gz, sha256 in the stamp) when they exist; the
                                  bundle size cap defaults to 512MB (config maxBundleBytes, --max-bundle-bytes overrides)
                                  with config offsite {ssh, remoteDir, keep?}, a good backup is then copied off-site
                                  (exit 4 when only the off-site copy failed; the local backup and its stamp stay)
-  offsite [--json]               retry the off-site copy of the newest backup + bundle (ssh/scp, remote sha256 checked,
-                                 remote retention, offsite.ok stamp); needs config offsite; exit 4 on failure
   freeze [--reason <t>]          write <home>/FROZEN: remote dispatch, monitor fires, new work lanes, running lanes' automatic
                                  re-prompts, task reminders and skill reviews stop within seconds (owner chat turns keep
                                  working); a due 'at' monitor waits and fires once after unfreeze; the 'frozen' gate stays
@@ -56,14 +52,15 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   gates [--json] [--strict]      read-only health projection; each gate is open, closed or unknown (nothing to judge: no
                                  heartbeat stamp or no ompbot.db yet); exit 1 if any open, with --strict also if any unknown.
                                  gates: backup_age, offsite_age (only with config offsite), sweep_stalled, slack_disconnected,
-                                 frozen, herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
+                                 discord_disconnected (only with config channels.discord), frozen,
+                                 herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
                                  disk_low, host_pressure, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
                                  monitors_failed, monitors_stalled, turns_failing, ledger_unreadable,
                                  cost_cap (only with config costCap.dailyUsd)
   inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${BRIEFING_USAGE}${FEEDBACK_USAGE}${TEAMS_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${TEAMS_USAGE}`;
 
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
 	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
@@ -88,7 +85,7 @@ function gcCommand(args: string[], homeDir: string): number {
 		process.stdout.write(`gc monitor_${verb} origin=${key}\n`);
 	}
 	process.stdout.write(
-		`gc_done ${verb}=${result.removed.length} retained=${result.retained.length} threads=${result.threadOriginsRemoved.length} monitors=${result.monitorOriginsRemoved.length} teams_qa=${result.teamsQaRemoved}\n`,
+		`gc_done ${verb}=${result.removed.length} retained=${result.retained.length} threads=${result.threadOriginsRemoved.length} monitors=${result.monitorOriginsRemoved.length} teams_qa=${result.teamsQaRemoved} inbound=${result.ledgerRemoved.inbound} deliveries=${result.ledgerRemoved.deliveries} delivery_posts=${result.ledgerRemoved.deliveryPosts} monitor_events=${result.ledgerRemoved.monitorEvents}\n`,
 	);
 	return 0;
 }
@@ -112,10 +109,7 @@ async function checkDispatchHosts(config: OmpbotConfig, run: ProcessRunner): Pro
 	const perHost = await Promise.all(
 		Object.entries(config.dispatchHosts ?? {}).map(async ([key, host]) => {
 			// config only warns about a control character in a host name; on a doctor line it must not start a new line.
-			const name = key.replace(
-				/[\p{Cc}\p{Cf}]/gu,
-				(c) => `\\u${(c.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`,
-			);
+			const name = escapeControl(key);
 			const [result, integration] = await Promise.all([
 				run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host.ssh, "true"], {
 					timeoutMs: DISPATCH_HOST_CHECK_MS,
@@ -181,7 +175,8 @@ export async function doctorCommand(
 	write: (line: string) => void,
 	deps: { doctor?: typeof runDoctor; run?: ProcessRunner } = {},
 ): Promise<number> {
-	const code = await (deps.doctor ?? runDoctor)(homeDir, write);
+	// This checkout (src/cli/index.ts → repo root) holds the daemon's code and any code rollback journal.
+	const code = await (deps.doctor ?? runDoctor)(homeDir, write, resolve(import.meta.dir, "..", ".."));
 	let config: OmpbotConfig | undefined;
 	try {
 		config = loadConfigIfPresent(homeDir);
@@ -230,16 +225,6 @@ async function offsiteRun(config: OmpbotConfig, homeDir: string, json: boolean):
 		`offsite_done files=${result.files.length} removed=${result.removed.length} stamp=${result.stamp}\n`,
 	);
 	return 0;
-}
-
-async function offsiteCommand(args: string[], homeDir: string): Promise<number> {
-	const { values } = parseArgs({ args, options: { json: { type: "boolean" } } });
-	const config = loadConfigIfPresent(homeDir);
-	if (config === undefined) {
-		process.stderr.write("offsite: no config.json\n");
-		return 2;
-	}
-	return offsiteRun(config, homeDir, values.json === true);
 }
 
 async function backupCommand(args: string[], homeDir: string): Promise<number> {
@@ -304,18 +289,10 @@ export function gatesCommand(args: string[], homeDir: string, deps: GatesCommand
 	const { values } = parseArgs({ args, options: { json: { type: "boolean" }, strict: { type: "boolean" } } });
 	// A db-only home (no config.json) has no omp to check; the omp_runtime gate is then omitted.
 	const config = loadConfigIfPresent(homeDir);
-	const omp = {
-		...(config !== undefined && (config.agent ?? "omp") === "omp" ? { ompExecutable: config.ompExecutable } : {}),
-		...(config?.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
-	};
 	const gates = collectGates({
 		homeDir,
 		now: (deps.now ?? Date.now)(),
-		offsiteConfigured: config?.offsite !== undefined,
-		...(config?.costCap?.dailyUsd === undefined
-			? {}
-			: { dailyCap: { usd: config.costCap.dailyUsd, timezone: config.timezone } }),
-		...omp,
+		...gateOptionsFromConfig(config),
 		...(deps.statfs === undefined ? {} : { statfs: deps.statfs }),
 		...(deps.hostLoad === undefined ? {} : { hostLoad: deps.hostLoad }),
 	});
@@ -354,13 +331,19 @@ async function statusCommand(args: string[], homeDir: string, hostLoad?: Partial
 			return 1;
 		}
 		// The database is the report; a db-only (recovery) home or broken token files must not hide it.
-		const config = loadConfigIfPresent(homeDir, { checkTokens: false });
+		let config: ReturnType<typeof loadConfigIfPresent>;
+		try {
+			config = loadConfigIfPresent(homeDir, { checkTokens: false });
+		} catch (error) {
+			// A broken config.json hides nothing the ledger can say; `doctor` names the same cause.
+			process.stderr.write(`status: config unreadable, version and gate settings unknown: ${String(error)}\n`);
+			config = undefined;
+		}
 		report = readStatusFromDb(
 			dbPath,
 			config === undefined ? "unknown" : await readVersion([config.ompExecutable, "--version"]),
 			config?.timezone ?? timezoneOfHome(homeDir),
-			config?.offsite !== undefined,
-			config?.costCap?.dailyUsd,
+			gateOptionsFromConfig(config),
 			hostLoad,
 		);
 	}
@@ -486,8 +469,6 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return gcCommand(rest, homeDir);
 			case "backup":
 				return await backupCommand(rest, homeDir);
-			case "offsite":
-				return await offsiteCommand(rest, homeDir);
 			case "freeze":
 				return freezeCommand(rest, homeDir);
 			case "unfreeze":
@@ -516,12 +497,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return skillsCommand(rest, env);
 			case "dashboard":
 				return await dashboardCommand(rest, homeDir);
-			case "briefing":
-				return await briefingCommand(rest, homeDir);
 			case "teams":
 				return await teamsCommand(rest, homeDir);
-			case "feedback":
-				return feedbackCommand(rest, homeDir);
 			default:
 				process.stderr.write(USAGE);
 				return command === undefined || command === "--help" || command === "help" ? 0 : 2;

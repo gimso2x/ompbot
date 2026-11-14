@@ -1,7 +1,7 @@
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { type DriverFactory, openOriginSession, sessionToResume } from "../core/mailbox";
-import { isTurnPromptFor, promptTextOf } from "../core/types";
+import { COMMAND_OP_REF, isTurnPromptFor, promptTextOf } from "../core/types";
 import type { Logger } from "../log";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { closingAnswer, turnAnswerParts } from "../omp/answers";
@@ -88,7 +88,7 @@ function parseRestartCut(text: string): RestartCut | undefined {
  * {@link RESTART_CUT_MAX_AGE_MS}, and for one that cannot be parsed (`restart_cut_unreadable`). Never deletes it: the
  * apply that wrote it does, so a rollback restart judges its cut turns by the same record.
  */
-export function readRestartCut(homeDir: string, now: number, log: Logger): Map<string, RestartCutEntry> {
+function readRestartCut(homeDir: string, now: number, log: Logger): Map<string, RestartCutEntry> {
 	const byOpRef = new Map<string, RestartCutEntry>();
 	const path = join(homeDir, RESTART_CUT_FILE);
 	let text: string;
@@ -176,7 +176,8 @@ function finalAnswerParts(entries: readonly OmpEntry[], promptText: string, last
  * the row's `entry_cursor` (-> answered + delivery) or gets exactly one interrupted notice. Prompts are never resent.
  * Exception: a conversation turn the planned restart cut (its op_ref is in {@link RESTART_CUT_FILE}) gets one resume
  * row `cut-<id>` in the same thread and {@link CONTINUE_NOTICE} instead — once: a turn of a resume row, a monitor
- * origin, or an op_ref not in a fresh record is interrupted as before.
+ * origin, a command op (`COMMAND_OP_REF`: lane, task, chat command) or an op_ref not in a fresh record is interrupted
+ * as before.
  * Rows that were steered into the same turn share an `op_ref` and are settled together by the first row's lookup.
  */
 export async function recoverDispatched(deps: RecoveryDeps): Promise<RecoveryResult> {
@@ -237,7 +238,10 @@ export async function recoverDispatched(deps: RecoveryDeps): Promise<RecoveryRes
 					log.warn("recovery_open_failed", { origin: originKey, error: String(openError) });
 				}
 				const resumed =
-					parts === undefined && !monitor && !group.some((row) => row.platformMessageId.startsWith(CONTINUE_ID_PREFIX))
+					parts === undefined &&
+					!monitor &&
+					!COMMAND_OP_REF.test(opRef) &&
+					!group.some((row) => row.platformMessageId.startsWith(CONTINUE_ID_PREFIX))
 						? cutTurnsOf().get(opRef)
 						: undefined;
 				if (parts === undefined && resumed !== undefined) {

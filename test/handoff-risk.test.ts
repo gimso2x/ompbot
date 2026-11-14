@@ -3,6 +3,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HANDOFF_SCAN_BYTES, scanHandoffBrief } from "../src/safety/handoff-risk";
 
+/** A GitHub account name, put together at run time so the public core carries no account literal. */
+const GH_ACCOUNT = ["gimso", "2x"].join("");
+
 const rulesOf = (brief: string, options?: { protectedBranches?: readonly string[] }) =>
 	scanHandoffBrief(brief, options).findings.map((finding) => finding.rule);
 
@@ -13,8 +16,18 @@ describe("scanHandoffBrief: high_risk rules", () => {
 		git_push_force: ["git push --force origin task/x", "git push --force-with-lease", "git push -f origin task/x"],
 		git_push_protected: ["git push origin main", "git push origin HEAD:master", "git push origin refs/heads/main"],
 		git_branch_force_delete: ["git branch -D task/old"],
+		git_stash_discard: ["git stash drop 해", "git stash clear"],
+		git_discard_worktree: ["git checkout -- . 로 되돌려", "git checkout .", "git restore ."],
+		git_push_delete: ["git push origin --delete feature/x", "git push -d origin x"],
+		gh_destructive: [`gh repo delete ${GH_ACCOUNT}/x --yes`],
+		crontab_remove: ["crontab -r"],
 		rm_rf_absolute: ["rm -rf /var/lib/x", "rm -fr ~/work", "rm -r -f $HOME/.cache", "sudo rm -Rf /"],
-		sql_destructive: ["sqlite3 ompbot.db 'DROP TABLE tasks'", "drop database ompbot;", "TRUNCATE TABLE inbound"],
+		sql_destructive: [
+			"sqlite3 ompbot.db 'DROP TABLE tasks'",
+			"drop database ompbot;",
+			"TRUNCATE TABLE inbound",
+			"sqlite3 x.db 'DELETE FROM jobs'",
+		],
 		service_control: [
 			"systemctl --user restart ompbot",
 			"systemctl stop nginx",
@@ -220,6 +233,9 @@ describe("scanHandoffBrief: 말고·않고 clause boundary", () => {
 		["git reset --hard는 하지 말고 테스트만 돌려", false],
 		["git reset --hard 하지 않고 테스트만 돌려", false],
 		["git reset --hard는 건드리지 않고 테스트만 돌려", false],
+		// fable 감사 IMP-01: `<명사> 말고` ends its clause too.
+		["rebase 말고 git push --force origin main 해", true],
+		["git push --force 말고 rebase 해", false],
 	];
 	test.each(table)("%s → high_risk %p", (brief, highRisk) => {
 		expect(scanHandoffBrief(brief).verdict === "high_risk").toBe(highRisk);
@@ -234,6 +250,10 @@ describe("scanHandoffBrief: negatives and advisory rules", () => {
 		expect(rulesOf("rm -rf node_modules")).toEqual([]);
 		expect(rulesOf("git branch -d task/x")).toEqual([]);
 		expect(rulesOf("git clean -n")).toEqual([]);
+		expect(rulesOf("git stash pop")).toEqual([]);
+		expect(rulesOf("git restore --staged .")).toEqual([]);
+		expect(rulesOf("git checkout ./src/a.ts")).toEqual([]);
+		expect(rulesOf("DELETE FROM jobs WHERE id = 3;")).toEqual([]);
 		const korean = scanHandoffBrief(
 			"로그 회전을 구현하고 테스트를 추가한다.\n바꾼 파일만 커밋하고 PROGRESS.md를 갱신한다.\n결과는 outcome.md에 적는다.",
 		);
@@ -321,5 +341,113 @@ describe("scanHandoffBrief: qa50b-low lane L", () => {
 		expect(scanHandoffBrief(`${"(".repeat(50)}git reset --hard${")".repeat(50)}; 하지 않는다`).verdict).toBe(
 			"high_risk",
 		);
+	});
+});
+
+// doc/plans/qa-i-low-fixes.md 묶음 A: each table names the qa-i item numbers it closes.
+describe("scanHandoffBrief: qa-i low A", () => {
+	const highRisk = (briefs: readonly string[], rule: string) => {
+		for (const brief of briefs) expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [rule] });
+	};
+
+	test("#43 #102 any git global option before the subcommand is skipped", () => {
+		highRisk(
+			[
+				"git --literal-pathspecs reset --hard HEAD",
+				"git --exec-path=/x reset --hard HEAD",
+				"git --attr-source=HEAD reset --hard HEAD",
+				"git --attr-source HEAD reset --hard HEAD",
+				"git --config-env core.x=Y reset --hard HEAD",
+			],
+			"git_reset_hard",
+		);
+		highRisk(["git --no-optional-locks clean -fdx"], "git_clean_force");
+		expect(rulesOf("git --no-optional-locks status")).toEqual([]);
+		expect(rulesOf("git -C reset log --oneline")).toEqual([]);
+	});
+
+	test("#101 repeated git -C stays fast", () => {
+		const started = performance.now();
+		expect(scanHandoffBrief("git -C ".repeat(Math.floor(HANDOFF_SCAN_BYTES / 7))).verdict).toBe("clear");
+		// The old nested option group took about 30s here; the bound only catches a return of that blow-up.
+		expect(performance.now() - started).toBeLessThan(5000);
+	});
+
+	test("#41 #97 #103 #104 checkout, restore and switch forms that discard the work tree", () => {
+		highRisk(
+			[
+				"git checkout ./",
+				"git checkout -f .",
+				"git checkout -q .",
+				"git checkout HEAD -- .",
+				"git checkout -f main",
+				"git restore --staged --worktree .",
+				"git restore --worktree --staged .",
+				"git restore -W --staged .",
+				"git restore :/",
+				"git restore --source=HEAD~3 .",
+				"git switch -f main",
+				"git switch --discard-changes main",
+			],
+			"git_discard_worktree",
+		);
+		for (const brief of [
+			"git restore --staged .",
+			"git checkout ./src/a.ts",
+			"git checkout -b feature/x",
+			"git switch -c fix-f",
+			"git checkout main",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [] });
+	});
+
+	test("#42 #98 delete and force together are a forced branch delete", () => {
+		highRisk(
+			["git branch -d -f x", "git branch --delete --force x", "git branch -f -d x", "git branch -df x"],
+			"git_branch_force_delete",
+		);
+		expect(rulesOf("git branch -d x")).toEqual([]);
+		expect(rulesOf("git branch -f x origin/main")).toEqual([]);
+	});
+
+	test("#99 abbreviated long options git accepts", () => {
+		highRisk(["git reset --har HEAD~3"], "git_reset_hard");
+		highRisk(["git clean --forc -d"], "git_clean_force");
+		highRisk(["git push --forc origin x", "git push --force-w origin x"], "git_push_force");
+		highRisk(["git push origin --del feature/x"], "git_push_delete");
+		expect(rulesOf("git push --follow-tags origin x")).toEqual([]);
+	});
+
+	test("#46 #106 a parameter expansion of HOME is an absolute target", () => {
+		highRisk([`rm -rf \${HOME:-/}`, `rm -rf \${HOME:?}`, `rm -rf \${HOME%/}/work`], "rm_rf_absolute");
+		expect(rulesOf(`rm -rf \${HOMEWORK_DIR}`)).toEqual([]);
+	});
+
+	test("#107 crontab -r after other options", () => {
+		highRisk(["crontab -u me -r", "crontab -u me -ir"], "crontab_remove");
+		expect(rulesOf("crontab -u me -l")).toEqual([]);
+	});
+
+	test("#40 #105 a backslash-newline inside a word joins it without a blank", () => {
+		for (const brief of ["git reset --\\\nhard HEAD~9", "rm -r\\\nf /", "git res\\\net --hard HEAD"])
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "high_risk" });
+		expect(scanHandoffBrief("git reset --\\\nsoft HEAD").verdict).toBe("clear");
+	});
+
+	test("#108 a long line's excerpt shows the command, not only the line's head", () => {
+		const line = `${"가나다라마바사아자차카타파하 ".repeat(14)}git reset --hard origin/main`;
+		const [finding] = scanHandoffBrief(line).findings;
+		expect(finding?.excerpt).toContain("git reset --hard origin/main");
+		expect(finding?.excerpt.startsWith("…")).toBe(true);
+		expect(Array.from(finding?.excerpt ?? "").length).toBeLessThanOrEqual(160);
+	});
+
+	test("#45 many forbidden hits on one long line do not stall the scan", () => {
+		const unit = "mkfs 하지않 ";
+		const brief = unit.repeat(Math.floor(HANDOFF_SCAN_BYTES / new TextEncoder().encode(unit).length));
+		const started = performance.now();
+		scanHandoffBrief(brief);
+		// About 4.7s before; the bound only catches a return of the per-hit rescan.
+		expect(performance.now() - started).toBeLessThan(1500);
 	});
 });
